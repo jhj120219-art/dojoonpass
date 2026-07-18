@@ -1,0 +1,73 @@
+﻿from config.settings import CourtInfo
+
+ALL_COURTS = [
+    CourtInfo(code="서울중앙지방법원", name="서울중앙지방법원", region="서울"),
+    CourtInfo(code="서울동부지방법원", name="서울동부지방법원", region="서울"),
+    CourtInfo(code="서울서부지방법원", name="서울서부지방법원", region="서울"),
+    CourtInfo(code="서울남부지방법원", name="서울남부지방법원", region="서울"),
+    CourtInfo(code="서울북부지방법원", name="서울북부지방법원", region="서울"),
+    CourtInfo(code="의정부지방법원",   name="의정부지방법원",   region="경기"),
+    CourtInfo(code="고양지원",         name="고양지원",         region="경기"),
+    CourtInfo(code="남양주지원",       name="남양주지원",       region="경기"),
+    CourtInfo(code="인천지방법원",     name="인천지방법원",     region="인천"),
+    CourtInfo(code="부천지원",         name="부천지원",         region="인천"),
+    CourtInfo(code="수원지방법원",     name="수원지방법원",     region="경기"),
+    CourtInfo(code="성남지원",         name="성남지원",         region="경기"),
+    CourtInfo(code="여주지원",         name="여주지원",         region="경기"),
+    CourtInfo(code="평택지원",         name="평택지원",         region="경기"),
+    CourtInfo(code="안산지원",         name="안산지원",         region="경기"),
+    CourtInfo(code="안양지원",         name="안양지원",         region="경기"),
+    CourtInfo(code="춘천지방법원",     name="춘천지방법원",     region="강원"),
+    CourtInfo(code="강릉지원",         name="강릉지원",         region="강원"),
+    CourtInfo(code="원주지원",         name="원주지원",         region="강원"),
+    CourtInfo(code="속초지원",         name="속초지원",         region="강원"),
+    CourtInfo(code="영월지원",         name="영월지원",         region="강원"),
+    CourtInfo(code="청주지방법원",     name="청주지방법원",     region="충북"),
+    CourtInfo(code="충주지원",         name="충주지원",         region="충북"),
+    CourtInfo(code="제천지원",         name="제천지원",         region="충북"),
+    CourtInfo(code="영동지원",         name="영동지원",         region="충북"),
+    CourtInfo(code="대전지방법원",     name="대전지방법원",     region="대전"),
+    CourtInfo(code="홍성지원",         name="홍성지원",         region="충남"),
+    CourtInfo(code="논산지원",         name="논산지원",         region="충남"),
+    CourtInfo(code="천안지원",         name="천안지원",         region="충남"),
+    CourtInfo(code="공주지원",         name="공주지원",         region="충남"),
+    CourtInfo(code="서산지원",         name="서산지원",         region="충남"),
+    CourtInfo(code="대구지방법원",     name="대구지방법원",     region="대구"),
+    CourtInfo(code="안동지원",         name="안동지원",         region="경북"),
+    CourtInfo(code="경주지원",         name="경주지원",         region="경북"),
+    CourtInfo(code="김천지원",         name="김천지원",         region="경북"),
+    CourtInfo(code="상주지원",         name="상주지원",         region="경북"),
+    CourtInfo(code="의성지원",         name="의성지원",         region="경북"),
+    CourtInfo(code="영덕지원",         name="영덕지원",         region="경북"),
+    CourtInfo(code="포항지원",         name="포항지원",         region="경북"),
+    CourtInfo(code="대구서부지원",     name="대구서부지원",     region="대구"),
+    CourtInfo(code="부산지방법원",     name="부산지방법원",     region="부산"),
+    CourtInfo(code="부산동부지원",     name="부산동부지원",     region="부산"),
+    CourtInfo(code="부산서부지원",     name="부산서부지원",     region="부산"),
+    CourtInfo(code="울산지방법원",     name="울산지방법원",     region="울산"),
+    CourtInfo(code="창원지방법원",     name="창원지방법원",     region="경남"),
+    CourtInfo(code="마산지원",         name="마산지원",         region="경남"),
+    CourtInfo(code="진주지원",         name="진주지원",         region="경남"),
+    CourtInfo(code="통영지원",         name="통영지원",         region="경남"),
+    CourtInfo(code="밀양지원",         name="밀양지원",         region="경남"),
+    CourtInfo(code="거창지원",         name="거창지원",         region="경남"),
+    CourtInfo(code="광주지방법원",     name="광주지방법원",     region="광주"),
+    CourtInfo(code="목포지원",         name="목포지원",         region="전남"),
+    CourtInfo(code="장흥지원",         name="장흥지원",         region="전남"),
+    CourtInfo(code="순천지원",         name="순천지원",         region="전남"),
+    CourtInfo(code="해남지원",         name="해남지원",         region="전남"),
+    CourtInfo(code="전주지방법원",     name="전주지방법원",     region="전북"),
+    CourtInfo(code="군산지원",         name="군산지원",         region="전북"),
+    CourtInfo(code="정읍지원",         name="정읍지원",         region="전북"),
+    CourtInfo(code="남원지원",         name="남원지원",         region="전북"),
+    CourtInfo(code="제주지방법원",     name="제주지방법원",     region="제주"),
+]
+
+def get_court_by_code(code: str) -> CourtInfo:
+    for court in ALL_COURTS:
+        if court.code == code:
+            return court
+    raise ValueError("Unknown court code: " + code)
+
+def get_courts_by_region(region: str):
+    return [c for c in ALL_COURTS if c.region == region]

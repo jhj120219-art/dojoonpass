@@ -1,0 +1,57 @@
+﻿from fastapi import APIRouter, HTTPException
+from storage.database import get_connection
+
+router = APIRouter()
+
+@router.get("/item/{item_id}")
+def get_item(item_id: int):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM auction_item WHERE id = ?", (item_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
+
+        case = conn.execute(
+            "SELECT * FROM auction_case WHERE id = ?", (row["case_id"],)
+        ).fetchone()
+
+        doc_status = conn.execute(
+            "SELECT doc_type, status FROM document_status WHERE item_id = ?",
+            (item_id,)
+        ).fetchall()
+
+        tenants = conn.execute(
+            "SELECT * FROM tenant_rights WHERE item_id = ?", (item_id,)
+        ).fetchall()
+
+        rights = conn.execute(
+            "SELECT * FROM rights_summary WHERE item_id = ?", (item_id,)
+        ).fetchone()
+
+        return {
+            "id": row["id"],
+            "case_no": row["case_no"],
+            "item_no": row["item_no"],
+            "court_name": row["court_name"],
+            "property_type": row["property_type"],
+            "sido": row["sido"],
+            "sigungu": row["sigungu"],
+            "dong": row["dong"],
+            "full_address": row["full_address"],
+            "appraisal_price": row["appraisal_price"],
+            "minimum_bid_price": row["minimum_bid_price"],
+            "bid_rate": row["bid_rate"],
+            "auction_date": row["auction_date"],
+            "status": row["status"],
+            "fail_count": row["fail_count"],
+            "validation_status": row["validation_status"],
+            "crawl_date": row["crawl_date"],
+            "case": dict(case) if case else None,
+            "documents": [{"doc_type": d["doc_type"], "status": d["status"]} for d in doc_status],
+            "tenants": [dict(t) for t in tenants],
+            "rights_summary": dict(rights) if rights else None,
+        }
+    finally:
+        conn.close()

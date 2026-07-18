@@ -39,3 +39,37 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# 크롤링 데이터 / 결과물 (코드 아님, 용량 크고 계속 바뀜)
+*.db
+*.csv
+*.log
+logs/
+downloads/
+documents/
+storage/
+
+# 디버깅용 캡처/덤프 파일
+debug_*.png
+debug_*.html
+page_dump.html
+*_result.json
+*_sample.json
+*_targets.json
+
+# 임시/실험 스크립트 (필요하면 나중에 따로 정리)
+step*.py
+patch_*.py
+check_*.py
+
+# 남은 부산물 파일들
+step*.json
+*.txt
+!requirements.txt
