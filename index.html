@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>도준패스 — 월 7~9만원 없이도 되는 경매 서비스</title>
+<meta name="description" content="한 달에 등기부등본 3~5건만 보는데 왜 7~9만원을 내나요. 도준패스는 필요한 만큼만 쓰는 가벼운 경매 서비스입니다. 베타 무료 신청.">
+
+<!-- ============================================================
+  분석 스크립트 설치 위치 (실제 배포 시 아래에 교체)
+  1) GA4:  gtag.js 스니펫
+  2) Meta Pixel: fbq 스니펫 (PageView, Lead 이벤트)
+  3) Microsoft Clarity: 프로젝트 ID 스니펫
+  각 스니펫은 </head> 직전에 붙여넣으세요.
+============================================================ -->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;700;900&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+
+<style>
+  :root{
+    --ink:#14213D;
+    --ink-soft:#2B3A5C;
+    --paper:#F0EBDE;
+    --paper-deep:#E4DCC6;
+    --paper-line:#CDC3A6;
+    --seal:#B7301E;
+    --seal-dark:#8B2216;
+    --slate:#5C6478;
+    --gold:#93712F;
+    --white:#FBF9F3;
+    --radius:2px;
+    --serif:'Noto Serif KR', serif;
+    --sans:'Pretendard', -apple-system, BlinkMacSystemFont, 'Malgun Gothic', sans-serif;
+    --mono:'IBM Plex Mono', monospace;
+  }
+
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html{scroll-behavior:smooth;}
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto;}
+    *{animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important;}
+  }
+
+  body{
+    font-family:var(--sans);
+    background:var(--paper);
+    color:var(--ink);
+    line-height:1.6;
+    background-image:
+      repeating-linear-gradient(0deg, rgba(20,33,61,0.028) 0px, rgba(20,33,61,0.028) 1px, transparent 1px, transparent 28px),
+      repeating-linear-gradient(90deg, rgba(20,33,61,0.02) 0px, rgba(20,33,61,0.02) 1px, transparent 1px, transparent 28px);
+  }
+
+  a{color:inherit;}
+  img{max-width:100%; display:block;}
+
+  .wrap{max-width:1080px; margin:0 auto; padding:0 24px;}
+
+  /* ---------- 상단 문서 헤더 바 ---------- */
+  .doc-bar{
+    border-bottom:1px solid var(--paper-line);
+    background:var(--white);
+  }
+  .doc-bar .wrap{
+    display:flex; justify-content:space-between; align-items:center;
+    padding:14px 24px;
+    font-family:var(--mono);
+    font-size:12px;
+    letter-spacing:0.03em;
+    color:var(--slate);
+  }
+  .doc-bar .case-no{color:var(--seal); font-weight:600;}
+  .doc-bar .brand{
+    font-family:var(--serif); font-weight:900; font-size:17px; color:var(--ink);
+    letter-spacing:-0.01em;
+  }
+
+  /* ---------- 히어로 ---------- */
+  .hero{
+    position:relative;
+    padding:96px 0 72px;
+    overflow:hidden;
+  }
+  .hero .wrap{
+    display:grid;
+    grid-template-columns:1.15fr 0.85fr;
+    gap:48px;
+    align-items:center;
+  }
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--mono);
+    font-size:12.5px; letter-spacing:0.06em;
+    color:var(--seal);
+    border:1px solid var(--seal);
+    padding:5px 12px 5px 10px;
+    border-radius:100px;
+    margin-bottom:22px;
+    background:rgba(183,48,30,0.05);
+  }
+  .eyebrow::before{content:"●"; font-size:8px;}
+
+  h1{
+    font-family:var(--serif);
+    font-weight:900;
+    font-size:clamp(32px, 4.4vw, 52px);
+    line-height:1.28;
+    letter-spacing:-0.015em;
+    color:var(--ink);
+    margin-bottom:22px;
+  }
+  h1 .accent{color:var(--seal);}
+
+  .lede{
+    font-size:clamp(16px,1.7vw,18.5px);
+    color:var(--ink-soft);
+    max-width:52ch;
+    margin-bottom:34px;
+  }
+
+  .cta-row{display:flex; flex-wrap:wrap; gap:14px; align-items:center; margin-bottom:16px;}
+
+  .btn{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--sans); font-weight:700; font-size:15.5px;
+    padding:15px 26px;
+    border-radius:var(--radius);
+    border:1px solid transparent;
+    cursor:pointer;
+    text-decoration:none;
+    transition:transform .15s ease, box-shadow .15s ease, background .15s ease;
+  }
+  .btn-primary{
+    background:var(--seal); color:var(--white);
+    box-shadow:0 3px 0 var(--seal-dark);
+  }
+  .btn-primary:hover{transform:translateY(-1px); box-shadow:0 4px 0 var(--seal-dark);}
+  .btn-primary:active{transform:translateY(2px); box-shadow:0 1px 0 var(--seal-dark);}
+  .btn-ghost{
+    background:transparent; color:var(--ink); border-color:var(--ink);
+  }
+  .btn-ghost:hover{background:var(--ink); color:var(--white);}
+  .btn:focus-visible{outline:3px solid var(--gold); outline-offset:2px;}
+
+  .hero-note{
+    font-family:var(--mono); font-size:12.5px; color:var(--slate);
+  }
+
+  /* ---------- 직인(도장) 시그니처 요소 ---------- */
+  .seal-wrap{
+    display:flex; justify-content:center; align-items:center;
+    position:relative;
+  }
+  .seal{
+    width:min(260px, 60vw);
+    height:min(260px, 60vw);
+    animation:seal-in 0.7s cubic-bezier(.2,.8,.2,1) both;
+    animation-delay:.15s;
+  }
+  @keyframes seal-in{
+    0%{opacity:0; transform:scale(1.5) rotate(-18deg);}
+    100%{opacity:1; transform:scale(1) rotate(-8deg);}
+  }
+  @media (prefers-reduced-motion: reduce){ .seal{animation:none; transform:rotate(-8deg);} }
+
+  /* ---------- 섹션 공통 ---------- */
+  section{padding:78px 0;}
+  .section-tab{
+    display:inline-block;
+    font-family:var(--mono); font-size:12px; letter-spacing:0.08em;
+    color:var(--slate);
+    border-left:3px solid var(--seal);
+    padding-left:10px;
+    margin-bottom:14px;
+  }
+  h2{
+    font-family:var(--serif); font-weight:700;
+    font-size:clamp(24px,3vw,32px);
+    color:var(--ink);
+    letter-spacing:-0.01em;
+    margin-bottom:12px;
+  }
+  .section-lede{color:var(--slate); font-size:15.5px; max-width:56ch; margin-bottom:44px;}
+
+  /* ---------- 문제 공감 (사유서 스타일) ---------- */
+  .reasons{
+    background:var(--white);
+    border-top:1px solid var(--paper-line);
+    border-bottom:1px solid var(--paper-line);
+  }
+  .reason-grid{
+    display:grid; grid-template-columns:repeat(2,1fr); gap:1px;
+    background:var(--paper-line);
+    border:1px solid var(--paper-line);
+  }
+  .reason-card{
+    background:var(--white);
+    padding:30px 28px;
+    opacity:0; transform:translateY(14px);
+    transition:opacity .5s ease, transform .5s ease;
+  }
+  .reason-card.in{opacity:1; transform:translateY(0);}
+  .reason-no{
+    font-family:var(--mono); font-size:12.5px; color:var(--seal); font-weight:600;
+    display:block; margin-bottom:10px;
+  }
+  .reason-card h3{
+    font-family:var(--sans); font-weight:700; font-size:17.5px;
+    margin-bottom:8px; color:var(--ink);
+  }
+  .reason-card p{color:var(--slate); font-size:14.5px;}
+
+  /* ---------- 비교표 ---------- */
+  .compare-scroll{overflow-x:auto; border:1px solid var(--paper-line);}
+  table.compare{
+    width:100%; border-collapse:collapse; min-width:640px;
+    background:var(--white);
+    font-size:14.5px;
+  }
+  table.compare th, table.compare td{
+    padding:16px 18px; text-align:left;
+    border-bottom:1px solid var(--paper-line);
+    border-right:1px solid var(--paper-line);
+  }
+  table.compare th:last-child, table.compare td:last-child{border-right:none;}
+  table.compare thead th{
+    font-family:var(--mono); font-size:12.5px; letter-spacing:0.03em;
+    color:var(--slate); background:var(--paper-deep);
+    font-weight:600;
+  }
+  table.compare tbody th{
+    font-weight:600; color:var(--ink-soft); background:var(--paper);
+    width:120px;
+  }
+  table.compare td.dojun{
+    background:rgba(183,48,30,0.05);
+    color:var(--ink);
+    font-weight:700;
+  }
+  table.compare thead th.dojun-head{
+    background:var(--seal); color:var(--white);
+  }
+  .mark-good::before{content:"○ "; color:var(--seal); font-weight:700;}
+  .mark-bad::before{content:"× "; color:var(--slate);}
+
+  /* ---------- 가격 콜아웃 박스 ---------- */
+  .price-callout{
+    margin-top:28px;
+    background:var(--ink); color:var(--white);
+    padding:52px 40px;
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:28px;
+    border-left:6px solid var(--seal);
+  }
+  .price-callout .pc-label{
+    font-family:var(--mono); font-size:13.5px; color:#93A0C4; letter-spacing:0.06em; margin-bottom:10px; text-transform:uppercase;
+  }
+  .price-callout .pc-price{
+    font-family:var(--serif); font-weight:900; font-size:clamp(52px,9vw,96px); color:var(--white);
+    line-height:1; letter-spacing:-0.02em;
+  }
+  .price-callout .pc-price .won{color:#E8896F; font-size:0.5em; margin-left:4px;}
+  .price-callout .pc-note{font-size:13.5px; color:#B7BFD6; max-width:32ch;}
+  .price-callout .pc-original{
+    font-family:var(--mono); font-size:22px; color:#8891AC;
+    text-decoration:line-through; text-decoration-thickness:2.5px; text-decoration-color:var(--seal);
+    margin-bottom:10px;
+  }
+  .badge-row{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px;}
+  .discount-badge{
+    display:inline-flex; align-items:center; gap:6px;
+    background:var(--seal); color:var(--white);
+    font-family:var(--mono); font-weight:700; font-size:13px;
+    padding:7px 14px; border-radius:100px;
+  }
+  .nationwide-badge{
+    display:inline-flex; align-items:center; gap:6px;
+    background:transparent; color:var(--white);
+    border:1.5px solid #93A0C4;
+    font-family:var(--mono); font-weight:700; font-size:13px;
+    padding:7px 14px; border-radius:100px;
+  }
+  .price-strike{
+    font-family:var(--mono); color:var(--slate); text-decoration:line-through;
+    text-decoration-thickness:2px; text-decoration-color:var(--seal); font-size:14px;
+  }
+
+  /* ---------- 설문 결과 시각화 ---------- */
+  .survey{background:var(--white); border-top:1px solid var(--paper-line); border-bottom:1px solid var(--paper-line);}
+  .survey-grid{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--paper-line); border:1px solid var(--paper-line);}
+  .survey-block{background:var(--white); padding:28px 26px; opacity:0; transform:translateY(14px); transition:opacity .5s ease, transform .5s ease;}
+  .survey-block.in{opacity:1; transform:translateY(0);}
+  .survey-block h3{font-size:14.5px; font-weight:700; color:var(--ink); margin-bottom:18px;}
+  .bar-row{margin-bottom:14px;}
+  .bar-row:last-child{margin-bottom:0;}
+  .bar-label{display:block; font-size:12.5px; color:var(--ink-soft); margin-bottom:6px;}
+  .bar-track{background:var(--paper); height:22px; position:relative; border:1px solid var(--paper-line);}
+  .bar-fill{
+    height:100%; background:var(--seal); display:flex; align-items:center; justify-content:flex-end;
+    padding-right:8px; color:var(--white); font-family:var(--mono); font-size:11.5px; font-weight:600;
+    min-width:34px;
+  }
+  .bar-fill.muted{background:var(--gold);}
+  .survey-note{font-size:12px; color:var(--slate); margin-top:26px; font-family:var(--mono);}
+
+  .insight-box{
+    margin-top:32px; background:rgba(183,48,30,0.06); border:1px dashed var(--seal);
+    padding:22px 24px; font-family:var(--serif); font-size:17px; color:var(--ink); font-weight:700; line-height:1.6;
+  }
+  .insight-box span{color:var(--seal);}
+
+  /* ---------- 창업 배경 ---------- */
+  .story{background:var(--paper-deep);}
+  .story-block{
+    max-width:680px; background:var(--white); border:1px solid var(--paper-line);
+    padding:44px 40px; position:relative;
+  }
+  .story-block::before{
+    content:"“"; font-family:var(--serif); font-size:64px; color:var(--seal); opacity:0.35;
+    position:absolute; top:8px; left:20px; line-height:1;
+  }
+  .story-block p{
+    font-family:var(--serif); font-size:clamp(16px,1.8vw,19px); color:var(--ink); line-height:1.85;
+    position:relative; z-index:1;
+  }
+  .story-block p + p{margin-top:14px;}
+  .story-sign{
+    margin-top:24px; font-family:var(--mono); font-size:12.5px; color:var(--slate);
+    display:block; text-align:right;
+  }
+
+  /* ---------- 해결책 3가지 ---------- */
+  .value-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:28px;}
+  .value-card{
+    padding:32px 26px;
+    background:var(--white);
+    border:1px solid var(--paper-line);
+    position:relative;
+  }
+  .value-card::before{
+    content:"";
+    position:absolute; top:0; left:0; width:100%; height:3px;
+    background:var(--seal);
+  }
+  .value-tag{
+    font-family:var(--mono); font-size:11.5px; color:var(--gold);
+    letter-spacing:0.05em; display:block; margin-bottom:14px;
+  }
+  .value-card h3{font-family:var(--serif); font-size:19px; font-weight:700; margin-bottom:10px;}
+  .value-card p{color:var(--slate); font-size:14.5px;}
+
+  /* ---------- 신뢰 / FAQ ---------- */
+  .trust{background:var(--ink); color:var(--paper);}
+  .trust .section-tab{color:#B9A98A; border-left-color:var(--seal);}
+  .trust h2{color:var(--white);}
+  .trust .section-lede{color:#B7BFD6;}
+  .stat-row{display:flex; gap:48px; flex-wrap:wrap; margin-bottom:52px;}
+  .stat{}
+  .stat .num{font-family:var(--serif); font-size:38px; font-weight:900; color:var(--white);}
+  .stat .label{font-family:var(--mono); font-size:12px; color:#93A0C4; margin-top:4px;}
+
+  .faq-item{
+    border-top:1px solid rgba(255,255,255,0.14);
+    padding:20px 0;
+  }
+  .faq-item:last-child{border-bottom:1px solid rgba(255,255,255,0.14);}
+  .faq-q{
+    display:flex; justify-content:space-between; align-items:center;
+    cursor:pointer; font-weight:700; font-size:15.5px; color:var(--white);
+    list-style:none;
+  }
+  .faq-q::-webkit-details-marker{display:none;}
+  .faq-q .plus{font-family:var(--mono); color:var(--seal); font-size:18px;}
+  .faq-a{color:#C3CAE0; font-size:14.5px; margin-top:12px; max-width:64ch;}
+
+  /* ---------- 신청 폼 ---------- */
+  .apply{background:var(--paper-deep); border-top:1px solid var(--paper-line);}
+  .apply-grid{display:grid; grid-template-columns:0.9fr 1.1fr; gap:56px; align-items:start;}
+  .apply-side .badge{
+    font-family:var(--mono); font-size:12px; color:var(--seal);
+    border:1px solid var(--seal); border-radius:100px;
+    padding:5px 12px; display:inline-block; margin-bottom:18px;
+  }
+  .apply-side ul{list-style:none; margin-top:22px;}
+  .apply-side li{
+    display:flex; gap:10px; font-size:14.5px; color:var(--ink-soft);
+    padding:9px 0; border-top:1px dashed var(--paper-line);
+  }
+  .apply-side li:first-of-type{border-top:none;}
+  .apply-side li::before{content:"◆"; color:var(--seal); font-size:9px; margin-top:5px;}
+
+  form{
+    background:var(--white); border:1px solid var(--paper-line); padding:36px;
+  }
+  .field{margin-bottom:20px;}
+  .field label{
+    display:block; font-size:13.5px; font-weight:700; color:var(--ink);
+    margin-bottom:7px;
+  }
+  .field .opt{font-weight:400; color:var(--slate); font-size:12.5px;}
+  .field input[type=email], .field input[type=text]{
+    width:100%; padding:13px 14px; font-size:15px;
+    border:1px solid var(--paper-line); background:var(--white);
+    font-family:var(--sans); border-radius:var(--radius);
+  }
+  .field input:focus-visible{outline:2px solid var(--seal); outline-offset:1px;}
+  .choice-group{display:flex; flex-wrap:wrap; gap:8px;}
+  .choice{
+    font-size:13.5px; padding:9px 14px;
+    border:1px solid var(--paper-line); border-radius:100px;
+    cursor:pointer; color:var(--ink-soft); background:var(--paper);
+    transition:all .15s ease;
+    user-select:none;
+  }
+  .choice input{position:absolute; opacity:0; pointer-events:none;}
+  .choice:has(input:checked){
+    background:var(--seal); border-color:var(--seal); color:var(--white); font-weight:600;
+  }
+  .choice:has(input:focus-visible){outline:2px solid var(--gold); outline-offset:2px;}
+
+  .submit-btn{width:100%; justify-content:center; font-size:16px; padding:16px;}
+  .form-foot{font-size:12px; color:var(--slate); margin-top:14px; text-align:center;}
+
+  #successMsg{display:none; text-align:center; padding:40px 20px;}
+  #successMsg .stamp-mini{width:72px; margin:0 auto 18px;}
+  #successMsg h3{font-family:var(--serif); font-size:20px; margin-bottom:8px;}
+  #successMsg p{color:var(--slate); font-size:14px;}
+
+  /* ---------- 하단 CTA / 푸터 ---------- */
+  .final-cta{
+    background:var(--ink); color:var(--white); text-align:center; padding:88px 0;
+  }
+  .final-cta h2{color:var(--white); margin-bottom:18px;}
+  .final-cta .section-lede{color:#B7BFD6; margin:0 auto 34px; text-align:center;}
+  .final-cta .cta-row{justify-content:center;}
+
+  footer{
+    background:var(--paper); padding:28px 0; text-align:center;
+    font-family:var(--mono); font-size:11.5px; color:var(--slate);
+    border-top:1px solid var(--paper-line);
+  }
+
+  /* ---------- 모바일 하단 고정 CTA ---------- */
+  .sticky-cta{
+    position:fixed; bottom:0; left:0; right:0; z-index:40;
+    background:var(--white); border-top:1px solid var(--paper-line);
+    padding:12px 16px; display:none;
+    box-shadow:0 -4px 18px rgba(20,33,61,0.12);
+  }
+  .sticky-cta .btn{width:100%; justify-content:center;}
+
+  /* ---------- 반응형 ---------- */
+  @media (max-width:860px){
+    .hero .wrap{grid-template-columns:1fr; gap:36px;}
+    .hero{padding:64px 0 48px; text-align:left;}
+    .seal-wrap{order:-1; transform:scale(0.85);}
+    .reason-grid{grid-template-columns:1fr;}
+    .survey-grid{grid-template-columns:1fr;}
+    .story-block{padding:30px 24px;}
+    .price-callout{flex-direction:column; align-items:flex-start; text-align:left; padding:32px 22px;}
+    .badge-row{flex-direction:column; align-items:flex-start;}
+    .value-grid{grid-template-columns:1fr;}
+    .apply-grid{grid-template-columns:1fr; gap:32px;}
+    .stat-row{gap:28px;}
+    .sticky-cta{display:block;}
+    body{padding-bottom:76px;}
+    form{padding:26px 20px;}
+  }
+</style>
+</head>
+<body>
+
+<!-- 상단 문서 바 -->
+<div class="doc-bar">
+  <div class="wrap">
+    <span class="brand">도준패스</span>
+    <span class="case-no">2026타경-BETA</span>
+  </div>
+</div>
+
+<!-- 히어로 -->
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-copy">
+      <span class="eyebrow">사전 설문 응답자 63% · "구독료가 부담된다"</span>
+      <h1>월 7~9만원짜리 경매 사이트,<br>정말 <span class="accent">필요</span>하신가요?</h1>
+      <p class="lede">
+        실제 투자자 대부분은 한 달에 등기부등본을 3~5건만 봅니다.
+        안 쓰는 기능에 매달 구독료를 낼 필요는 없습니다.
+        도준패스는 필요한 만큼만 쓰는 가벼운 경매 서비스입니다.
+      </p>
+      <div class="cta-row">
+        <a href="#apply" class="btn btn-primary" id="heroCta">지금 9,900원에 베타 신청하기</a>
+        <a href="#pricing" class="btn btn-ghost">가격 비교 먼저 보기</a>
+      </div>
+      <p class="hero-note">정가 <span class="price-strike">21,900원</span> → 베타 테스트 참여 시 <strong style="color:var(--seal)">9,900원</strong> (55% 할인) · 전국 단일가, 지역별 추가 결제 없음</p>
+    </div>
+
+    <div class="seal-wrap" aria-hidden="true">
+      <svg class="seal" viewBox="0 0 200 200" role="img" aria-label="도준패스 접수중 직인">
+        <defs>
+          <path id="circlePath" d="M 100,100 m -76,0 a 76,76 0 1,1 152,0 a 76,76 0 1,1 -152,0"/>
+        </defs>
+        <circle cx="100" cy="100" r="92" fill="none" stroke="#B7301E" stroke-width="2.5"/>
+        <circle cx="100" cy="100" r="80" fill="none" stroke="#B7301E" stroke-width="1.5"/>
+        <text font-family="'IBM Plex Mono', monospace" font-size="12.5" font-weight="600" fill="#B7301E" letter-spacing="3">
+          <textPath href="#circlePath" startOffset="2%">DOJUNPASS · 법원경매정보서비스 · BETA</textPath>
+        </text>
+        <text x="100" y="93" text-anchor="middle" font-family="'Noto Serif KR', serif" font-weight="900" font-size="30" fill="#B7301E">접수</text>
+        <text x="100" y="124" text-anchor="middle" font-family="'Noto Serif KR', serif" font-weight="900" font-size="30" fill="#B7301E">중</text>
+      </svg>
+    </div>
+  </div>
+</header>
+
+<!-- 설문 결과 시각화 -->
+<section class="survey">
+  <div class="wrap">
+    <span class="section-tab">사전 설문 결과 · 응답자 8명</span>
+    <h2>"검색이 느리다"보다 "돈이 아깝다"가 더 컸습니다</h2>
+    <p class="section-lede">베타 신청 전 사전 인터뷰·설문에서 나온 실제 응답입니다. 표본은 크지 않지만, 방향은 뚜렷했습니다.</p>
+
+    <div class="survey-grid">
+      <div class="survey-block">
+        <h3>경매 서비스 이용 시 가장 불편한 점</h3>
+        <div class="bar-row">
+          <span class="bar-label">검색 자체가 어렵고 복잡하다</span>
+          <div class="bar-track"><div class="bar-fill" style="width:55%">55%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">권리분석이 어렵다</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:27%">27%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">지역별로 따로 결제해야 한다</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:18%">18%</div></div>
+        </div>
+      </div>
+
+      <div class="survey-block">
+        <h3>기존 유료 서비스 비용에 대한 생각</h3>
+        <div class="bar-row">
+          <span class="bar-label">필요할 때만 쓰는데 구독료가 부담된다</span>
+          <div class="bar-track"><div class="bar-fill" style="width:63%">63%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">지역마다 따로 결제하는 게 아깝다</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:25%">25%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">비싸서 무료 자료만 본다</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:13%">13%</div></div>
+        </div>
+      </div>
+
+      <div class="survey-block">
+        <h3>최근 한 달 등기부등본 열람 횟수</h3>
+        <div class="bar-row">
+          <span class="bar-label">3~5건</span>
+          <div class="bar-track"><div class="bar-fill" style="width:63%">63%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">1~2건</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:25%">25%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">6~10건</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:13%">13%</div></div>
+        </div>
+      </div>
+
+      <div class="survey-block">
+        <h3>가장 선호하는 서비스 형태</h3>
+        <div class="bar-row">
+          <span class="bar-label">모바일 중심 + 저렴한 가격</span>
+          <div class="bar-track"><div class="bar-fill" style="width:63%">63%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">전국 물건 검색 가능</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:25%">25%</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">기타</span>
+          <div class="bar-track"><div class="bar-fill muted" style="width:13%">13%</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="insight-box">
+      한 달에 3~5건만 보는데, 매달 <span>7~9만원</span>을 내고 계셨습니다.
+    </div>
+
+  </div>
+</section>
+
+<!-- 창업 배경 -->
+<section class="story">
+  <div class="wrap">
+    <span class="section-tab">창업자 진술</span>
+    <h2>저도 매달 그 돈이 아까웠습니다</h2>
+    <div class="story-block">
+      <p>경매를 하면서 지지옥션을 썼습니다.</p>
+      <p>그런데 정작 한 달에 등기부등본을 열어본 건 3~4건이 전부였습니다. 그마저도 지역이 바뀌면 또 따로 결제해야 했습니다.</p>
+      <p>"이 돈, 정말 다 쓰고 있나" 하는 생각이 들었습니다.</p>
+      <p>그래서 필요한 만큼만 쓰는 가벼운 서비스, 도준패스를 만들고 있습니다.</p>
+      <span class="story-sign">— 도준패스 팀 드림</span>
+    </div>
+  </div>
+</section>
+
+<!-- 가격 비교 -->
+<section id="pricing">
+  <div class="wrap">
+    <span class="section-tab">가격 확인서</span>
+    <h2>지지옥션 · 탱크옥션보다 가벼운 가격</h2>
+    <p class="section-lede">기능 비교보다 가격 비교가 먼저입니다. 정말 필요한 만큼만 내는 구조로 설계하고 있습니다.</p>
+
+    <div class="compare-scroll">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th scope="col">비교 항목</th>
+            <th scope="col">지지옥션</th>
+            <th scope="col">탱크옥션</th>
+            <th scope="col" class="dojun-head">도준패스</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">월 구독료</th>
+            <td class="mark-bad">79,000원~</td>
+            <td class="mark-bad">89,000원~</td>
+            <td class="dojun mark-good"><span class="price-strike">21,900원</span> → 9,900원 (베타 한정)</td>
+          </tr>
+          <tr>
+            <th scope="row">지역별 추가 결제</th>
+            <td class="mark-bad">필요</td>
+            <td class="mark-bad">필요</td>
+            <td class="dojun mark-good" style="font-weight:900; color:var(--seal);">불필요 — 전국 단일가</td>
+          </tr>
+          <tr>
+            <th scope="row">이용 단위</th>
+            <td class="mark-bad">월 단위 고정 구독</td>
+            <td class="mark-bad">월 단위 고정 구독</td>
+            <td class="dojun mark-good">가벼운 요금제 (검토중)</td>
+          </tr>
+          <tr>
+            <th scope="row">주요 타겟</th>
+            <td class="mark-good">전업·전문 투자자</td>
+            <td class="mark-good">전업·전문 투자자</td>
+            <td class="dojun mark-good">초보·소액 투자자</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="price-callout">
+      <div>
+        <div class="badge-row">
+          <span class="discount-badge">● 베타 테스트 한정 55% 할인</span>
+          <span class="nationwide-badge">✓ 전국 단일가 · 지역 추가 결제 없음</span>
+        </div>
+        <div class="pc-original">정가 21,900원</div>
+        <div class="pc-label">베타 신청자 할인가 · 전국 어디서나 동일</div>
+        <div class="pc-price">9,900<span class="won">원</span></div>
+      </div>
+      <p class="pc-note">지지옥션·탱크옥션처럼 지역별로 나눠 결제할 필요 없이, 전국 물건을 이 가격 하나로 다 봅니다.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 해결책 -->
+<section class="values">
+  <div class="wrap">
+    <span class="section-tab">제공 방식</span>
+    <h2>가격은 낮추고, 필요한 기능만 남겼습니다</h2>
+    <p class="section-lede">이것저것 다 담기보다, 실제로 자주 쓰는 기능에만 집중합니다.</p>
+
+    <div class="value-grid">
+      <div class="value-card">
+        <span class="value-tag">PRICE</span>
+        <h3>지역 나누지 않는 단일 요금</h3>
+        <p>전국 물건을 하나의 이용권으로 확인합니다. 얼마 쓰지도 않는 지역별 결제, 이제 없습니다.</p>
+      </div>
+      <div class="value-card">
+        <span class="value-tag">SEARCH</span>
+        <h3>쉬운 조건 검색</h3>
+        <p>사건번호를 몰라도 지역·가격대·유형만 고르면 원하는 물건을 바로 찾을 수 있습니다.</p>
+      </div>
+      <div class="value-card">
+        <span class="value-tag">ANALYSIS</span>
+        <h3>초보자 눈높이 분석</h3>
+        <p>권리분석, 낙찰가율 같은 용어를 어렵지 않게 풀어서 정리해드립니다.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 신뢰/FAQ -->
+<section class="trust">
+  <div class="wrap">
+    <span class="section-tab">사전 접수 현황</span>
+    <h2>먼저 신청해주신 분들</h2>
+    <p class="section-lede">베타 오픈 전, 지금까지의 사전 신청 현황입니다. (매일 갱신)</p>
+
+    <div class="stat-row">
+      <div class="stat"><div class="num" id="statApplicants">-</div><div class="label">사전 신청자</div></div>
+      <div class="stat"><div class="num">30초</div><div class="label">평균 신청 소요 시간</div></div>
+      <div class="stat"><div class="num">100명</div><div class="label">1차 베타 한정 인원</div></div>
+    </div>
+
+    <div class="faq-list">
+      <details class="faq-item" open>
+        <summary class="faq-q">언제 출시되나요? <span class="plus">+</span></summary>
+        <p class="faq-a">현재는 수요 검증 단계로, 정식 출시일은 확정되지 않았습니다. 신청해주신 분께 진행 상황을 이메일로 안내드립니다.</p>
+      </details>
+      <details class="faq-item">
+        <summary class="faq-q">가격은 얼마인가요? <span class="plus">+</span></summary>
+        <p class="faq-a">정가는 21,900원이며, 이번 베타 테스트에 참여하시는 신청자에게는 9,900원 할인가로 제공합니다. (약 55% 할인)</p>
+      </details>
+      <details class="faq-item">
+        <summary class="faq-q">왜 이렇게 저렴한가요? 품질이 떨어지는 건 아닌가요? <span class="plus">+</span></summary>
+        <p class="faq-a">전문가용 고급 리포트 같은 부가 기능보다, 실제로 자주 쓰는 검색과 기본 분석에만 집중했기 때문입니다. 다 담기보다 필요한 것만 남기는 방식으로 가격을 낮췄습니다.</p>
+      </details>
+      <details class="faq-item">
+        <summary class="faq-q">지역별로 나눠 결제해야 하나요? <span class="plus">+</span></summary>
+        <p class="faq-a">아니요. 도준패스는 9,900원 하나로 전국 물건을 모두 확인할 수 있습니다. 지지옥션·탱크옥션처럼 지역마다 따로 결제하도록 설계하지 않는 것을 원칙으로 하고 있습니다.</p>
+      </details>
+      <details class="faq-item">
+        <summary class="faq-q">경매 경험이 없어도 신청할 수 있나요? <span class="plus">+</span></summary>
+        <p class="faq-a">물론입니다. 오히려 처음 시작하시는 분들의 의견이 서비스 설계에 큰 도움이 됩니다.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- 신청 폼 -->
+<section class="apply" id="apply">
+  <div class="wrap apply-grid">
+    <div class="apply-side">
+      <span class="badge">30초 신청</span>
+      <h2>베타 신청하고<br>가장 먼저 알림 받기</h2>
+      <p class="section-lede" style="margin-bottom:0;">신청서 내용은 서비스 설계에 그대로 반영됩니다. 필수 항목은 이메일뿐입니다.</p>
+      <ul>
+        <li>선착순 100명, 정식 출시 시 우선 혜택 제공</li>
+        <li>불필요한 광고성 메일을 보내지 않습니다</li>
+        <li>언제든 수신 거부 가능합니다</li>
+      </ul>
+    </div>
+
+    <div>
+      <form id="applyForm" novalidate>
+        <div id="formFields">
+          <div class="field">
+            <label for="email">이메일 <span class="opt">(필수)</span></label>
+            <input type="email" id="email" name="email" placeholder="you@email.com" required autocomplete="email">
+          </div>
+
+          <div class="field">
+            <label for="name">이름 또는 닉네임 <span class="opt">(선택)</span></label>
+            <input type="text" id="name" name="name" placeholder="홍길동" autocomplete="name">
+          </div>
+
+          <div class="field">
+            <label>법원경매 경험이 있으신가요? <span class="opt">(선택)</span></label>
+            <div class="choice-group" data-name="experience">
+              <label class="choice"><input type="radio" name="experience" value="없음">없음</label>
+              <label class="choice"><input type="radio" name="experience" value="알아보는 중">알아보는 중</label>
+              <label class="choice"><input type="radio" name="experience" value="1~3건 낙찰">1~3건 낙찰</label>
+              <label class="choice"><input type="radio" name="experience" value="4건 이상">4건 이상</label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>현재 어떤 방법으로 물건을 찾으시나요? <span class="opt">(선택)</span></label>
+            <div class="choice-group" data-name="method">
+              <label class="choice"><input type="radio" name="method" value="대법원 사이트">대법원 사이트</label>
+              <label class="choice"><input type="radio" name="method" value="지지옥션·탱크옥션">지지옥션·탱크옥션</label>
+              <label class="choice"><input type="radio" name="method" value="카페·유튜브">카페·유튜브</label>
+              <label class="choice"><input type="radio" name="method" value="안 찾아봄">안 찾아봄</label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>가장 힘든 점은 무엇인가요? <span class="opt">(선택)</span></label>
+            <div class="choice-group" data-name="pain">
+              <label class="choice"><input type="radio" name="pain" value="가격 부담">기존 서비스 가격 부담</label>
+              <label class="choice"><input type="radio" name="pain" value="검색이 어려움">검색이 어려움</label>
+              <label class="choice"><input type="radio" name="pain" value="판단이 안 됨">어떤 물건이 좋은지 판단 안 됨</label>
+              <label class="choice"><input type="radio" name="pain" value="정보 부족">정보가 부족함</label>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>유료 서비스라면 월 얼마까지 지불하실 수 있나요? <span class="opt">(선택)</span></label>
+            <div class="choice-group" data-name="willingness">
+              <label class="choice"><input type="radio" name="willingness" value="무료만">무료만</label>
+              <label class="choice"><input type="radio" name="willingness" value="~1만원">~1만원</label>
+              <label class="choice"><input type="radio" name="willingness" value="1~3만원">1~3만원</label>
+              <label class="choice"><input type="radio" name="willingness" value="3만원 이상">3만원 이상</label>
+            </div>
+          </div>
+
+          <button type="submit" class="btn btn-primary submit-btn">지금 9,900원에 베타 신청하기</button>
+          <p class="form-foot">신청 시 개인정보는 베타 안내 목적으로만 사용됩니다.</p>
+        </div>
+
+        <div id="successMsg">
+          <svg class="stamp-mini" viewBox="0 0 100 100" aria-hidden="true">
+            <circle cx="50" cy="50" r="44" fill="none" stroke="#B7301E" stroke-width="3"/>
+            <text x="50" y="46" text-anchor="middle" font-family="'Noto Serif KR', serif" font-weight="900" font-size="16" fill="#B7301E">접수</text>
+            <text x="50" y="66" text-anchor="middle" font-family="'Noto Serif KR', serif" font-weight="900" font-size="16" fill="#B7301E">완료</text>
+          </svg>
+          <h3>신청이 접수되었습니다</h3>
+          <p>도준패스가 준비되는 대로 입력하신 이메일로 가장 먼저 안내드리겠습니다.</p>
+        </div>
+      </form>
+    </div>
+  </div>
+</section>
+
+<!-- 하단 CTA -->
+<section class="final-cta">
+  <div class="wrap">
+    <h2>월 7~9만원, 어디에 다 쓰고 계신가요?</h2>
+    <p class="section-lede">필요한 만큼만 쓰는 도준패스, 지금 신청하고 가장 먼저 만나보세요.</p>
+    <div class="cta-row">
+      <a href="#apply" class="btn btn-primary">지금 9,900원에 베타 신청하기</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">도준패스 · 본 페이지는 서비스 수요 검증을 위한 베타 신청 페이지입니다.</div>
+</footer>
+
+<!-- 모바일 하단 고정 CTA -->
+<div class="sticky-cta">
+  <a href="#apply" class="btn btn-primary">지금 9,900원에 베타 신청하기</a>
+</div>
+
+<script>
+  // ---------- 사전 신청자 카운트 (데모용 - 실제 배포 시 실데이터/폼 응답 수로 교체) ----------
+  (function(){
+    var base = 42;
+    var el = document.getElementById('statApplicants');
+    var target = base + Math.floor(Math.random() * 6);
+    var current = 0;
+    var timer = setInterval(function(){
+      current++;
+      el.textContent = current + '명';
+      if(current >= target) clearInterval(timer);
+    }, 25);
+  })();
+
+  // ---------- 스크롤 리빌 애니메이션 ----------
+  (function(){
+    var cards = document.querySelectorAll('.reason-card, .survey-block, .story-block');
+    if(!('IntersectionObserver' in window)){
+      cards.forEach(function(c){ c.classList.add('in'); });
+      return;
+    }
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        if(entry.isIntersecting){
+          entry.target.classList.add('in');
+          io.unobserve(entry.target);
+        }
+      });
+    }, {threshold:0.2});
+    cards.forEach(function(c){ io.observe(c); });
+  })();
+
+  // ---------- 구글 시트 연동 설정 ----------
+  // 아래에 Apps Script 배포 후 발급된 웹 앱 URL을 붙여넣으세요.
+  // 예: https://script.google.com/macros/s/AKfycb.../exec
+  var GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzj6vR4cJCkvcpqFqR2KS98cpO5NUEbI1157v2Z_CofghqziFMTSF8dSnsp7xK_YBaStQ/exec";
+
+  // ---------- UTM 파라미터 캡처 (유입 경로 추적) ----------
+  function getUtmParams(){
+    var params = new URLSearchParams(window.location.search);
+    return {
+      utm_source: params.get('utm_source') || '',
+      utm_medium: params.get('utm_medium') || '',
+      utm_campaign: params.get('utm_campaign') || ''
+    };
+  }
+
+  // ---------- 폼 제출 처리 ----------
+  var form = document.getElementById('applyForm');
+  form.addEventListener('submit', function(e){
+    e.preventDefault();
+    var emailInput = document.getElementById('email');
+    if(!emailInput.checkValidity()){
+      emailInput.focus();
+      emailInput.reportValidity();
+      return;
+    }
+
+    var submitBtn = form.querySelector('.submit-btn');
+    submitBtn.disabled = true;
+    submitBtn.textContent = '접수 중...';
+
+    var data = Object.assign({
+      email: emailInput.value,
+      name: document.getElementById('name').value,
+      experience: form.querySelector('input[name=experience]:checked') ? form.querySelector('input[name=experience]:checked').value : '',
+      method: form.querySelector('input[name=method]:checked') ? form.querySelector('input[name=method]:checked').value : '',
+      pain: form.querySelector('input[name=pain]:checked') ? form.querySelector('input[name=pain]:checked').value : '',
+      willingness: form.querySelector('input[name=willingness]:checked') ? form.querySelector('input[name=willingness]:checked').value : ''
+    }, getUtmParams());
+
+    function showSuccess(){
+      // GA4 이벤트 예시 (실배포 시 gtag 로드 후 아래 주석 해제)
+      // gtag('event', 'form_submit', { form_id: 'apply' });
+      // Meta Pixel 이벤트 예시
+      // fbq('track', 'Lead');
+
+      document.getElementById('formFields').style.display = 'none';
+      document.getElementById('successMsg').style.display = 'block';
+    }
+
+    if(GOOGLE_SCRIPT_URL.indexOf('script.google.com') === -1){
+      // URL이 아직 설정되지 않은 경우 콘솔에만 기록 (개발/미리보기 상태)
+      console.warn('GOOGLE_SCRIPT_URL이 설정되지 않았습니다. 데이터가 저장되지 않습니다:', data);
+      showSuccess();
+      return;
+    }
+
+    // Apps Script는 기본적으로 CORS 프리플라이트를 지원하지 않으므로
+    // text/plain으로 전송하고 no-cors 모드로 응답을 요청합니다.
+    // (응답 본문은 읽을 수 없지만, 시트에는 정상적으로 기록됩니다)
+    fetch(GOOGLE_SCRIPT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(data)
+    })
+      .then(showSuccess)
+      .catch(function(err){
+        console.error('신청 전송 실패:', err);
+        submitBtn.disabled = false;
+        submitBtn.textContent = '지금 9,900원에 베타 신청하기';
+        alert('신청 중 문제가 발생했습니다. 잠시 후 다시 시도해주세요.');
+      });
+  });
+
+  // ---------- CTA 클릭 GA4 이벤트 훅 (실배포 시 주석 해제) ----------
+  document.querySelectorAll('a.btn-primary').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      // gtag('event', btn.id === 'heroCta' ? 'cta_click_hero' : 'cta_click_bottom');
+    });
+  });
+</script>
+
+</body>
+</html>
