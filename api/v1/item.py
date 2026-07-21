@@ -1,10 +1,13 @@
-﻿from fastapi import APIRouter, HTTPException
+﻿from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from storage.database import get_connection
+from api.v1.recent_items import record_view
 
 router = APIRouter()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 @router.get("/item/{item_id}")
-def get_item(item_id: int):
+def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     conn = get_connection()
     try:
         row = conn.execute(
@@ -29,6 +32,19 @@ def get_item(item_id: int):
         rights = conn.execute(
             "SELECT * FROM rights_summary WHERE item_id = ?", (item_id,)
         ).fetchone()
+
+        # 로그인 사용자면 최근조회 자동 기록
+        if credentials:
+            try:
+                from api.auth import SUPABASE_JWT_SECRET
+                from jose import jwt
+                payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
+                    algorithms=["HS256"], options={"verify_aud": False})
+                user_id = payload.get("sub")
+                if user_id:
+                    record_view(conn, user_id, item_id)
+            except:
+                pass
 
         return {
             "id": row["id"],

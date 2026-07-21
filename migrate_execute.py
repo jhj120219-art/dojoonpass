@@ -4,7 +4,14 @@ from storage.database import get_connection
 from datetime import datetime
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/migrate_execute.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ]
+)
 logger = logging.getLogger(__name__)
 
 def extract_fail_count(status: str) -> int:
@@ -152,6 +159,11 @@ def execute():
         raise
     finally:
         conn.close()
-
+        
 if __name__ == "__main__":
-    execute()
+    try:
+        execute()
+        sys.exit(0)
+    except Exception as e:
+        print("FATAL:", str(e))
+        sys.exit(1)
