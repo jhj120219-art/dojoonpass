@@ -1,17 +1,45 @@
 import { redirect } from 'next/navigation'
 import { createServerSupabaseClient } from '@/lib/supabaseServer'
 import Link from 'next/link'
+import SearchFilters from './SearchFilters'
 
-export default async function PropertiesPage() {
+type PropertiesPageProps = {
+  searchParams: Promise<{
+    sido?: string
+    sigungu?: string
+    minPrice?: string
+    maxPrice?: string
+  }>
+}
+
+export default async function PropertiesPage({ searchParams }: PropertiesPageProps) {
   const supabase = await createServerSupabaseClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
 
-  const { data: properties } = await supabase
+  const params = await searchParams
+  const minPrice = params.minPrice ? Number(params.minPrice) : 0
+  const maxPrice = params.maxPrice ? Number(params.maxPrice) : 0
+
+  let query = supabase
     .from('properties')
     .select('*')
     .eq('status', 'active')
-    .order('bid_date', { ascending: true })
+
+  if (params.sido) {
+    query = query.ilike('address', `%${params.sido}%`)
+  }
+  if (params.sigungu) {
+    query = query.ilike('address', `%${params.sigungu}%`)
+  }
+  if (minPrice > 0) {
+    query = query.gte('appraisal_price', minPrice)
+  }
+  if (maxPrice > 0) {
+    query = query.lte('appraisal_price', maxPrice)
+  }
+
+  const { data: properties } = await query.order('bid_date', { ascending: true })
 
   function formatPrice(price: number) {
     return (price / 100000000).toFixed(1) + '억'
@@ -29,6 +57,12 @@ export default async function PropertiesPage() {
         <span className="text-xs text-gray-400">{user.email}</span>
       </div>
       <div className="px-4 py-4 space-y-3">
+        <SearchFilters
+          initialSido={params.sido ?? ''}
+          initialSigungu={params.sigungu ?? ''}
+          initialMinPrice={minPrice}
+          initialMaxPrice={maxPrice}
+        />
         {properties && properties.length > 0 ? (
           properties.map((property) => (
             <Link key={property.id} href={`/properties/${property.id}`}>
