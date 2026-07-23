@@ -1,0 +1,31 @@
+00 CEO
+
+01 Vision.md                ✅
+02 Company Manual.md        ✅
+03 Company Strategy.md      ✅
+04 Product Strategy.md      ✅
+05 Business Model.md        ✅
+06 OKR.md
+07 KPI Dashboard.md
+08 AI Organization.md
+09 Decision Framework.md    (CEO Operating System 포함)
+10 CEO Prompt.md
+00 CEO
+        ↓
+01 COO
+        ↓
+02 CTO
+        ↓
+03 CMO (이미 완료)
+        ↓
+04 CFO
+        ↓
+05 Legal
+        ↓
+06 HR
+        ↓
+07 Customer Success
+        ↓
+08 AI Automation
+        ↓
+09 Analytics
