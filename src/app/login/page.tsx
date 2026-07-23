@@ -26,7 +26,7 @@ export default function LoginPage() {
           <p className="text-sm text-red-500 text-center">{currentState.error}</p>
         </div>
       )}
-      {currentState?.message && (
+      {currentState && 'message' in currentState && currentState.message && (
         <div className="mb-4 p-4 bg-blue-50 border border-blue-100 rounded-2xl">
           <p className="text-sm text-blue-500 text-center">{currentState.message}</p>
         </div>

@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { loginAction, signUpAction } from './actions'
+import { loginAction, signUpAction } from './action'
 
 export default function LoginPage() {
   // 로그인/회원가입 모드 전환

@@ -1,22 +1,43 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { createClient } from '@/lib/supabaseClient'
+import { fetchJSON } from '@/lib/api'
 import { decreaseViewCount, getViewCount } from './actions'
+
+interface AuctionItemDetail {
+  id: number
+  case_no: string
+  item_no: string
+  court_name: string
+  property_type: string
+  full_address: string
+  appraisal_price: number
+  minimum_bid_price: number
+  bid_rate: number
+  auction_date: string
+  status: string
+  fail_count: number
+  validation_status: string
+}
+
 export default function PropertyDetailPage() {
   const params = useParams()
   const router = useRouter()
   const id = params.id as string
-  const [property, setProperty] = useState<any>(null)
+  const [property, setProperty] = useState<AuctionItemDetail | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(false)
   const [revealed, setRevealed] = useState(false)
   const [remaining, setRemaining] = useState<number | null>(null)
   const [showPopup, setShowPopup] = useState(false)
   useEffect(() => {
     async function fetchData() {
-      const supabase = createClient()
-      const { data } = await supabase.from('properties').select('*').eq('id', id).single()
-      setProperty(data)
+      try {
+        const data = await fetchJSON<AuctionItemDetail>(`/api/v1/item/${id}`)
+        setProperty(data)
+      } catch {
+        setLoadError(true)
+      }
       const count = await getViewCount()
       setRemaining(count)
       setLoading(false)
@@ -31,7 +52,7 @@ export default function PropertyDetailPage() {
   }
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
   if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
-  if (!property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
+  if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
@@ -41,9 +62,9 @@ export default function PropertyDetailPage() {
       </div>
       <div className="px-4 py-4 space-y-3">
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-          <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type}</span>
-          <h2 className="text-xl font-bold text-gray-900 mt-3 mb-1">{property.title}</h2>
-          <p className="text-sm text-gray-400">{property.address}</p>
+          <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
+          <h2 className="text-xl font-bold text-gray-900 mt-3 mb-1">{property.full_address || '주소 미확인'}</h2>
+          <p className="text-sm text-gray-400">{property.case_no}{property.item_no && property.item_no !== '1' ? ` (${property.item_no})` : ''}</p>
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex justify-between items-center mb-4">
@@ -59,7 +80,7 @@ export default function PropertyDetailPage() {
           <div className="pt-4 border-t border-gray-50 space-y-2">
             <div className="flex justify-between">
               <span className="text-sm text-gray-400">입찰기일</span>
-              <span className="text-sm font-medium text-gray-700">{property.bid_date}</span>
+              <span className="text-sm font-medium text-gray-700">{property.auction_date}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-sm text-gray-400">담당법원</span>
@@ -67,7 +88,7 @@ export default function PropertyDetailPage() {
             </div>
             <div className="flex justify-between">
               <span className="text-sm text-gray-400">사건번호</span>
-              <span className="text-sm font-medium text-gray-700">{property.case_number}</span>
+              <span className="text-sm font-medium text-gray-700">{property.case_no}</span>
             </div>
           </div>
         </div>
@@ -78,7 +99,7 @@ export default function PropertyDetailPage() {
               <div className="bg-green-50 border border-green-100 rounded-xl p-3 mb-3">
                 <p className="text-xs text-green-600 font-medium">✅ 열람 완료</p>
               </div>
-              <p className="text-sm text-gray-600 leading-relaxed">{property.detail_info}</p>
+              <p className="text-sm text-gray-400 leading-relaxed">등기부등본 내용 조회 기능은 준비 중입니다</p>
             </div>
           ) : (
             <div className="text-center py-4">
