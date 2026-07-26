@@ -1,0 +1,1063 @@
+<div style="width:1040px;margin:0 auto">
+    <div style="height:45px">
+        <div id="totalCntArea" class="fleft bold_900 f16" style="padding-top: 10px; display: block;">
+            검색된 물건수 : <span class="bold red"><span id="totalCnt">178</span>건</span>
+                                </div>
+        <div style="position:relative;">
+            <div style="position:absolute;z-index:0;right:0;width:600px;height:40px;background:#FFFFFF">&nbsp;</div>
+        </div>
+        <div class="right" id="prt_logo"><span class="f16 bold span_block" style="padding:4px 8px 8px">출력일 : 2026.07.25 </span> <img src="/img/inc/tank_logo.svg" height="30" valign="bottom"></div>
+    </div>
+    <div class="clear"></div>
+
+    <div class="list_title" id="Prt_none" style="display: block;">
+        <div class="fleft">
+                            <div class="btn_whitegray btn_medium tooltip blue-tooltip" onclick="alert('유료결제 회원 서비스 입니다.')">선택보기 
+                    <span style="bottom:35px;position:absolute;left:100px;">유료결제 회원 서비스 입니다.<br></span>
+                </div>
+                    </div>
+        <div class="title_btn fright">
+            <div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn" id="odr10" data-val="10" data-name="사건번호" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">사건번호</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span>▲</span><br><span>▼</span></div>
+    </div>
+</div><div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn" id="odr11" data-val="11" data-name="소재지" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">소재지</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span>▲</span><br><span>▼</span></div>
+    </div>
+</div><div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn" id="odr12" data-val="12" data-name="감정가" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">감정가</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span>▲</span><br><span>▼</span></div>
+    </div>
+</div><div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn" id="odr13" data-val="13" data-name="최저입찰가" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">최저입찰가</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span>▲</span><br><span>▼</span></div>
+    </div>
+</div><div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn on" id="odr14" data-val="14" data-name="매각기일" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">매각기일</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span style="color: rgb(2, 77, 189);">▲</span><br><span>▼</span></div>
+    </div>
+</div><div class="fleft order_text" style="margin:3px 0 3px 20px">
+    <div class="odrBtn" id="odr15" data-val="15" data-name="유찰회수" style="color:#000;padding:3px;cursor:pointer;">
+        <div class="fleft right" style="padding:0 3px;font-size:13px;min-width:30px;">유찰회수</div>
+        <div class="fright bold order_ment" style="font-size: 9px; color: rgb(221, 221, 221); line-height: 10px;"><span>▲</span><br><span>▼</span></div>
+    </div>
+</div>            <div class="fleft right" style="padding-left:9px;">
+                <select name="dataSize" id="dataSize" class="srch-data-highlight">
+                    <option value="20" selected="">목록수</option>
+                    <option value="20">20</option>
+                    <option value="30">30</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                </select>
+            </div>
+            <div class="fleft right">
+                <span id="photo_chk_btn_0" class="button btn_medium_icon btn_tank">
+                    <img src="/img/svg/icon_list_m.svg">
+                </span>
+                <span id="photo_chk_btn_1" class="button btn_medium_icon btn_white">
+                    <img src="/img/svg/icon_pic.svg">
+                </span>
+            </div>
+            <span id="chk_print" class="button btn_medium_icon btn_whitegray chk_print" alt="인쇄" style="border-left:0">
+                <img src="/img/svg/print.svg" alt="인쇄">
+            </span>
+            <span data-list-mode-hide="nearby" class="button btn_medium_icon btn_whitegray" id="memCsv" style="padding:7px 8px 4px;vertical-align:top;margin-left:-5px">
+                <img src="/img/icon/icon_csv.svg" width="16">
+            </span>
+            <span data-list-mode-hide="nearby" class="button btn_medium_icon btn_whitegray" id="memXlsx" style="padding:7px 8px 4px;vertical-align:top;margin-left:-5px">
+                <img src="/img/icon/icon_xlsx.svg" width="16">
+            </span>
+        </div>
+    </div>
+
+    <table id="tblLst" class="tbl_list">
+        <thead id="lsThead_0">
+            <tr height="60" id="lsTheader" style="display: table-row;">
+                <th style="padding:8px 0 0"><input type="checkbox" id="chkAll"></th>
+                <th width="15%" class="left">전체선택/해제</th>
+                <th width="50%">소재지</th>
+                <th style="min-width:100px;">
+                    감정가<br>최저가
+                                    </th>
+                <th>진행상태</th>
+                <th>입찰일자<br>(시간)</th>
+                <th>조회수<br>(열람일시)</th>
+            </tr>
+        </thead>
+        <thead id="lsThead_1" style="display:none">
+            <tr height="60" id="lsTheader" class="no-print" style="display: table-row;">
+                <th style="padding:8px 0 0" width="15"><input type="checkbox" id="chkAll_s"></th>
+                <th width="980px" class="left" colspan="6">전체선택/해제</th>
+            </tr>
+        </thead>
+        <tbody id="lsTbody">
+            <tr id="Tr_1" data-row="1" data-tid="2172011" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2172011" value="2172011" class="chk_idx" data-row="1">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2172011" data-row="1" data-mask="0">
+                    <dd id="list_ch_1" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1110/2023/T_BA-1110-2023051714-0000-0021.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2172011" data-row="1" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2172011"><span>아파트</span></div>
+                    <div id="int_chk_2172011"></div>
+                    <div class="clear f15 bold" id="saNo_2172011">2023-51714</div>
+                    <div class="f13" style="width:98%">서울 송파구 문정동 145, 8동 9층906호 (문정동,문정시영아파트) 외 1필지<br>(서울 송파구 송이로31길 56)</div>
+                    <div class="blue f12">건물 46.26㎡(13.994평), 대지권 30.994㎡(9.376평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">NPL물건</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2172011" data-row="1" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2172011"><span class="selectedNumType" data-value="800000000">800,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2172011"><span class="selectedNumType" data-value="640000000">640,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2172011" data-row="1" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2172011">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2172011" data-row="1" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2172011"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2172011" data-row="1" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2172011" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 1358</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_2" data-row="2" data-tid="2377465" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2377465" value="2377465" class="chk_idx" data-row="2">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2377465" data-row="2" data-mask="0">
+                    <dd id="list_ch_2" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1110/2025/T_BA-1110-2025051117-002.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2377465" data-row="2" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2377465"><span>아파트</span></div>
+                    <div id="int_chk_2377465"></div>
+                    <div class="clear f15 bold" id="saNo_2377465">2025-51117</div>
+                    <div class="f13" style="width:98%">서울특별시 강동구 길동 343-1 현대웰하임1단지  3층306호<br>(서울 강동구 천중로53길 6)</div>
+                    <div class="blue f12">건물 16.959㎡(5.13평), 대지권 10.328㎡(3.124평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 대항력 있는 임차인, 공시가 1억이하</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2377465" data-row="2" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2377465"><span class="selectedNumType" data-value="130000000">130,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2377465"><span class="selectedNumType" data-value="66560000">66,560,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2377465" data-row="2" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2377465">유찰 3회</div>
+                    <div class="blue">(51%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2377465" data-row="2" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2377465"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2377465" data-row="2" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2377465" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 345</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_3" data-row="3" data-tid="2408583" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2408583" value="2408583" class="chk_idx" data-row="3">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2408583" data-row="3" data-mask="0">
+                    <dd id="list_ch_3" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1110/2025/T_BA-1110-2025051367-0000-0023.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2408583" data-row="3" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2408583"><span>아파트</span></div>
+                    <div id="int_chk_2408583"></div>
+                    <div class="clear f15 bold" id="saNo_2408583">2025-51367</div>
+                    <div class="f13" style="width:98%">서울특별시 송파구 거여동 45-1 블레스아파트 5층 502호<br>(서울 송파구 거마로8길 23)</div>
+                    <div class="blue f12">건물 84.18㎡(25.464평), 토지 0.688㎡(0.208평), 대지권 49.5843㎡(14.999평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2408583" data-row="3" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2408583"><span class="selectedNumType" data-value="1091668800">1,091,668,800</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2408583"><span class="selectedNumType" data-value="873335000">873,335,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2408583" data-row="3" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2408583">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2408583" data-row="3" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2408583"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2408583" data-row="3" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2408583" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 543</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_4" data-row="4" data-tid="2418009" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2418009" value="2418009" class="chk_idx" data-row="4">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2418009" data-row="4" data-mask="0">
+                    <dd id="list_ch_4" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1110/2025/T_BA-1110-2025051614-0000-0021.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2418009" data-row="4" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2418009"><span>아파트</span></div>
+                    <div id="int_chk_2418009"></div>
+                    <div class="clear f15 bold" id="saNo_2418009">2025-51614</div>
+                    <div class="f13" style="width:98%">서울특별시 성동구 성수동1가 718 트리마제 102동 12층1204호<br>(서울 성동구 왕십리로 16)</div>
+                    <div class="blue f12">건물 152.1556㎡(46.027평), 대지권 67.7303㎡(20.488평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2418009" data-row="4" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2418009"><span class="selectedNumType" data-value="7390000000">7,390,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2418009"><span class="selectedNumType" data-value="5912000000">5,912,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2418009" data-row="4" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2418009">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2418009" data-row="4" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부6계</div>
+                    <div id="bidDt_2418009"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2418009" data-row="4" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2418009" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 592</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_5" data-row="5" data-tid="2421540" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2421540" value="2421540" class="chk_idx" data-row="5">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2421540" data-row="5" data-mask="0">
+                    <dd id="list_ch_5" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1110/2025/T_BE-1110-2025051654-008.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2421540" data-row="5" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2421540"><span>아파트</span></div>
+                    <div id="int_chk_2421540"></div>
+                    <div class="clear f15 bold" id="saNo_2421540">2025-51654</div>
+                    <div class="f13" style="width:98%">서울특별시 성동구 마장동 818 청계현대아파트 106동 19층1902호<br>(서울 성동구 마장로35길 76)</div>
+                    <div class="blue f12">건물 84.91㎡(25.685평), 대지권 28.754㎡(8.698평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2421540" data-row="5" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2421540"><span class="selectedNumType" data-value="1080000000">1,080,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2421540"><span class="selectedNumType" data-value="1080000000">1,080,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2421540" data-row="5" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2421540">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2421540" data-row="5" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2421540"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2421540" data-row="5" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2421540" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 239</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_6" data-row="6" data-tid="2445786" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2445786" value="2445786" class="chk_idx" data-row="6">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2445786" data-row="6" data-mask="0">
+                    <dd id="list_ch_6" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1110/2025/T_BA-1110-2025052013-001.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2445786" data-row="6" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2445786"><span>아파트</span></div>
+                    <div id="int_chk_2445786"></div>
+                    <div class="clear f15 bold" id="saNo_2445786">2025-52013</div>
+                    <div class="f13" style="width:98%">서울특별시 강동구 상일동 514 고덕롯데캐슬베네루체 719동 3층304호<br>(서울 강동구 구천면로 630)</div>
+                    <div class="blue f12">건물 42.073㎡(12.727평), 대지권 22.4445㎡(6.789평)</div>
+                    <div class="blue f12"><span>토지및건물 지분 매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2445786" data-row="6" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2445786"><span class="selectedNumType" data-value="785000000">785,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2445786"><span class="selectedNumType" data-value="785000000">785,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2445786" data-row="6" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2445786">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2445786" data-row="6" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2445786"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2445786" data-row="6" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2445786" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 182</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_7" data-row="7" data-tid="2450485" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2450485" value="2450485" class="chk_idx" data-row="7">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2450485" data-row="7" data-mask="0">
+                    <dd id="list_ch_7" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1110/2025/T_BE-1110-2025052080-009.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2450485" data-row="7" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2450485"><span>아파트</span></div>
+                    <div id="int_chk_2450485"></div>
+                    <div class="clear f15 bold" id="saNo_2450485">2025-52080</div>
+                    <div class="f13" style="width:98%">서울특별시 송파구 오금동 69-9 오금아르미안아파트  5층501호<br>(서울 송파구 성내천로6길 9-7)</div>
+                    <div class="blue f12">건물 70.87㎡(21.438평), 대지권 26.63㎡(8.056평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">위반건축물, 임차권등기, 대항력 있는 임차인, 공시가 2~3억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2450485" data-row="7" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2450485"><span class="selectedNumType" data-value="481370000">481,370,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2450485"><span class="selectedNumType" data-value="481370000">481,370,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2450485" data-row="7" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2450485">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2450485" data-row="7" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울동부1계</div>
+                    <div id="bidDt_2450485"><span>26.07.27</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 2일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2450485" data-row="7" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2450485" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 108</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_8" data-row="8" data-tid="2342652" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2342652" value="2342652" class="chk_idx" data-row="8">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2342652" data-row="8" data-mask="0">
+                    <dd id="list_ch_8" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1210/2024/T_BE-1210-2024062034-006.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2342652" data-row="8" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2342652"><span>아파트</span></div>
+                    <div id="int_chk_2342652"></div>
+                    <div class="clear f15 bold" id="saNo_2342652">2024-62034</div>
+                    <div class="f13" style="width:98%">서울 은평구 신사동 365, 103동 14층1401호 (신사동,한신휴플러스)<br>(서울 은평구 갈현로1길 31)</div>
+                    <div class="blue f12">건물 67.72㎡(20.485평), 대지권 37.088㎡(11.219평)</div>
+                    <div class="blue f12"><span>토지및건물 지분 매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2342652" data-row="8" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2342652"><span class="selectedNumType" data-value="565000000">565,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2342652"><span class="selectedNumType" data-value="452000000">452,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2342652" data-row="8" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2342652">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2342652" data-row="8" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울서부5계</div>
+                    <div id="bidDt_2342652"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2342652" data-row="8" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2342652" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 372</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_9" data-row="9" data-tid="2284862" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2284862" value="2284862" class="chk_idx" data-row="9">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2284862" data-row="9" data-mask="0">
+                    <dd id="list_ch_9" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1410/2024/T_BE-1410-2024106792-007.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2284862" data-row="9" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2284862"><span>아파트</span></div>
+                    <div id="int_chk_2284862"></div>
+                    <div class="clear f15 bold" id="saNo_2284862">2024-106792</div>
+                    <div class="f13" style="width:98%">서울 동대문구 답십리동 42, 제1동 제11층 제1101호 (답십리동,동답한신아파트)<br>(서울 동대문구 답십리로 210-30)</div>
+                    <div class="blue f12">건물 96.4㎡(29.161평), 대지권 43.34㎡(13.11평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">항고사건</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2284862" data-row="9" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2284862"><span class="selectedNumType" data-value="719000000">719,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2284862"><span class="selectedNumType" data-value="575200000">575,200,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2284862" data-row="9" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2284862">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2284862" data-row="9" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부9계</div>
+                    <div id="bidDt_2284862"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2284862" data-row="9" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2284862" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 919</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_10" data-row="10" data-tid="2316285" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2316285" value="2316285" class="chk_idx" data-row="10">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2316285" data-row="10" data-mask="0">
+                    <dd id="list_ch_10" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1410/2024/T_BE-1410-2024113318-008.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2316285" data-row="10" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2316285"><span>아파트</span></div>
+                    <div id="int_chk_2316285"></div>
+                    <div class="clear f15 bold" id="saNo_2316285">2024-113318</div>
+                    <div class="f13" style="width:98%">서울 도봉구 도봉동 30-1, 105동 15층1506호 (도봉동,도봉한신아파트)<br>(서울 도봉구 마들로 859-19)</div>
+                    <div class="blue f12">건물 84.94㎡(25.694평), 대지권 34.047㎡(10.299평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">NPL물건, 공시가 3~4억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2316285" data-row="10" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2316285"><span class="selectedNumType" data-value="626000000">626,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2316285"><span class="selectedNumType" data-value="500800000">500,800,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2316285" data-row="10" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2316285">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2316285" data-row="10" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부8계</div>
+                    <div id="bidDt_2316285"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2316285" data-row="10" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2316285" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 634</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_11" data-row="11" data-tid="2334793" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2334793" value="2334793" class="chk_idx" data-row="11">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2334793" data-row="11" data-mask="0">
+                    <dd id="list_ch_11" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1410/2024/T_BE-1410-2024116782-009.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2334793" data-row="11" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2334793"><span>아파트</span></div>
+                    <div id="int_chk_2334793"></div>
+                    <div class="clear f15 bold" id="saNo_2334793">2024-116782</div>
+                    <div class="f13" style="width:98%">서울 동대문구 이문동 291-35, 11층1104호 (이문동,이문스카이뷰) 외 1필지<br>(서울 동대문구 이문로 127)</div>
+                    <div class="blue f12">건물 25.99㎡(7.862평), 대지권 5.5㎡(1.664평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 대항력 있는 임차인, 공시가 2~3억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2334793" data-row="11" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2334793"><span class="selectedNumType" data-value="347000000">347,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2334793"><span class="selectedNumType" data-value="37259000">37,259,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2334793" data-row="11" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2334793">유찰 10회</div>
+                    <div class="blue">(11%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2334793" data-row="11" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부8계</div>
+                    <div id="bidDt_2334793"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2334793" data-row="11" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2334793" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 1078</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_12" data-row="12" data-tid="2356395" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2356395" value="2356395" class="chk_idx" data-row="12">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2356395" data-row="12" data-mask="0">
+                    <dd id="list_ch_12" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1310/2024/T_BE-1310-2024142962-007.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2356395" data-row="12" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2356395"><span>아파트</span></div>
+                    <div id="int_chk_2356395"></div>
+                    <div class="clear f15 bold" id="saNo_2356395">2024-142962</div>
+                    <div class="f13" style="width:98%">서울 강서구 화곡동 938-23, 제12층 제1202호 (화곡동, 에스엠케이아파트)<br>(서울 강서구 곰달래로 60-1)</div>
+                    <div class="blue f12">건물 28.01㎡(8.473평), 대지권 6.9㎡(2.087평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 공시가 1~2억, HUG 임차권 인수조건변경</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2356395" data-row="12" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2356395"><span class="selectedNumType" data-value="295000000">295,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2356395"><span class="selectedNumType" data-value="236000000">236,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2356395" data-row="12" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2356395">유찰 6회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2356395" data-row="12" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울남부16계</div>
+                    <div id="bidDt_2356395"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2356395" data-row="12" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2356395" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 383</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_13" data-row="13" data-tid="2471603" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2471603" value="2471603" class="chk_idx" data-row="13">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2471603" data-row="13" data-mask="0">
+                    <dd id="list_ch_13" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1210/2025/T_BA-1210-2025002299-0000-0021.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2471603" data-row="13" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2471603"><span>아파트</span></div>
+                    <div id="int_chk_2471603"></div>
+                    <div class="clear f15 bold" id="saNo_2471603">2025-2299</div>
+                    <div class="f13" style="width:98%">서울특별시 마포구 도화동 357 도화동현대아파트 107동 4층408호 외 5필지<br>(서울 마포구 새창로 52)</div>
+                    <div class="blue f12">건물 128.26㎡(38.799평), 대지권 56.79㎡(17.179평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">대항력 있는 임차인</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2471603" data-row="13" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2471603"><span class="selectedNumType" data-value="1650000000">1,650,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2471603"><span class="selectedNumType" data-value="1650000000">1,650,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2471603" data-row="13" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2471603">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2471603" data-row="13" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울서부7계</div>
+                    <div id="bidDt_2471603"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2471603" data-row="13" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2471603" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 183</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_14" data-row="14" data-tid="2470529" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2470529" value="2470529" class="chk_idx" data-row="14">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2470529" data-row="14" data-mask="0">
+                    <dd id="list_ch_14" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1410/2025/T_BA-1410-2025003463-0000-0021.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2470529" data-row="14" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2470529"><span>아파트</span></div>
+                    <div id="int_chk_2470529"></div>
+                    <div class="clear f15 bold" id="saNo_2470529">2025-3463</div>
+                    <div class="f13" style="width:98%">서울특별시 동대문구 이문동 327-7 세진빌딩  14층1411호 외 6필지<br>(서울 동대문구 이문로 89)</div>
+                    <div class="blue f12">건물 11.48㎡(3.473평), 대지권 2.976㎡(0.9평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 공시가 1~2억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2470529" data-row="14" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2470529"><span class="selectedNumType" data-value="227000000">227,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2470529"><span class="selectedNumType" data-value="181600000">181,600,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2470529" data-row="14" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2470529">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2470529" data-row="14" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부8계</div>
+                    <div id="bidDt_2470529"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2470529" data-row="14" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2470529" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 64</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_15" data-row="15" data-tid="2378741" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2378741" value="2378741" class="chk_idx" data-row="15">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2378741" data-row="15" data-mask="0">
+                    <dd id="list_ch_15" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1310/2025/T_BA-1310-2025008954-001.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2378741" data-row="15" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2378741"><span>아파트</span></div>
+                    <div id="int_chk_2378741"></div>
+                    <div class="clear f15 bold" id="saNo_2378741">2025-8954</div>
+                    <div class="f13" style="width:98%">서울특별시 강서구 화곡동 922-17 우공아파트  제5층 제502호 외 1필지<br>(서울 강서구 월정로20길 42)</div>
+                    <div class="blue f12">건물 26.36㎡(7.974평), 대지권 7.9436㎡(2.403평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 공시가 1~2억, HUG 임차권 인수조건변경</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2378741" data-row="15" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2378741"><span class="selectedNumType" data-value="238000000">238,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2378741"><span class="selectedNumType" data-value="238000000">238,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2378741" data-row="15" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2378741">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2378741" data-row="15" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울남부16계</div>
+                    <div id="bidDt_2378741"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2378741" data-row="15" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2378741" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 24</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_16" data-row="16" data-tid="2397551" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2397551" value="2397551" class="chk_idx" data-row="16">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2397551" data-row="16" data-mask="0">
+                    <dd id="list_ch_16" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1310/2025/T_BA-1310-2025009547-001.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2397551" data-row="16" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2397551"><span>아파트</span></div>
+                    <div id="int_chk_2397551"></div>
+                    <div class="clear f15 bold" id="saNo_2397551">2025-9547</div>
+                    <div class="f13" style="width:98%">서울특별시 강서구 화곡동 894-12  제5층 제504호<br>(서울 강서구 강서로8길 9)</div>
+                    <div class="blue f12">건물 25.75㎡(7.789평), 대지권 8.59㎡(2.598평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 공시가 1~2억, HUG 임차권 인수조건변경</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2397551" data-row="16" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2397551"><span class="selectedNumType" data-value="268000000">268,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2397551"><span class="selectedNumType" data-value="268000000">268,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2397551" data-row="16" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2397551">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2397551" data-row="16" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울남부16계</div>
+                    <div id="bidDt_2397551"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2397551" data-row="16" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2397551" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 22</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_17" data-row="17" data-tid="2474704" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2474704" value="2474704" class="chk_idx" data-row="17">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2474704" data-row="17" data-mask="0">
+                    <dd id="list_ch_17" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1410/2025/T_BE-1410-2025012005-009.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2474704" data-row="17" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2474704"><span>아파트</span></div>
+                    <div id="int_chk_2474704"></div>
+                    <div class="clear f15 bold" id="saNo_2474704">2025-12005</div>
+                    <div class="f13" style="width:98%">서울특별시 성북구 정릉동 800-95 동일스카이아파트  2층204호<br>(서울 성북구 보국문로30길 34)</div>
+                    <div class="blue f12">건물 82.69㎡(25.014평), 대지권 50.91㎡(15.4평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">임차권등기, 대항력 있는 임차인, 공시가 2~3억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2474704" data-row="17" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2474704"><span class="selectedNumType" data-value="412000000">412,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2474704"><span class="selectedNumType" data-value="108003000">108,003,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2474704" data-row="17" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2474704">유찰 6회</div>
+                    <div class="blue">(26%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2474704" data-row="17" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부9계</div>
+                    <div id="bidDt_2474704"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2474704" data-row="17" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2474704" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 668</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_18" data-row="18" data-tid="2401245" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2401245" value="2401245" class="chk_idx" data-row="18">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2401245" data-row="18" data-mask="0">
+                    <dd id="list_ch_18" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BE/1410/2025/T_BE-1410-2025012293-008.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2401245" data-row="18" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2401245"><span>아파트</span></div>
+                    <div id="int_chk_2401245"></div>
+                    <div class="clear f15 bold" id="saNo_2401245">2025-12293</div>
+                    <div class="f13" style="width:98%">서울특별시 노원구 중계동 504-1 중계그린아파트 제123동 제6층 제603호<br>(서울 노원구 섬밭로 285)</div>
+                    <div class="blue f12">건물 59.46㎡(17.987평), 대지권 35.919㎡(10.865평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">공시가 3~4억</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2401245" data-row="18" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2401245"><span class="selectedNumType" data-value="631000000">631,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2401245"><span class="selectedNumType" data-value="504800000">504,800,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2401245" data-row="18" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2401245">유찰 1회</div>
+                    <div class="blue">(80%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2401245" data-row="18" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울북부9계</div>
+                    <div id="bidDt_2401245"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2401245" data-row="18" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2401245" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 695</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_19" data-row="19" data-tid="2414742" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2414742" value="2414742" class="chk_idx" data-row="19">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2414742" data-row="19" data-mask="0">
+                    <dd id="list_ch_19" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1210/2025/T_BA-1210-2025051527-002.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2414742" data-row="19" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2414742"><span>아파트</span></div>
+                    <div id="int_chk_2414742"></div>
+                    <div class="clear f15 bold" id="saNo_2414742">2025-51527</div>
+                    <div class="f13" style="width:98%">서울특별시 은평구 응암동 176 응암푸르지오 104동 4층402호<br>(서울 은평구 백련산로 146)</div>
+                    <div class="blue f12">건물 114.92㎡(34.763평), 대지권 69.69㎡(21.081평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12">대항력 있는 임차인</span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2414742" data-row="19" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2414742"><span class="selectedNumType" data-value="927000000">927,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2414742"><span class="selectedNumType" data-value="593280000">593,280,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2414742" data-row="19" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2414742">유찰 2회</div>
+                    <div class="blue">(64%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2414742" data-row="19" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울서부5계</div>
+                    <div id="bidDt_2414742"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2414742" data-row="19" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2414742" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 521</div>
+                    
+                    
+                </td>
+            </tr>
+            <tr id="Tr_20" data-row="20" data-tid="2445307" class="hand js-hover-row " style="height:135px;border-bottom: 1px solid #ddd">
+                <td class="center" style="padding:0">
+                    <div class="chk_idx_box">
+                        <input type="checkbox" name="chk_idx" id="chk_idx_2445307" value="2445307" class="chk_idx" data-row="20">
+                    </div>
+                </td>
+                <td class="js-open-pn" data-tid="2445307" data-row="20" data-mask="0">
+                    <dd id="list_ch_20" class="list-current-marker"></dd>
+                    <div class="clear"></div>
+                    <div><img src="/FILE/CA/BA/1210/2025/T_BA-1210-2025051907-004.jpg" width="120px" height="90px" style="border:1px solid #ddd" class="org_viewimg"></div>
+                </td>
+                <td class="js-open-pn" data-tid="2445307" data-row="20" data-mask="0">
+                    <div class="bold blue f14 fleft" style="padding-right:10px" id="ctgr_2445307"><span>아파트</span></div>
+                    <div id="int_chk_2445307"></div>
+                    <div class="clear f15 bold" id="saNo_2445307">2025-51907</div>
+                    <div class="f13" style="width:98%">서울특별시 서대문구 남가좌동 105-1 창덕에버빌  15층1501호<br>(서울 서대문구 모래내로 143)</div>
+                    <div class="blue f12">건물 99.57㎡(30.12평), 대지권 20.38㎡(6.165평)</div>
+                    <div class="blue f12"><span>토지·건물 일괄매각</span>&nbsp;&nbsp;<span class="orange f12"></span></div>
+                    
+                    
+                    
+                </td>
+                <td class="right js-open-pn" data-tid="2445307" data-row="20" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="bold"><span id="apslAmt_2445307"><span class="selectedNumType" data-value="774000000">774,000,000</span></span></div>
+                    <div class="bold"><span class="blue" id="minbAmt_2445307"><span class="selectedNumType" data-value="774000000">774,000,000</span></span></div>
+                    
+                </td>
+                <td id="caStatus" class="center js-open-pn" data-tid="2445307" data-row="20" data-mask="0" style="padding:3px 0px 2px 2px">
+                    
+                    <div id="statNm_2445307">신건</div>
+                    <div class="blue">(100%)</div>
+                    
+                </td>
+                <td class="center js-open-pn" data-tid="2445307" data-row="20" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div>서울서부5계</div>
+                    <div id="bidDt_2445307"><span>26.07.28</span></div>
+                    <div>(10:00)</div>
+                    <div class="blue">입찰 3일전</div>
+                </td>
+                <td class="right js-open-pn" data-tid="2445307" data-row="20" data-mask="0" style="padding:3px 0px 2px 2px">
+                    <div class="liveSTatBox">
+                        <div id="liveStat_2445307" class="liveSTat"></div>
+                    </div>
+                    <div>조회: 94</div>
+                    
+                    
+                </td>
+            </tr></tbody>
+    </table>
+    <div id="orgimg_box"></div>
+    <div id="paging" class="pagn"><div id="loadPage_1" class="pageBtn"><strong>1</strong></div><div id="loadPage_2" data-role="paging-link" data-page="2" class="pageBtn pageNo">2</div><div id="loadPage_3" data-role="paging-link" data-page="3" class="pageBtn pageNo">3</div><div id="loadPage_4" data-role="paging-link" data-page="4" class="pageBtn pageNo">4</div><div id="loadPage_5" data-role="paging-link" data-page="5" class="pageBtn pageNo">5</div><div id="loadPage_6" data-role="paging-link" data-page="6" class="pageBtn pageNo">6</div><div id="loadPage_7" data-role="paging-link" data-page="7" class="pageBtn pageNo">7</div><div id="loadPage_8" data-role="paging-link" data-page="8" class="pageBtn pageNo">8</div><div id="loadPage_9" data-role="paging-link" data-page="9" class="pageBtn pageNo">9</div></div>
+</div>

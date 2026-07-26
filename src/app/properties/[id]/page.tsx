@@ -1,8 +1,22 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { fetchJSON } from '@/lib/api'
+import { fetchJSON, API_BASE_URL } from '@/lib/api'
 import { decreaseViewCount, getViewCount } from './actions'
+
+interface DocumentStatusItem {
+  doc_type: string
+  status: string
+}
+
+interface RightsSummary {
+  risk_level: string | null
+  occupancy_difficulty: string | null
+  estimated_inheritance: number | null
+  foreclosure_note: string | null
+  occupancy_status: string | null
+  total_tenant_count: number | null
+}
 
 interface AuctionItemDetail {
   id: number
@@ -18,6 +32,21 @@ interface AuctionItemDetail {
   status: string
   fail_count: number
   validation_status: string
+  documents: DocumentStatusItem[]
+  rights_summary: RightsSummary | null
+  is_favorited: boolean
+}
+
+const DOC_TYPE_LABEL: Record<string, string> = {
+  SPEC: '매각물건명세서',
+  APPRAISAL: '감정평가서',
+  STATUS: '현황조사서',
+}
+
+const DOC_STATUS_LABEL: Record<string, string> = {
+  READY: '수집완료',
+  COLLECTING: '수집중',
+  FAILED: '수집실패',
 }
 
 export default function PropertyDetailPage() {
@@ -30,6 +59,15 @@ export default function PropertyDetailPage() {
   const [revealed, setRevealed] = useState(false)
   const [remaining, setRemaining] = useState<number | null>(null)
   const [showPopup, setShowPopup] = useState(false)
+  const [viewingDoc, setViewingDoc] = useState<string | null>(null)
+  const [docAvailable, setDocAvailable] = useState<'checking' | 'ok' | 'notfound'>('checking')
+  useEffect(() => {
+    if (!viewingDoc) return
+    setDocAvailable('checking')
+    fetch(`${API_BASE_URL}/api/v1/item/${id}/documents/${viewingDoc}`, { method: 'HEAD' })
+      .then((res) => setDocAvailable(res.ok ? 'ok' : 'notfound'))
+      .catch(() => setDocAvailable('notfound'))
+  }, [viewingDoc, id])
   useEffect(() => {
     async function fetchData() {
       try {
@@ -58,6 +96,9 @@ export default function PropertyDetailPage() {
       <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
         <button onClick={() => router.back()} className="text-gray-500 text-lg">←</button>
         <h1 className="text-base font-bold text-gray-900">매물 상세</h1>
+        <span className="text-lg" title={property.is_favorited ? '즐겨찾기됨' : '즐겨찾기 안됨'}>
+          {property.is_favorited ? '❤️' : '🤍'}
+        </span>
         {remaining !== null && <span className="ml-auto text-xs text-gray-400">등기열람 잔여 {remaining}회</span>}
       </div>
       <div className="px-4 py-4 space-y-3">
@@ -90,6 +131,61 @@ export default function PropertyDetailPage() {
               <span className="text-sm text-gray-400">사건번호</span>
               <span className="text-sm font-medium text-gray-700">{property.case_no}</span>
             </div>
+            <div className="flex justify-between">
+              <span className="text-sm text-gray-400">진행상태</span>
+              <span className="text-sm font-medium text-gray-700">{property.status || '데이터 없음'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-sm text-gray-400">유찰횟수</span>
+              <span className="text-sm font-medium text-gray-700">{property.fail_count}회</span>
+            </div>
+          </div>
+        </div>
+        {property.rights_summary && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">권리분석</h3>
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">점유관계</span>
+                <span className="text-sm font-medium text-gray-700">{property.rights_summary.occupancy_status || '정보 없음'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">임대차 인원수</span>
+                <span className="text-sm font-medium text-gray-700">
+                  {property.rights_summary.total_tenant_count != null ? `${property.rights_summary.total_tenant_count}명` : '정보 없음'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">명도난이도</span>
+                <span className="text-sm font-medium text-gray-700">{property.rights_summary.occupancy_difficulty || '정보 없음'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">위험도</span>
+                <span className="text-sm font-medium text-gray-700">{property.rights_summary.risk_level || '정보 없음'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">인수금액</span>
+                <span className="text-sm font-medium text-gray-700">
+                  {property.rights_summary.estimated_inheritance != null ? formatPrice(property.rights_summary.estimated_inheritance) : '정보 없음'}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+        <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <h3 className="text-sm font-bold text-gray-900 mb-3">관련 문서</h3>
+          <div className="space-y-2">
+            {property.documents.map((doc) => (
+              <button
+                key={doc.doc_type}
+                type="button"
+                onClick={() => setViewingDoc(doc.doc_type)}
+                className="w-full flex justify-between items-center text-left"
+              >
+                <span className="text-sm text-blue-500 underline">{DOC_TYPE_LABEL[doc.doc_type] || doc.doc_type}</span>
+                <span className="text-sm font-medium text-gray-700">{DOC_STATUS_LABEL[doc.status] || doc.status}</span>
+              </button>
+            ))}
           </div>
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
@@ -121,6 +217,25 @@ export default function PropertyDetailPage() {
             <button className="w-full py-4 bg-blue-500 text-white font-semibold rounded-2xl mb-3" onClick={() => setShowPopup(false)}>추가 충전하기</button>
             <button className="w-full py-4 bg-gray-100 text-gray-500 font-semibold rounded-2xl" onClick={() => setShowPopup(false)}>다음에 하기</button>
           </div>
+        </div>
+      )}
+      {viewingDoc && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex flex-col z-50">
+          <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-gray-100">
+            <button onClick={() => setViewingDoc(null)} className="text-gray-500 text-lg">✕</button>
+            <h2 className="text-sm font-bold text-gray-900">{DOC_TYPE_LABEL[viewingDoc] || viewingDoc}</h2>
+          </div>
+          {docAvailable === 'notfound' ? (
+            <div className="flex-1 w-full bg-white flex items-center justify-center">
+              <p className="text-sm text-gray-400">문서를 찾을 수 없습니다.</p>
+            </div>
+          ) : (
+            <iframe
+              src={`${API_BASE_URL}/api/v1/item/${id}/documents/${viewingDoc}`}
+              className="flex-1 w-full bg-white"
+              title={DOC_TYPE_LABEL[viewingDoc] || viewingDoc}
+            />
+          )}
         </div>
       )}
     </div>

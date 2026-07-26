@@ -13,6 +13,7 @@ from api.v1.favorites import router as favorites_router
 from api.v1.recent_items import router as recent_router
 from api.v1.search_presets import router as presets_router
 from api.v1.registry import router as registry_router
+from api.v1.documents import router as documents_router
 
 app = FastAPI(
     title="도준패스 법원경매 API",
@@ -34,6 +35,7 @@ app.include_router(favorites_router, prefix="/api/v1", tags=["favorites"])
 app.include_router(recent_router, prefix="/api/v1", tags=["recent"])
 app.include_router(presets_router, prefix="/api/v1", tags=["presets"])
 app.include_router(registry_router, prefix="/api/v1", tags=["registry"])
+app.include_router(documents_router, prefix="/api/v1", tags=["documents"])
 
 @app.get("/")
 def root():
@@ -66,4 +68,4 @@ def stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api_server:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("api_server:app", host="127.0.0.1", port=8000, reload=True)

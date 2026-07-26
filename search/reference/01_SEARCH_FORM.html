@@ -1,0 +1,1907 @@
+<div id="fmSrch">
+    <table class="tbl_search input_box inputWrap">
+        <tbody><tr>
+                <th width="10%" class="AdrCrtName">주소선택</th>
+    <td width="40%">
+        <div class="search-address">
+            <div class="toggleBtn">
+                <span id="addrlaw_0" class="button_tiny radius_10_l btn_tank" style="padding:5px;">주소</span>
+                <span id="addrlaw_1" class="button_tiny radius_10_r btn_whitegray" style="padding:5px;border-left:0;">법원</span>
+            </div>
+            <div class="toggleContent">
+                <span id="al_0">
+                    <select name="siCd" id="siCd" style="width:80px">
+                        <option value="0">-시/도-</option>
+                        <option value="11">서울</option>
+<option value="26">부산</option>
+<option value="27">대구</option>
+<option value="28" title="인천 행정구역 개편
+2군8구에서 2군9구 체계로 변경됩니다.
+
+달라지는 주소(검색 반영)
+중구 &gt; 영종구(내륙은 제물포구)
+동구 &gt; 제물포구
+서구 &gt; 서해구 + 검단구">인천</option>
+<option value="12" title="전남광주통합특별시 출범
+기존 전라남도, 광주광역시가 통합하여 출범합니다.
+
+달라지는 주소
+광주광역시 동구 &gt; 전남광주통합특별시 동구
+전라남도 목포시 &gt; 전남광주통합특별시 목포시
+
+탱크옥션 주소검색
+광주광역시와 전라남도 모두 광주로 검색하시면 됩니다.">광주</option>
+<option value="30">대전</option>
+<option value="31">울산</option>
+<option value="36">세종</option>
+<option value="41">경기</option>
+<option value="51">강원</option>
+<option value="43">충북</option>
+<option value="44">충남</option>
+<option value="52">전북</option>
+<option value="47">경북</option>
+<option value="48">경남</option>
+<option value="50">제주</option>
+                    </select>
+                    <select name="guCd" id="guCd">
+                        <option value="0">-시/구/군-</option>
+                    </select>
+                    <select name="dnCd" id="dnCd">
+                        <option value="0">-읍/면/동-</option>
+                    </select>
+                </span>
+                <span id="adrPl_btn" class="button_tiny btn_tank radius_5">추가</span>
+                <div id="adrsPl"></div>
+                <span id="al_1" style="display:none">
+                    <div class="sptArrDiv">
+                        <select name="sptCd[]" class="sptCd" style="width:150px" disabled="">
+                            <option value="0">-선택-</option>
+                            <option value="10,11,12,13,14" class="bg_yellow">서울지법</option>
+<option value="1010" class="">서울 중앙</option>
+<option value="1110" class="">서울 동부</option>
+<option value="1210" class="">서울 서부</option>
+<option value="1310" class="">서울 남부</option>
+<option value="1410" class="">서울 북부</option>
+<option value="15" class="bg_yellow">의정부지법</option>
+<option value="1510" class="">의정부 본원</option>
+<option value="1511" class="">의정부 고양</option>
+<option value="1512" class="">의정부 남양주</option>
+<option value="16" class="bg_yellow">인천지법</option>
+<option value="1610" class="">인천 본원</option>
+<option value="1611" class="">인천 부천</option>
+<option value="17" class="bg_yellow">수원지법</option>
+<option value="1710,1715" class="">수원 본원/안양</option>
+<option value="1710" class="">수원 본원</option>
+<option value="1711" class="">수원 성남</option>
+<option value="1712" class="">수원 여주</option>
+<option value="1713" class="">수원 평택</option>
+<option value="1714" class="">수원 안산</option>
+<option value="1715" class="">수원 안양</option>
+<option value="18" class="bg_yellow">춘천지법</option>
+<option value="1810" class="">춘천 본원</option>
+<option value="1811" class="">춘천 강릉</option>
+<option value="1812" class="">춘천 원주</option>
+<option value="1813" class="">춘천 속초</option>
+<option value="1814" class="">춘천 영월</option>
+<option value="19" class="bg_yellow">청주지법</option>
+<option value="1910" class="">청주 본원</option>
+<option value="1911" class="">청주 충주</option>
+<option value="1912" class="">청주 제천</option>
+<option value="1913" class="">청주 영동</option>
+<option value="20" class="bg_yellow">대전지법</option>
+<option value="2010" class="">대전 본원</option>
+<option value="2011" class="">대전 홍성</option>
+<option value="2012" class="">대전 논산</option>
+<option value="2013" class="">대전 천안</option>
+<option value="2014" class="">대전 공주</option>
+<option value="2015" class="">대전 서산</option>
+<option value="21" class="bg_yellow">대구지법</option>
+<option value="2110,2111" class="">대구 본원/서부</option>
+<option value="2110" class="">대구 본원</option>
+<option value="2111" class="">대구 서부</option>
+<option value="2112" class="">대구 안동</option>
+<option value="2113" class="">대구 경주</option>
+<option value="2114" class="">대구 김천</option>
+<option value="2115" class="">대구 상주</option>
+<option value="2116" class="">대구 의성</option>
+<option value="2117" class="">대구 영덕</option>
+<option value="2118" class="">대구 포항</option>
+<option value="22" class="bg_yellow">부산지법</option>
+<option value="2210,2212" class="">부산 본원/서부</option>
+<option value="2210" class="">부산 본원</option>
+<option value="2211" class="">부산 동부</option>
+<option value="2212" class="">부산 서부</option>
+<option value="23" class="bg_yellow">울산지법</option>
+<option value="24" class="bg_yellow">창원지법</option>
+<option value="2410,2411" class="">창원 본원/마산</option>
+<option value="2410" class="">창원 본원</option>
+<option value="2411" class="">창원 마산</option>
+<option value="2412" class="">창원 진주</option>
+<option value="2413" class="">창원 통영</option>
+<option value="2414" class="">창원 밀양</option>
+<option value="2415" class="">창원 거창</option>
+<option value="25" class="bg_yellow">광주지법</option>
+<option value="2510" class="">광주 본원</option>
+<option value="2511" class="">광주 목포</option>
+<option value="2512" class="">광주 장흥</option>
+<option value="2513" class="">광주 순천</option>
+<option value="2514" class="">광주 해남</option>
+<option value="26" class="bg_yellow">전주지법</option>
+<option value="2610" class="">전주 본원</option>
+<option value="2611" class="">전주 군산</option>
+<option value="2612" class="">전주 정읍</option>
+<option value="2613" class="">전주 남원</option>
+<option value="27" class="bg_yellow">제주지법</option>
+                        </select>
+                        <select name="dptCd[]" class="dptCd" style="width:70px; display:none;">
+                            <option value="0">전체</option>
+                        </select>
+                        <span id="sptPl_btn" class="button_tiny btn_tank radius_5" style="display: none;">추가</span>
+                    </div>
+                </span>
+            </div>
+        </div>
+    </td>                <th width="10%">세부주소</th>
+    <td>
+        <select name="adrsEtcType" id="adrsEtcType">
+            <option value="0">-선택-</option>
+            <option value="1">건물명</option>
+            <option value="2">지번</option>
+        </select>
+        <input type="text" id="adrsEtc" name="adrsEtc" value="" class="tx200" placeholder="세부주소나 건물명 검색시">
+    </td>        </tr>
+        <tr>
+                <th>물건종류</th>
+    <td>
+        <select name="ctgr" id="ctgr" style="width:130px" disabled="true">
+            <option value="" selected="">-선택-</option>
+            <option value="10" class="bg_yellow">주거용</option>
+<option value="201013">아파트</option>
+<option value="201014">연립주택</option>
+<option value="201015,201017,201021">다세대주택</option>
+<option value="201020">오피스텔(주거)</option>
+<option value="201010">단독주택</option>
+<option value="201011,201012">다가구주택</option>
+<option value="201022">도시형생활주택</option>
+<option value="201016">기숙사</option>
+<option value="201018">상가주택</option>
+<option value="20" class="bg_yellow">상업 및 산업용</option>
+<option value="201110,201120,201124">근린생활시설</option>
+<option value="201111,201019">오피스텔(상업)</option>
+<option value="201130">근린상가</option>
+<option value="201122">숙박시설</option>
+<option value="201123">숙박(콘도등)</option>
+<option value="201131">목욕탕</option>
+<option value="201121">업무시설</option>
+<option value="201118">노유자시설</option>
+<option value="201112">문화및집회시설</option>
+<option value="201113">종교시설</option>
+<option value="201116">의료시설</option>
+<option value="201117">교육연구시설</option>
+<option value="201128">묘지관련시설</option>
+<option value="201132,201115,201119,201125,201126,201127,201129,201310,201311,201312,201114">기타시설</option>
+<option value="201210">공장</option>
+<option value="201216">지식산업센터</option>
+<option value="201211">창고시설</option>
+<option value="201212">위험물저장및처리</option>
+<option value="201213">자동차관련</option>
+<option value="201214">동물및식물관련</option>
+<option value="201215">분뇨및쓰레기처리</option>
+<option value="30" class="bg_yellow">토지</option>
+<option value="101010">전</option>
+<option value="101011">답</option>
+<option value="101012">과수원</option>
+<option value="101014">임야</option>
+<option value="101017">대지</option>
+<option value="101037">잡종지</option>
+<option value="101023">도로</option>
+<option value="101020">주차장</option>
+<option value="101031">공원</option>
+<option value="101033">유원지</option>
+<option value="101035">사적지</option>
+<option value="101036">묘지</option>
+<option value="101013">목장용지</option>
+<option value="101018">공장용지</option>
+<option value="101019">학교용지</option>
+<option value="101021">주유소용지</option>
+<option value="101022">창고용지</option>
+<option value="101024">철도용지</option>
+<option value="101030">수도용지</option>
+<option value="101032">체육용지</option>
+<option value="101034">종교용지</option>
+<option value="101025">제방</option>
+<option value="101026">하천</option>
+<option value="101027">구거</option>
+<option value="101015">광천지</option>
+<option value="101016">염전</option>
+<option value="101028">유지</option>
+<option value="101029">양어장</option>
+<option value="40" class="bg_yellow">차량 및 중장비</option>
+<option value="301010">승용차</option>
+<option value="301011">승합차</option>
+<option value="301012">버스</option>
+<option value="301013">화물차</option>
+<option value="301014">기타차량</option>
+<option value="301110">덤프트럭</option>
+<option value="301113,301111,301112">기타중기</option>
+<option value="50" class="bg_yellow">기타</option>
+<option value="301210">선박</option>
+<option value="401010">어업권</option>
+<option value="401011">광업권</option>
+<option value="401110,301310,301410,401012">기타</option>
+        </select>
+        <input type="button" id="btn_power" class="button btn_small btn_whitegray radius_10" value="단일선택">
+        
+    </td>                <th>사건번호</th>
+    <td>
+        <select name="sn1" id="sn1">
+            <option value="0">-선택-</option>
+            <option value="2026">2026</option>
+<option value="2025">2025</option>
+<option value="2024">2024</option>
+<option value="2023">2023</option>
+<option value="2022">2022</option>
+<option value="2021">2021</option>
+<option value="2020">2020</option>
+<option value="2019">2019</option>
+<option value="2018">2018</option>
+<option value="2017">2017</option>
+<option value="2016">2016</option>
+<option value="2015">2015</option>
+<option value="2014">2014</option>
+<option value="2013">2013</option>
+<option value="2012">2012</option>
+<option value="2011">2011</option>
+<option value="2010">2010</option>
+<option value="2009">2009</option>
+<option value="2008">2008</option>
+<option value="2007">2007</option>
+<option value="2006">2006</option>
+<option value="2005">2005</option>
+<option value="2004">2004</option>
+<option value="2003">2003</option>
+<option value="2002">2002</option>
+<option value="2001">2001</option>
+<option value="2000">2000</option>
+<option value="1999">1999</option>
+<option value="1998">1998</option>
+<option value="1997">1997</option>
+<option value="1996">1996</option>
+<option value="1995">1995</option>
+        </select>타경
+        <input type="number" name="sn2" id="sn2" value="" class="tx70 num_type input_num"> &nbsp;
+        <input type="number" name="pn" id="pn" class="tx30 num_type input_num">
+    </td>        </tr>
+        <tr id="trCtgrMulti" style="">
+                    <td colspan="4">
+            <table border="0" cellspacing="0" class="cl_group" style="border-top:1px solid #ddd">
+                <tbody><tr>
+                    <th class="cl_gt">물건종류 복수선택</th>
+                    <td class="cl_gc">
+                        <ul>
+                            <li>
+                                <label for="chkAllCtgr">
+                                    <input type="checkbox" id="chkAllCtgr" name="chkAllCtgr" value="0" checked="">
+                                    <span class="chk_ment">전체보기</span>
+                                </label>
+                            </li>
+                        </ul>
+                    </td>
+                </tr>
+                    <tr>
+        <th class="cl_gt">
+            <label for="chkGrpCtgr_10">
+                <input type="checkbox" id="chkGrpCtgr_10" name="chkGrpCtgr" value="10" class="js-chk-grp-ctgr" data-group="10">
+                <span class="chk_ment">주거용</span>
+            </label>
+        </th>
+        <td class="cl_gc">
+            <ul id="ulGrpCtgr_10">
+                    <li>
+        <label for="chkEaCtgr_201013">
+            <input type="checkbox" id="chkEaCtgr_201013" name="chkEaCtgr" value="201013" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">아파트</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201014">
+            <input type="checkbox" id="chkEaCtgr_201014" name="chkEaCtgr" value="201014" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">연립주택</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201015_201017_201021">
+            <input type="checkbox" id="chkEaCtgr_201015_201017_201021" name="chkEaCtgr" value="201015,201017,201021" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">다세대주택</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201020">
+            <input type="checkbox" id="chkEaCtgr_201020" name="chkEaCtgr" value="201020" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">오피스텔(주거)</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201010">
+            <input type="checkbox" id="chkEaCtgr_201010" name="chkEaCtgr" value="201010" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">단독주택</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201011_201012">
+            <input type="checkbox" id="chkEaCtgr_201011_201012" name="chkEaCtgr" value="201011,201012" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">다가구주택</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201022">
+            <input type="checkbox" id="chkEaCtgr_201022" name="chkEaCtgr" value="201022" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">도시형생활주택</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201016">
+            <input type="checkbox" id="chkEaCtgr_201016" name="chkEaCtgr" value="201016" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">기숙사</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201018">
+            <input type="checkbox" id="chkEaCtgr_201018" name="chkEaCtgr" value="201018" class="js-chk-ea-ctgr" data-group="10">
+            <span class="chk_ment">상가주택</span>
+        </label>
+    </li>
+            </ul>
+        </td>
+    </tr>    <tr>
+        <th class="cl_gt">
+            <label for="chkGrpCtgr_20">
+                <input type="checkbox" id="chkGrpCtgr_20" name="chkGrpCtgr" value="20" class="js-chk-grp-ctgr" data-group="20">
+                <span class="chk_ment">상업 및 산업용</span>
+            </label>
+        </th>
+        <td class="cl_gc">
+            <ul id="ulGrpCtgr_20">
+                    <li>
+        <label for="chkEaCtgr_201110_201120_201124">
+            <input type="checkbox" id="chkEaCtgr_201110_201120_201124" name="chkEaCtgr" value="201110,201120,201124" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">근린생활시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201111_201019">
+            <input type="checkbox" id="chkEaCtgr_201111_201019" name="chkEaCtgr" value="201111,201019" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">오피스텔(상업)</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201130">
+            <input type="checkbox" id="chkEaCtgr_201130" name="chkEaCtgr" value="201130" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">근린상가</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201122">
+            <input type="checkbox" id="chkEaCtgr_201122" name="chkEaCtgr" value="201122" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">숙박시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201123">
+            <input type="checkbox" id="chkEaCtgr_201123" name="chkEaCtgr" value="201123" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">숙박(콘도등)</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201131">
+            <input type="checkbox" id="chkEaCtgr_201131" name="chkEaCtgr" value="201131" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">목욕탕</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201121">
+            <input type="checkbox" id="chkEaCtgr_201121" name="chkEaCtgr" value="201121" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">업무시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201118">
+            <input type="checkbox" id="chkEaCtgr_201118" name="chkEaCtgr" value="201118" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">노유자시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201112">
+            <input type="checkbox" id="chkEaCtgr_201112" name="chkEaCtgr" value="201112" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">문화및집회시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201113">
+            <input type="checkbox" id="chkEaCtgr_201113" name="chkEaCtgr" value="201113" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">종교시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201116">
+            <input type="checkbox" id="chkEaCtgr_201116" name="chkEaCtgr" value="201116" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">의료시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201117">
+            <input type="checkbox" id="chkEaCtgr_201117" name="chkEaCtgr" value="201117" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">교육연구시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201128">
+            <input type="checkbox" id="chkEaCtgr_201128" name="chkEaCtgr" value="201128" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">묘지관련시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201132_201115_201119_201125_201126_201127_201129_201310_201311_201312_201114">
+            <input type="checkbox" id="chkEaCtgr_201132_201115_201119_201125_201126_201127_201129_201310_201311_201312_201114" name="chkEaCtgr" value="201132,201115,201119,201125,201126,201127,201129,201310,201311,201312,201114" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">기타시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201210">
+            <input type="checkbox" id="chkEaCtgr_201210" name="chkEaCtgr" value="201210" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">공장</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201216">
+            <input type="checkbox" id="chkEaCtgr_201216" name="chkEaCtgr" value="201216" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">지식산업센터</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201211">
+            <input type="checkbox" id="chkEaCtgr_201211" name="chkEaCtgr" value="201211" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">창고시설</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201212">
+            <input type="checkbox" id="chkEaCtgr_201212" name="chkEaCtgr" value="201212" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">위험물저장및처리</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201213">
+            <input type="checkbox" id="chkEaCtgr_201213" name="chkEaCtgr" value="201213" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">자동차관련</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201214">
+            <input type="checkbox" id="chkEaCtgr_201214" name="chkEaCtgr" value="201214" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">동물및식물관련</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_201215">
+            <input type="checkbox" id="chkEaCtgr_201215" name="chkEaCtgr" value="201215" class="js-chk-ea-ctgr" data-group="20">
+            <span class="chk_ment">분뇨및쓰레기처리</span>
+        </label>
+    </li>
+            </ul>
+        </td>
+    </tr>    <tr>
+        <th class="cl_gt">
+            <label for="chkGrpCtgr_30">
+                <input type="checkbox" id="chkGrpCtgr_30" name="chkGrpCtgr" value="30" class="js-chk-grp-ctgr" data-group="30">
+                <span class="chk_ment">토지</span>
+            </label>
+        </th>
+        <td class="cl_gc">
+            <ul id="ulGrpCtgr_30">
+                    <li>
+        <label for="chkEaCtgr_101010">
+            <input type="checkbox" id="chkEaCtgr_101010" name="chkEaCtgr" value="101010" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">전</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101011">
+            <input type="checkbox" id="chkEaCtgr_101011" name="chkEaCtgr" value="101011" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">답</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101012">
+            <input type="checkbox" id="chkEaCtgr_101012" name="chkEaCtgr" value="101012" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">과수원</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101014">
+            <input type="checkbox" id="chkEaCtgr_101014" name="chkEaCtgr" value="101014" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">임야</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101017">
+            <input type="checkbox" id="chkEaCtgr_101017" name="chkEaCtgr" value="101017" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">대지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101037">
+            <input type="checkbox" id="chkEaCtgr_101037" name="chkEaCtgr" value="101037" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">잡종지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101023">
+            <input type="checkbox" id="chkEaCtgr_101023" name="chkEaCtgr" value="101023" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">도로</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101020">
+            <input type="checkbox" id="chkEaCtgr_101020" name="chkEaCtgr" value="101020" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">주차장</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101031">
+            <input type="checkbox" id="chkEaCtgr_101031" name="chkEaCtgr" value="101031" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">공원</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101033">
+            <input type="checkbox" id="chkEaCtgr_101033" name="chkEaCtgr" value="101033" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">유원지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101035">
+            <input type="checkbox" id="chkEaCtgr_101035" name="chkEaCtgr" value="101035" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">사적지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101036">
+            <input type="checkbox" id="chkEaCtgr_101036" name="chkEaCtgr" value="101036" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">묘지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101013">
+            <input type="checkbox" id="chkEaCtgr_101013" name="chkEaCtgr" value="101013" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">목장용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101018">
+            <input type="checkbox" id="chkEaCtgr_101018" name="chkEaCtgr" value="101018" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">공장용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101019">
+            <input type="checkbox" id="chkEaCtgr_101019" name="chkEaCtgr" value="101019" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">학교용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101021">
+            <input type="checkbox" id="chkEaCtgr_101021" name="chkEaCtgr" value="101021" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">주유소용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101022">
+            <input type="checkbox" id="chkEaCtgr_101022" name="chkEaCtgr" value="101022" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">창고용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101024">
+            <input type="checkbox" id="chkEaCtgr_101024" name="chkEaCtgr" value="101024" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">철도용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101030">
+            <input type="checkbox" id="chkEaCtgr_101030" name="chkEaCtgr" value="101030" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">수도용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101032">
+            <input type="checkbox" id="chkEaCtgr_101032" name="chkEaCtgr" value="101032" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">체육용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101034">
+            <input type="checkbox" id="chkEaCtgr_101034" name="chkEaCtgr" value="101034" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">종교용지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101025">
+            <input type="checkbox" id="chkEaCtgr_101025" name="chkEaCtgr" value="101025" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">제방</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101026">
+            <input type="checkbox" id="chkEaCtgr_101026" name="chkEaCtgr" value="101026" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">하천</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101027">
+            <input type="checkbox" id="chkEaCtgr_101027" name="chkEaCtgr" value="101027" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">구거</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101015">
+            <input type="checkbox" id="chkEaCtgr_101015" name="chkEaCtgr" value="101015" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">광천지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101016">
+            <input type="checkbox" id="chkEaCtgr_101016" name="chkEaCtgr" value="101016" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">염전</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101028">
+            <input type="checkbox" id="chkEaCtgr_101028" name="chkEaCtgr" value="101028" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">유지</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_101029">
+            <input type="checkbox" id="chkEaCtgr_101029" name="chkEaCtgr" value="101029" class="js-chk-ea-ctgr" data-group="30">
+            <span class="chk_ment">양어장</span>
+        </label>
+    </li>
+            </ul>
+        </td>
+    </tr>    <tr>
+        <th class="cl_gt">
+            <label for="chkGrpCtgr_40">
+                <input type="checkbox" id="chkGrpCtgr_40" name="chkGrpCtgr" value="40" class="js-chk-grp-ctgr" data-group="40">
+                <span class="chk_ment">차량 및 중장비</span>
+            </label>
+        </th>
+        <td class="cl_gc">
+            <ul id="ulGrpCtgr_40">
+                    <li>
+        <label for="chkEaCtgr_301010">
+            <input type="checkbox" id="chkEaCtgr_301010" name="chkEaCtgr" value="301010" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">승용차</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301011">
+            <input type="checkbox" id="chkEaCtgr_301011" name="chkEaCtgr" value="301011" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">승합차</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301012">
+            <input type="checkbox" id="chkEaCtgr_301012" name="chkEaCtgr" value="301012" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">버스</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301013">
+            <input type="checkbox" id="chkEaCtgr_301013" name="chkEaCtgr" value="301013" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">화물차</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301014">
+            <input type="checkbox" id="chkEaCtgr_301014" name="chkEaCtgr" value="301014" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">기타차량</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301110">
+            <input type="checkbox" id="chkEaCtgr_301110" name="chkEaCtgr" value="301110" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">덤프트럭</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_301113_301111_301112">
+            <input type="checkbox" id="chkEaCtgr_301113_301111_301112" name="chkEaCtgr" value="301113,301111,301112" class="js-chk-ea-ctgr" data-group="40">
+            <span class="chk_ment">기타중기</span>
+        </label>
+    </li>
+            </ul>
+        </td>
+    </tr>    <tr>
+        <th class="cl_gt">
+            <label for="chkGrpCtgr_50">
+                <input type="checkbox" id="chkGrpCtgr_50" name="chkGrpCtgr" value="50" class="js-chk-grp-ctgr" data-group="50">
+                <span class="chk_ment">기타</span>
+            </label>
+        </th>
+        <td class="cl_gc">
+            <ul id="ulGrpCtgr_50">
+                    <li>
+        <label for="chkEaCtgr_301210">
+            <input type="checkbox" id="chkEaCtgr_301210" name="chkEaCtgr" value="301210" class="js-chk-ea-ctgr" data-group="50">
+            <span class="chk_ment">선박</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_401010">
+            <input type="checkbox" id="chkEaCtgr_401010" name="chkEaCtgr" value="401010" class="js-chk-ea-ctgr" data-group="50">
+            <span class="chk_ment">어업권</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_401011">
+            <input type="checkbox" id="chkEaCtgr_401011" name="chkEaCtgr" value="401011" class="js-chk-ea-ctgr" data-group="50">
+            <span class="chk_ment">광업권</span>
+        </label>
+    </li>    <li>
+        <label for="chkEaCtgr_401110_301310_301410_401012">
+            <input type="checkbox" id="chkEaCtgr_401110_301310_301410_401012" name="chkEaCtgr" value="401110,301310,301410,401012" class="js-chk-ea-ctgr" data-group="50">
+            <span class="chk_ment">기타</span>
+        </label>
+    </li>
+            </ul>
+        </td>
+    </tr>
+            </tbody></table>
+        </td>        </tr>
+        <tr>
+                <th>진행상태</th>
+    <td>
+        <select name="stat" id="stat" style="width:130px">
+            <option value="11">진행물건</option>
+<option value="1110">신건</option>
+<option disabled="" style="background:#1B43A9;color:#77EBFF">유료서비스 항목 ▼</option>
+<option class="bg_yellow" disabled="" style="color:#aaa">진행물건</option>
+<option class="bg_gray" disabled="" style="color:#aaa">신건</option>
+<option class="bg_gray" disabled="" style="color:#aaa">유찰</option>
+<option class="bg_yellow" disabled="" style="color:#aaa">매각전부</option>
+<option class="bg_gray" disabled="" style="color:#aaa">매각/매각허가등</option>
+<option class="bg_gray" disabled="" style="color:#aaa">잔금납부물건</option>
+<option class="bg_gray" disabled="" style="color:#aaa">배당기일/종결</option>
+<option class="bg_yellow" disabled="" style="color:#aaa">진행외물건</option>
+<option class="bg_gray" disabled="" style="color:#aaa">미진행</option>
+<option class="bg_gray" disabled="" style="color:#aaa">변경/연기</option>
+<option class="bg_gray" disabled="" style="color:#aaa">불허가/허가취소</option>
+<option class="bg_gray" disabled="" style="color:#aaa">정지</option>
+<option class="bg_yellow" disabled="" style="color:#aaa">종국물건</option>
+<option class="bg_gray" disabled="" style="color:#aaa">각하</option>
+<option class="bg_gray" disabled="" style="color:#aaa">기각</option>
+<option class="bg_gray" disabled="" style="color:#aaa">기타</option>
+<option class="bg_gray" disabled="" style="color:#aaa">이송</option>
+<option class="bg_gray" disabled="" style="color:#aaa">취소</option>
+<option class="bg_gray" disabled="" style="color:#aaa">취하</option>
+<option class="bg_gray" disabled="" style="color:#aaa">모사건종결</option>
+        </select>
+        유찰
+        <select name="fbCntBgn" id="fbCntBgn" style="width:80px">
+            <option value="0">-선택-</option>
+            <option value="1">1</option>
+<option value="2">2</option>
+<option value="3">3</option>
+<option value="4">4</option>
+<option value="5">5</option>
+<option value="6">6</option>
+<option value="7">7</option>
+<option value="8">8</option>
+<option value="9">9</option>
+<option value="10">10</option>
+        </select> ~
+        <select name="fbCntEnd" id="fbCntEnd" style="width:80px">
+            <option value="0">-선택-</option>
+            <option value="1">1</option>
+<option value="2">2</option>
+<option value="3">3</option>
+<option value="4">4</option>
+<option value="5">5</option>
+<option value="6">6</option>
+<option value="7">7</option>
+<option value="8">8</option>
+<option value="9">9</option>
+<option value="10">10</option>
+        </select>
+    </td>                <th>매각기일</th>
+    <td id="bidDtCell">
+        <input type="text" name="bgnDt" id="bgnDt" class="txDt hasDatepicker" autocomplete="off" value="">~
+        <input type="text" name="endDt" id="endDt" class="txDt hasDatepicker" autocomplete="off" value="">
+        <span class="button_tiny btn_tank radius_5 js-set-bid-dt" data-dt="2026-07-25" data-num="1">당일</span>
+        <span class="button_tiny btn_tank radius_5 js-set-bid-dt" data-dt="2026-08-01" data-num="7" style="min-width:15px;">+7</span>
+        <span class="button_tiny btn_tank radius_5 js-set-bid-dt" data-dt="2026-08-08" data-num="14" style="min-width:15px;">+14</span>
+        <span class="button_tiny btn_tank radius_5 js-set-bid-dt" data-dt="" data-num="0">X</span>
+    </td>        </tr>
+        <tr>
+                <th>감정가격</th><td><select name="apslAmtBgn" id="apslAmtBgn" dir="ltr"><option value="0">- 선택 -</option>
+		<option value="1000000">1백만</option>
+		<option value="2000000">2백만</option>
+		<option value="3000000">3백만</option>
+		<option value="4000000">4백만</option>
+		<option value="5000000">5백만</option>
+		<option value="6000000">6백만</option>
+		<option value="7000000">7백만</option>
+		<option value="8000000">8백만</option>
+		<option value="9000000">9백만</option>
+		<option value="10000000">1천만</option>
+		<option value="20000000">2천만</option>
+		<option value="30000000">3천만</option>
+		<option value="40000000">4천만</option>
+		<option value="50000000">5천만</option>
+		<option value="60000000">6천만</option>
+		<option value="70000000">7천만</option>
+		<option value="80000000">8천만</option>
+		<option value="90000000">9천만</option>
+		<option value="100000000">1억</option>
+		<option value="150000000">1억 5천만</option>
+		<option value="200000000">2억</option>
+		<option value="250000000">2억 5천만</option>
+		<option value="300000000">3억</option>
+		<option value="350000000">3억 5천만</option>
+		<option value="400000000">4억</option>
+		<option value="450000000">4억 5천만</option>
+		<option value="500000000">5억</option>
+		<option value="600000000">6억</option>
+		<option value="700000000">7억</option>
+		<option value="800000000">8억</option>
+		<option value="900000000">9억</option>
+		<option value="1000000000">10억</option>
+		<option value="1100000000">11억</option>
+		<option value="1200000000">12억</option>
+		<option value="1300000000">13억</option>
+		<option value="1400000000">14억</option>
+		<option value="1500000000">15억</option>
+		<option value="1600000000">16억</option>
+		<option value="1700000000">17억</option>
+		<option value="1800000000">18억</option>
+		<option value="1900000000">19억</option>
+		<option value="2000000000">20억</option>
+		<option value="3000000000">30억</option>
+		<option value="4000000000">40억</option>
+		<option value="5000000000">50억</option>
+		<option value="6000000000">60억</option>
+		<option value="7000000000">70억</option>
+		<option value="8000000000">80억</option>
+		<option value="9000000000">90억</option>
+		<option value="10000000000">100억</option>
+		<option value="20000000000">200억</option>
+		<option value="30000000000">300억</option>
+		<option value="40000000000">400억</option>
+		<option value="50000000000">500억</option>
+		<option value="60000000000">600억</option>
+		<option value="70000000000">700억</option>
+		<option value="80000000000">800억</option>
+		<option value="90000000000">900억</option>
+		<option value="100000000000">1000억</option></select> ~ <select name="apslAmtEnd" id="apslAmtEnd" dir="ltr"><option value="0">- 선택 -</option>
+		<option value="1000000">1백만</option>
+		<option value="2000000">2백만</option>
+		<option value="3000000">3백만</option>
+		<option value="4000000">4백만</option>
+		<option value="5000000">5백만</option>
+		<option value="6000000">6백만</option>
+		<option value="7000000">7백만</option>
+		<option value="8000000">8백만</option>
+		<option value="9000000">9백만</option>
+		<option value="10000000">1천만</option>
+		<option value="20000000">2천만</option>
+		<option value="30000000">3천만</option>
+		<option value="40000000">4천만</option>
+		<option value="50000000">5천만</option>
+		<option value="60000000">6천만</option>
+		<option value="70000000">7천만</option>
+		<option value="80000000">8천만</option>
+		<option value="90000000">9천만</option>
+		<option value="100000000">1억</option>
+		<option value="150000000">1억 5천만</option>
+		<option value="200000000">2억</option>
+		<option value="250000000">2억 5천만</option>
+		<option value="300000000">3억</option>
+		<option value="350000000">3억 5천만</option>
+		<option value="400000000">4억</option>
+		<option value="450000000">4억 5천만</option>
+		<option value="500000000">5억</option>
+		<option value="600000000">6억</option>
+		<option value="700000000">7억</option>
+		<option value="800000000">8억</option>
+		<option value="900000000">9억</option>
+		<option value="1000000000">10억</option>
+		<option value="1100000000">11억</option>
+		<option value="1200000000">12억</option>
+		<option value="1300000000">13억</option>
+		<option value="1400000000">14억</option>
+		<option value="1500000000">15억</option>
+		<option value="1600000000">16억</option>
+		<option value="1700000000">17억</option>
+		<option value="1800000000">18억</option>
+		<option value="1900000000">19억</option>
+		<option value="2000000000">20억</option>
+		<option value="3000000000">30억</option>
+		<option value="4000000000">40억</option>
+		<option value="5000000000">50억</option>
+		<option value="6000000000">60억</option>
+		<option value="7000000000">70억</option>
+		<option value="8000000000">80억</option>
+		<option value="9000000000">90억</option>
+		<option value="10000000000">100억</option>
+		<option value="20000000000">200억</option>
+		<option value="30000000000">300억</option>
+		<option value="40000000000">400억</option>
+		<option value="50000000000">500억</option>
+		<option value="60000000000">600억</option>
+		<option value="70000000000">700억</option>
+		<option value="80000000000">800억</option>
+		<option value="90000000000">900억</option>
+		<option value="100000000000">1000억</option></select>원</td>                <th>토지면적</th>
+    <td>
+        <span id="land_view_0">
+            <input type="number" name="landSqmBgn" id="landSqmBgn" class="tx100 num_type input_num" min="0" value=""> ~
+            <input type="number" name="landSqmEnd" id="landSqmEnd" class="tx100 num_type input_num" min="0">㎡
+        </span>
+        <span id="land_view_1" style="display:none">
+            <input type="number" id="landSqmBgn_1" class="tx100 num_type input_num" min="0"> ~
+            <input type="number" id="landSqmEnd_1" class="tx100 num_type input_num" min="0">평
+        </span>
+        &nbsp;<span class="button_tiny btn_tank" id="land_btn_0" title="소수점 첫째자리에서 버림">㎡</span><span class="button_tiny btn_whitegray" id="land_btn_1" title="소수점 첫째자리에서 버림">평</span>
+    </td>        </tr>
+        <tr>
+                <th>최저가격</th><td><select name="minbAmtBgn" id="minbAmtBgn" dir="ltr"><option value="0">- 선택 -</option>
+		<option value="1000000">1백만</option>
+		<option value="2000000">2백만</option>
+		<option value="3000000">3백만</option>
+		<option value="4000000">4백만</option>
+		<option value="5000000">5백만</option>
+		<option value="6000000">6백만</option>
+		<option value="7000000">7백만</option>
+		<option value="8000000">8백만</option>
+		<option value="9000000">9백만</option>
+		<option value="10000000">1천만</option>
+		<option value="20000000">2천만</option>
+		<option value="30000000">3천만</option>
+		<option value="40000000">4천만</option>
+		<option value="50000000">5천만</option>
+		<option value="60000000">6천만</option>
+		<option value="70000000">7천만</option>
+		<option value="80000000">8천만</option>
+		<option value="90000000">9천만</option>
+		<option value="100000000">1억</option>
+		<option value="150000000">1억 5천만</option>
+		<option value="200000000">2억</option>
+		<option value="250000000">2억 5천만</option>
+		<option value="300000000">3억</option>
+		<option value="350000000">3억 5천만</option>
+		<option value="400000000">4억</option>
+		<option value="450000000">4억 5천만</option>
+		<option value="500000000">5억</option>
+		<option value="600000000">6억</option>
+		<option value="700000000">7억</option>
+		<option value="800000000">8억</option>
+		<option value="900000000">9억</option>
+		<option value="1000000000">10억</option>
+		<option value="1100000000">11억</option>
+		<option value="1200000000">12억</option>
+		<option value="1300000000">13억</option>
+		<option value="1400000000">14억</option>
+		<option value="1500000000">15억</option>
+		<option value="1600000000">16억</option>
+		<option value="1700000000">17억</option>
+		<option value="1800000000">18억</option>
+		<option value="1900000000">19억</option>
+		<option value="2000000000">20억</option>
+		<option value="3000000000">30억</option>
+		<option value="4000000000">40억</option>
+		<option value="5000000000">50억</option>
+		<option value="6000000000">60억</option>
+		<option value="7000000000">70억</option>
+		<option value="8000000000">80억</option>
+		<option value="9000000000">90억</option>
+		<option value="10000000000">100억</option>
+		<option value="20000000000">200억</option>
+		<option value="30000000000">300억</option>
+		<option value="40000000000">400억</option>
+		<option value="50000000000">500억</option>
+		<option value="60000000000">600억</option>
+		<option value="70000000000">700억</option>
+		<option value="80000000000">800억</option>
+		<option value="90000000000">900억</option>
+		<option value="100000000000">1000억</option></select> ~ <select name="minbAmtEnd" id="minbAmtEnd" dir="ltr"><option value="0">- 선택 -</option>
+		<option value="1000000">1백만</option>
+		<option value="2000000">2백만</option>
+		<option value="3000000">3백만</option>
+		<option value="4000000">4백만</option>
+		<option value="5000000">5백만</option>
+		<option value="6000000">6백만</option>
+		<option value="7000000">7백만</option>
+		<option value="8000000">8백만</option>
+		<option value="9000000">9백만</option>
+		<option value="10000000">1천만</option>
+		<option value="20000000">2천만</option>
+		<option value="30000000">3천만</option>
+		<option value="40000000">4천만</option>
+		<option value="50000000">5천만</option>
+		<option value="60000000">6천만</option>
+		<option value="70000000">7천만</option>
+		<option value="80000000">8천만</option>
+		<option value="90000000">9천만</option>
+		<option value="100000000">1억</option>
+		<option value="150000000">1억 5천만</option>
+		<option value="200000000">2억</option>
+		<option value="250000000">2억 5천만</option>
+		<option value="300000000">3억</option>
+		<option value="350000000">3억 5천만</option>
+		<option value="400000000">4억</option>
+		<option value="450000000">4억 5천만</option>
+		<option value="500000000">5억</option>
+		<option value="600000000">6억</option>
+		<option value="700000000">7억</option>
+		<option value="800000000">8억</option>
+		<option value="900000000">9억</option>
+		<option value="1000000000">10억</option>
+		<option value="1100000000">11억</option>
+		<option value="1200000000">12억</option>
+		<option value="1300000000">13억</option>
+		<option value="1400000000">14억</option>
+		<option value="1500000000">15억</option>
+		<option value="1600000000">16억</option>
+		<option value="1700000000">17억</option>
+		<option value="1800000000">18억</option>
+		<option value="1900000000">19억</option>
+		<option value="2000000000">20억</option>
+		<option value="3000000000">30억</option>
+		<option value="4000000000">40억</option>
+		<option value="5000000000">50억</option>
+		<option value="6000000000">60억</option>
+		<option value="7000000000">70억</option>
+		<option value="8000000000">80억</option>
+		<option value="9000000000">90억</option>
+		<option value="10000000000">100억</option>
+		<option value="20000000000">200억</option>
+		<option value="30000000000">300억</option>
+		<option value="40000000000">400억</option>
+		<option value="50000000000">500억</option>
+		<option value="60000000000">600억</option>
+		<option value="70000000000">700억</option>
+		<option value="80000000000">800억</option>
+		<option value="90000000000">900억</option>
+		<option value="100000000000">1000억</option></select>원</td>                <th>건물면적</th>
+    <td>
+        <span id="bldg_view_0">
+            <input type="number" name="bldgSqmBgn" id="bldgSqmBgn" class="tx100 num_type input_num" min="0"> ~
+            <input type="number" name="bldgSqmEnd" id="bldgSqmEnd" class="tx100 num_type input_num" min="0">㎡
+        </span>
+        <span id="bldg_view_1" style="display:none">
+            <input type="number" id="bldgSqmBgn_1" class="tx100 num_type input_num" min="0"> ~
+            <input type="number" id="bldgSqmEnd_1" class="tx100 num_type input_num" min="0">평
+        </span>
+        &nbsp;<span class="button_tiny btn_tank" id="bldg_btn_0" title="소수점 첫째자리에서 버림">㎡</span><span class="button_tiny btn_whitegray" id="bldg_btn_1" title="소수점 첫째자리에서 버림">평</span>
+    </td>        </tr>
+        <tr>
+                    <th>감정가대비</th>
+        <td>
+            <select id="minbPctBgn" name="minbPctBgn">
+                <option value="0">-선택-</option>
+                <option value="0.1">10</option>
+<option value="0.2">20</option>
+<option value="0.3">30</option>
+<option value="0.4">40</option>
+<option value="0.5">50</option>
+<option value="0.6">60</option>
+<option value="0.7">70</option>
+<option value="0.8">80</option>
+<option value="0.9">90</option>
+<option value="1">100</option>
+            </select> ~
+            <select id="minbPctEnd" name="minbPctEnd">
+                <option value="0">-선택-</option>
+                <option value="1">100</option>
+<option value="0.9">90</option>
+<option value="0.8">80</option>
+<option value="0.7">70</option>
+<option value="0.6">60</option>
+<option value="0.5">50</option>
+<option value="0.4">40</option>
+<option value="0.3">30</option>
+<option value="0.2">20</option>
+<option value="0.1">10</option>
+            </select>%
+        </td>                    <th>신건등록</th>
+        <td id="preRegCell">
+            <input type="text" name="preBgnDt" id="preBgnDt" class="txDt hasDatepicker">~
+            <input type="text" name="preEndDt" id="preEndDt" class="txDt hasDatepicker"> &nbsp;
+            <span class="button_tiny btn_tank radius_5 js-set-pre-dt" data-bgn="2026-07-24" data-end="2026-07-24">최근</span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-pre-dt" data-bgn="2026-07-23" data-end="2026-07-24"> - 1 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-pre-dt" data-bgn="2026-07-22" data-end="2026-07-24"> - 2 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-pre-dt" data-bgn="2026-07-21" data-end="2026-07-24"> - 3 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-pre-dt" data-bgn="" data-end=""> X </span> &nbsp;
+        </td>        </tr>
+        </tbody><tbody class="ViewAddSer" id="ViewAddSer" name="ViewAddSer" style="">
+            <tr>
+                        <th>지상층수</th>
+        <td>
+            <select id="totFlrBgn" name="totFlrBgn">
+                <option value="0">-선택-</option>
+                <option value="3">3</option>
+<option value="4">4</option>
+<option value="5">5</option>
+<option value="6">6</option>
+<option value="7">7</option>
+<option value="8">8</option>
+<option value="9">9</option>
+<option value="10">10</option>
+<option value="15">15</option>
+<option value="20">20</option>
+<option value="25">25</option>
+<option value="30">30</option>
+<option value="35">35</option>
+<option value="40">40</option>
+<option value="45">45</option>
+<option value="50">50</option>
+<option value="55">55</option>
+<option value="60">60</option>
+<option value="65">65</option>
+<option value="70">70</option>
+<option value="75">75</option>
+<option value="80">80</option>
+<option value="85">85</option>
+<option value="90">90</option>
+<option value="95">95</option>
+<option value="100">100</option>
+            </select> ~
+            <select id="totFlrEnd" name="totFlrEnd">
+                <option value="0">-선택-</option>
+                <option value="3">3</option>
+<option value="4">4</option>
+<option value="5">5</option>
+<option value="6">6</option>
+<option value="7">7</option>
+<option value="8">8</option>
+<option value="9">9</option>
+<option value="10">10</option>
+<option value="15">15</option>
+<option value="20">20</option>
+<option value="25">25</option>
+<option value="30">30</option>
+<option value="35">35</option>
+<option value="40">40</option>
+<option value="45">45</option>
+<option value="50">50</option>
+<option value="55">55</option>
+<option value="60">60</option>
+<option value="65">65</option>
+<option value="70">70</option>
+<option value="75">75</option>
+<option value="80">80</option>
+<option value="85">85</option>
+<option value="90">90</option>
+<option value="95">95</option>
+<option value="100">100</option>
+            </select>층
+            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;집합건물
+        </td>                        <th>보존등기</th>
+        <td id="prsvCell">
+            <select id="prsvBgn" name="prsvBgn">
+                <option value="0">-선택-</option>
+                <option value="1980">1980</option>
+<option value="1981">1981</option>
+<option value="1982">1982</option>
+<option value="1983">1983</option>
+<option value="1984">1984</option>
+<option value="1985">1985</option>
+<option value="1986">1986</option>
+<option value="1987">1987</option>
+<option value="1988">1988</option>
+<option value="1989">1989</option>
+<option value="1990">1990</option>
+<option value="1991">1991</option>
+<option value="1992">1992</option>
+<option value="1993">1993</option>
+<option value="1994">1994</option>
+<option value="1995">1995</option>
+<option value="1996">1996</option>
+<option value="1997">1997</option>
+<option value="1998">1998</option>
+<option value="1999">1999</option>
+<option value="2000">2000</option>
+<option value="2001">2001</option>
+<option value="2002">2002</option>
+<option value="2003">2003</option>
+<option value="2004">2004</option>
+<option value="2005">2005</option>
+<option value="2006">2006</option>
+<option value="2007">2007</option>
+<option value="2008">2008</option>
+<option value="2009">2009</option>
+<option value="2010">2010</option>
+<option value="2011">2011</option>
+<option value="2012">2012</option>
+<option value="2013">2013</option>
+<option value="2014">2014</option>
+<option value="2015">2015</option>
+<option value="2016">2016</option>
+<option value="2017">2017</option>
+<option value="2018">2018</option>
+<option value="2019">2019</option>
+<option value="2020">2020</option>
+<option value="2021">2021</option>
+<option value="2022">2022</option>
+<option value="2023">2023</option>
+<option value="2024">2024</option>
+<option value="2025">2025</option>
+<option value="2026">2026</option>
+            </select> ~
+            <select id="prsvEnd" name="prsvEnd">
+                <option value="0">-선택-</option>
+                <option value="1980">1980</option>
+<option value="1981">1981</option>
+<option value="1982">1982</option>
+<option value="1983">1983</option>
+<option value="1984">1984</option>
+<option value="1985">1985</option>
+<option value="1986">1986</option>
+<option value="1987">1987</option>
+<option value="1988">1988</option>
+<option value="1989">1989</option>
+<option value="1990">1990</option>
+<option value="1991">1991</option>
+<option value="1992">1992</option>
+<option value="1993">1993</option>
+<option value="1994">1994</option>
+<option value="1995">1995</option>
+<option value="1996">1996</option>
+<option value="1997">1997</option>
+<option value="1998">1998</option>
+<option value="1999">1999</option>
+<option value="2000">2000</option>
+<option value="2001">2001</option>
+<option value="2002">2002</option>
+<option value="2003">2003</option>
+<option value="2004">2004</option>
+<option value="2005">2005</option>
+<option value="2006">2006</option>
+<option value="2007">2007</option>
+<option value="2008">2008</option>
+<option value="2009">2009</option>
+<option value="2010">2010</option>
+<option value="2011">2011</option>
+<option value="2012">2012</option>
+<option value="2013">2013</option>
+<option value="2014">2014</option>
+<option value="2015">2015</option>
+<option value="2016">2016</option>
+<option value="2017">2017</option>
+<option value="2018">2018</option>
+<option value="2019">2019</option>
+<option value="2020">2020</option>
+<option value="2021">2021</option>
+<option value="2022">2022</option>
+<option value="2023">2023</option>
+<option value="2024">2024</option>
+<option value="2025">2025</option>
+<option value="2026">2026</option>
+            </select>년
+            &nbsp;
+            <span class="button_tiny btn_tank radius_5 js-set-prsv-year" data-bgn="2023" data-end="2026"> -3 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-prsv-year" data-bgn="2021" data-end="2026"> -5 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-prsv-year" data-bgn="2016" data-end="2026"> -10 </span> &nbsp;
+<span class="button_tiny btn_tank radius_5 js-set-prsv-year" data-bgn="" data-end=""> X </span> &nbsp;
+        </td>            </tr>
+            <tr>
+                        <th>해당층수</th>
+        <td>
+            <select id="flrBgn" name="flrBgn">
+                <option value="0">-선택-</option>
+                <option value="101">1</option>
+<option value="102">2</option>
+<option value="103">3</option>
+<option value="104">4</option>
+<option value="105">5</option>
+<option value="106">6</option>
+<option value="107">7</option>
+<option value="108">8</option>
+<option value="109">9</option>
+<option value="110">10</option>
+<option value="115">15</option>
+<option value="120">20</option>
+<option value="125">25</option>
+<option value="130">30</option>
+<option value="135">35</option>
+<option value="140">40</option>
+<option value="145">45</option>
+<option value="150">50</option>
+<option value="155">55</option>
+<option value="160">60</option>
+<option value="165">65</option>
+<option value="170">70</option>
+<option value="175">75</option>
+<option value="180">80</option>
+<option value="185">85</option>
+<option value="190">90</option>
+<option value="195">95</option>
+<option value="200">100</option>
+            </select> ~
+            <select id="flrEnd" name="flrEnd">
+                <option value="0">-선택-</option>
+                <option value="101">1</option>
+<option value="102">2</option>
+<option value="103">3</option>
+<option value="104">4</option>
+<option value="105">5</option>
+<option value="106">6</option>
+<option value="107">7</option>
+<option value="108">8</option>
+<option value="109">9</option>
+<option value="110">10</option>
+<option value="115">15</option>
+<option value="120">20</option>
+<option value="125">25</option>
+<option value="130">30</option>
+<option value="135">35</option>
+<option value="140">40</option>
+<option value="145">45</option>
+<option value="150">50</option>
+<option value="155">55</option>
+<option value="160">60</option>
+<option value="165">65</option>
+<option value="170">70</option>
+<option value="175">75</option>
+<option value="180">80</option>
+<option value="185">85</option>
+<option value="190">90</option>
+<option value="195">95</option>
+<option value="200">100</option>
+            </select>층
+            &nbsp;&nbsp;&nbsp;
+            <input type="checkbox" id="baseFlr" name="baseFlr" value="1">지하층
+        </td>                        <th>물건번호</th>
+        <td>
+            <select id="maxPnBgn" name="maxPnBgn">
+                <option value="0">-선택-</option>
+                <option value="10">10</option>
+<option value="20">20</option>
+<option value="30">30</option>
+<option value="40">40</option>
+<option value="50">50</option>
+<option value="60">60</option>
+<option value="70">70</option>
+<option value="80">80</option>
+<option value="90">90</option>
+<option value="100">100</option>
+            </select> ~
+            <select id="maxPnEnd" name="maxPnEnd">
+                <option value="0">-선택-</option>
+                <option value="10">10</option>
+<option value="20">20</option>
+<option value="30">30</option>
+<option value="40">40</option>
+<option value="50">50</option>
+<option value="60">60</option>
+<option value="70">70</option>
+<option value="80">80</option>
+<option value="90">90</option>
+<option value="100">100</option>
+            </select>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;최대번호수
+        </td>            </tr>
+            <tr>
+                        <th>매각구분</th>
+        <td>
+            <select name="dpslDvsn" id="dpslDvsn" style="width:230px">
+                <option value="0">-선택-</option>
+                <option value="10">토지·건물 일괄매각</option>
+<option value="11">토지 매각</option>
+<option value="12">토지지분매각</option>
+<option value="13">토지만 매각</option>
+<option value="14">토지만 매각(제시외기타제외)</option>
+<option value="15">토지및건물 지분 매각</option>
+<option value="16">토지만 매각이며,지분 매각임</option>
+<option value="17">건물만 매각</option>
+<option value="18">건물전부, 토지지분</option>
+<option value="19">토지 매각(제시외기타 포함)</option>
+<option value="20">토지만매각,지분매각(건물X)</option>
+<option value="21">토지지분매각(제시외기타 포함)</option>
+<option value="22">건물만 매각이며,지분 매각임</option>
+<option value="23">토지전부, 건물지분</option>
+<option value="24">전세권만 매각</option>
+<option value="25">지상권만 매각</option>
+<option value="26">기타</option>
+            </select>
+        </td>                        <th>경매절차</th>
+        <td>
+            <select name="auctType" id="auctType" style="width:210px">
+                <option value="0">-선택-</option>
+                <option value="1">임의경매</option>
+<option value="2">강제경매</option>
+            </select>
+        </td>            </tr>
+            <tr>
+                        <th>역세권</th>
+        <td colspan="3">
+            <select id="local" name="local" class="tx_70">
+                <option value="0">-지역-</option>
+                <option value="11">수도권</option>
+<option value="26">부산</option>
+<option value="27">대구</option>
+<option value="12">광주</option>
+<option value="30">대전</option>
+            </select>
+            <select id="line" name="line" class="tx_120">
+                <option value="0">-노선-</option>
+            </select>
+            <select id="station" name="station" class="tx_120">
+                <option value="0">-역명-</option>
+            </select>
+            <select id="distance" name="distance" class="distance tx_70" style="background-color:#FFF">
+                <option value="0">-반경-</option>
+                <option value="100">100m</option>
+                <option value="300">300m</option>
+                <option value="500">500m</option>
+                <option value="700">700m</option>
+                <option value="1000">1km</option>
+            </select>
+        </td>            </tr>
+        </tbody>
+        <tbody><tr>
+            <td colspan="4" valign="top" class="center">
+                <div style="border-top:1px solid #ddd;padding:0px 0 10px">
+                    <span id="AddSer_0" class="button_tiny btn_whitegray radius_10_b BtnAddSer_0" style="vertical-align: top; width: 120px; display: none;">추가검색 +</span>
+                    <span id="AddSer_1" class="button_tiny btn_whitegray radius_10_b BtnAddSer_1" style="vertical-align: top; width: 120px;">추가검색 -</span>
+                    <!-- svg 추가 img/icon/icon_setting -->
+                                    </div>
+            </td>
+        </tr>
+
+        </tbody><tbody class="ViewUseArea" style="">
+            <tr>
+                <td colspan="4">
+                    <table id="useAreaTable" width="100%">
+                        <tbody><tr>
+                                                                                        </tr><tr>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">도시지역<br>(주거지역)</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_1">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_1" name="chkPrps" value="1" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">제1종전용주거지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_2" name="chkPrps" value="2" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">제2종전용주거지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_3" name="chkPrps" value="3" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">제1종일반주거지역</span>
+                                                    </label>
+                                                    <br>                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_4" name="chkPrps" value="4" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">제2종일반주거지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_5" name="chkPrps" value="5" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">제3종일반주거지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_6" name="chkPrps" value="6" class="js-chk-prps" data-group="1"><span class="chk_ment f13" style="padding-left:2px;">준주거지역</span>
+                                                    </label>
+                                                    <br>                                                                                            </div>
+                                        </td>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">도시지역<br>(상업지역)</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_2">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_7" name="chkPrps" value="7" class="js-chk-prps" data-group="2"><span class="chk_ment f13" style="padding-left:2px;">중심상업지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_8" name="chkPrps" value="8" class="js-chk-prps" data-group="2"><span class="chk_ment f13" style="padding-left:2px;">일반상업지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_9" name="chkPrps" value="9" class="js-chk-prps" data-group="2"><span class="chk_ment f13" style="padding-left:2px;">근린상업지역</span>
+                                                    </label>
+                                                    <br>                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_10" name="chkPrps" value="10" class="js-chk-prps" data-group="2"><span class="chk_ment f13" style="padding-left:2px;">유통상업지역</span>
+                                                    </label>
+                                                                                                                                                </div>
+                                        </td>
+                                                                    </tr>
+                                                            <tr>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">도시지역<br>(공업지역)</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_3">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_11" name="chkPrps" value="11" class="js-chk-prps" data-group="3"><span class="chk_ment f13" style="padding-left:2px;">전용공업지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_12" name="chkPrps" value="12" class="js-chk-prps" data-group="3"><span class="chk_ment f13" style="padding-left:2px;">일반공업지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_13" name="chkPrps" value="13" class="js-chk-prps" data-group="3"><span class="chk_ment f13" style="padding-left:2px;">준공업지역</span>
+                                                    </label>
+                                                    <br>                                                                                            </div>
+                                        </td>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">도시지역<br>(녹지지역)</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_4">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_14" name="chkPrps" value="14" class="js-chk-prps" data-group="4"><span class="chk_ment f13" style="padding-left:2px;">보전녹지지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_15" name="chkPrps" value="15" class="js-chk-prps" data-group="4"><span class="chk_ment f13" style="padding-left:2px;">생산녹지지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_16" name="chkPrps" value="16" class="js-chk-prps" data-group="4"><span class="chk_ment f13" style="padding-left:2px;">자연녹지지역</span>
+                                                    </label>
+                                                    <br>                                                                                            </div>
+                                        </td>
+                                                                    </tr>
+                                                            <tr>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">관리지역</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_5">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_17" name="chkPrps" value="17" class="js-chk-prps" data-group="5"><span class="chk_ment f13" style="padding-left:2px;">계획관리지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_18" name="chkPrps" value="18" class="js-chk-prps" data-group="5"><span class="chk_ment f13" style="padding-left:2px;">생산관리지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_19" name="chkPrps" value="19" class="js-chk-prps" data-group="5"><span class="chk_ment f13" style="padding-left:2px;">보전관리지역</span>
+                                                    </label>
+                                                    <br>                                                                                            </div>
+                                        </td>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <span class="f13 bold_900" style="display:inline-block;vertical-align:top">기타지역</span>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_6">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_20" name="chkPrps" value="20" class="js-chk-prps" data-group="6"><span class="chk_ment f13" style="padding-left:2px;">농림지역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_21" name="chkPrps" value="21" class="js-chk-prps" data-group="6"><span class="chk_ment f13" style="padding-left:2px;">자연환경보전지역</span>
+                                                    </label>
+                                                                                                                                                </div>
+                                        </td>
+                                                                    </tr>
+                                                            <tr>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <label class="hand">
+                                                    <input type="checkbox" id="chkGrpPrp_7" name="chkGrpPrp" value="7" class="js-chk-grp-prp" data-group="7" style="display:inline-block;vertical-align:top">
+                                                    <span class="f12 bold_900" style="display:inline-block;vertical-align:top">용도지구</span>
+                                                </label>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_7">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_22" name="chkPrps" value="22" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">경관지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_23" name="chkPrps" value="23" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">고도지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_24" name="chkPrps" value="24" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">방화지구</span>
+                                                    </label>
+                                                    <br>                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_25" name="chkPrps" value="25" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">방재지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_26" name="chkPrps" value="26" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">보호지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_27" name="chkPrps" value="27" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">취락지구</span>
+                                                    </label>
+                                                    <br>                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_28" name="chkPrps" value="28" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">개발진흥지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_29" name="chkPrps" value="29" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">특정용도제한지구</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_30" name="chkPrps" value="30" class="js-chk-prps" data-group="7"><span class="chk_ment f13" style="padding-left:2px;">복합용도지구</span>
+                                                    </label>
+                                                    <br>                                                                                            </div>
+                                        </td>
+                                                                            <th class="left" style="width:75px">
+                                                                                            <label class="hand">
+                                                    <input type="checkbox" id="chkGrpPrp_8" name="chkGrpPrp" value="8" class="js-chk-grp-prp" data-group="8" style="display:inline-block;vertical-align:top">
+                                                    <span class="f12 bold_900" style="display:inline-block;vertical-align:top">용도구역</span>
+                                                </label>
+                                                                                    </th>
+                                        <td>
+                                            <div id="ulGrpPrp_8">
+                                                                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_31" name="chkPrps" value="31" class="js-chk-prps" data-group="8"><span class="chk_ment f13" style="padding-left:2px;">개발제한구역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_32" name="chkPrps" value="32" class="js-chk-prps" data-group="8"><span class="chk_ment f13" style="padding-left:2px;">도시자연공원구역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_33" name="chkPrps" value="33" class="js-chk-prps" data-group="8"><span class="chk_ment f13" style="padding-left:2px;">시가화조정구역</span>
+                                                    </label>
+                                                    <br>                                                                                                                                                        <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_34" name="chkPrps" value="34" class="js-chk-prps" data-group="8"><span class="chk_ment f13" style="padding-left:2px;">수산자원보호구역</span>
+                                                    </label>
+                                                                                                                                                                                                            <label class="fleft" style="width:calc(100% /3)">
+                                                        <input type="checkbox" id="chkPrps_35" name="chkPrps" value="35" class="js-chk-prps" data-group="8"><span class="chk_ment f13" style="padding-left:2px;">입지규제최소구역</span>
+                                                    </label>
+                                                                                                                                                </div>
+                                        </td>
+                                                                    </tr>
+                                                    
+                    </tbody></table>
+                </td>
+            </tr>
+        </tbody>
+        <tbody><tr>
+            <td colspan="4" valign="top" class="center">
+                <div style="border-top:1px solid #ddd;padding:0px 0 10px">
+                    <span id="UseArea_0" class="button_tiny btn_whitegray radius_10_b BtnUseArea_0" style="vertical-align: top; width: 120px; display: none;">용도검색 +</span>
+                    <span id="UseArea_1" class="button_tiny btn_whitegray radius_10_b BtnUseArea_1" style="vertical-align: top; width: 120px;">용도검색 -</span>
+                    <!-- svg 추가 img/icon/icon_setting -->
+                                    </div>
+            </td>
+        </tr>
+        <tr>
+            <td colspan="4" style="padding:3px 15px">
+                <table id="splSrchTable">
+                    <tbody><tr>
+                        <th class="left" width="90">특수조건</th>
+                        <td>
+                            <div style="padding-bottom:10px;border-bottom:1px solid #ddd">
+                                <label>
+                                    <input type="radio" name="splSrchType" id="splSrchType0" value="0" checked="">
+                                    <span class="rdo_ment">적용 안함</span>
+                                </label>&nbsp;&nbsp;&nbsp;&nbsp;
+                                <label>
+                                    <input type="radio" name="splSrchType" id="splSrchType1" value="1">
+                                    <span class="rdo_ment">선택 1개 이상 포함</span>
+                                </label>&nbsp;
+                                <span class="tooltip blue-tooltip" style="margin-right:20px">
+                                    <p class="btn_whitegray radius_30 center" style="width:17px;font-size:11px">?</p>
+                                    <span style="width:290px;">선택 조건이 하나라도 포함된 물건이 검색됩니다.</span>
+                                </span>
+                                <label>
+                                    <input type="radio" name="splSrchType" id="splSrchType2" value="2">
+                                    <span class="rdo_ment">선택 모두 포함</span>
+                                </label>&nbsp;
+                                <span class="tooltip blue-tooltip" style="margin-right:60px">
+                                    <p class="btn_whitegray radius_30 center" style="width:17px;font-size:11px">?</p>
+                                    <span style="width:280px;">선택 조건을 모두 포함하는 물건이 검색됩니다.</span>
+                                </span>
+                                <label>
+                                    <input type="radio" name="splSrchType" id="splSrchType4" value="4">
+                                    <span class="rdo_ment blue">선택 제외</span>
+                                </label>&nbsp;
+                                <span class="tooltip blue-tooltip">
+                                    <p class="btn_whitegray radius_30 center" style="width:17px;font-size:11px">?</p>
+                                    <span style="width:250px;">선택 조건이 제외된 물건이 검색됩니다.</span>
+                                </span>
+                            </div>
+                        </td>
+                    </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_1" class="hand chkGrpSpl_1" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_1" name="chkGrpSpl" value="1" class="js-chk-grp-spl" data-group="1">
+                                    <span>권리</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_1">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_1" value="1" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_1">유치권</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_2" value="2" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_2">유치권 배제</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_3" value="3" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_3">법정지상권</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_4" value="4" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_4">분묘기지권</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_14" value="14" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_14">선순위 가등기</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_15" value="15" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_15">선순위 가처분</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_121" value="121" class="js-chk-spl" data-group="1">
+                                            <span class="chk_ment" id="chkSplMent_121">지분입찰 물건</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_2" class="hand chkGrpSpl_2" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_2" name="chkGrpSpl" value="2" class="js-chk-grp-spl" data-group="2">
+                                    <span>임차인</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_2">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_13" value="13" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_13">임차인우선매수신고</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_16" value="16" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_16">선순위 전세권 설정</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_17" value="17" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_17">선순위 임차권 설정</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_18" value="18" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_18">임차권 등기</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_19" value="19" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_19">대항력 있는 임차인</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_112" value="112" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_112">전세권만 매각</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_31" value="31" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_31">HUG 임차권 인수조건변경</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_32" value="32" class="js-chk-spl" data-group="2">
+                                            <span class="chk_ment" id="chkSplMent_32">HF 임차권 인수조건변경</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_3" class="hand chkGrpSpl_3" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_3" name="chkGrpSpl" value="3" class="js-chk-grp-spl" data-group="3">
+                                    <span>물건현황</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_3">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_8" value="8" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_8">맹지</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_11" value="11" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_11">위반건축물</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_101" value="101" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_101">오늘 공고된 신건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_102" value="102" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_102">재매각 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_103" value="103" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_103">반값 경매물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_105" value="105" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_105">토지건물 일괄매각</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_116" value="116" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_116">대지권미등기</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_117" value="117" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_117">토지별도등기 있는 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_118" value="118" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_118">토지별도등기인수조건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_119" value="119" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_119">건물만 입찰 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_120" value="120" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_120">토지만 입찰 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_130" value="130" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_130">감정시점 1년 지난 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_131" value="131" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_131">경매/공매 동시 (진행/과거)</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_132" value="132" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_132">최근 2주 주요변동 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_21" value="21" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_21">NPL 물건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_133" value="133" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_133">공고보다 빠른 신건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:50%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_134" value="134" class="js-chk-spl" data-group="3">
+                                            <span class="chk_ment" id="chkSplMent_134">공고임박 예정물건(주소만 검색)</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_4" class="hand chkGrpSpl_4" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_4" name="chkGrpSpl" value="4" class="js-chk-grp-spl" data-group="4">
+                                    <span>자격</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_4">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_5" value="5" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_5">공유자우선매수</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_6" value="6" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_6">농지취득자격증명</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_7" value="7" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_7">채권자매수청구</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_9" value="9" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_9">대위변제</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_10" value="10" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_10">항고사건</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_12" value="12" class="js-chk-spl" data-group="4">
+                                            <span class="chk_ment" id="chkSplMent_12">임금채권자</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_5" class="hand chkGrpSpl_5" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_5" name="chkGrpSpl" value="5" class="js-chk-grp-spl" data-group="5">
+                                    <span>형식적경매</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_5">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_122" value="122" class="js-chk-spl" data-group="5">
+                                            <span class="chk_ment" id="chkSplMent_122">유치권에 의한 형식적경매</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_123" value="123" class="js-chk-spl" data-group="5">
+                                            <span class="chk_ment" id="chkSplMent_123">공유물분할을 위한 형식적경매</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_124" value="124" class="js-chk-spl" data-group="5">
+                                            <span class="chk_ment" id="chkSplMent_124">청산을 위한 형식적경매</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_125" value="125" class="js-chk-spl" data-group="5">
+                                            <span class="chk_ment" id="chkSplMent_125">기타 형식적경매</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                            <tr>
+                            <th class="left">
+                                <label for="chkGrpSpl_6" class="hand chkGrpSpl_6" style="position:relative">
+                                    <input type="checkbox" id="chkGrpSpl_6" name="chkGrpSpl" value="6" class="js-chk-grp-spl" data-group="6">
+                                    <span>공시가격<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(주거용)</span>
+                                </label>
+                            </th>
+                            <td>
+                                <div id="ulGrpSpl_6">
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_20" value="20" class="js-chk-spl" data-group="6">
+                                            <span class="chk_ment" id="chkSplMent_20">공시가 1억 이하</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_22" value="22" class="js-chk-spl" data-group="6">
+                                            <span class="chk_ment" id="chkSplMent_22">공시가 1~2억 이하</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_23" value="23" class="js-chk-spl" data-group="6">
+                                            <span class="chk_ment" id="chkSplMent_23">공시가 2~3억 이하</span>
+                                        </label>
+                                                                                                                    <label class="fleft" style="width:25%">
+                                            <input type="checkbox" name="chkSpl" id="chkSpl_24" value="24" class="js-chk-spl" data-group="6">
+                                            <span class="chk_ment" id="chkSplMent_24">공시가 3~4억 이하</span>
+                                        </label>
+                                                                    </div>
+                            </td>
+                        </tr>
+                                        <tr id="spl134Notice" class="spl134-notice" style="display:none;">
+                        <th></th>
+                        <td>
+                            공고임박 예정물건은 주소 조건만 적용됩니다. 최저가, 감정가, 기일, 종별 등 다른 검색조건은 결과에 반영되지 않습니다.
+                        </td>
+                    </tr>
+                </tbody></table>
+            </td>
+        </tr>
+        <tr height="20px">
+            <td colspan="4" style="border-bottom:1px solid #5475EF;"></td>
+        </tr>
+        <tr height="100px">
+            <td colspan="4" class="center">
+                <button type="button" id="btnNewG" class="button btn_tank_2 radius_10">즐겨쓰는검색추가</button>
+                <button type="button" id="btnRest" class="button btn_whitegray radius_10">다 시</button>
+                <button type="button" id="btnSrch" class="button btn_tank radius_10">검 색</button>
+                            </td>
+        </tr>
+    </tbody></table>
+</div>

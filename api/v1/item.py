@@ -33,7 +33,8 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "SELECT * FROM rights_summary WHERE item_id = ?", (item_id,)
         ).fetchone()
 
-        # 로그인 사용자면 최근조회 자동 기록
+        # 로그인 사용자면 최근조회 자동 기록 + 즐겨찾기 여부 확인
+        user_id = None
         if credentials:
             try:
                 from api.auth import SUPABASE_JWT_SECRET
@@ -45,6 +46,14 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
                     record_view(conn, user_id, item_id)
             except:
                 pass
+
+        is_favorited = False
+        if user_id:
+            fav = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND item_id=?",
+                (user_id, item_id)
+            ).fetchone()
+            is_favorited = fav is not None
 
         return {
             "id": row["id"],
@@ -68,6 +77,7 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "documents": [{"doc_type": d["doc_type"], "status": d["status"]} for d in doc_status],
             "tenants": [dict(t) for t in tenants],
             "rights_summary": dict(rights) if rights else None,
+            "is_favorited": is_favorited,
         }
     finally:
         conn.close()
