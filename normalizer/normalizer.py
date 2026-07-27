@@ -55,8 +55,10 @@ def normalize_address(address: str) -> dict:
             remainder = remainder.replace(prefix, "").strip()
             break
 
-    # 시군구: 앞에서 첫 번째로 나오는 구/시/군
-    sigungu_match = re.search(r'[가-힣]+[구시군](?=\s|$)', remainder)
+    # 시군구: 앞에서 첫 번째로 나오는 구/시/군.
+    # 고양시/성남시/수원시 등 일반구를 둔 시는 "OO시 OO구" 형태로 구까지 함께 잡아야
+    # sigungu LIKE 검색에서 구 단위(예: "일산동구")가 누락되지 않는다.
+    sigungu_match = re.search(r'[가-힣]+[구시군](?:\s+[가-힣]+구)?(?=\s|$)', remainder)
     if sigungu_match:
         sigungu = sigungu_match.group()
 
