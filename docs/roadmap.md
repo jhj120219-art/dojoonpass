@@ -161,6 +161,26 @@ Priority 3
 
 ---
 
+# Sprint Backlog
+
+## [P1] run_daily.bat 실패 은폐 구조 개선
+
+배경: migrate_execute.py 로그 파일 잠금 버그(2026-07-27 수정 완료) 조사 중, run_daily.bat가
+migrate_execute.py 실패 후에도 뒤따르는 echo 명령 때문에 배치 자체의 종료코드가 0(성공)으로
+남는 구조적 결함이 확인됨. Task Scheduler의 LastTaskResult가 실제 내부 실패를 반영하지 못함.
+
+목표
+
+- 현재 하위 프로세스(mvp_scraper.py / migrate_execute.py) 실패 시 BAT가 exit code 0으로
+  종료될 수 있는지 재확인
+- 실패 시 즉시 종료(다음 단계로 넘어가지 않음)
+- 적절한 exit code 반환(Task Scheduler가 실패를 인지 가능하도록)
+- 어느 단계에서 실패했는지 로그에 명확히 남기기
+
+이번 Sprint 범위: 등록만 함. 설계/구현은 다음 Sprint에서 진행.
+
+---
+
 # Risks
 
 - SQLite 단일 DB 운영

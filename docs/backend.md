@@ -8,7 +8,7 @@
 
 ## 현재 Backend 구조
 
-dojun-pass/
+dojoonpass/
 api_server.py
 mvp_scraper.py
 collect_documents.py
@@ -144,7 +144,7 @@ JWT 없으면 기록 안 함 (에러 없음).
 ## Database 연동 방식
 
 - 종류: SQLite
-- 파일: `C:\Users\Administrator\Desktop\dojun-pass\auction.db`
+- 파일: `C:\Users\Administrator\Desktop\dojoonpass\auction.db`
 - 연결: `storage/database.py` → `get_connection()`
 - DB_PATH: `"auction.db"` (상대경로)
 - 크롤러(mvp_scraper.py)와 API 서버(api_server.py) 동일 DB 파일 사용 확인됨
@@ -260,7 +260,7 @@ Task Scheduler (매일 06:00)
 
 ## 절대 변경하면 안 되는 것
 
-- `auction.db` 경로: `C:\Users\Administrator\Desktop\dojun-pass\auction.db`
+- `auction.db` 경로: `C:\Users\Administrator\Desktop\dojoonpass\auction.db`
 - `auction` 테이블 구조 (크롤러 원본)
 - `auction_item.id` (프론트 라우팅 /auction/{itemId} 기준 PK, 정수형)
 - GET /api/v1/search 응답 필드명 (프론트 연동 완료)

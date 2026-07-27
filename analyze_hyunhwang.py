@@ -8,7 +8,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
-DOWNLOAD_DIR = "C:\\Users\\Administrator\\Desktop\\dojun-pass\\downloads"
+DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 
 def build_driver():
     opts = Options()
