@@ -89,6 +89,9 @@ export default function PriceRangeSelect({
   selectClassName,
   labelClassName,
 }: PriceRangeSelectProps) {
+  const maxNum = Number(maxValue)
+  const minNum = Number(minValue)
+
   return (
     <div>
       <span className={labelClassName}>{label}</span>
@@ -99,7 +102,13 @@ export default function PriceRangeSelect({
           className={selectClassName}
         >
           {PRICE_OPTIONS.map((opt) => (
-            <option key={`min-${opt.value}`} value={opt.value}>
+            <option
+              key={`min-${opt.value}`}
+              value={opt.value}
+              // "제한없음"(0)은 항상 선택 가능. 그 외에는 최대값보다 큰 옵션을 막아
+              // 최소 > 최대 조합 자체가 만들어지지 않게 한다.
+              disabled={opt.value !== 0 && maxNum > 0 && opt.value > maxNum}
+            >
               최소 {opt.label}
             </option>
           ))}
@@ -110,7 +119,11 @@ export default function PriceRangeSelect({
           className={selectClassName}
         >
           {PRICE_OPTIONS.map((opt) => (
-            <option key={`max-${opt.value}`} value={opt.value}>
+            <option
+              key={`max-${opt.value}`}
+              value={opt.value}
+              disabled={opt.value !== 0 && minNum > 0 && opt.value < minNum}
+            >
               최대 {opt.label}
             </option>
           ))}

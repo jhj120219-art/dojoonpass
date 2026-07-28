@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation'
 import { useState } from 'react'
 import type { SearchQueryParams } from './types'
 import PriceRangeSelect from '@/components/PriceRangeSelect'
+import RangeSelect from '@/components/RangeSelect'
 import SearchAccordionSection from '@/components/SearchAccordionSection'
 import PropertyTypeTree from '@/components/PropertyTypeTree'
 
@@ -31,6 +32,8 @@ const SPECIAL_SEARCH_TYPES = [
   { value: '2', label: '선택 모두 포함' },
   { value: '4', label: '선택 제외' },
 ] as const
+
+type SpecialSearchType = (typeof SPECIAL_SEARCH_TYPES)[number]['value']
 
 // Tank Auction의 fbCntBgn/fbCntEnd select(0~10, 자유 숫자입력 아님)와 동일 구성.
 const FAIL_COUNT_OPTIONS = Array.from({ length: 11 }, (_, i) => String(i))
@@ -98,7 +101,7 @@ export default function SearchForm() {
   // Tank Auction의 주소선택 toggleBtn(주소/법원)과 동일한 2-way 탭. UI 전용 상태(mock).
   const [addressMode, setAddressMode] = useState<'address' | 'court'>('address')
   // Tank Auction의 splSrchType 라디오. UI 전용 상태(mock, TODO 참고).
-  const [specialSearchType, setSpecialSearchType] = useState<string>('0')
+  const [specialSearchType, setSpecialSearchType] = useState<SpecialSearchType>('0')
   // Tank Auction의 물건종류 체크박스 트리 선택값. TODO 참고(단일 선택시에만 API 연동).
   const [propertyCategories, setPropertyCategories] = useState<string[]>([])
 
@@ -118,6 +121,15 @@ export default function SearchForm() {
     const end = new Date(today)
     end.setDate(end.getDate() + days)
     setForm((prev) => ({ ...prev, auctionDateFrom: toISODate(today), auctionDateTo: toISODate(end) }))
+  }
+
+  // Tank Auction의 btnRest("다 시")와 동일한 전체 초기화. 검색은 실행하지 않고
+  // 폼 상태만 최초값으로 되돌린다 (API 호출/router.push 없음).
+  function resetForm() {
+    setForm(INITIAL_STATE)
+    setAddressMode('address')
+    setSpecialSearchType('0')
+    setPropertyCategories([])
   }
 
   function toggleSpecialCondition(value: string) {
@@ -187,7 +199,7 @@ export default function SearchForm() {
   return (
     <div className="bg-white rounded-2xl px-4 shadow-sm border border-gray-100 mb-3">
       {/* 주소/법원 토글 — Tank Auction의 toggleBtn(주소/법원 탭) 참고 */}
-      <div className="pt-4">
+      <div className="pt-4 pb-3 border-b border-gray-100">
         <div className="flex rounded-full overflow-hidden border border-gray-200 mb-2">
           <button
             type="button"
@@ -292,12 +304,12 @@ export default function SearchForm() {
         </div>
 
         <div>
-          <span className={labelClass}>
-            물건종류
-            {propertyCategories.length >= 2 && (
-              <span className="text-amber-500 font-normal"> (2개 이상 선택 시 검색에는 미반영 — API 연동 예정)</span>
-            )}
-          </span>
+          <span className={labelClass}>물건종류</span>
+          {propertyCategories.length >= 2 && (
+            <p className="text-xs text-amber-500 mb-1">
+              2개 이상 선택 시 검색에는 미반영 — API 연동 예정
+            </p>
+          )}
           <PropertyTypeTree selected={propertyCategories} onChange={setPropertyCategories} />
         </div>
       </SearchAccordionSection>
@@ -321,31 +333,17 @@ export default function SearchForm() {
           selectClassName={inputClass}
           labelClassName={labelClass}
         />
-        <div>
-          <span className={labelClass}>감정가 대비율 (최저가율)</span>
-          <div className="grid grid-cols-2 gap-2">
-            <select
-              value={form.bidRateMin}
-              onChange={(e) => update('bidRateMin', e.target.value)}
-              className={inputClass}
-            >
-              <option value="">최소 선택 안함</option>
-              {BID_RATE_OPTIONS.map((v) => (
-                <option key={`brmin-${v}`} value={v}>최소 {v}%</option>
-              ))}
-            </select>
-            <select
-              value={form.bidRateMax}
-              onChange={(e) => update('bidRateMax', e.target.value)}
-              className={inputClass}
-            >
-              <option value="">최대 선택 안함</option>
-              {BID_RATE_OPTIONS.map((v) => (
-                <option key={`brmax-${v}`} value={v}>최대 {v}%</option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <RangeSelect
+          label="감정가 대비율 (최저가율)"
+          minValue={form.bidRateMin}
+          maxValue={form.bidRateMax}
+          onMinChange={(v) => update('bidRateMin', v)}
+          onMaxChange={(v) => update('bidRateMax', v)}
+          options={BID_RATE_OPTIONS.map((v) => ({ value: v, label: `${v}%` }))}
+          placeholder="선택 안함"
+          selectClassName={inputClass}
+          labelClassName={labelClass}
+        />
       </SearchAccordionSection>
 
       <SearchAccordionSection title="일정 · 유찰횟수">
@@ -398,31 +396,17 @@ export default function SearchForm() {
           </div>
         </div>
 
-        <div>
-          <span className={labelClass}>유찰횟수</span>
-          <div className="grid grid-cols-2 gap-2">
-            <select
-              value={form.failCountMin}
-              onChange={(e) => update('failCountMin', e.target.value)}
-              className={inputClass}
-            >
-              <option value="">최소 선택 안함</option>
-              {FAIL_COUNT_OPTIONS.map((v) => (
-                <option key={`fcmin-${v}`} value={v}>최소 {v}회</option>
-              ))}
-            </select>
-            <select
-              value={form.failCountMax}
-              onChange={(e) => update('failCountMax', e.target.value)}
-              className={inputClass}
-            >
-              <option value="">최대 선택 안함</option>
-              {FAIL_COUNT_OPTIONS.map((v) => (
-                <option key={`fcmax-${v}`} value={v}>최대 {v}회</option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <RangeSelect
+          label="유찰횟수"
+          minValue={form.failCountMin}
+          maxValue={form.failCountMax}
+          onMinChange={(v) => update('failCountMin', v)}
+          onMaxChange={(v) => update('failCountMax', v)}
+          options={FAIL_COUNT_OPTIONS.map((v) => ({ value: v, label: `${v}회` }))}
+          placeholder="선택 안함"
+          selectClassName={inputClass}
+          labelClassName={labelClass}
+        />
       </SearchAccordionSection>
 
       <SearchAccordionSection title="면적 조건" defaultOpen={false}>
@@ -514,11 +498,18 @@ export default function SearchForm() {
         </div>
       </SearchAccordionSection>
 
-      <div className="py-4">
+      <div className="py-4 flex gap-2">
+        <button
+          type="button"
+          onClick={resetForm}
+          className="shrink-0 rounded-xl bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-500 active:bg-gray-200 transition-colors"
+        >
+          초기화
+        </button>
         <button
           type="button"
           onClick={handleSearch}
-          className="w-full rounded-xl bg-blue-500 py-2.5 text-sm font-medium text-white active:bg-blue-600 transition-colors"
+          className="flex-1 rounded-xl bg-blue-500 py-2.5 text-sm font-medium text-white active:bg-blue-600 transition-colors"
         >
           검색
         </button>
