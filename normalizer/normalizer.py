@@ -63,9 +63,21 @@ def normalize_address(address: str) -> dict:
         sigungu = sigungu_match.group()
 
     # 동/읍/면/리
-    dong_match = re.search(r'[가-힣]+[동읍면리](?=\s|\d|$)', remainder)
-    if dong_match:
-        dong = dong_match.group()
+    # 1순위: "(법정동,건물명)" 괄호 표기 — 도로명주소 뒤에 참고사항으로 법정동+건물명을
+    # 병기하는 공식 관용 형식이라 존재할 경우 가장 신뢰도가 높다. 이 표기가 없으면
+    # "에이동"/"비동"/"판매시설동" 같은 건물 내부 동 라벨이나 "젊음의거리"처럼 우연히
+    # 동/읍/면/리로 끝나는 고유명사를, 정규식이 왼쪽에서 먼저 만난다는 이유로 잘못
+    # 채택해버리는 문제가 있었다.
+    paren_dong_match = re.search(r'\(([가-힣]+[동읍면리])[,\s]', remainder)
+    if paren_dong_match:
+        dong = paren_dong_match.group(1)
+    else:
+        # 2순위: 괄호 표기가 아예 없는 주소(순수 도로명주소 등)에 대한 기존 로직.
+        # 동 뒤에 콤마가 바로 오는 경우("...5 지2층비202호 (문정동,푸르지오시티)")도
+        # 있어 콤마를 lookahead에 포함시킨다.
+        dong_match = re.search(r'[가-힣]+[동읍면리](?=[\s\d,]|$)', remainder)
+        if dong_match:
+            dong = dong_match.group()
 
     # 지번
     lot_match = re.search(r'\d+[-\d]*(?=\s|$|\[)', address)

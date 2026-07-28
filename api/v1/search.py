@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from storage.database import get_connection
+from normalizer.normalizer import extract_sido
 
 router = APIRouter()
 
@@ -60,6 +61,13 @@ def search(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
+    # sort_by/sort_order는 기존에 미등록 값을 조용히 기본값으로 폴백하고 있었다.
+    # 안정성을 위해 여기서만 명시적으로 거부하고, 그 외 검색 조건/SQL 로직은 그대로 둔다.
+    if sort_by is not None and sort_by not in SORT_COLUMNS:
+        raise HTTPException(status_code=400, detail=f"허용되지 않는 sort_by 값입니다: {sort_by}")
+    if sort_order is not None and str(sort_order).lower() not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail=f"허용되지 않는 sort_order 값입니다: {sort_order}")
+
     conn = get_connection()
     try:
         conditions = ["1=1"]
@@ -69,8 +77,11 @@ def search(
             conditions.append("case_no LIKE ?")
             params.append(f"%{case_no}%")
         if sido:
+            # "서울시"/"서울특별시"처럼 축약 코드가 아닌 표기로 와도, auction_item.sido에
+            # 저장된 축약 코드("서울" 등)와 매치되도록 검색 진입 시에만 정규화한다.
+            # extract_sido가 못 알아들으면(빈 문자열) 원본 입력을 그대로 사용해 기존 동작을 보존한다.
             conditions.append("sido = ?")
-            params.append(sido)
+            params.append(extract_sido(sido) or sido)
         if sigungu:
             conditions.append("sigungu LIKE ?")
             params.append(f"%{sigungu}%")
@@ -146,5 +157,9 @@ def search(
             "total_pages": (total + size - 1) // size,
             "items": [row_to_item(r) for r in rows],
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="검색 처리 중 오류가 발생했습니다") from e
     finally:
         conn.close()
