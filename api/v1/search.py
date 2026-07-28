@@ -2,8 +2,61 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from storage.database import get_connection
 from normalizer.normalizer import extract_sido
+from intent.analyzer import (
+    analyze_intent,
+    INTENT_SIDO, INTENT_SIGUNGU, INTENT_DONG, INTENT_LOT_NUMBER,
+    INTENT_FULL_ADDRESS, INTENT_MIXED,
+)
 
 router = APIRouter()
+
+
+def _address_detail_condition(address_detail: str):
+    """
+    address_detail 입력의 검색 의도(Intent)를 판별해 SQL 조건과 파라미터를 생성한다.
+    구조화할 수 없는 입력(UNKNOWN, 건물명/도로명 등)은 기존 방식(full_address LIKE)을
+    그대로 유지해 기존에 되던 검색을 깨뜨리지 않는다.
+    """
+    result = analyze_intent(address_detail)
+    intent = result["intent"]
+    parsed = result["parsed"]
+    residual = result["residual"]
+
+    if intent == INTENT_SIDO:
+        return "sido = ?", [parsed["sido"]]
+    if intent == INTENT_SIGUNGU:
+        return "sigungu LIKE ?", [f"%{parsed['sigungu']}%"]
+    if intent == INTENT_DONG:
+        return "dong LIKE ?", [f"%{parsed['dong']}%"]
+    if intent == INTENT_LOT_NUMBER:
+        return "lot_number = ?", [parsed["lot_number"]]
+    if intent == INTENT_FULL_ADDRESS:
+        return (
+            "sido = ? AND sigungu LIKE ? AND dong LIKE ?",
+            [parsed["sido"], f"%{parsed['sigungu']}%", f"%{parsed['dong']}%"],
+        )
+    if intent == INTENT_MIXED:
+        sub_conditions = []
+        sub_params = []
+        if parsed["sido"]:
+            sub_conditions.append("sido = ?")
+            sub_params.append(parsed["sido"])
+        if parsed["sigungu"]:
+            sub_conditions.append("sigungu LIKE ?")
+            sub_params.append(f"%{parsed['sigungu']}%")
+        if parsed["dong"]:
+            sub_conditions.append("dong LIKE ?")
+            sub_params.append(f"%{parsed['dong']}%")
+        if residual:
+            sub_conditions.append("full_address LIKE ?")
+            sub_params.append(f"%{residual}%")
+        if sub_conditions:
+            return "(" + " AND ".join(sub_conditions) + ")", sub_params
+        # 구조화 가능한 필드가 하나도 없으면(이론상 UNKNOWN으로 분류되어 도달하지
+        # 않지만) 아래 기존 방식으로 안전하게 폴백한다.
+
+    # UNKNOWN(건물명/도로명 등) — 기존 방식 그대로 유지
+    return "full_address LIKE ?", [f"%{address_detail}%"]
 
 def row_to_item(row) -> dict:
     return {
@@ -89,8 +142,9 @@ def search(
             conditions.append("dong LIKE ?")
             params.append(f"%{dong}%")
         if address_detail:
-            conditions.append("full_address LIKE ?")
-            params.append(f"%{address_detail}%")
+            addr_sql, addr_params = _address_detail_condition(address_detail)
+            conditions.append(addr_sql)
+            params.extend(addr_params)
         if property_type:
             conditions.append("property_type LIKE ?")
             params.append(f"%{property_type}%")
