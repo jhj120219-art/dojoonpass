@@ -1,6 +1,6 @@
 'use client'
 
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { useState } from 'react'
 import type { SearchQueryParams } from './types'
 import PriceRangeSelect from '@/components/PriceRangeSelect'
@@ -94,16 +94,106 @@ const INITIAL_STATE: SearchFormState = {
   specialConditions: [],
 }
 
-export default function SearchForm() {
-  const router = useRouter()
-  const [form, setForm] = useState<SearchFormState>(INITIAL_STATE)
+// buildSearchQuery()가 생성하는 쿼리 파라미터 중 검색조건(필터)에 해당하는 키 전체.
+// sort_by/sort_order/page/size는 검색조건이 아니라 표시 설정이므로 여기 포함하지 않는다
+// (SortBar.tsx/Pagination.tsx가 별도로 관리) — SearchForm은 이 키들의 값이 실제로
+// 바뀔 때만 폼을 URL 기준으로 다시 초기화해야, 정렬/페이지 이동만으로 아코디언 열림상태 등
+// 폼의 UI 상태가 불필요하게 리셋되지 않는다.
+const FILTER_PARAM_KEYS = [
+  'sido', 'sigungu', 'dong', 'address_detail', 'court_name', 'case_no',
+  'property_type', 'status', 'min_fail_count', 'max_fail_count',
+  'auction_date_from', 'auction_date_to', 'min_appraisal', 'max_appraisal',
+  'min_bid_price', 'max_bid_price', 'min_bid_rate', 'max_bid_rate',
+  'min_building_area', 'max_building_area', 'min_land_area', 'max_land_area',
+  'special_conditions',
+] as const
 
-  // Tank Auction의 주소선택 toggleBtn(주소/법원)과 동일한 2-way 탭. UI 전용 상태(mock).
-  const [addressMode, setAddressMode] = useState<'address' | 'court'>('address')
-  // Tank Auction의 splSrchType 라디오. UI 전용 상태(mock, TODO 참고).
+type SearchParamsLike = ReturnType<typeof useSearchParams>
+
+// 위 필터 키들만으로 만든 안정적인 문자열. SearchFormInner의 React key로 사용해
+// "필터 조건이 실제로 바뀐 시점에만 폼 상태를 URL에서 다시 읽어온다"를 구현한다.
+function filterKeyFromParams(searchParams: SearchParamsLike): string {
+  return FILTER_PARAM_KEYS.map((key) => `${key}=${searchParams.get(key) ?? ''}`).join('&')
+}
+
+// bid_rate는 URL/API에는 0~1 비율로 실리지만 폼에는 %(BID_RATE_OPTIONS, 10 단위) 문자열로 표시한다.
+// SearchForm.buildSearchQuery()의 "/100" 변환을 역으로 되돌린다.
+function ratioToPercentString(ratio: string | null): string {
+  if (!ratio) return ''
+  const num = Number(ratio)
+  if (Number.isNaN(num)) return ''
+  return String(Math.round(num * 100))
+}
+
+// case_no는 buildSearchQuery()에서 `${caseYear}타경${caseNo}` 형태로 합쳐 전송된다.
+// 그 포맷을 역으로 분리한다. "타경"이 없으면(연도 없이 번호만 입력했던 경우) 전체를 caseNo로 취급한다.
+function splitCaseNo(caseNo: string | null): { caseYear: string; caseNo: string } {
+  if (!caseNo) return { caseYear: '', caseNo: '' }
+  const match = caseNo.match(/^(.*)타경(.*)$/)
+  if (!match) return { caseYear: '', caseNo }
+  return { caseYear: match[1], caseNo: match[2] }
+}
+
+function parseFormState(searchParams: SearchParamsLike): SearchFormState {
+  const { caseYear, caseNo } = splitCaseNo(searchParams.get('case_no'))
+  const specialConditionsRaw = searchParams.get('special_conditions')
+  return {
+    sido: searchParams.get('sido') ?? '',
+    sigungu: searchParams.get('sigungu') ?? '',
+    dong: searchParams.get('dong') ?? '',
+    addressDetail: searchParams.get('address_detail') ?? '',
+    courtName: searchParams.get('court_name') ?? '',
+    caseYear,
+    caseNo,
+    status: searchParams.get('status') ?? '',
+    failCountMin: searchParams.get('min_fail_count') ?? '',
+    failCountMax: searchParams.get('max_fail_count') ?? '',
+    auctionDateFrom: searchParams.get('auction_date_from') ?? '',
+    auctionDateTo: searchParams.get('auction_date_to') ?? '',
+    appraisalMin: searchParams.get('min_appraisal') ?? '0',
+    appraisalMax: searchParams.get('max_appraisal') ?? '0',
+    bidPriceMin: searchParams.get('min_bid_price') ?? '0',
+    bidPriceMax: searchParams.get('max_bid_price') ?? '0',
+    buildingAreaMin: searchParams.get('min_building_area') ?? '',
+    buildingAreaMax: searchParams.get('max_building_area') ?? '',
+    landAreaMin: searchParams.get('min_land_area') ?? '',
+    landAreaMax: searchParams.get('max_land_area') ?? '',
+    bidRateMin: ratioToPercentString(searchParams.get('min_bid_rate')),
+    bidRateMax: ratioToPercentString(searchParams.get('max_bid_rate')),
+    specialConditions: specialConditionsRaw ? specialConditionsRaw.split(',').filter(Boolean) : [],
+  }
+}
+
+// court_name이 있으면 법원 탭, 없으면 주소 탭으로 복원한다. addressMode 자체는 URL에
+// 별도 파라미터로 실리지 않으므로(주소/법원 탭은 court_name 유무로만 구분 가능) 이 방식이 유일한 근거다.
+function parseAddressMode(searchParams: SearchParamsLike): 'address' | 'court' {
+  return searchParams.get('court_name') ? 'court' : 'address'
+}
+
+// property_type은 buildSearchQuery()에서 "정확히 1개 선택"일 때만 그 항목명 그대로 전송된다.
+// 역으로 복원할 때도 동일하게 단일 항목 선택으로만 되돌린다(다중 선택 정보는 애초에 전송되지 않아 복원 불가).
+function parsePropertyCategories(searchParams: SearchParamsLike): string[] {
+  const propertyType = searchParams.get('property_type')
+  return propertyType ? [propertyType] : []
+}
+
+export default function SearchForm() {
+  const searchParams = useSearchParams()
+  // 필터 조건이 바뀔 때만 SearchFormInner를 새로 마운트해 URL 기준으로 폼을 재초기화한다.
+  // 정렬/페이지 변경(FILTER_PARAM_KEYS에 없는 파라미터)은 key가 그대로라 리마운트되지 않는다.
+  return <SearchFormInner key={filterKeyFromParams(searchParams)} searchParams={searchParams} />
+}
+
+function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
+  const router = useRouter()
+  const [form, setForm] = useState<SearchFormState>(() => parseFormState(searchParams))
+
+  // Tank Auction의 주소선택 toggleBtn(주소/법원)과 동일한 2-way 탭.
+  const [addressMode, setAddressMode] = useState<'address' | 'court'>(() => parseAddressMode(searchParams))
+  // Tank Auction의 splSrchType 라디오. UI 전용 상태(mock, TODO 참고) — URL에 실리지 않으므로 URL 복원 대상이 아니다.
   const [specialSearchType, setSpecialSearchType] = useState<SpecialSearchType>('0')
   // Tank Auction의 물건종류 체크박스 트리 선택값. TODO 참고(단일 선택시에만 API 연동).
-  const [propertyCategories, setPropertyCategories] = useState<string[]>([])
+  const [propertyCategories, setPropertyCategories] = useState<string[]>(() => parsePropertyCategories(searchParams))
 
   function update<K extends keyof SearchFormState>(key: K, value: SearchFormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }))
@@ -183,6 +273,14 @@ export default function SearchForm() {
   function handleSearch() {
     const query = buildSearchQuery()
     const params = new URLSearchParams()
+    // 정렬(sort_by/sort_order)과 페이지 크기(size)는 검색조건이 아니라 표시 설정이므로
+    // 새 검색을 실행해도 유지한다. page는 새 검색이므로 항상 1페이지부터 시작(파라미터 생략).
+    const sortBy = searchParams.get('sort_by')
+    const sortOrder = searchParams.get('sort_order')
+    const size = searchParams.get('size')
+    if (sortBy) params.set('sort_by', sortBy)
+    if (sortOrder) params.set('sort_order', sortOrder)
+    if (size) params.set('size', size)
     Object.entries(query).forEach(([key, value]) => {
       if (value === undefined) return
       params.set(key, Array.isArray(value) ? value.join(',') : String(value))
