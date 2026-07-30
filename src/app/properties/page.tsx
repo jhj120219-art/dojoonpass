@@ -54,7 +54,10 @@ export default async function PropertiesPage({ searchParams }: PropertiesPagePro
     <div className="min-h-screen bg-gray-50">
       <div className="bg-white px-5 py-4 flex items-center justify-between border-b border-gray-100">
         <h1 className="text-lg font-bold text-gray-900">콕찰 경매 매물</h1>
-        <span className="text-xs text-gray-400">{user.email}</span>
+        <div className="flex items-center gap-3">
+          <Link href="/search" className="text-xs text-blue-500 font-medium">검색</Link>
+          <span className="text-xs text-gray-400">{user.email}</span>
+        </div>
       </div>
       <div className="px-4 py-4 space-y-3">
         <SearchFilters
