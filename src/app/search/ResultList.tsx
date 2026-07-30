@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 
 function formatPrice(price: number) {
@@ -16,6 +17,7 @@ function ResultItemRow({ item }: { item: SearchResultItem }) {
   const location = item.full_address || [item.sido, item.sigungu, item.dong].filter(Boolean).join(' ')
 
   return (
+    <Link href={`/properties/${item.id}`} className="block">
     <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 mb-3">
       <div className="flex gap-3">
         {/* 대표 이미지: auction_item에 이미지 컬럼 없음 (TODO) */}
@@ -58,6 +60,7 @@ function ResultItemRow({ item }: { item: SearchResultItem }) {
         <span>조회수 -</span>
       </div>
     </div>
+    </Link>
   )
 }
 
