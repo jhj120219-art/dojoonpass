@@ -56,6 +56,7 @@ export default async function PropertiesPage({ searchParams }: PropertiesPagePro
         <h1 className="text-lg font-bold text-gray-900">콕찰 경매 매물</h1>
         <div className="flex items-center gap-3">
           <Link href="/search" className="text-xs text-blue-500 font-medium">검색</Link>
+          <Link href="/properties/recent" className="text-xs text-blue-500 font-medium">최근 본 물건</Link>
           <span className="text-xs text-gray-400">{user.email}</span>
         </div>
       </div>

@@ -53,3 +53,15 @@ export async function deleteJSON<T>(path: string, token: string): Promise<ApiEnv
   }
   return res.json() as Promise<ApiEnvelope<T>>
 }
+
+// GET이지만 인증 필요 라우트(recent-items, search-presets 등)라 envelope 응답을 반환하는 것들 전용
+export async function fetchAuthedJSON<T>(path: string, token: string): Promise<ApiEnvelope<T>> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    cache: 'no-store',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!res.ok) {
+    throw new ApiError(res.status, `API 요청 실패 (${res.status}): ${path}`)
+  }
+  return res.json() as Promise<ApiEnvelope<T>>
+}
