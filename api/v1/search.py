@@ -224,3 +224,24 @@ def search(
         raise HTTPException(status_code=500, detail="검색 처리 중 오류가 발생했습니다") from e
     finally:
         conn.close()
+
+
+@router.get("/search/regions")
+def get_regions(sido: str = Query(...)):
+    """
+    선택한 sido에 실제로 존재하는 sigungu 목록을 반환한다 (읽기 전용, 데이터 교정 없음).
+    /search와 마찬가지로 인증 불필요 라우트라 {"success","data","message"} envelope를 쓰지 않는다.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT sigungu FROM auction_item "
+            "WHERE sido = ? AND sigungu IS NOT NULL AND sigungu != '' "
+            "ORDER BY sigungu",
+            (sido,),
+        ).fetchall()
+        return {"sido": sido, "sigungu": [r["sigungu"] for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="지역 목록 조회 중 오류가 발생했습니다") from e
+    finally:
+        conn.close()

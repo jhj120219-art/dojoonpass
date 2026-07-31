@@ -1,8 +1,9 @@
 'use client'
 
 import { useRouter, useSearchParams } from 'next/navigation'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { SearchQueryParams } from './types'
+import { fetchJSON } from '@/lib/api'
 import PriceRangeSelect from '@/components/PriceRangeSelect'
 import RangeSelect from '@/components/RangeSelect'
 import SearchAccordionSection from '@/components/SearchAccordionSection'
@@ -263,8 +264,50 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
   // Tank Auction의 물건종류 체크박스 트리 선택값. TODO 참고(단일 선택시에만 API 연동).
   const [propertyCategories, setPropertyCategories] = useState<string[]>(() => parsePropertyCategories(searchParams))
 
+  // 시/도에 종속된 시/군/구 목록 — GET /api/v1/search/regions?sido=에서 실제 auction_item
+  // 데이터 기준으로 가져온다. sido가 바뀔 때마다(초기 URL 복원 포함) 다시 조회한다.
+  const [sigunguOptions, setSigunguOptions] = useState<string[]>([])
+  const [sigunguLoading, setSigunguLoading] = useState(false)
+  const [sigunguError, setSigunguError] = useState(false)
+  const [sigunguRetryKey, setSigunguRetryKey] = useState(0)
+
+  useEffect(() => {
+    // sido가 비어있으면 조회할 대상이 없다 — 화면에는 sigunguOptions를 그대로 두지 않고
+    // 렌더링 시점에 `form.sido ? sigunguOptions : []`로 파생시켜 표시한다(별도 초기화 불요).
+    if (!form.sido) return
+    let cancelled = false
+    setSigunguLoading(true)
+    setSigunguError(false)
+    fetchJSON<{ sido: string; sigungu: string[] }>(
+      `/api/v1/search/regions?sido=${encodeURIComponent(form.sido)}`
+    )
+      .then((data) => {
+        if (!cancelled) setSigunguOptions(data.sigungu ?? [])
+      })
+      .catch(() => {
+        if (!cancelled) setSigunguError(true)
+      })
+      .finally(() => {
+        if (!cancelled) setSigunguLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+    // form.sido 값 자체만 기준으로 재조회한다 — sigunguRetryKey는 같은 sido로 재시도할 때만 쓰는 트리거.
+  }, [form.sido, sigunguRetryKey])
+
   function update<K extends keyof SearchFormState>(key: K, value: SearchFormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }))
+  }
+
+  // 시/도 변경 시 하위 지역(시/군/구, 읍/면/동)은 더 이상 유효하지 않으므로 함께 초기화한다.
+  function handleSidoChange(value: string) {
+    setForm((prev) => ({ ...prev, sido: value, sigungu: '', dong: '' }))
+  }
+
+  // 시/군/구 변경 시 읍/면/동도 함께 초기화한다.
+  function handleSigunguChange(value: string) {
+    setForm((prev) => ({ ...prev, sigungu: value, dong: '' }))
   }
 
   // Tank Auction의 매각기일 퀵버튼(당일/+7/+14/X, js-set-bid-dt)과 동일한 동작.
@@ -391,7 +434,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
             <div className="grid grid-cols-2 gap-2">
               <select
                 value={form.sido}
-                onChange={(e) => update('sido', e.target.value)}
+                onChange={(e) => handleSidoChange(e.target.value)}
                 className={inputClass}
               >
                 <option value="">시/도 전체</option>
@@ -399,14 +442,32 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
                   <option key={item} value={item}>{item}</option>
                 ))}
               </select>
-              <input
-                type="text"
-                placeholder="시/군/구"
+              <select
                 value={form.sigungu}
-                onChange={(e) => update('sigungu', e.target.value)}
+                onChange={(e) => handleSigunguChange(e.target.value)}
+                disabled={!form.sido || sigunguLoading}
                 className={inputClass}
-              />
+              >
+                <option value="">
+                  {!form.sido ? '시/도를 먼저 선택하세요' : sigunguLoading ? '불러오는 중...' : '시/군/구 전체'}
+                </option>
+                {(form.sido ? sigunguOptions : []).map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
             </div>
+            {form.sido && sigunguError && (
+              <p className="text-xs text-red-500 flex items-center gap-2">
+                시/군/구 목록을 불러오지 못했습니다
+                <button
+                  type="button"
+                  onClick={() => setSigunguRetryKey((k) => k + 1)}
+                  className="text-blue-500 underline"
+                >
+                  다시 시도
+                </button>
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-2">
               <input
                 type="text"
