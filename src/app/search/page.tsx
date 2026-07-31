@@ -1,4 +1,5 @@
 import SearchForm from './SearchForm'
+import SearchPresets from './SearchPresets'
 import SortBar from './SortBar'
 import ResultList from './ResultList'
 import Pagination from './Pagination'
@@ -28,6 +29,7 @@ export default async function SearchPage({ searchParams }: SearchPageProps) {
       </div>
       <div className="px-4 py-4">
         <SearchForm />
+        <SearchPresets />
         <SortBar />
         {error && <p className="text-center text-sm text-red-400 py-10">{error}</p>}
         {data && (

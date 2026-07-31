@@ -99,7 +99,7 @@ const INITIAL_STATE: SearchFormState = {
 // (SortBar.tsx/Pagination.tsx가 별도로 관리) — SearchForm은 이 키들의 값이 실제로
 // 바뀔 때만 폼을 URL 기준으로 다시 초기화해야, 정렬/페이지 이동만으로 아코디언 열림상태 등
 // 폼의 UI 상태가 불필요하게 리셋되지 않는다.
-const FILTER_PARAM_KEYS = [
+export const FILTER_PARAM_KEYS = [
   'sido', 'sigungu', 'dong', 'address_detail', 'court_name', 'case_no',
   'property_type', 'status', 'min_fail_count', 'max_fail_count',
   'auction_date_from', 'auction_date_to', 'min_appraisal', 'max_appraisal',
