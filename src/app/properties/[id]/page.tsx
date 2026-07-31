@@ -1,7 +1,8 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { fetchJSON, API_BASE_URL } from '@/lib/api'
+import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
+import { createClient } from '@/lib/supabaseClient'
 import { decreaseViewCount, getViewCount } from './actions'
 
 interface DocumentStatusItem {
@@ -61,6 +62,10 @@ export default function PropertyDetailPage() {
   const [showPopup, setShowPopup] = useState(false)
   const [viewingDoc, setViewingDoc] = useState<string | null>(null)
   const [docAvailable, setDocAvailable] = useState<'checking' | 'ok' | 'notfound'>('checking')
+  const [accessToken, setAccessToken] = useState<string | null>(null)
+  const [favorited, setFavorited] = useState(false)
+  const [favBusy, setFavBusy] = useState(false)
+  const [favError, setFavError] = useState<string | null>(null)
   useEffect(() => {
     if (!viewingDoc) return
     setDocAvailable('checking')
@@ -70,9 +75,14 @@ export default function PropertyDetailPage() {
   }, [viewingDoc, id])
   useEffect(() => {
     async function fetchData() {
+      const supabase = createClient()
+      const { data: { session } } = await supabase.auth.getSession()
+      const token = session?.access_token ?? null
+      setAccessToken(token)
       try {
-        const data = await fetchJSON<AuctionItemDetail>(`/api/v1/item/${id}`)
+        const data = await fetchJSON<AuctionItemDetail>(`/api/v1/item/${id}`, token ?? undefined)
         setProperty(data)
+        setFavorited(data.is_favorited)
       } catch {
         setLoadError(true)
       }
@@ -88,6 +98,42 @@ export default function PropertyDetailPage() {
     setRevealed(true)
     setRemaining(result.remaining ?? null)
   }
+  async function handleToggleFavorite() {
+    if (favBusy || !property) return
+    let token = accessToken
+    if (!token) {
+      const supabase = createClient()
+      const { data: { session } } = await supabase.auth.getSession()
+      token = session?.access_token ?? null
+      setAccessToken(token)
+    }
+    if (!token) {
+      router.push(`/login?redirect=/properties/${id}`)
+      return
+    }
+    setFavBusy(true)
+    setFavError(null)
+    try {
+      if (favorited) {
+        const result = await deleteJSON<{ item_id: number }>(`/api/v1/favorites/${property.id}`, token)
+        setFavorited(false)
+        if (!result.success) setFavError(result.message ?? '즐겨찾기 삭제에 실패했습니다')
+      } else {
+        const result = await postJSON<{ item_id: number; created_at: string }>('/api/v1/favorites', { item_id: property.id }, token)
+        setFavorited(true)
+        if (!result.success) setFavError(result.message ?? '즐겨찾기 등록에 실패했습니다')
+      }
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        setFavError('로그인이 만료되었습니다. 다시 로그인해주세요')
+        router.push(`/login?redirect=/properties/${id}`)
+      } else {
+        setFavError('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
+      }
+    } finally {
+      setFavBusy(false)
+    }
+  }
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
   if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
   if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
@@ -96,11 +142,23 @@ export default function PropertyDetailPage() {
       <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
         <button onClick={() => router.back()} className="text-gray-500 text-lg">←</button>
         <h1 className="text-base font-bold text-gray-900">매물 상세</h1>
-        <span className="text-lg" title={property.is_favorited ? '즐겨찾기됨' : '즐겨찾기 안됨'}>
-          {property.is_favorited ? '❤️' : '🤍'}
-        </span>
+        <button
+          type="button"
+          onClick={handleToggleFavorite}
+          disabled={favBusy}
+          aria-label={favorited ? '즐겨찾기 해제' : '즐겨찾기 추가'}
+          title={favorited ? '즐겨찾기됨' : '즐겨찾기 안됨'}
+          className="text-lg disabled:opacity-50"
+        >
+          {favorited ? '❤️' : '🤍'}
+        </button>
         {remaining !== null && <span className="ml-auto text-xs text-gray-400">등기열람 잔여 {remaining}회</span>}
       </div>
+      {favError && (
+        <div className="px-4 pt-3">
+          <p className="text-xs text-red-500">{favError}</p>
+        </div>
+      )}
       <div className="px-4 py-4 space-y-3">
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
