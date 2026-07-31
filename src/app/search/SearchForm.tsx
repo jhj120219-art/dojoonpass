@@ -13,6 +13,74 @@ const SIDO_LIST = [
   '경기', '강원', '충북', '충남', '전북', '전남', '경북', '경남', '제주',
 ]
 
+// config/courts.py(ALL_COURTS)의 실제 법원 마스터 데이터를 그대로 옮겼다 — 같은 목록을
+// 두 곳에서 관리하므로, config/courts.py가 바뀌면 이 목록도 함께 갱신해야 한다.
+// court_name은 Backend에서 LIKE 매칭이라 정식 법원명을 그대로 보내도 기존 계약과 호환된다.
+type CourtInfo = { name: string; region: string }
+const COURT_LIST: CourtInfo[] = [
+  { name: '서울중앙지방법원', region: '서울' },
+  { name: '서울동부지방법원', region: '서울' },
+  { name: '서울서부지방법원', region: '서울' },
+  { name: '서울남부지방법원', region: '서울' },
+  { name: '서울북부지방법원', region: '서울' },
+  { name: '의정부지방법원', region: '경기' },
+  { name: '고양지원', region: '경기' },
+  { name: '남양주지원', region: '경기' },
+  { name: '인천지방법원', region: '인천' },
+  { name: '부천지원', region: '인천' },
+  { name: '수원지방법원', region: '경기' },
+  { name: '성남지원', region: '경기' },
+  { name: '여주지원', region: '경기' },
+  { name: '평택지원', region: '경기' },
+  { name: '안산지원', region: '경기' },
+  { name: '안양지원', region: '경기' },
+  { name: '춘천지방법원', region: '강원' },
+  { name: '강릉지원', region: '강원' },
+  { name: '원주지원', region: '강원' },
+  { name: '속초지원', region: '강원' },
+  { name: '영월지원', region: '강원' },
+  { name: '청주지방법원', region: '충북' },
+  { name: '충주지원', region: '충북' },
+  { name: '제천지원', region: '충북' },
+  { name: '영동지원', region: '충북' },
+  { name: '대전지방법원', region: '대전' },
+  { name: '홍성지원', region: '충남' },
+  { name: '논산지원', region: '충남' },
+  { name: '천안지원', region: '충남' },
+  { name: '공주지원', region: '충남' },
+  { name: '서산지원', region: '충남' },
+  { name: '대구지방법원', region: '대구' },
+  { name: '안동지원', region: '경북' },
+  { name: '경주지원', region: '경북' },
+  { name: '김천지원', region: '경북' },
+  { name: '상주지원', region: '경북' },
+  { name: '의성지원', region: '경북' },
+  { name: '영덕지원', region: '경북' },
+  { name: '포항지원', region: '경북' },
+  { name: '대구서부지원', region: '대구' },
+  { name: '부산지방법원', region: '부산' },
+  { name: '부산동부지원', region: '부산' },
+  { name: '부산서부지원', region: '부산' },
+  { name: '울산지방법원', region: '울산' },
+  { name: '창원지방법원', region: '경남' },
+  { name: '마산지원', region: '경남' },
+  { name: '진주지원', region: '경남' },
+  { name: '통영지원', region: '경남' },
+  { name: '밀양지원', region: '경남' },
+  { name: '거창지원', region: '경남' },
+  { name: '광주지방법원', region: '광주' },
+  { name: '목포지원', region: '전남' },
+  { name: '장흥지원', region: '전남' },
+  { name: '순천지원', region: '전남' },
+  { name: '해남지원', region: '전남' },
+  { name: '전주지방법원', region: '전북' },
+  { name: '군산지원', region: '전북' },
+  { name: '정읍지원', region: '전북' },
+  { name: '남원지원', region: '전북' },
+  { name: '제주지방법원', region: '제주' },
+]
+const COURT_REGIONS = Array.from(new Set(COURT_LIST.map((c) => c.region)))
+
 const SPECIAL_CONDITIONS = [
   { value: 'lien', label: '유치권' },
   { value: 'lien_excluded', label: '유치권 배제' },
@@ -170,11 +238,11 @@ function parseAddressMode(searchParams: SearchParamsLike): 'address' | 'court' {
   return searchParams.get('court_name') ? 'court' : 'address'
 }
 
-// property_type은 buildSearchQuery()에서 "정확히 1개 선택"일 때만 그 항목명 그대로 전송된다.
-// 역으로 복원할 때도 동일하게 단일 항목 선택으로만 되돌린다(다중 선택 정보는 애초에 전송되지 않아 복원 불가).
+// property_type은 buildSearchQuery()에서 선택된 항목 전부가 콤마join되어 전송된다
+// (special_conditions와 동일한 URL 인코딩 방식). 역으로 복원할 때도 콤마로 분리한다.
 function parsePropertyCategories(searchParams: SearchParamsLike): string[] {
   const propertyType = searchParams.get('property_type')
-  return propertyType ? [propertyType] : []
+  return propertyType ? propertyType.split(',').filter(Boolean) : []
 }
 
 export default function SearchForm() {
@@ -243,9 +311,8 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
     }
     if (form.caseYear && form.caseNo) query.case_no = `${form.caseYear}타경${form.caseNo}`
     else if (form.caseNo) query.case_no = form.caseNo
-    // property_type은 자유텍스트 단일 컬럼(LIKE)이라 다중 카테고리 선택을 표현할 수 없음.
-    // 정확히 1개만 선택된 경우에만 best-effort로 매핑한다 (PropertyTypeTree.tsx 참고).
-    if (propertyCategories.length === 1) query.property_type = propertyCategories[0]
+    // Backend가 콤마로 구분된 여러 property_type을 OR 조건으로 검색한다 (api/v1/search.py 참고).
+    if (propertyCategories.length > 0) query.property_type = propertyCategories
     if (form.status) query.status = form.status
     if (form.failCountMin) query.min_fail_count = Number(form.failCountMin)
     if (form.failCountMax) query.max_fail_count = Number(form.failCountMax)
@@ -358,13 +425,20 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
             </div>
           </div>
         ) : (
-          <input
-            type="text"
-            placeholder="법원명"
+          <select
             value={form.courtName}
             onChange={(e) => update('courtName', e.target.value)}
             className={inputClass}
-          />
+          >
+            <option value="">법원 전체</option>
+            {COURT_REGIONS.map((region) => (
+              <optgroup key={region} label={region}>
+                {COURT_LIST.filter((c) => c.region === region).map((c) => (
+                  <option key={c.name} value={c.name}>{c.name}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
         )}
       </div>
 
@@ -403,11 +477,6 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
 
         <div>
           <span className={labelClass}>물건종류</span>
-          {propertyCategories.length >= 2 && (
-            <p className="text-xs text-amber-500 mb-1">
-              2개 이상 선택 시 검색에는 미반영 — API 연동 예정
-            </p>
-          )}
           <PropertyTypeTree selected={propertyCategories} onChange={setPropertyCategories} />
         </div>
       </SearchAccordionSection>

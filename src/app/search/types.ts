@@ -8,7 +8,8 @@ export type SearchQueryParams = {
   dong?: string
   address_detail?: string
   court_name?: string
-  property_type?: string
+  // 다중 물건종류 선택 시 배열(콤마join되어 URL에 실림), 단일 선택 시 문자열도 허용(하위호환)
+  property_type?: string | string[]
   status?: string
   min_fail_count?: number
   max_fail_count?: number

@@ -11,6 +11,8 @@ const SORT_OPTIONS: { value: SortBy; label: string }[] = [
   { value: 'minimum_bid_price', label: '최저입찰가' },
   { value: 'fail_count', label: '유찰횟수' },
   { value: 'bid_rate', label: '감정가 대비율' },
+  { value: 'case_no', label: '사건번호' },
+  { value: 'full_address', label: '소재지' },
 ]
 
 export default function SortBar() {

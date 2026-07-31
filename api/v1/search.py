@@ -87,6 +87,8 @@ SORT_COLUMNS = {
     "bid_rate": "bid_rate",
     "fail_count": "fail_count",
     "crawl_date": "crawl_date",
+    "case_no": "case_no",
+    "full_address": "full_address",
 }
 
 @router.get("/search")
@@ -146,8 +148,13 @@ def search(
             conditions.append(addr_sql)
             params.extend(addr_params)
         if property_type:
-            conditions.append("property_type LIKE ?")
-            params.append(f"%{property_type}%")
+            # 다중 물건종류 선택 시 콤마로 join되어 들어온다("아파트,오피스텔(주거)").
+            # 콤마가 없는 기존 단일값 호출도 1개짜리 리스트가 되어 동일하게 동작한다.
+            types = [t.strip() for t in property_type.split(",") if t.strip()]
+            if types:
+                or_clause = " OR ".join(["property_type LIKE ?"] * len(types))
+                conditions.append(f"({or_clause})")
+                params.extend(f"%{t}%" for t in types)
         if court_name:
             conditions.append("court_name LIKE ?")
             params.append(f"%{court_name}%")

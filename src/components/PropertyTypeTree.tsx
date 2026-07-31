@@ -8,11 +8,9 @@ type CategoryGroup = {
 
 // Tank Auction 검색폼(search/reference/01_SEARCH_FORM.html)의 물건종류 체크박스 트리
 // (chkGrpCtgr = 그룹, chkEaCtgr = 세부항목)에 실제로 존재하는 그룹/항목명을 그대로 옮겼다.
-// TODO(API 미지원): auction_item.property_type은 자유텍스트 단일 컬럼(LIKE 매칭)이라
-// "여러 카테고리 중 하나라도 포함" 같은 다중 선택 검색을 표현할 방법이 없다.
-// 카테고리 코드 체계가 백엔드에 추가되기 전까지, 세부항목을 정확히 1개만 선택한 경우에
-// 한해서만 property_type 쿼리로 best-effort 매핑한다 (SearchForm.tsx 참고).
 // HTML 전수 파싱(chkGrpCtgr 5개 그룹 x chkEaCtgr 69개 세부항목) 결과를 그대로 반영 — 축약 없음.
+// 다중 선택 시 SearchForm.tsx가 콤마로 join해 property_type으로 보내고,
+// Backend(api/v1/search.py)가 OR 조건(LIKE)으로 검색한다.
 export const PROPERTY_CATEGORY_GROUPS: CategoryGroup[] = [
   {
     value: '10',
