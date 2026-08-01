@@ -4,6 +4,7 @@ import { useParams, useRouter } from 'next/navigation'
 import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { decreaseViewCount, getViewCount } from './actions'
+import { mapSpecView, type TenantRow } from './rightsAnalysis'
 
 interface DocumentStatusItem {
   doc_type: string
@@ -17,6 +18,7 @@ interface RightsSummary {
   foreclosure_note: string | null
   occupancy_status: string | null
   total_tenant_count: number | null
+  is_vacant: number | null
 }
 
 interface AuctionItemDetail {
@@ -33,7 +35,9 @@ interface AuctionItemDetail {
   status: string
   fail_count: number
   validation_status: string
+  crawl_date: string | null
   documents: DocumentStatusItem[]
+  tenants: TenantRow[]
   rights_summary: RightsSummary | null
   is_favorited: boolean
 }
@@ -48,6 +52,11 @@ const DOC_STATUS_LABEL: Record<string, string> = {
   READY: '수집완료',
   COLLECTING: '수집중',
   FAILED: '수집실패',
+}
+
+const VALIDATION_STATUS_LABEL: Record<string, string> = {
+  PASS: '검증완료',
+  FAIL: '검증실패',
 }
 
 export default function PropertyDetailPage() {
@@ -135,6 +144,8 @@ export default function PropertyDetailPage() {
     }
   }
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
+  function formatWon(amount: number) { return amount.toLocaleString() + '원' }
+  const specView = property ? mapSpecView(property.tenants) : undefined
   if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
   if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
   return (
@@ -164,6 +175,7 @@ export default function PropertyDetailPage() {
           <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
           <h2 className="text-xl font-bold text-gray-900 mt-3 mb-1">{property.full_address || '주소 미확인'}</h2>
           <p className="text-sm text-gray-400">{property.case_no}{property.item_no && property.item_no !== '1' ? ` (${property.item_no})` : ''}</p>
+          {property.crawl_date && <p className="text-xs text-gray-300 mt-2">최근 수집일 {property.crawl_date}</p>}
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex justify-between items-center mb-4">
@@ -197,6 +209,14 @@ export default function PropertyDetailPage() {
               <span className="text-sm text-gray-400">유찰횟수</span>
               <span className="text-sm font-medium text-gray-700">{property.fail_count}회</span>
             </div>
+            <div className="flex justify-between">
+              <span className="text-sm text-gray-400">입찰가율</span>
+              <span className="text-sm font-medium text-gray-700">{(property.bid_rate * 100).toFixed(1)}%</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-sm text-gray-400">검증상태</span>
+              <span className="text-sm font-medium text-gray-700">{VALIDATION_STATUS_LABEL[property.validation_status] || property.validation_status}</span>
+            </div>
           </div>
         </div>
         {property.rights_summary && (
@@ -206,6 +226,12 @@ export default function PropertyDetailPage() {
               <div className="flex justify-between">
                 <span className="text-sm text-gray-400">점유관계</span>
                 <span className="text-sm font-medium text-gray-700">{property.rights_summary.occupancy_status || '정보 없음'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">공실여부</span>
+                <span className="text-sm font-medium text-gray-700">
+                  {property.rights_summary.is_vacant == null ? '정보 없음' : property.rights_summary.is_vacant === 1 ? '공실' : '점유중'}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-gray-400">임대차 인원수</span>
@@ -227,6 +253,40 @@ export default function PropertyDetailPage() {
                   {property.rights_summary.estimated_inheritance != null ? formatPrice(property.rights_summary.estimated_inheritance) : '정보 없음'}
                 </span>
               </div>
+              {property.rights_summary.foreclosure_note && (
+                <div className="pt-2 border-t border-gray-50">
+                  <p className="text-xs text-gray-400 mb-1">특이사항</p>
+                  <p className="text-sm text-gray-700">{property.rights_summary.foreclosure_note}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {specView && specView.tenants.length > 0 && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">임차인 상세 ({specView.tenantCount}명)</h3>
+            <div className="space-y-3">
+              {specView.tenants.map((tenant, idx) => (
+                <div key={idx} className="pb-3 border-b border-gray-50 last:border-0 last:pb-0 space-y-1">
+                  <p className="text-sm font-medium text-gray-700">{tenant.name || '성명 미상'}{tenant.occupiedArea ? ` · ${tenant.occupiedArea}` : ''}</p>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">보증금</span>
+                    <span className="text-xs text-gray-600">{tenant.deposit != null ? formatWon(tenant.deposit) : '정보 없음'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">월세</span>
+                    <span className="text-xs text-gray-600">{tenant.monthlyRent != null ? formatWon(tenant.monthlyRent) : '정보 없음'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">전입일 / 확정일자</span>
+                    <span className="text-xs text-gray-600">{tenant.moveInDate || '-'} / {tenant.fixedDate || '-'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">배당요구</span>
+                    <span className="text-xs text-gray-600">{tenant.hasDemand == null ? '정보 없음' : tenant.hasDemand ? `있음 (${tenant.demandDate || '일자 미상'})` : '없음'}</span>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
