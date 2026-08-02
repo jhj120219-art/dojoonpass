@@ -2,6 +2,7 @@ import { redirect } from 'next/navigation'
 import { createServerSupabaseClient } from '@/lib/supabaseServer'
 import Link from 'next/link'
 import SearchFilters from './SearchFilters'
+import PrimaryNav from '@/components/PrimaryNav'
 
 type PropertiesPageProps = {
   searchParams: Promise<{
@@ -55,8 +56,7 @@ export default async function PropertiesPage({ searchParams }: PropertiesPagePro
       <div className="bg-white px-5 py-4 flex items-center justify-between border-b border-gray-100">
         <h1 className="text-lg font-bold text-gray-900">콕찰 경매 매물</h1>
         <div className="flex items-center gap-3">
-          <Link href="/search" className="text-xs text-blue-500 font-medium">검색</Link>
-          <Link href="/properties/recent" className="text-xs text-blue-500 font-medium">최근 본 물건</Link>
+          <PrimaryNav />
           <span className="text-xs text-gray-400">{user.email}</span>
         </div>
       </div>

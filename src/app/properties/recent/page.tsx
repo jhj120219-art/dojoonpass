@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { fetchAuthedJSON, ApiError } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
+import PrimaryNav from '@/components/PrimaryNav'
 
 interface RecentItem {
   id: number
@@ -74,6 +75,9 @@ export default function RecentItemsPage() {
       <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
         <button onClick={() => router.back()} className="text-gray-500 text-lg">←</button>
         <h1 className="text-base font-bold text-gray-900">최근 본 물건</h1>
+        <div className="ml-auto">
+          <PrimaryNav current="recent" />
+        </div>
       </div>
       <div className="px-4 py-4 space-y-3">
         {error && <p className="text-sm text-red-500 text-center py-20">{error}</p>}

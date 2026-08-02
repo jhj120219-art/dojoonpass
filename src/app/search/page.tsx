@@ -5,6 +5,7 @@ import ResultList from './ResultList'
 import Pagination from './Pagination'
 import { fetchJSON } from '@/lib/api'
 import type { SearchResponse } from './types'
+import PrimaryNav from '@/components/PrimaryNav'
 
 type SearchPageProps = {
   searchParams: Promise<Record<string, string>>
@@ -26,6 +27,7 @@ export default async function SearchPage({ searchParams }: SearchPageProps) {
     <div className="min-h-screen bg-gray-50">
       <div className="bg-white px-5 py-4 flex items-center justify-between border-b border-gray-100">
         <h1 className="text-lg font-bold text-gray-900">경매 물건 검색</h1>
+        <PrimaryNav current="search" />
       </div>
       <div className="px-4 py-4">
         <SearchForm />
