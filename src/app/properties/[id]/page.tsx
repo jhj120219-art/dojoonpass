@@ -28,6 +28,7 @@ interface AuctionItemDetail {
   court_name: string
   property_type: string
   full_address: string
+  lot_number: string | null
   appraisal_price: number
   minimum_bid_price: number
   bid_rate: number
@@ -175,6 +176,7 @@ export default function PropertyDetailPage() {
           <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
           <h2 className="text-xl font-bold text-gray-900 mt-3 mb-1">{property.full_address || '주소 미확인'}</h2>
           <p className="text-sm text-gray-400">{property.case_no}{property.item_no && property.item_no !== '1' ? ` (${property.item_no})` : ''}</p>
+          {property.lot_number && <p className="text-xs text-gray-400 mt-1">지번 {property.lot_number}</p>}
           {property.crawl_date && <p className="text-xs text-gray-300 mt-2">최근 수집일 {property.crawl_date}</p>}
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">

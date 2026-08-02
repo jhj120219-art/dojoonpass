@@ -64,6 +64,7 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "sido": row["sido"],
             "sigungu": row["sigungu"],
             "dong": row["dong"],
+            "lot_number": row["lot_number"],
             "full_address": row["full_address"],
             "appraisal_price": row["appraisal_price"],
             "minimum_bid_price": row["minimum_bid_price"],
