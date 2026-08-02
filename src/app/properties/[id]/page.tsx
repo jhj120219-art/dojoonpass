@@ -21,6 +21,12 @@ interface RightsSummary {
   is_vacant: number | null
 }
 
+interface CaseInfo {
+  case_type: string | null
+  filed_date: string | null
+  demand_deadline: string | null
+}
+
 interface AuctionItemDetail {
   id: number
   case_no: string
@@ -40,6 +46,7 @@ interface AuctionItemDetail {
   documents: DocumentStatusItem[]
   tenants: TenantRow[]
   rights_summary: RightsSummary | null
+  case: CaseInfo | null
   is_favorited: boolean
 }
 
@@ -179,6 +186,25 @@ export default function PropertyDetailPage() {
           {property.lot_number && <p className="text-xs text-gray-400 mt-1">지번 {property.lot_number}</p>}
           {property.crawl_date && <p className="text-xs text-gray-300 mt-2">최근 수집일 {property.crawl_date}</p>}
         </div>
+        {property.case && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">사건 정보</h3>
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">사건종류</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.case_type || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">접수일</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.filed_date || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">배당요구종기일</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.demand_deadline || '-'}</span>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex justify-between items-center mb-4">
             <div>
