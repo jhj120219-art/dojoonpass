@@ -154,6 +154,7 @@ export default function PropertyDetailPage() {
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
   function formatWon(amount: number) { return amount.toLocaleString() + '원' }
   const specView = property ? mapSpecView(property.tenants) : undefined
+  const statusTenants = property ? property.tenants.filter((t) => t.source === 'STATUS') : []
   const rightsAnalysis = property
     ? assembleRightsAnalysis(
         property.rights_summary,
@@ -400,6 +401,34 @@ export default function PropertyDetailPage() {
                   <div className="flex justify-between">
                     <span className="text-xs text-gray-400">배당요구</span>
                     <span className="text-xs text-gray-600">{tenant.hasDemand == null ? '정보 없음' : tenant.hasDemand ? `있음 (${tenant.demandDate || '일자 미상'})` : '없음'}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {statusTenants.length > 0 && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">현황조사서 임차인 ({statusTenants.length}명)</h3>
+            <div className="space-y-3">
+              {statusTenants.map((tenant, idx) => (
+                <div key={idx} className="pb-3 border-b border-gray-50 last:border-0 last:pb-0 space-y-1">
+                  <p className="text-sm font-medium text-gray-700">{tenant.tenant_name || '-'}{tenant.occupied_area ? ` · ${tenant.occupied_area}` : ' · -'}</p>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">보증금</span>
+                    <span className="text-xs text-gray-600">{tenant.deposit != null ? formatWon(tenant.deposit) : '-'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">월세</span>
+                    <span className="text-xs text-gray-600">{tenant.monthly_rent != null ? formatWon(tenant.monthly_rent) : '-'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">전입일 / 확정일자</span>
+                    <span className="text-xs text-gray-600">{tenant.move_in_date || '-'} / {tenant.fixed_date || '-'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-xs text-gray-400">배당요구</span>
+                    <span className="text-xs text-gray-600">{tenant.has_demand == null ? '-' : tenant.has_demand ? '있음' : '없음'}</span>
                   </div>
                 </div>
               ))}
