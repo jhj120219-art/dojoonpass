@@ -4,7 +4,7 @@ import { useParams, useRouter } from 'next/navigation'
 import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { decreaseViewCount, getViewCount } from './actions'
-import { mapSpecView, type TenantRow } from './rightsAnalysis'
+import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 
 interface DocumentStatusItem {
   doc_type: string
@@ -154,6 +154,13 @@ export default function PropertyDetailPage() {
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
   function formatWon(amount: number) { return amount.toLocaleString() + '원' }
   const specView = property ? mapSpecView(property.tenants) : undefined
+  const rightsAnalysis = property
+    ? assembleRightsAnalysis(
+        property.rights_summary,
+        property.tenants,
+        property.documents.some((d) => d.doc_type === 'SPEC' && d.status === 'READY')
+      )
+    : undefined
   if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
   if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
   return (
@@ -287,6 +294,87 @@ export default function PropertyDetailPage() {
                   <p className="text-sm text-gray-700">{property.rights_summary.foreclosure_note}</p>
                 </div>
               )}
+            </div>
+          </div>
+        )}
+        {rightsAnalysis && rightsAnalysis.sources.length > 0 && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">권리분석 신뢰도</h3>
+            <div className="space-y-2">
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-gray-400">신뢰도</span>
+                <span
+                  className={
+                    'text-xs font-bold px-2 py-1 rounded-lg ' +
+                    (rightsAnalysis.confidence === 'HIGH'
+                      ? 'bg-green-50 text-green-600'
+                      : rightsAnalysis.confidence === 'MEDIUM'
+                      ? 'bg-yellow-50 text-yellow-600'
+                      : 'bg-red-50 text-red-600')
+                  }
+                >
+                  {rightsAnalysis.confidence}
+                </span>
+              </div>
+              <div className="flex justify-between items-start">
+                <span className="text-sm text-gray-400 shrink-0">정보원</span>
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  {rightsAnalysis.sourceStatus
+                    .filter((s) => s.source !== 'REGISTRY')
+                    .map((s) => (
+                      <span
+                        key={s.source}
+                        className={
+                          'text-xs font-medium px-2 py-1 rounded-lg ' +
+                          (s.available
+                            ? 'bg-blue-50 text-blue-600'
+                            : 'bg-gray-100 text-gray-400')
+                        }
+                      >
+                        {s.source} {s.available ? '✓ 확보' : '미확보'}
+                      </span>
+                    ))}
+                </div>
+              </div>
+              <div className="flex justify-between items-start">
+                <span className="text-sm text-gray-400 shrink-0">충돌</span>
+                {rightsAnalysis.conflicts.length === 0 ? (
+                  <span className="text-sm font-medium text-gray-700">충돌 없음</span>
+                ) : (
+                  <div className="flex flex-col items-end gap-1">
+                    {rightsAnalysis.conflicts.map((c, idx) => (
+                      <span
+                        key={idx}
+                        className={
+                          'text-xs font-medium px-2 py-1 rounded-lg text-right ' +
+                          (c.type === 'DIRECT_CONFLICT'
+                            ? 'bg-red-50 text-red-600'
+                            : 'bg-orange-50 text-orange-600')
+                        }
+                      >
+                        [{c.type}] {c.description}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="flex justify-between items-start">
+                <span className="text-sm text-gray-400 shrink-0">경고</span>
+                {rightsAnalysis.warnings.length === 0 ? (
+                  <span className="text-sm font-medium text-gray-700">경고 없음</span>
+                ) : (
+                  <div className="flex flex-col items-end gap-1">
+                    {rightsAnalysis.warnings.map((w, idx) => (
+                      <span
+                        key={idx}
+                        className="text-xs font-medium px-2 py-1 rounded-lg bg-orange-50 text-orange-600 text-right"
+                      >
+                        [{w.code}] {w.message}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
