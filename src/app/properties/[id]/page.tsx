@@ -1,10 +1,11 @@
 'use client'
 import { useEffect, useState } from 'react'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { decreaseViewCount, getViewCount } from './actions'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
+import { formatDday } from '@/app/search/ResultList'
 
 interface DocumentStatusItem {
   doc_type: string
@@ -70,7 +71,21 @@ const VALIDATION_STATUS_LABEL: Record<string, string> = {
 export default function PropertyDetailPage() {
   const params = useParams()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const id = params.id as string
+  // Search 결과 목록에서 넘어온 경우에만 존재하는 이동 컨텍스트(같은 페이지 안에서의 id 순서 + 현재 인덱스).
+  // 직접 링크로 들어온 경우 등 컨텍스트가 없으면 이전/다음 버튼을 아예 노출하지 않는다.
+  const navIds = (searchParams.get('ids') ?? '')
+    .split(',')
+    .map((v) => Number(v))
+    .filter((n) => Number.isInteger(n))
+  const navIndexRaw = Number(searchParams.get('i'))
+  const navIndex = Number.isInteger(navIndexRaw) && navIndexRaw >= 0 && navIndexRaw < navIds.length ? navIndexRaw : -1
+  const prevNavId = navIndex > 0 ? navIds[navIndex - 1] : null
+  const nextNavId = navIndex >= 0 && navIndex < navIds.length - 1 ? navIds[navIndex + 1] : null
+  function goToNav(targetId: number, targetIndex: number) {
+    router.push(`/properties/${targetId}?ids=${navIds.join(',')}&i=${targetIndex}`)
+  }
   const [property, setProperty] = useState<AuctionItemDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
@@ -92,6 +107,16 @@ export default function PropertyDetailPage() {
   }, [viewingDoc, id])
   useEffect(() => {
     async function fetchData() {
+      // 이전/다음 물건 이동은 같은 라우트([id])의 파라미터만 바뀌는 클라이언트 전환이라
+      // 컴포넌트가 재마운트되지 않는다 — 이전 물건에서 남은 열람/문서뷰어 상태가 새 물건에
+      // 그대로 노출되지 않도록 id가 바뀔 때마다 명시적으로 초기화한다.
+      setLoading(true)
+      setLoadError(false)
+      setProperty(null)
+      setRevealed(false)
+      setShowPopup(false)
+      setViewingDoc(null)
+      setFavError(null)
       const supabase = createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
@@ -162,6 +187,7 @@ export default function PropertyDetailPage() {
         property.documents.some((d) => d.doc_type === 'SPEC' && d.status === 'READY')
       )
     : undefined
+  const dday = property ? formatDday(property.auction_date) : null
   if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
   if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
   return (
@@ -181,6 +207,27 @@ export default function PropertyDetailPage() {
         </button>
         {remaining !== null && <span className="ml-auto text-xs text-gray-400">등기열람 잔여 {remaining}회</span>}
       </div>
+      {navIndex >= 0 && (
+        <div className="bg-white px-4 py-2 flex items-center justify-between border-b border-gray-100">
+          <button
+            type="button"
+            onClick={() => prevNavId != null && goToNav(prevNavId, navIndex - 1)}
+            disabled={prevNavId == null}
+            className="text-sm text-gray-500 disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            ← 이전 물건
+          </button>
+          <span className="text-xs text-gray-300">{navIndex + 1} / {navIds.length}</span>
+          <button
+            type="button"
+            onClick={() => nextNavId != null && goToNav(nextNavId, navIndex + 1)}
+            disabled={nextNavId == null}
+            className="text-sm text-gray-500 disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            다음 물건 →
+          </button>
+        </div>
+      )}
       {favError && (
         <div className="px-4 pt-3">
           <p className="text-xs text-red-500">{favError}</p>
@@ -188,31 +235,19 @@ export default function PropertyDetailPage() {
       )}
       <div className="px-4 py-4 space-y-3">
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-          <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
+          <div className="flex items-start justify-between gap-2">
+            <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
+            {dday && (
+              <span className="shrink-0 text-xs font-medium text-orange-500 bg-orange-50 px-2 py-1 rounded-lg">
+                {dday}
+              </span>
+            )}
+          </div>
           <h2 className="text-xl font-bold text-gray-900 mt-3 mb-1">{property.full_address || '주소 미확인'}</h2>
           <p className="text-sm text-gray-400">{property.case_no}{property.item_no && property.item_no !== '1' ? ` (${property.item_no})` : ''}</p>
           {property.lot_number && <p className="text-xs text-gray-400 mt-1">지번 {property.lot_number}</p>}
           {property.crawl_date && <p className="text-xs text-gray-300 mt-2">최근 수집일 {property.crawl_date}</p>}
         </div>
-        {property.case && (
-          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-            <h3 className="text-sm font-bold text-gray-900 mb-3">사건 정보</h3>
-            <div className="space-y-2">
-              <div className="flex justify-between">
-                <span className="text-sm text-gray-400">사건종류</span>
-                <span className="text-sm font-medium text-gray-700">{property.case.case_type || '-'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm text-gray-400">접수일</span>
-                <span className="text-sm font-medium text-gray-700">{property.case.filed_date || '-'}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-sm text-gray-400">배당요구종기일</span>
-                <span className="text-sm font-medium text-gray-700">{property.case.demand_deadline || '-'}</span>
-              </div>
-            </div>
-          </div>
-        )}
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex justify-between items-center mb-4">
             <div>
@@ -241,13 +276,16 @@ export default function PropertyDetailPage() {
               <span className="text-sm text-gray-400">진행상태</span>
               <span className="text-sm font-medium text-gray-700">{property.status || '데이터 없음'}</span>
             </div>
-            <div className="flex justify-between">
-              <span className="text-sm text-gray-400">유찰횟수</span>
-              <span className="text-sm font-medium text-gray-700">{property.fail_count}회</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-sm text-gray-400">입찰가율</span>
-              <span className="text-sm font-medium text-gray-700">{(property.bid_rate * 100).toFixed(1)}%</span>
+            <div className="flex justify-between items-center">
+              <span className="text-sm text-gray-400">가격 지표</span>
+              <div className="flex gap-1.5">
+                <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">
+                  입찰가율 {(property.bid_rate * 100).toFixed(1)}%
+                </span>
+                <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">
+                  유찰 {property.fail_count}회
+                </span>
+              </div>
             </div>
             <div className="flex justify-between">
               <span className="text-sm text-gray-400">검증상태</span>
@@ -275,13 +313,43 @@ export default function PropertyDetailPage() {
                   {property.rights_summary.total_tenant_count != null ? `${property.rights_summary.total_tenant_count}명` : '정보 없음'}
                 </span>
               </div>
-              <div className="flex justify-between">
+              <div className="flex justify-between items-center">
                 <span className="text-sm text-gray-400">명도난이도</span>
-                <span className="text-sm font-medium text-gray-700">{property.rights_summary.occupancy_difficulty || '정보 없음'}</span>
+                {property.rights_summary.occupancy_difficulty ? (
+                  <span
+                    className={
+                      'text-xs font-bold px-2 py-1 rounded-lg ' +
+                      (property.rights_summary.occupancy_difficulty === 'HARD'
+                        ? 'bg-red-50 text-red-600'
+                        : property.rights_summary.occupancy_difficulty === 'NORMAL'
+                        ? 'bg-yellow-50 text-yellow-600'
+                        : 'bg-green-50 text-green-600')
+                    }
+                  >
+                    {property.rights_summary.occupancy_difficulty}
+                  </span>
+                ) : (
+                  <span className="text-sm font-medium text-gray-700">정보 없음</span>
+                )}
               </div>
-              <div className="flex justify-between">
+              <div className="flex justify-between items-center">
                 <span className="text-sm text-gray-400">위험도</span>
-                <span className="text-sm font-medium text-gray-700">{property.rights_summary.risk_level || '정보 없음'}</span>
+                {property.rights_summary.risk_level ? (
+                  <span
+                    className={
+                      'text-xs font-bold px-2 py-1 rounded-lg ' +
+                      (property.rights_summary.risk_level === 'HIGH'
+                        ? 'bg-red-50 text-red-600'
+                        : property.rights_summary.risk_level === 'MID'
+                        ? 'bg-yellow-50 text-yellow-600'
+                        : 'bg-green-50 text-green-600')
+                    }
+                  >
+                    {property.rights_summary.risk_level}
+                  </span>
+                ) : (
+                  <span className="text-sm font-medium text-gray-700">정보 없음</span>
+                )}
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-gray-400">인수금액</span>
@@ -375,6 +443,25 @@ export default function PropertyDetailPage() {
                     ))}
                   </div>
                 )}
+              </div>
+            </div>
+          </div>
+        )}
+        {property.case && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+            <h3 className="text-sm font-bold text-gray-900 mb-3">사건 정보</h3>
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">사건종류</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.case_type || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">접수일</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.filed_date || '-'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-sm text-gray-400">배당요구종기일</span>
+                <span className="text-sm font-medium text-gray-700">{property.case.demand_deadline || '-'}</span>
               </div>
             </div>
           </div>

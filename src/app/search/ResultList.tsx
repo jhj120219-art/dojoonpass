@@ -46,7 +46,7 @@ function formatArea(area: { label: string; sqm: number }): string {
 
 // 매각기일까지 남은 일수를 "오늘" 기준으로 계산한다. 절대 날짜(auction_date)는 그대로 유지하고
 // 이 값은 보조 표시로만 사용한다.
-function formatDday(auctionDate: string | null): string | null {
+export function formatDday(auctionDate: string | null): string | null {
   if (!auctionDate) return null
   const target = new Date(`${auctionDate}T00:00:00`)
   if (Number.isNaN(target.getTime())) return null
@@ -58,13 +58,13 @@ function formatDday(auctionDate: string | null): string | null {
   return `입찰 ${Math.abs(diffDays)}일 경과`
 }
 
-function ResultItemRow({ item }: { item: SearchResultItem }) {
+function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: string }) {
   const location = item.full_address || [item.sido, item.sigungu, item.dong].filter(Boolean).join(' ')
   const area = parseArea(item.full_address)
   const dday = formatDday(item.auction_date)
 
   return (
-    <Link href={`/properties/${item.id}`} className="block">
+    <Link href={`/properties/${item.id}?${navQuery}`} className="block">
     <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 mb-3">
       {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적 */}
       <div className="flex gap-3">
@@ -132,13 +132,18 @@ export default function ResultList({ data }: { data: SearchResponse }) {
     )
   }
 
+  // 같은 페이지 안에서 "다음/이전 물건"으로 이동할 수 있도록, 현재 결과 목록의 id 순서와
+  // 클릭한 아이템의 인덱스를 Detail로 넘긴다. 페이지를 넘어가는 이동은 다루지 않는다
+  // (다음 페이지 데이터는 이 화면이 아직 모르므로, 새 API 호출 없이는 알 수 없음).
+  const ids = data.items.map((item) => item.id).join(',')
+
   return (
     <div>
       <p className="text-xs text-gray-400 mb-2 px-1">
         총 {data.total.toLocaleString()}건 ({data.page}/{data.total_pages}페이지)
       </p>
-      {data.items.map((item) => (
-        <ResultItemRow key={item.id} item={item} />
+      {data.items.map((item, index) => (
+        <ResultItemRow key={item.id} item={item} navQuery={`ids=${ids}&i=${index}`} />
       ))}
     </div>
   )
