@@ -1,5 +1,6 @@
 import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
+import FavoriteButton from './FavoriteButton'
 
 function formatPrice(price: number) {
   if (!price) return '-'
@@ -82,6 +83,7 @@ function ResultItemRow({ item }: { item: SearchResultItem }) {
                   {dday}
                 </span>
               )}
+              <FavoriteButton itemId={item.id} />
             </div>
           </div>
           <p className="text-sm font-bold text-gray-900 truncate">
