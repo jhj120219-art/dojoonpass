@@ -21,7 +21,7 @@ export default function SortBar() {
   const searchParams = useSearchParams()
 
   const currentSortBy = searchParams.get('sort_by') || 'auction_date'
-  const currentSortOrder = searchParams.get('sort_order') || 'desc'
+  const currentSortOrder = searchParams.get('sort_order') || 'asc'
 
   function handleSortClick(value: SortBy) {
     const params = new URLSearchParams(searchParams.toString())
@@ -35,7 +35,7 @@ export default function SortBar() {
   }
 
   return (
-    <div className="flex gap-1.5 overflow-x-auto pb-1 mb-3">
+    <div className="flex gap-1.5 overflow-x-auto pb-1 mb-4">
       {SORT_OPTIONS.map((opt) => {
         const active = currentSortBy === opt.value
         return (

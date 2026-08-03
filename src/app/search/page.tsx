@@ -25,11 +25,13 @@ export default async function SearchPage({ searchParams }: SearchPageProps) {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="bg-white px-5 py-4 flex items-center justify-between border-b border-gray-100">
-        <h1 className="text-lg font-bold text-gray-900">경매 물건 검색</h1>
-        <PrimaryNav current="search" />
+      <div className="bg-white border-b border-gray-100">
+        <div className="max-w-[1320px] mx-auto px-8 py-4 flex items-center justify-between">
+          <h1 className="text-lg font-bold text-gray-900">경매 물건 검색</h1>
+          <PrimaryNav current="search" />
+        </div>
       </div>
-      <div className="px-4 py-4">
+      <div className="max-w-[1320px] mx-auto px-8 py-4">
         <SearchForm />
         <SearchPresets />
         <SortBar />

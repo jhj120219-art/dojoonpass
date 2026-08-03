@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
@@ -73,6 +73,13 @@ export default function PropertyDetailPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const id = params.id as string
+  // 이전/다음 물건 이동은 컴포넌트를 재마운트하지 않으므로, 즐겨찾기 토글이 진행 중인 상태로
+  // 다른 물건으로 넘어가면 나중에 도착하는 응답이 "현재" 물건의 상태를 덮어쓸 수 있다.
+  // 비동기 완료 시점마다 이 값과 비교해 이미 물건이 바뀌었으면 결과를 버린다.
+  const idRef = useRef(id)
+  useEffect(() => {
+    idRef.current = id
+  }, [id])
   // Search 결과 목록에서 넘어온 경우에만 존재하는 이동 컨텍스트(같은 페이지 안에서의 id 순서 + 현재 인덱스).
   // 직접 링크로 들어온 경우 등 컨텍스트가 없으면 이전/다음 버튼을 아예 노출하지 않는다.
   const navIds = (searchParams.get('ids') ?? '')
@@ -117,6 +124,9 @@ export default function PropertyDetailPage() {
       setShowPopup(false)
       setViewingDoc(null)
       setFavError(null)
+      // 이전 물건에서 즐겨찾기 요청이 아직 끝나지 않은 채로 넘어온 경우, 그 요청은 위 idRef
+      // 가드로 무시되므로 favBusy가 절대 풀리지 않는다 — 새 물건에서는 항상 false로 시작한다.
+      setFavBusy(false)
       const supabase = createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
@@ -142,12 +152,13 @@ export default function PropertyDetailPage() {
   }
   async function handleToggleFavorite() {
     if (favBusy || !property) return
+    const requestId = id
     let token = accessToken
     if (!token) {
       const supabase = createClient()
       const { data: { session } } = await supabase.auth.getSession()
       token = session?.access_token ?? null
-      setAccessToken(token)
+      if (idRef.current === requestId) setAccessToken(token)
     }
     if (!token) {
       router.push(`/login?redirect=/properties/${id}`)
@@ -158,14 +169,17 @@ export default function PropertyDetailPage() {
     try {
       if (favorited) {
         const result = await deleteJSON<{ item_id: number }>(`/api/v1/favorites/${property.id}`, token)
+        if (idRef.current !== requestId) return
         setFavorited(false)
         if (!result.success) setFavError(result.message ?? '즐겨찾기 삭제에 실패했습니다')
       } else {
         const result = await postJSON<{ item_id: number; created_at: string }>('/api/v1/favorites', { item_id: property.id }, token)
+        if (idRef.current !== requestId) return
         setFavorited(true)
         if (!result.success) setFavError(result.message ?? '즐겨찾기 등록에 실패했습니다')
       }
     } catch (err) {
+      if (idRef.current !== requestId) return
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         setFavError('로그인이 만료되었습니다. 다시 로그인해주세요')
         router.push(`/login?redirect=/properties/${id}`)
@@ -173,7 +187,7 @@ export default function PropertyDetailPage() {
         setFavError('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
       }
     } finally {
-      setFavBusy(false)
+      if (idRef.current === requestId) setFavBusy(false)
     }
   }
   function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }

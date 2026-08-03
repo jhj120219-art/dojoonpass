@@ -1,7 +1,7 @@
 'use client'
 
 import { useRouter, useSearchParams } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 import type { SearchQueryParams } from './types'
 import { fetchJSON } from '@/lib/api'
 import PriceRangeSelect from '@/components/PriceRangeSelect'
@@ -81,28 +81,6 @@ const COURT_LIST: CourtInfo[] = [
   { name: '제주지방법원', region: '제주' },
 ]
 const COURT_REGIONS = Array.from(new Set(COURT_LIST.map((c) => c.region)))
-
-const SPECIAL_CONDITIONS = [
-  { value: 'lien', label: '유치권' },
-  { value: 'lien_excluded', label: '유치권 배제' },
-  { value: 'statutory_superficies', label: '법정지상권' },
-  { value: 'grave_right', label: '분묘기지권' },
-  { value: 'senior_provisional_registration', label: '선순위 가등기' },
-  { value: 'senior_provisional_disposition', label: '선순위 가처분' },
-  { value: 'partial_bid', label: '지분입찰 물건' },
-]
-
-// Tank Auction의 splSrchType 라디오(적용 안함/선택 1개 이상 포함/선택 모두 포함/선택 제외)와 동일 구성.
-// TODO(API 미지원): 백엔드 special_conditions 필터 자체가 아직 구현되지 않아, 이 라디오는
-// UI만 제공하고 검색 쿼리에는 반영하지 않는다.
-const SPECIAL_SEARCH_TYPES = [
-  { value: '0', label: '적용 안함' },
-  { value: '1', label: '선택 1개 이상 포함' },
-  { value: '2', label: '선택 모두 포함' },
-  { value: '4', label: '선택 제외' },
-] as const
-
-type SpecialSearchType = (typeof SPECIAL_SEARCH_TYPES)[number]['value']
 
 // Tank Auction의 fbCntBgn/fbCntEnd select(0~10, 자유 숫자입력 아님)와 동일 구성.
 const FAIL_COUNT_OPTIONS = Array.from({ length: 11 }, (_, i) => String(i))
@@ -255,12 +233,11 @@ export default function SearchForm() {
 
 function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
   const router = useRouter()
+  const [isSearchPending, startSearchTransition] = useTransition()
   const [form, setForm] = useState<SearchFormState>(() => parseFormState(searchParams))
 
   // Tank Auction의 주소선택 toggleBtn(주소/법원)과 동일한 2-way 탭.
   const [addressMode, setAddressMode] = useState<'address' | 'court'>(() => parseAddressMode(searchParams))
-  // Tank Auction의 splSrchType 라디오. UI 전용 상태(mock, TODO 참고) — URL에 실리지 않으므로 URL 복원 대상이 아니다.
-  const [specialSearchType, setSpecialSearchType] = useState<SpecialSearchType>('0')
   // Tank Auction의 물건종류 체크박스 트리 선택값. TODO 참고(단일 선택시에만 API 연동).
   const [propertyCategories, setPropertyCategories] = useState<string[]>(() => parsePropertyCategories(searchParams))
 
@@ -329,17 +306,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
   function resetForm() {
     setForm(INITIAL_STATE)
     setAddressMode('address')
-    setSpecialSearchType('0')
     setPropertyCategories([])
-  }
-
-  function toggleSpecialCondition(value: string) {
-    setForm((prev) => ({
-      ...prev,
-      specialConditions: prev.specialConditions.includes(value)
-        ? prev.specialConditions.filter((v) => v !== value)
-        : [...prev.specialConditions, value],
-    }))
   }
 
   function buildSearchQuery(): SearchQueryParams {
@@ -405,7 +372,15 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
   const labelClass = 'text-xs font-medium text-gray-500 mb-1 block'
 
   return (
-    <div className="bg-white rounded-2xl px-4 shadow-sm border border-gray-100 mb-3">
+    <form
+      className="bg-white rounded-2xl px-4 shadow-sm border border-gray-100 mb-4"
+      onSubmit={(e) => {
+        e.preventDefault()
+        startSearchTransition(() => {
+          handleSearch()
+        })
+      }}
+    >
       {/* 주소/법원 토글 — Tank Auction의 toggleBtn(주소/법원 탭) 참고 */}
       <div className="pt-4 pb-3 border-b border-gray-100">
         <div className="flex rounded-full overflow-hidden border border-gray-200 mb-2">
@@ -503,7 +478,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         )}
       </div>
 
-      <SearchAccordionSection title="물건정보">
+      <SearchAccordionSection title="물건정보" defaultOpen={false}>
         <div>
           <span className={labelClass}>사건번호</span>
           <div className="flex items-center gap-1">
@@ -542,7 +517,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         </div>
       </SearchAccordionSection>
 
-      <SearchAccordionSection title="가격 조건">
+      <SearchAccordionSection title="가격 조건" defaultOpen={false}>
         <PriceRangeSelect
           label="감정가"
           minValue={form.appraisalMin}
@@ -574,7 +549,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         />
       </SearchAccordionSection>
 
-      <SearchAccordionSection title="일정 · 유찰횟수">
+      <SearchAccordionSection title="일정 · 유찰횟수" defaultOpen={false}>
         <div>
           <span className={labelClass}>매각기일</span>
           <div className="flex items-center gap-2">
@@ -637,93 +612,12 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         />
       </SearchAccordionSection>
 
-      <SearchAccordionSection title="면적 조건" defaultOpen={false}>
-        <p className="text-xs text-amber-500">
-          건물면적/토지면적은 auction_item에 대응 컬럼이 없어 API 연동 예정입니다 (TODO)
-        </p>
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <span className={labelClass}>건물면적 (㎡)</span>
-            <div className="flex items-center gap-1">
-              <input
-                type="number"
-                min={0}
-                placeholder="최소"
-                value={form.buildingAreaMin}
-                onChange={(e) => update('buildingAreaMin', e.target.value)}
-                className={inputClass}
-              />
-              <span className="text-xs text-gray-400">~</span>
-              <input
-                type="number"
-                min={0}
-                placeholder="최대"
-                value={form.buildingAreaMax}
-                onChange={(e) => update('buildingAreaMax', e.target.value)}
-                className={inputClass}
-              />
-            </div>
-          </div>
-          <div>
-            <span className={labelClass}>토지면적 (㎡)</span>
-            <div className="flex items-center gap-1">
-              <input
-                type="number"
-                min={0}
-                placeholder="최소"
-                value={form.landAreaMin}
-                onChange={(e) => update('landAreaMin', e.target.value)}
-                className={inputClass}
-              />
-              <span className="text-xs text-gray-400">~</span>
-              <input
-                type="number"
-                min={0}
-                placeholder="최대"
-                value={form.landAreaMax}
-                onChange={(e) => update('landAreaMax', e.target.value)}
-                className={inputClass}
-              />
-            </div>
-          </div>
-        </div>
+      <SearchAccordionSection title="면적 조건" defaultOpen={false} muted>
+        <p className="text-xs text-gray-400 py-1">준비 중입니다</p>
       </SearchAccordionSection>
 
-      <SearchAccordionSection title="특수조건" defaultOpen={false}>
-        <p className="text-xs text-amber-500">
-          아래 적용방식(라디오)과 특수조건 매칭은 API 연동 예정입니다 (TODO)
-        </p>
-        <div>
-          <span className={labelClass}>적용방식</span>
-          <div className="flex flex-col gap-1.5">
-            {SPECIAL_SEARCH_TYPES.map((opt) => (
-              <label key={opt.value} className="flex items-center gap-1.5 text-sm text-gray-600">
-                <input
-                  type="radio"
-                  name="specialSearchType"
-                  checked={specialSearchType === opt.value}
-                  onChange={() => setSpecialSearchType(opt.value)}
-                />
-                {opt.label}
-              </label>
-            ))}
-          </div>
-        </div>
-        <div>
-          <span className={labelClass}>특수조건 항목</span>
-          <div className="grid grid-cols-2 gap-y-1">
-            {SPECIAL_CONDITIONS.map((cond) => (
-              <label key={cond.value} className="flex items-center gap-1.5 text-sm text-gray-600">
-                <input
-                  type="checkbox"
-                  checked={form.specialConditions.includes(cond.value)}
-                  onChange={() => toggleSpecialCondition(cond.value)}
-                />
-                {cond.label}
-              </label>
-            ))}
-          </div>
-        </div>
+      <SearchAccordionSection title="특수조건" defaultOpen={false} muted>
+        <p className="text-xs text-gray-400 py-1">준비 중입니다</p>
       </SearchAccordionSection>
 
       <div className="py-4 flex gap-2">
@@ -735,13 +629,14 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           초기화
         </button>
         <button
-          type="button"
-          onClick={handleSearch}
-          className="flex-1 rounded-xl bg-blue-500 py-2.5 text-sm font-medium text-white active:bg-blue-600 transition-colors"
+          type="submit"
+          disabled={isSearchPending}
+          aria-busy={isSearchPending}
+          className="flex-1 rounded-xl bg-blue-500 py-2.5 text-sm font-medium text-white active:bg-blue-600 transition-colors disabled:opacity-50"
         >
           검색
         </button>
       </div>
-    </div>
+    </form>
   )
 }

@@ -65,40 +65,36 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
 
   return (
     <Link href={`/properties/${item.id}?${navQuery}`} className="block">
-    <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 mb-3">
-      {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적 */}
-      <div className="flex gap-3">
-        {/* 대표 이미지: auction_item에 이미지 컬럼 없음 (TODO) */}
-        <div className="w-16 h-16 shrink-0 rounded-lg bg-gray-100 flex items-center justify-center text-[10px] text-gray-400">
-          이미지 없음
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-start justify-between gap-2 mb-1">
-            <span className="text-sm font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg">
-              {item.property_type || '-'}
-            </span>
-            <div className="flex items-center gap-2 shrink-0">
-              {dday && (
-                <span className="shrink-0 text-xs font-medium text-orange-500 bg-orange-50 px-2 py-1 rounded-lg">
-                  {dday}
-                </span>
-              )}
-              <FavoriteButton itemId={item.id} />
-            </div>
+    <div className="bg-white rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow border border-gray-100 mb-4">
+      {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적.
+          대표 이미지는 넣지 않는다 — auction_item에 이미지 컬럼이 없어 항상 빈 placeholder만
+          차지하므로, 그 공간을 텍스트 정보가 쓰도록 비워둔다. */}
+      <div className="min-w-0">
+        <div className="flex items-start justify-between gap-2 mb-1">
+          <span className="text-sm font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg">
+            {item.property_type || '-'}
+          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            {dday && (
+              <span className="shrink-0 text-xs font-medium text-orange-500 bg-orange-50 px-2 py-1 rounded-lg">
+                {dday}
+              </span>
+            )}
+            <FavoriteButton itemId={item.id} />
           </div>
-          <p className="text-sm font-bold text-gray-900 truncate">
-            {item.case_no}{item.item_no ? ` (${item.item_no})` : ''}
-          </p>
-          <p className="text-xs text-gray-400 line-clamp-2 break-all">{location || '-'}</p>
-          {area && <p className="text-xs text-gray-400 mt-0.5">{formatArea(area)}</p>}
         </div>
+        <p className="text-sm font-bold text-gray-900 truncate">
+          {item.case_no}{item.item_no ? ` (${item.item_no})` : ''}
+        </p>
+        <p className="text-xs text-gray-400 line-clamp-2 break-all">{location || '-'}</p>
+        {area && <p className="text-xs text-gray-400 mt-0.5">{formatArea(area)}</p>}
       </div>
 
       {/* 가격 그룹: 실입찰 기준가인 최저입찰가를 가장 크게, 감정가는 대비용으로 보조 표시 */}
       <div className="mt-3 flex items-end justify-between border-t border-gray-50 pt-3">
         <div>
           <p className="text-[11px] text-gray-400">최저입찰가</p>
-          <p className="text-lg font-bold text-blue-500 leading-tight">{formatPrice(item.minimum_bid_price)}</p>
+          <p className="text-lg font-bold text-blue-600 leading-tight">{formatPrice(item.minimum_bid_price)}</p>
           <p className="text-[11px] text-gray-400 mt-0.5">감정가 {formatPrice(item.appraisal_price)}</p>
         </div>
         <div className="flex gap-1.5 shrink-0">
@@ -111,12 +107,14 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
         </div>
       </div>
 
-      {/* 일정 그룹: 절대 매각기일 + 법원, 상대일수는 위 물건 그룹 배지로 이미 노출됨 */}
-      <div className="mt-2 flex items-center justify-between text-xs text-gray-400">
-        <span>{item.court_name || '-'}</span>
-        <span>{item.auction_date || '-'} 매각 · {item.status || '-'}</span>
+      {/* 일정 그룹: 절대 매각기일 + 법원, 상대일수는 위 물건 그룹 배지로 이미 노출됨.
+          법원명 길이가 들쭉날쭉해도 이 줄이 항상 한 줄로 유지되도록, 가변 길이인 법원명만
+          truncate로 줄이고 나머지 고정 길이 항목은 줄바꿈되지 않게 고정한다. */}
+      <div className="mt-2 flex items-center justify-between gap-2 text-xs text-gray-400">
+        <span className="min-w-0 truncate">{item.court_name || '-'}</span>
+        <span className="shrink-0 whitespace-nowrap">{item.auction_date || '-'} 매각 · {item.status || '-'}</span>
         {/* 조회수: auction_item에 조회수 컬럼 없음 (TODO) */}
-        <span>조회수 -</span>
+        <span className="shrink-0 whitespace-nowrap">조회수 -</span>
       </div>
     </div>
     </Link>
@@ -139,8 +137,9 @@ export default function ResultList({ data }: { data: SearchResponse }) {
 
   return (
     <div>
-      <p className="text-xs text-gray-400 mb-2 px-1">
-        총 {data.total.toLocaleString()}건 ({data.page}/{data.total_pages}페이지)
+      <p className="mb-2 px-1">
+        <span className="text-sm font-bold text-blue-600">총 {data.total.toLocaleString()}건</span>
+        <span className="text-xs font-medium text-gray-600"> ({data.page}/{data.total_pages}페이지)</span>
       </p>
       {data.items.map((item, index) => (
         <ResultItemRow key={item.id} item={item} navQuery={`ids=${ids}&i=${index}`} />
