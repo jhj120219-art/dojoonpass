@@ -52,6 +52,7 @@ export type SearchResultItem = {
   fail_count: number
   validation_status: string | null
   crawl_date: string | null
+  is_favorited: boolean
 }
 
 export type SearchResponse = {

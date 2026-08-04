@@ -9,11 +9,11 @@ import { createClient } from '@/lib/supabaseClient'
 // 대상뿐: Detail은 고정 경로(/properties/{id})지만, 여기서는 검색 조건(쿼리스트링)을 잃지
 // 않도록 현재 검색 URL 전체를 redirect 대상으로 쓴다(middleware.ts와 동일하게
 // URLSearchParams로 인코딩).
-export default function FavoriteButton({ itemId }: { itemId: number }) {
+export default function FavoriteButton({ itemId, initialFavorited }: { itemId: number; initialFavorited: boolean }) {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
-  const [favorited, setFavorited] = useState(false)
+  const [favorited, setFavorited] = useState(initialFavorited)
   const [favBusy, setFavBusy] = useState(false)
   const [favError, setFavError] = useState<string | null>(null)
 
@@ -31,16 +31,19 @@ export default function FavoriteButton({ itemId }: { itemId: number }) {
     e.preventDefault()
     e.stopPropagation()
     if (favBusy) return
+    // getSession()이 끝나기 전에 재클릭이 들어오면 이 시점의 favBusy는 아직 false라
+    // 위 가드를 그대로 통과한다 — await 이전에 동기적으로 busy 처리해 재진입을 막는다.
+    setFavBusy(true)
 
     const supabase = createClient()
     const { data: { session } } = await supabase.auth.getSession()
     const token = session?.access_token ?? null
     if (!token) {
+      setFavBusy(false)
       redirectToLogin()
       return
     }
 
-    setFavBusy(true)
     setFavError(null)
     try {
       if (favorited) {

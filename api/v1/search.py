@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from storage.database import get_connection
 from normalizer.normalizer import extract_sido
@@ -9,6 +10,9 @@ from intent.analyzer import (
 )
 
 router = APIRouter()
+# item.py와 동일한 선택적 인증 패턴 — 로그인 안 해도 검색은 그대로 동작하고,
+# 로그인한 경우에만 결과에 is_favorited를 채운다.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _address_detail_condition(address_detail: str):
@@ -58,7 +62,7 @@ def _address_detail_condition(address_detail: str):
     # UNKNOWN(건물명/도로명 등) — 기존 방식 그대로 유지
     return "full_address LIKE ?", [f"%{address_detail}%"]
 
-def row_to_item(row) -> dict:
+def row_to_item(row, favorited_ids=frozenset()) -> dict:
     return {
         "id": row["id"],
         "case_no": row["case_no"],
@@ -77,6 +81,7 @@ def row_to_item(row) -> dict:
         "fail_count": row["fail_count"],
         "validation_status": row["validation_status"],
         "crawl_date": row["crawl_date"],
+        "is_favorited": row["id"] in favorited_ids,
     }
 
 # 정렬 파라미터 화이트리스트 (컬럼명을 쿼리 문자열에 직접 삽입하지 않기 위한 매핑)
@@ -115,6 +120,7 @@ def search(
     sort_order: Optional[str] = Query("desc"),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     # sort_by/sort_order는 기존에 미등록 값을 조용히 기본값으로 폴백하고 있었다.
     # 안정성을 위해 여기서만 명시적으로 거부하고, 그 외 검색 조건/SQL 로직은 그대로 둔다.
@@ -122,6 +128,19 @@ def search(
         raise HTTPException(status_code=400, detail=f"허용되지 않는 sort_by 값입니다: {sort_by}")
     if sort_order is not None and str(sort_order).lower() not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail=f"허용되지 않는 sort_order 값입니다: {sort_order}")
+
+    # item.py와 동일한 선택적 인증: 토큰이 없거나 유효하지 않으면 비로그인으로 취급하고
+    # 검색 자체는 그대로 진행한다(검증 실패가 검색 API를 막으면 안 됨).
+    user_id = None
+    if credentials:
+        try:
+            from api.auth import SUPABASE_JWT_SECRET
+            from jose import jwt
+            payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
+                algorithms=["HS256"], options={"verify_aud": False})
+            user_id = payload.get("sub")
+        except:
+            pass
 
     conn = get_connection()
     try:
@@ -211,12 +230,24 @@ def search(
             params + [size, offset]
         ).fetchall()
 
+        # 로그인 유저에 한해, 이 페이지에 나온 id들의 찜 여부를 배치 조회 1회로 확인한다
+        # (아이템별 개별 조회 없음 → N+1 아님). item.py:52-56의 단일 조회 패턴을 배치로 확장.
+        favorited_ids = set()
+        if user_id and rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            fav_rows = conn.execute(
+                f"SELECT item_id FROM favorites WHERE user_id = ? AND item_id IN ({placeholders})",
+                [user_id] + ids
+            ).fetchall()
+            favorited_ids = {r["item_id"] for r in fav_rows}
+
         return {
             "total": total,
             "page": page,
             "size": size,
             "total_pages": (total + size - 1) // size,
-            "items": [row_to_item(r) for r in rows],
+            "items": [row_to_item(r, favorited_ids) for r in rows],
         }
     except HTTPException:
         raise

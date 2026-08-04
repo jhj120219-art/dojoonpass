@@ -80,7 +80,7 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
                 {dday}
               </span>
             )}
-            <FavoriteButton itemId={item.id} />
+            <FavoriteButton itemId={item.id} initialFavorited={item.is_favorited} />
           </div>
         </div>
         <p className="text-sm font-bold text-gray-900 truncate">

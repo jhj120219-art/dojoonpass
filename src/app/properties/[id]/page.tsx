@@ -127,18 +127,25 @@ export default function PropertyDetailPage() {
       // 이전 물건에서 즐겨찾기 요청이 아직 끝나지 않은 채로 넘어온 경우, 그 요청은 위 idRef
       // 가드로 무시되므로 favBusy가 절대 풀리지 않는다 — 새 물건에서는 항상 false로 시작한다.
       setFavBusy(false)
+      // handleToggleFavorite와 동일한 idRef 가드: 이 요청이 시작된 뒤 다른 물건으로
+      // 넘어가 있으면(idRef.current !== requestId) 늦게 도착한 응답은 화면에 반영하지 않는다.
+      const requestId = id
       const supabase = createClient()
       const { data: { session } } = await supabase.auth.getSession()
+      if (idRef.current !== requestId) return
       const token = session?.access_token ?? null
       setAccessToken(token)
       try {
         const data = await fetchJSON<AuctionItemDetail>(`/api/v1/item/${id}`, token ?? undefined)
+        if (idRef.current !== requestId) return
         setProperty(data)
         setFavorited(data.is_favorited)
       } catch {
+        if (idRef.current !== requestId) return
         setLoadError(true)
       }
       const count = await getViewCount()
+      if (idRef.current !== requestId) return
       setRemaining(count)
       setLoading(false)
     }
