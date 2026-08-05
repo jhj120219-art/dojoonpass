@@ -1,3 +1,11 @@
+DojoonPass(콕찰) — 법원경매 검색/상세조회/관심물건/결제 서비스.
+
+프로젝트 현황, 완료/미완료 기능, 로드맵은 이 README가 아니라 `docs/`(특히 `docs/roadmap.md`,
+`docs/CURRENT_STATE.md`, `docs/backend.md`)를 기준으로 확인한다. 이 README는 별도의 진행률
+정보를 유지하지 않는다 (Single Source of Truth는 `docs/README.md` 참고).
+
+---
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

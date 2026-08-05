@@ -14,6 +14,8 @@ from api.v1.recent_items import router as recent_router
 from api.v1.search_presets import router as presets_router
 from api.v1.registry import router as registry_router
 from api.v1.documents import router as documents_router
+from api.v1.payments import router as payments_router
+from api.v1.admin import router as admin_router
 
 app = FastAPI(
     title="도준패스 법원경매 API",
@@ -26,6 +28,9 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # Content-Disposition은 브라우저 CORS 기본 안전 헤더 목록에 없어 명시적으로 노출해야
+    # 프론트(registry-requests/{id}/download)가 응답의 파일명을 읽을 수 있다.
+    expose_headers=["Content-Disposition"],
 )
 
 app.include_router(search_router, prefix="/api/v1", tags=["search"])
@@ -36,6 +41,8 @@ app.include_router(recent_router, prefix="/api/v1", tags=["recent"])
 app.include_router(presets_router, prefix="/api/v1", tags=["presets"])
 app.include_router(registry_router, prefix="/api/v1", tags=["registry"])
 app.include_router(documents_router, prefix="/api/v1", tags=["documents"])
+app.include_router(payments_router, prefix="/api/v1", tags=["payments"])
+app.include_router(admin_router, prefix="/api/v1", tags=["admin"])
 
 @app.get("/")
 def root():

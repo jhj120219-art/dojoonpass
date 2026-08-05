@@ -54,6 +54,7 @@ venv/
 logs/
 downloads/
 documents/
+registry_documents/
 storage/
 
 # 디버깅용 캡처/덤프 파일

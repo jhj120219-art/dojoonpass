@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
+from datetime import date
 from storage.database import get_connection
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
@@ -120,6 +121,7 @@ def search(
     sort_order: Optional[str] = Query("desc"),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
+    include_closed: bool = Query(False),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
     # sort_by/sort_order는 기존에 미등록 값을 조용히 기본값으로 폴백하고 있었다.
@@ -183,6 +185,11 @@ def search(
         if auction_date_from:
             conditions.append("auction_date >= ?")
             params.append(auction_date_from)
+        elif not include_closed:
+            # D7: 종결물건 기본 제외. auction_date_from을 명시한 호출은 그 값을 그대로
+            # 신뢰하고 이 기본 필터를 적용하지 않는다(기존 호출과의 호환 유지).
+            conditions.append("auction_date >= ?")
+            params.append(date.today().isoformat())
         if auction_date_to:
             conditions.append("auction_date <= ?")
             params.append(auction_date_to)

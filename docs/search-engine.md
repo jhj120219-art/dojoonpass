@@ -139,8 +139,8 @@ GET /api/v1/stats
   - `status` 필터, `sort_by`: 설계만 있고 미구현
   - `property_type`: 설계는 ENUM 코드 / 실제는 자유 문자열 LIKE
   - 프리미엄 접근제어(403): 설계만 있고 미구현
-- 백엔드 API에 인증 로직이 전혀 없는 상태 (Phase 1 JWT 인증 작업 미착수)
-- `favorites`, `recent_items`, `search_presets`, `subscriptions`, `payments`, `registry_requests` 테이블은 설계만 완료된 상태이며 실제 SQLite에 생성 여부 미확인
+- `search`/`item` 엔드포인트는 인증 없이 공개(설계상 의도). `favorites`/`recent-items`/`search-presets`/`registry-requests`/`payments`는 Supabase JWT 인증 적용됨 (`api/auth.py`, 완료)
+- `favorites`, `recent_items`, `search_presets`, `subscriptions`, `payments`, `registry_requests` 테이블은 모두 SQLite에 생성 완료(`storage/migrations/001~007.sql`, `migration_history`로 적용 확인). `subscriptions`/`payments`는 2026-08-05부터 `api/v1/payments.py`(Mock)로 실제 write 발생, `registry_usage`/`registry_requests`는 `api/v1/registry.py`가 write (자세한 내용은 `docs/backend.md` 참고)
 
 ## 주의사항
 

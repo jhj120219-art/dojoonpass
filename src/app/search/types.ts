@@ -15,6 +15,8 @@ export type SearchQueryParams = {
   max_fail_count?: number
   auction_date_from?: string
   auction_date_to?: string
+  // 기본값(false)은 종결물건 제외(auction_date >= 오늘). true면 종결물건 포함.
+  include_closed?: boolean
   min_appraisal?: number
   max_appraisal?: number
   min_bid_price?: number

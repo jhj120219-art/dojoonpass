@@ -1,9 +1,8 @@
 'use client'
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
-import { fetchJSON, postJSON, deleteJSON, ApiError, API_BASE_URL } from '@/lib/api'
+import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiError, API_BASE_URL } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
-import { decreaseViewCount, getViewCount } from './actions'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { formatDday } from '@/app/search/ResultList'
 
@@ -68,6 +67,30 @@ const VALIDATION_STATUS_LABEL: Record<string, string> = {
   FAIL: '검증실패',
 }
 
+// api/v1/registry.py의 실제 status 값(PENDING/PAYMENT_REQUIRED/PROCESSING/COMPLETED/FAILED) 그대로 표시한다.
+// 발급 자동화(다운로드)는 백엔드에 아직 없어(501) PENDING/PROCESSING도 "접수/처리 중"까지만 안내한다 — 거짓 완료 표시 금지.
+const REGISTRY_STATUS_LABEL: Record<string, string> = {
+  PENDING: '신청 접수됨 (발급 처리 대기 — 아직 자동화되지 않음)',
+  PROCESSING: '처리 중',
+  COMPLETED: '발급 완료',
+  FAILED: '신청 실패',
+}
+
+// api/v1/registry.py:9 FREE_LIMIT 초과 시 건당 금액과 동일(registry.py의 charged_amount 하드코딩값).
+// GET /registry-requests 목록 응답에는 charged_amount가 없어(POST 응답에만 존재) 표시용으로 고정값을 둔다.
+const REGISTRY_OVERAGE_FEE = 1000
+
+interface RegistryRequestSummary {
+  id: number
+  item_id: number
+  status: string
+  reason?: string | null
+  requested_at: string
+  is_free?: boolean
+  free_remaining?: number
+  charged_amount?: number
+}
+
 export default function PropertyDetailPage() {
   const params = useParams()
   const router = useRouter()
@@ -96,9 +119,10 @@ export default function PropertyDetailPage() {
   const [property, setProperty] = useState<AuctionItemDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
-  const [revealed, setRevealed] = useState(false)
-  const [remaining, setRemaining] = useState<number | null>(null)
-  const [showPopup, setShowPopup] = useState(false)
+  const [registryRequest, setRegistryRequest] = useState<RegistryRequestSummary | null>(null)
+  const [registryLoading, setRegistryLoading] = useState(true)
+  const [registryBusy, setRegistryBusy] = useState(false)
+  const [registryMessage, setRegistryMessage] = useState<string | null>(null)
   const [viewingDoc, setViewingDoc] = useState<string | null>(null)
   const [docAvailable, setDocAvailable] = useState<'checking' | 'ok' | 'notfound'>('checking')
   const [accessToken, setAccessToken] = useState<string | null>(null)
@@ -120,8 +144,9 @@ export default function PropertyDetailPage() {
       setLoading(true)
       setLoadError(false)
       setProperty(null)
-      setRevealed(false)
-      setShowPopup(false)
+      setRegistryRequest(null)
+      setRegistryMessage(null)
+      setRegistryLoading(true)
       setViewingDoc(null)
       setFavError(null)
       // 이전 물건에서 즐겨찾기 요청이 아직 끝나지 않은 채로 넘어온 경우, 그 요청은 위 idRef
@@ -144,19 +169,152 @@ export default function PropertyDetailPage() {
         if (idRef.current !== requestId) return
         setLoadError(true)
       }
-      const count = await getViewCount()
+      // 등기부 신청 여부/상태는 백엔드(registry_requests)가 유일한 근거다 — 프론트는 무료횟수를
+      // 스스로 계산하지 않고, 이미 신청한 기록이 있는지만 조회해 그 상태를 그대로 보여준다.
+      if (token) {
+        try {
+          const result = await fetchAuthedJSON<RegistryRequestSummary[]>('/api/v1/registry-requests', token)
+          if (idRef.current !== requestId) return
+          if (result.success && result.data) {
+            const existing = result.data.find((r) => r.item_id === Number(id))
+            setRegistryRequest(existing ?? null)
+          }
+        } catch {
+          // 등기부 상태 조회 실패는 조용히 무시한다 — "신청하기" 버튼을 눌렀을 때 다시 확인된다.
+        }
+      }
       if (idRef.current !== requestId) return
-      setRemaining(count)
+      setRegistryLoading(false)
       setLoading(false)
     }
     fetchData()
   }, [id])
-  async function handleReveal() {
-    const result = await decreaseViewCount(Number(id))
-    if (result.error) { setShowPopup(true); return }
-    setRevealed(true)
-    setRemaining(result.remaining ?? null)
+
+  // 로그인 토큰이 없으면 로그인으로 보낸다 (handleToggleFavorite와 동일한 재조회 패턴).
+  async function requireToken(): Promise<string | null> {
+    let token = accessToken
+    if (!token) {
+      const supabase = createClient()
+      const { data: { session } } = await supabase.auth.getSession()
+      token = session?.access_token ?? null
+      setAccessToken(token)
+    }
+    if (!token) {
+      router.push(`/login?redirect=/properties/${id}`)
+      return null
+    }
+    return token
   }
+
+  // "등기부등본 신청하기" — 무료/초과 판단은 전부 백엔드(has_active_subscription/get_free_count)가
+  // 내리고, 프론트는 그 응답(status/is_free/free_remaining/charged_amount)을 그대로 반영만 한다.
+  async function handleRegistryRequest() {
+    const token = await requireToken()
+    if (!token) return
+    setRegistryBusy(true)
+    setRegistryMessage(null)
+    try {
+      const result = await postJSON<RegistryRequestSummary>('/api/v1/registry-requests', { item_id: Number(id) }, token)
+      if (!result.success || !result.data) {
+        setRegistryMessage(result.message ?? '등기부 신청에 실패했습니다')
+        return
+      }
+      setRegistryRequest(result.data)
+    } catch {
+      setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
+    } finally {
+      setRegistryBusy(false)
+    }
+  }
+
+  // Mock 구독 결제(api/v1/payments.py, PG 미연동) — 성공하면 subscriptions가 생성되어
+  // has_active_subscription()이 true가 되므로, 곧바로 등기부 신청을 재시도한다.
+  async function handleSubscribe() {
+    const token = await requireToken()
+    if (!token) return
+    setRegistryBusy(true)
+    setRegistryMessage(null)
+    try {
+      const result = await postJSON<unknown>(
+        '/api/v1/payments',
+        { payment_type: 'SUBSCRIPTION', plan: 'BETA_EARLYBIRD', amount: 9900 },
+        token
+      )
+      if (!result.success) {
+        setRegistryMessage(result.message ?? '구독 처리에 실패했습니다')
+        return
+      }
+      await handleRegistryRequest()
+    } catch {
+      setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
+    } finally {
+      setRegistryBusy(false)
+    }
+  }
+
+  // 무료 초과(PAYMENT_REQUIRED) 건별 결제 — api/v1/payments.py가 결제 성공 시 가장 오래된
+  // PAYMENT_REQUIRED 신청을 찾아 payment_id를 연결하고 status를 PENDING으로 바꾼 뒤 그 결과를
+  // 응답에 함께 실어준다. 프론트는 그 값을 그대로 반영만 한다(직접 상태를 추정하지 않음).
+  async function handlePayOverage() {
+    const token = await requireToken()
+    if (!token || !registryRequest) return
+    setRegistryBusy(true)
+    setRegistryMessage(null)
+    try {
+      const result = await postJSON<{ registry_request: RegistryRequestSummary | null }>(
+        '/api/v1/payments',
+        { payment_type: 'OVERAGE_USAGE', amount: registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE },
+        token
+      )
+      if (!result.success || !result.data) {
+        setRegistryMessage(result.message ?? '결제에 실패했습니다')
+        return
+      }
+      if (result.data.registry_request) {
+        setRegistryRequest(result.data.registry_request)
+      }
+    } catch {
+      setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
+    } finally {
+      setRegistryBusy(false)
+    }
+  }
+
+  // 등기부 문서 실제 다운로드 — api/v1/registry.py:download_registry()는 COMPLETED가 아니면
+  // {success:false} JSON을(200으로) 돌려주고, COMPLETED면 실제 파일을 응답 바디로 돌려준다.
+  // 두 경우를 Content-Type으로 구분해서 처리한다(거짓 성공 표시 금지).
+  async function handleDownloadRegistry() {
+    const token = await requireToken()
+    if (!token || !registryRequest) return
+    setRegistryBusy(true)
+    setRegistryMessage(null)
+    try {
+      const res = await fetchAuthedRaw(`/api/v1/registry-requests/${registryRequest.id}/download`, token)
+      const contentType = res.headers.get('content-type') ?? ''
+      if (!res.ok || contentType.includes('application/json')) {
+        const body = await res.json().catch(() => null)
+        setRegistryMessage(body?.message ?? '다운로드에 실패했습니다')
+        return
+      }
+      const blob = await res.blob()
+      const disposition = res.headers.get('content-disposition') ?? ''
+      const filenameMatch = disposition.match(/filename="?([^"; ]+)"?/)
+      const filename = filenameMatch?.[1] ?? `registry-${registryRequest.id}`
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch {
+      setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
+    } finally {
+      setRegistryBusy(false)
+    }
+  }
+
   async function handleToggleFavorite() {
     if (favBusy || !property) return
     const requestId = id
@@ -226,7 +384,9 @@ export default function PropertyDetailPage() {
         >
           {favorited ? '❤️' : '🤍'}
         </button>
-        {remaining !== null && <span className="ml-auto text-xs text-gray-400">등기열람 잔여 {remaining}회</span>}
+        {registryRequest?.is_free && registryRequest.free_remaining !== undefined && (
+          <span className="ml-auto text-xs text-gray-400">등기열람 무료 잔여 {registryRequest.free_remaining}회</span>
+        )}
       </div>
       {navIndex >= 0 && (
         <div className="bg-white px-4 py-2 flex items-center justify-between border-b border-gray-100">
@@ -561,35 +721,76 @@ export default function PropertyDetailPage() {
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <h3 className="text-sm font-bold text-gray-900 mb-3">📋 등기부등본</h3>
-          {revealed ? (
-            <div>
+          {registryLoading ? (
+            <p className="text-sm text-gray-400 text-center py-4">확인 중...</p>
+          ) : registryMessage === '구독이 필요합니다' ? (
+            <div className="text-center py-4">
+              <p className="text-sm text-gray-400 mb-3">등기부등본 신청은 구독 후 이용할 수 있습니다</p>
+              <button
+                onClick={handleSubscribe}
+                disabled={registryBusy}
+                className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
+              >
+                {registryBusy ? '처리 중...' : '구독하기 (베타 9,900원/월)'}
+              </button>
+            </div>
+          ) : registryRequest?.status === 'PAYMENT_REQUIRED' ? (
+            <div className="text-center py-4">
+              <p className="text-sm text-gray-400 mb-2">무료 열람 횟수를 모두 사용했습니다</p>
+              <p className="text-xs text-gray-300 mb-5">
+                건당 {(registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE).toLocaleString()}원 결제가 필요합니다
+              </p>
+              <button
+                onClick={handlePayOverage}
+                disabled={registryBusy}
+                className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
+              >
+                {registryBusy ? '처리 중...' : `${(registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE).toLocaleString()}원 결제하기`}
+              </button>
+            </div>
+          ) : registryRequest?.status === 'COMPLETED' ? (
+            <div className="text-center py-4">
               <div className="bg-green-50 border border-green-100 rounded-xl p-3 mb-3">
-                <p className="text-xs text-green-600 font-medium">✅ 열람 완료</p>
+                <p className="text-xs text-green-600 font-medium">발급 완료</p>
               </div>
-              <p className="text-sm text-gray-400 leading-relaxed">등기부등본 내용 조회 기능은 준비 중입니다</p>
+              <button
+                onClick={handleDownloadRegistry}
+                disabled={registryBusy}
+                className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
+              >
+                {registryBusy ? '다운로드 중...' : '📥 등기부 다운로드'}
+              </button>
+            </div>
+          ) : registryRequest?.status === 'FAILED' ? (
+            <div className="bg-red-50 border border-red-100 rounded-xl p-3">
+              <p className="text-xs text-red-600 font-medium mb-1">신청 실패</p>
+              <p className="text-xs text-gray-500">{registryRequest.reason || '사유가 등록되지 않았습니다'}</p>
+            </div>
+          ) : registryRequest ? (
+            <div className="bg-green-50 border border-green-100 rounded-xl p-3">
+              <p className="text-xs text-green-600 font-medium">
+                {REGISTRY_STATUS_LABEL[registryRequest.status] ?? registryRequest.status}
+              </p>
             </div>
           ) : (
             <div className="text-center py-4">
-              <p className="text-sm text-gray-400 mb-2">열람 시 <span className="text-blue-500 font-medium">1회 차감</span>됩니다</p>
-              <p className="text-xs text-gray-300 mb-5">잔여 횟수: {remaining}회 / 월 5회</p>
-              <button onClick={handleReveal} className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200">📄 등기부등본 열람하기</button>
+              <p className="text-sm text-gray-400 mb-2">
+                신청 시 무료 횟수 <span className="text-blue-500 font-medium">1회</span>가 차감됩니다(초과 시 유료)
+              </p>
+              <button
+                onClick={handleRegistryRequest}
+                disabled={registryBusy}
+                className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
+              >
+                {registryBusy ? '처리 중...' : '📄 등기부등본 신청하기'}
+              </button>
             </div>
+          )}
+          {registryMessage && registryMessage !== '구독이 필요합니다' && (
+            <p className="text-xs text-red-400 mt-2">{registryMessage}</p>
           )}
         </div>
       </div>
-      {showPopup && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-end justify-center z-50">
-          <div className="bg-white rounded-t-3xl p-6 w-full">
-            <div className="w-12 h-12 bg-orange-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
-              <span className="text-2xl">😢</span>
-            </div>
-            <h2 className="text-lg font-bold text-gray-900 text-center mb-2">이번 달 열람 횟수를 모두 소진하셨습니다</h2>
-            <p className="text-sm text-gray-400 text-center mb-6">추가 충전하시겠습니까?</p>
-            <button className="w-full py-4 bg-blue-500 text-white font-semibold rounded-2xl mb-3" onClick={() => setShowPopup(false)}>추가 충전하기</button>
-            <button className="w-full py-4 bg-gray-100 text-gray-500 font-semibold rounded-2xl" onClick={() => setShowPopup(false)}>다음에 하기</button>
-          </div>
-        </div>
-      )}
       {viewingDoc && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex flex-col z-50">
           <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-gray-100">

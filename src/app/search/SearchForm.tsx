@@ -101,6 +101,7 @@ type SearchFormState = {
   failCountMax: string
   auctionDateFrom: string
   auctionDateTo: string
+  includeClosed: boolean
   appraisalMin: string
   appraisalMax: string
   bidPriceMin: string
@@ -127,6 +128,7 @@ const INITIAL_STATE: SearchFormState = {
   failCountMax: '',
   auctionDateFrom: '',
   auctionDateTo: '',
+  includeClosed: false,
   // PriceRangeSelect의 프리셋 select 값은 '0'을 "제한없음" sentinel로 사용한다
   appraisalMin: '0',
   appraisalMax: '0',
@@ -149,7 +151,7 @@ const INITIAL_STATE: SearchFormState = {
 export const FILTER_PARAM_KEYS = [
   'sido', 'sigungu', 'dong', 'address_detail', 'court_name', 'case_no',
   'property_type', 'status', 'min_fail_count', 'max_fail_count',
-  'auction_date_from', 'auction_date_to', 'min_appraisal', 'max_appraisal',
+  'auction_date_from', 'auction_date_to', 'include_closed', 'min_appraisal', 'max_appraisal',
   'min_bid_price', 'max_bid_price', 'min_bid_rate', 'max_bid_rate',
   'min_building_area', 'max_building_area', 'min_land_area', 'max_land_area',
   'special_conditions',
@@ -197,6 +199,7 @@ function parseFormState(searchParams: SearchParamsLike): SearchFormState {
     failCountMax: searchParams.get('max_fail_count') ?? '',
     auctionDateFrom: searchParams.get('auction_date_from') ?? '',
     auctionDateTo: searchParams.get('auction_date_to') ?? '',
+    includeClosed: searchParams.get('include_closed') === 'true',
     appraisalMin: searchParams.get('min_appraisal') ?? '0',
     appraisalMax: searchParams.get('max_appraisal') ?? '0',
     bidPriceMin: searchParams.get('min_bid_price') ?? '0',
@@ -328,6 +331,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
     if (form.failCountMax) query.max_fail_count = Number(form.failCountMax)
     if (form.auctionDateFrom) query.auction_date_from = form.auctionDateFrom
     if (form.auctionDateTo) query.auction_date_to = form.auctionDateTo
+    if (form.includeClosed) query.include_closed = true
     // '0'(제한없음) sentinel이므로 truthy 문자열 체크가 아니라 수치 비교로 판정해야 한다
     if (Number(form.appraisalMin) > 0) query.min_appraisal = Number(form.appraisalMin)
     if (Number(form.appraisalMax) > 0) query.max_appraisal = Number(form.appraisalMax)
@@ -597,6 +601,15 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
               X
             </button>
           </div>
+          <label className="flex items-center gap-1.5 mt-2 text-xs text-gray-500">
+            <input
+              type="checkbox"
+              checked={form.includeClosed}
+              onChange={(e) => update('includeClosed', e.target.checked)}
+              className="rounded border-gray-300"
+            />
+            종결물건 포함
+          </label>
         </div>
 
         <RangeSelect

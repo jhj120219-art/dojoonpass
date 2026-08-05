@@ -65,3 +65,13 @@ export async function fetchAuthedJSON<T>(path: string, token: string): Promise<A
   }
   return res.json() as Promise<ApiEnvelope<T>>
 }
+
+// 응답이 JSON envelope일 수도, 실제 파일(예: 등기부 다운로드)일 수도 있는 엔드포인트 전용.
+// 다른 래퍼와 달리 !res.ok에서도 던지지 않는다 — 호출부(registry-requests/{id}/download)가
+// Content-Type/상태코드를 직접 보고 "파일" vs "아직 미완료(JSON fail)"를 구분해야 하기 때문.
+export async function fetchAuthedRaw(path: string, token: string): Promise<Response> {
+  return fetch(`${API_BASE_URL}${path}`, {
+    cache: 'no-store',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
