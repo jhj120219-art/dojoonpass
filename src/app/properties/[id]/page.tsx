@@ -80,6 +80,39 @@ const REGISTRY_STATUS_LABEL: Record<string, string> = {
 // GET /registry-requests 목록 응답에는 charged_amount가 없어(POST 응답에만 존재) 표시용으로 고정값을 둔다.
 const REGISTRY_OVERAGE_FEE = 1000
 
+// api/v1/payments.py의 PLAN_CATALOG와 동일한 값(표시/전송용 미러) — 실제 금액 검증은 서버가 한다.
+// listPrice(정상가)와 price(실판매가)를 나눠 두어, 할인 이벤트가 붙어도 표시 로직을 바꾸지 않고
+// 값만 교체하면 되도록 한다(서버 카탈로그와 동일한 구조).
+type SubscriptionPlan = 'BASIC' | 'PRO'
+type BillingCycle = 'MONTHLY' | 'YEARLY'
+type PlanOption = {
+  plan: SubscriptionPlan
+  label: string
+  registryLimit: number
+  prices: Record<BillingCycle, { listPrice: number; price: number }>
+}
+const PLAN_OPTIONS: PlanOption[] = [
+  {
+    plan: 'BASIC',
+    label: '베이직',
+    registryLimit: 5,
+    prices: {
+      MONTHLY: { listPrice: 12900, price: 12900 },
+      YEARLY: { listPrice: 154800, price: 154800 },
+    },
+  },
+  {
+    plan: 'PRO',
+    label: '프로',
+    registryLimit: 10,
+    prices: {
+      MONTHLY: { listPrice: 22900, price: 22900 },
+      // 연간 할인 이벤트: 정상가 274,800원 -> 판매가 198,000원
+      YEARLY: { listPrice: 274800, price: 198000 },
+    },
+  },
+]
+
 interface RegistryRequestSummary {
   id: number
   item_id: number
@@ -129,6 +162,8 @@ export default function PropertyDetailPage() {
   const [favorited, setFavorited] = useState(false)
   const [favBusy, setFavBusy] = useState(false)
   const [favError, setFavError] = useState<string | null>(null)
+  const [selectedPlan, setSelectedPlan] = useState<SubscriptionPlan>('BASIC')
+  const [billingCycle, setBillingCycle] = useState<BillingCycle>('MONTHLY')
   useEffect(() => {
     if (!viewingDoc) return
     setDocAvailable('checking')
@@ -229,15 +264,22 @@ export default function PropertyDetailPage() {
 
   // Mock 구독 결제(api/v1/payments.py, PG 미연동) — 성공하면 subscriptions가 생성되어
   // has_active_subscription()이 true가 되므로, 곧바로 등기부 신청을 재시도한다.
-  async function handleSubscribe() {
+  // amount는 PLAN_OPTIONS(프론트 미러값)에서 가져오되, 서버가 PLAN_CATALOG로 다시 검증한다.
+  async function handleSubscribe(plan: SubscriptionPlan, cycle: BillingCycle) {
     const token = await requireToken()
     if (!token) return
+    const planOption = PLAN_OPTIONS.find((p) => p.plan === plan) ?? PLAN_OPTIONS[0]
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
       const result = await postJSON<unknown>(
         '/api/v1/payments',
-        { payment_type: 'SUBSCRIPTION', plan: 'BETA_EARLYBIRD', amount: 9900 },
+        {
+          payment_type: 'SUBSCRIPTION',
+          plan: planOption.plan,
+          billing_cycle: cycle,
+          amount: planOption.prices[cycle].price,
+        },
         token
       )
       if (!result.success) {
@@ -724,14 +766,65 @@ export default function PropertyDetailPage() {
           {registryLoading ? (
             <p className="text-sm text-gray-400 text-center py-4">확인 중...</p>
           ) : registryMessage === '구독이 필요합니다' ? (
-            <div className="text-center py-4">
-              <p className="text-sm text-gray-400 mb-3">등기부등본 신청은 구독 후 이용할 수 있습니다</p>
+            <div className="py-4">
+              <p className="text-sm text-gray-400 mb-3 text-center">등기부등본 신청은 구독 후 이용할 수 있습니다</p>
+              {/* 월/연 결제주기 토글 */}
+              <div className="flex rounded-full overflow-hidden border border-gray-200 mb-3">
+                {(['MONTHLY', 'YEARLY'] as BillingCycle[]).map((cycle) => (
+                  <button
+                    key={cycle}
+                    type="button"
+                    onClick={() => setBillingCycle(cycle)}
+                    aria-pressed={billingCycle === cycle}
+                    className={`flex-1 py-1.5 text-xs font-medium transition-colors ${
+                      billingCycle === cycle ? 'bg-blue-500 text-white' : 'bg-gray-50 text-gray-500'
+                    }`}
+                  >
+                    {cycle === 'MONTHLY' ? '월 결제' : '연 결제'}
+                  </button>
+                ))}
+              </div>
+              <div className="space-y-2 mb-3">
+                {PLAN_OPTIONS.map((opt) => {
+                  const p = opt.prices[billingCycle]
+                  const discounted = p.price < p.listPrice
+                  return (
+                    <button
+                      key={opt.plan}
+                      type="button"
+                      onClick={() => setSelectedPlan(opt.plan)}
+                      aria-pressed={selectedPlan === opt.plan}
+                      className={
+                        'w-full text-left p-3 rounded-xl border transition-colors ' +
+                        (selectedPlan === opt.plan
+                          ? 'border-blue-500 bg-blue-50'
+                          : 'border-gray-100 bg-white')
+                      }
+                    >
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm font-semibold text-gray-900">{opt.label}</span>
+                        <span className="text-sm font-bold text-blue-500">
+                          {discounted && (
+                            <span className="mr-1.5 text-xs font-normal text-gray-400 line-through">
+                              {p.listPrice.toLocaleString()}원
+                            </span>
+                          )}
+                          {p.price.toLocaleString()}원{billingCycle === 'MONTHLY' ? '/월' : '/년'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1">등기부등본 월 {opt.registryLimit}회 제공</p>
+                    </button>
+                  )
+                })}
+              </div>
               <button
-                onClick={handleSubscribe}
+                onClick={() => handleSubscribe(selectedPlan, billingCycle)}
                 disabled={registryBusy}
                 className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
               >
-                {registryBusy ? '처리 중...' : '구독하기 (베타 9,900원/월)'}
+                {registryBusy
+                  ? '처리 중...'
+                  : `구독하기 (${(PLAN_OPTIONS.find((p) => p.plan === selectedPlan) ?? PLAN_OPTIONS[0]).prices[billingCycle].price.toLocaleString()}원${billingCycle === 'MONTHLY' ? '/월' : '/년'})`}
               </button>
             </div>
           ) : registryRequest?.status === 'PAYMENT_REQUIRED' ? (

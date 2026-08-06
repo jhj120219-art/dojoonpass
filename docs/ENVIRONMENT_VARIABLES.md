@@ -1,0 +1,345 @@
+# 환경변수 가이드 (Environment Variables)
+
+Status: Active
+Last Updated: 2026-08-06
+Owner: CTO
+
+---
+
+## 이 문서의 목적
+
+이 저장소를 실행/배포할 때 필요한 모든 환경변수를 한 곳에 정리한다.
+**Claude Code가 그대로 참고할 수 있는 개발 문서**를 목표로 하며, 각 항목마다
+"지금 필요한지 / 론칭 직전에 필요한지 / 지금은 Skip해도 되는지"를 명시한다.
+
+## 읽는 법 / 중요 규칙
+
+- **`.env` 파일은 승인 없이 수정하지 않는다** (프로젝트 규칙). 이 문서는 "무엇이 필요한가"를
+  기술할 뿐이며, 실제 값 입력은 사용자가 직접 수행한다.
+- **실제 키 값을 이 문서에 적지 않는다.** 예시는 전부 형식만 보여주는 더미다.
+- 현재 저장소의 `.env` / `.env.local` 두 파일이 사용된다:
+  - `.env` — 백엔드(FastAPI, `api_server.py`가 `load_dotenv()`로 로드)
+  - `.env.local` — 프론트엔드(Next.js, `NEXT_PUBLIC_*` 포함)
+- **Next.js에서 `NEXT_PUBLIC_` 접두사가 붙은 값은 브라우저에 그대로 노출된다.**
+  비밀키에는 절대 이 접두사를 붙이지 않는다.
+
+## 현재 상태 요약 (2026-08-06 코드 기준)
+
+| 상태 | 항목 |
+|---|---|
+| ✅ 설정 완료·동작 중 | `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
+| ⚠️ 코드는 완성, 값 미설정 | `ADMIN_API_KEY` (미설정 시 `/api/v1/admin/*` 전체 500) |
+| 🕓 론칭 직전 필요 | KG이니시스 4종, Mail, SMS, GA4, Sentry, Slack |
+| 💤 지금 Skip 가능 | 코드에 참조 지점이 아직 없는 항목 전부(아래 "코드 참조 여부" 열 확인) |
+
+## 시점별 분류 (한눈에 보기)
+
+### A. 지금 당장 필요 — 없으면 기능이 막힌다
+
+| 변수 | 상태 | 없을 때 증상 |
+|---|---|---|
+| `SUPABASE_JWT_SECRET` | ✅ 설정됨 | 인증 필요 API 전부 `500 "JWT Secret 미설정"` |
+| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 설정됨 | 로그인/회원가입 불가 |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 설정됨 | 로그인/회원가입 불가 |
+| `ADMIN_API_KEY` | ❌ **미설정** | `/api/v1/admin/*` 전체 `500 "관리자 키 미설정"` — 등기부 신청 상태 관리 불가 |
+
+### B. 론칭 직전 필요 — 결제/모니터링 개시 시점
+
+| 변수 | 선행 조건 |
+|---|---|
+| `KG_MID` / `KG_API_KEY` / `KG_SECRET_KEY` | KG이니시스 사업자 계약·심사 완료 |
+| `KG_WEBHOOK_SECRET` | Webhook 수신 엔드포인트 구현 후 |
+| `PAYMENT_PROVIDER=kginicis` | `KGInicisProvider` 신설 후 (현재 값 없으면 안전하게 `mock`) |
+| `SENTRY_DSN` | 실사용자 트래픽 전 예외 수집 시작 |
+| `GA4_MEASUREMENT_ID` | 개인정보처리방침에 분석도구 고지 후 |
+
+### C. 운영 중 필요 — 서비스 성장에 따라 추가
+
+| 변수 | 도입 시점 |
+|---|---|
+| `SLACK_WEBHOOK_URL` | 크롤링 실패/결제 실패를 즉시 인지해야 할 때(현재는 로그 수동 확인) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | 등기부 발급 완료·영수증·구독 만료 안내 메일을 자체 발송할 때 |
+| `SMS_API_KEY` / `SMS_SECRET` | 매각기일 임박 등 실시간 알림을 붙일 때 |
+| `SUPABASE_SERVICE_ROLE_KEY` | 서버가 RLS를 우회해 Supabase 데이터를 직접 조작해야 할 때 |
+
+---
+
+# 1. Supabase (인증)
+
+인증은 Supabase Auth를 쓰고, 경매 데이터는 SQLite에 있다(`docs/decision-log.md` 참고).
+
+## SUPABASE_URL
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Supabase |
+| 설명 | Supabase 프로젝트 API 엔드포인트 URL |
+| 필수 여부 | **필수** |
+| 언제 필요한지 | 로그인/회원가입 등 인증 기능 전체 |
+| 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
+| 발급 위치 | Supabase 대시보드 → Project Settings → API → Project URL |
+| 코드 참조 여부 | 프론트는 `NEXT_PUBLIC_SUPABASE_URL`로 참조(`src/lib/supabaseClient.ts`, `src/lib/supabaseServer.ts`, `src/middleware.ts`) |
+| 비고 | 프론트에서 쓰려면 반드시 `NEXT_PUBLIC_` 접두사 버전이 `.env.local`에 있어야 한다. 비밀값이 아니므로 노출되어도 무방 |
+| 예시 | `NEXT_PUBLIC_SUPABASE_URL=https://abcdefghijklm.supabase.co` |
+
+## SUPABASE_ANON_KEY
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Supabase |
+| 설명 | 익명(공개) 클라이언트 키. RLS 정책 적용을 전제로 브라우저에 노출되는 것이 정상 |
+| 필수 여부 | **필수** |
+| 언제 필요한지 | 로그인/회원가입/세션 갱신 |
+| 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
+| 발급 위치 | Supabase 대시보드 → Project Settings → API → Project API keys → `anon` `public` |
+| 코드 참조 여부 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` (`supabaseClient.ts`/`supabaseServer.ts`/`middleware.ts`) |
+| 비고 | 공개 키지만 RLS가 없으면 데이터가 열린다 — Supabase 쪽 RLS 설정과 함께 관리할 것 |
+| 예시 | `NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.<...>` |
+
+## SUPABASE_SERVICE_ROLE_KEY
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Supabase |
+| 설명 | RLS를 우회하는 **관리자 권한 키**. 서버에서만 사용 |
+| 필수 여부 | 선택 (현재 미사용) |
+| 언제 필요한지 | 서버가 사용자 대신 Supabase 데이터를 직접 조작해야 할 때(예: 관리자 배치, 사용자 강제 탈퇴) |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능.** 현재 코드에 참조 지점이 전혀 없다 |
+| 발급 위치 | Supabase 대시보드 → Project Settings → API → `service_role` `secret` |
+| 코드 참조 여부 | **없음** (저장소 전체 grep 결과 0건) |
+| 비고 | **절대 `NEXT_PUBLIC_` 접두사를 붙이지 말 것.** 유출 시 전체 데이터 조작 가능 |
+| 예시 | `SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.<...>` |
+
+---
+
+# 2. JWT (백엔드 토큰 검증)
+
+## JWT_SECRET
+
+> **주의 — 실제 코드가 쓰는 이름은 `SUPABASE_JWT_SECRET`이다.**
+> 이 문서의 요청 항목명은 `JWT_SECRET`이지만, `api/auth.py`는
+> `os.getenv("SUPABASE_JWT_SECRET")`을 읽는다. 이름을 바꾸려면 코드 수정이 필요하므로
+> **현재는 `SUPABASE_JWT_SECRET`으로 설정해야 동작한다.**
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | JWT |
+| 실제 변수명 | **`SUPABASE_JWT_SECRET`** |
+| 설명 | FastAPI가 Supabase 발급 JWT의 서명을 검증하는 비밀키(HS256) |
+| 필수 여부 | **필수** |
+| 언제 필요한지 | 인증이 필요한 모든 API(favorites/recent-items/search-presets/registry-requests/payments) |
+| 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
+| 발급 위치 | Supabase 대시보드 → Project Settings → API → JWT Settings → JWT Secret |
+| 코드 참조 여부 | `api/auth.py:9`, `api/v1/item.py`, `api/v1/search.py`(선택적 검증) |
+| 비고 | 미설정 시 인증 필요 API가 전부 `500 "JWT Secret 미설정"`으로 막힌다. `NEXT_PUBLIC_` 금지 |
+| 예시 | `SUPABASE_JWT_SECRET=super-long-random-secret-from-supabase` |
+
+---
+
+# 3. Admin (운영자 전용 API)
+
+## ADMIN_API_KEY
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Admin |
+| 설명 | `/api/v1/admin/*` 접근용 공유 키. `X-Admin-Key` 헤더 값과 상수시간 비교(`hmac.compare_digest`) |
+| 필수 여부 | **필수 (운영 전)** |
+| 언제 필요한지 | 등기부 신청 상태 관리(목록 조회, PENDING→PROCESSING→COMPLETED 전이, `doc_url` 등록) |
+| 현재 필요한가 | **예 — 지금 미설정 상태라 Admin API 전체가 `500 "관리자 키 미설정"`으로 막혀 있다** |
+| 발급 위치 | 외부 발급 없음. **직접 생성**(예: `python -c "import secrets; print(secrets.token_urlsafe(32))"`) |
+| 코드 참조 여부 | `api/v1/admin.py:23` (`require_admin`) |
+| 비고 | 역할(role) 구분이 없어 키를 아는 사람은 전체 관리자 권한을 갖는다(MVP 한계). 유출 시 즉시 교체 필요 |
+| 예시 | `ADMIN_API_KEY=Xy9-3fQz...랜덤32바이트...` |
+
+---
+
+# 4. Payment — KG이니시스
+
+**PG사는 KG이니시스로 확정**(2026-08-06, `docs/decision-log.md`).
+단 실제 API 연동·계약·키 입력·Webhook 연결·실결제 테스트는 **론칭 직전까지 연기**한다.
+현재는 `MockProvider`로 동작하며, 아래 4개 변수는 **지금 전부 Skip 가능**하다.
+
+> 현재 코드 상태: `api/v1/payment_providers.py`에 `KGInicisProvider`가 **아직 없다**.
+> `get_payment_provider()`는 `PAYMENT_PROVIDER`(mock/toss/portone)만 인식하며 기본값은 `mock`이다.
+
+## PAYMENT_PROVIDER (기존 변수, 참고)
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment |
+| 설명 | 사용할 결제 Provider 선택 |
+| 필수 여부 | 선택 (미설정 시 `mock`) |
+| 현재 필요한가 | **아니오 — 미설정 상태 유지 권장**(설정하지 않으면 Mock으로 안전하게 동작) |
+| 코드 참조 여부 | `api/v1/payment_providers.py:132` |
+| 비고 | 론칭 시 `kginicis` 값을 추가하려면 `_PROVIDERS` 맵에 Provider 등록이 선행돼야 한다 |
+| 예시 | `PAYMENT_PROVIDER=mock` |
+
+## KG_MID
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment (KG이니시스) |
+| 설명 | 상점 아이디(Merchant ID). 가맹점 식별자 |
+| 필수 여부 | 론칭 시 **필수** |
+| 언제 필요한지 | 결제창 호출, 승인 API 요청 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** (사업자 계약 완료 후) |
+| 발급 위치 | KG이니시스 가맹점 관리자(https://iniweb.inicis.com) → 상점정보. 테스트용 MID는 이니시스 개발 가이드에서 제공 |
+| 코드 참조 여부 | **없음** (Provider 미구현) |
+| 비고 | 테스트 MID와 운영 MID가 다르다. 운영 MID는 사업자 계약·심사 완료 후 발급 |
+| 예시 | `KG_MID=INIpayTest` |
+
+## KG_API_KEY
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment (KG이니시스) |
+| 설명 | 결제 API 인증 키(상점 인증용) |
+| 필수 여부 | 론칭 시 **필수** |
+| 언제 필요한지 | 승인/취소/조회 API 호출 시 인증 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** |
+| 발급 위치 | KG이니시스 가맹점 관리자 → 상점정보 → API 키 관리 |
+| 코드 참조 여부 | **없음** (Provider 미구현) |
+| 비고 | 서버 전용. `NEXT_PUBLIC_` 금지 |
+| 예시 | `KG_API_KEY=ItEQKi3rY7uvDS8l` |
+
+## KG_SECRET_KEY
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment (KG이니시스) |
+| 설명 | 요청 서명(해시) 생성용 비밀키 |
+| 필수 여부 | 론칭 시 **필수** |
+| 언제 필요한지 | 결제 요청 위·변조 방지 서명 생성/검증 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** |
+| 발급 위치 | KG이니시스 가맹점 관리자 → 상점정보 (`signKey`/`iniapiKey` 계열) |
+| 코드 참조 여부 | **없음** (Provider 미구현) |
+| 비고 | 유출 시 결제 요청 위조가 가능하므로 최우선 보호 대상 |
+| 예시 | `KG_SECRET_KEY=SU5JTElURV9UUklQTEVERVNfS0VZU1RS` |
+
+## KG_WEBHOOK_SECRET
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment (KG이니시스) |
+| 설명 | Webhook(입금통보/결제결과 노티) 요청이 실제 KG이니시스에서 왔는지 검증하는 키 |
+| 필수 여부 | 론칭 시 **필수** |
+| 언제 필요한지 | 가상계좌 입금통보, 비동기 결제결과 수신 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** (Webhook 수신 엔드포인트 자체가 아직 없음) |
+| 발급 위치 | KG이니시스 가맹점 관리자 → 노티(Noti) 설정 |
+| 코드 참조 여부 | **없음.** `PaymentProvider.handle_webhook()` 인터페이스는 있으나 호출하는 엔드포인트가 없다 |
+| 비고 | 서명 검증 없이 Webhook을 신뢰하면 결제 위조가 가능하다 — 구현 시 반드시 검증 먼저 |
+| 예시 | `KG_WEBHOOK_SECRET=whsec_<랜덤문자열>` |
+
+---
+
+# 5. Mail (SMTP)
+
+현재 저장소에 메일 발송 코드가 **전혀 없다**(회원가입 인증메일은 Supabase가 자체 발송).
+아래 4개는 자체 메일 발송 기능을 만들 때 필요하며, **지금은 전부 Skip 가능**하다.
+
+| 변수명 | 설명 | 필수 | 현재 필요 | 발급 위치 | 예시 |
+|---|---|---|---|---|---|
+| `SMTP_HOST` | 메일 서버 주소 | 론칭 시 선택 | ❌ Skip | 메일 제공사(Gmail/AWS SES/Naver Works 등) | `smtp.gmail.com` |
+| `SMTP_PORT` | 메일 서버 포트 | 론칭 시 선택 | ❌ Skip | 위와 동일 | `587` (TLS) / `465` (SSL) |
+| `SMTP_USER` | SMTP 인증 계정 | 론칭 시 선택 | ❌ Skip | 위와 동일 | `no-reply@kokchal.com` |
+| `SMTP_PASSWORD` | SMTP 인증 비밀번호 | 론칭 시 선택 | ❌ Skip | 위와 동일 (Gmail은 앱 비밀번호 발급 필요) | `abcd efgh ijkl mnop` |
+
+- **언제 필요한지**: 등기부 발급 완료 알림, 결제 영수증, 구독 만료 예정 안내 등 **알림 기능을 새로 만들 때**
+- **코드 참조 여부**: 없음(저장소 전체 grep 0건)
+- **비고**: Supabase Auth 메일(가입 확인/비밀번호 재설정)은 이 설정과 무관하게 Supabase 쪽에서 처리된다
+
+---
+
+# 6. SMS
+
+현재 저장소에 SMS 발송 코드가 **전혀 없다**. **지금은 전부 Skip 가능**하다.
+
+| 변수명 | 설명 | 필수 | 현재 필요 | 발급 위치 | 예시 |
+|---|---|---|---|---|---|
+| `SMS_API_KEY` | SMS 발송 API 키 | 론칭 시 선택 | ❌ Skip | SMS 제공사(NHN Toast/Solapi/알리고 등) 콘솔 | `NCSKEY-xxxxxxxx` |
+| `SMS_SECRET` | SMS API 서명용 비밀키 | 론칭 시 선택 | ❌ Skip | 위와 동일 | `s3cr3t-xxxxxxxx` |
+
+- **언제 필요한지**: 매각기일 임박 알림, 등기부 발급 완료 알림 등 **실시간성이 중요한 알림**을 붙일 때
+- **코드 참조 여부**: 없음
+- **비고**: 광고성 문자를 보내려면 수신동의 및 야간 발송 제한 등 정보통신망법 준수가 선행돼야 한다
+
+---
+
+# 7. Google Analytics
+
+## GA4_MEASUREMENT_ID
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Analytics |
+| 설명 | GA4 측정 ID. 페이지뷰/전환 추적용 |
+| 필수 여부 | 선택 |
+| 언제 필요한지 | 베타 오픈 후 사용자 유입/전환(구독 결제) 분석 시작 시점 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** (분석 스크립트 미삽입) |
+| 발급 위치 | Google Analytics → 관리 → 데이터 스트림 → 웹 스트림 세부정보 |
+| 코드 참조 여부 | **없음** |
+| 비고 | 프론트에서 쓰므로 `NEXT_PUBLIC_GA4_MEASUREMENT_ID` 형태가 되어야 하며, 공개되어도 무방한 값이다. 개인정보처리방침에 분석도구 사용 고지 필요 |
+| 예시 | `NEXT_PUBLIC_GA4_MEASUREMENT_ID=G-XXXXXXXXXX` |
+
+---
+
+# 8. Sentry (에러 모니터링)
+
+## SENTRY_DSN
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Monitoring |
+| 설명 | Sentry 프로젝트 DSN. 런타임 예외 자동 수집 |
+| 필수 여부 | 선택 (운영 안정성 관점에서는 권장) |
+| 언제 필요한지 | **론칭 직전** — 실사용자 트래픽에서 발생하는 예외를 놓치지 않으려면 오픈 전 설정이 바람직 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** |
+| 발급 위치 | Sentry → Projects → 프로젝트 선택 → Settings → Client Keys (DSN) |
+| 코드 참조 여부 | **없음** |
+| 비고 | 프론트/백엔드 각각 별도 DSN을 두는 것이 일반적. 백엔드 DSN에는 `NEXT_PUBLIC_` 금지. 크롤러(`mvp_scraper.py`/`doc_worker.py`) 실패 추적에도 유용 |
+| 예시 | `SENTRY_DSN=https://<key>@o0.ingest.sentry.io/0` |
+
+---
+
+# 9. Slack (운영 알림)
+
+## SLACK_WEBHOOK_URL
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Ops Notification |
+| 설명 | Slack Incoming Webhook URL. 운영 이벤트를 채널로 전송 |
+| 필수 여부 | 선택 |
+| 언제 필요한지 | 크롤링 실패, 등기부 신청 접수, 결제 실패 등 **운영자가 즉시 알아야 하는 이벤트** 알림 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능** |
+| 발급 위치 | Slack API → Your Apps → Incoming Webhooks → Add New Webhook to Workspace |
+| 코드 참조 여부 | **없음** |
+| 비고 | URL 자체가 인증 수단이라 유출 시 누구나 채널에 메시지를 보낼 수 있다. `run_daily.bat`이 실패(exit 1)할 때 알림을 보내면 크롤링 중단을 조기에 발견할 수 있다(현재는 로그를 직접 봐야 함) |
+| 예시 | `SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/XXXX` |
+
+---
+
+# 부록 A. 지금 당장 해야 할 일
+
+1. **`ADMIN_API_KEY` 설정** — 유일하게 "코드는 완성됐는데 값이 없어서 막혀 있는" 항목이다.
+   설정 즉시 Admin API(등기부 신청 상태 관리)가 동작한다.
+
+그 외 항목은 전부 현재 동작에 영향이 없다.
+
+# 부록 B. 론칭 직전 체크리스트
+
+- [ ] KG이니시스 사업자 계약 완료 → `KG_MID` / `KG_API_KEY` / `KG_SECRET_KEY` 발급
+- [ ] `KGInicisProvider` 구현 + `_PROVIDERS` 등록 → `PAYMENT_PROVIDER=kginicis`
+- [ ] Webhook 수신 엔드포인트 구현 + `KG_WEBHOOK_SECRET` 서명 검증
+- [ ] 테스트 MID로 실결제 테스트 → 운영 MID 전환
+- [ ] `SENTRY_DSN` 설정(예외 수집)
+- [ ] `SLACK_WEBHOOK_URL` 설정(크롤링/결제 실패 알림)
+- [ ] `GA4_MEASUREMENT_ID` 설정 + 개인정보처리방침에 고지
+- [ ] 방화벽 설정 검토 (`docs/backend.md` 주의사항)
+
+# 부록 C. 관련 문서
+
+- `docs/decision-log.md` — PG사/구독 정책 확정 내역
+- `docs/backend.md` — 인증 방식, API 목록, 확정 Spec 미반영 항목
+- `docs/BUGS.md` — 알려진 이슈

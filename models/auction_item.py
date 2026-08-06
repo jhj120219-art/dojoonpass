@@ -1,5 +1,5 @@
 ﻿from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 @dataclass
 class AuctionItem:

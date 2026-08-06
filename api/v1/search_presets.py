@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+﻿from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection

@@ -1,13 +1,7 @@
 import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 import FavoriteButton from './FavoriteButton'
-
-function formatPrice(price: number) {
-  if (!price) return '-'
-  if (price >= 100000000) return (price / 100000000).toFixed(1) + '억'
-  if (price >= 10000) return Math.round(price / 10000) + '만'
-  return String(price)
-}
+import { formatPrice } from '@/lib/format'
 
 function formatBidRate(bidRate: number) {
   if (bidRate === null || bidRate === undefined) return '-'

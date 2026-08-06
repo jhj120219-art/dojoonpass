@@ -34,7 +34,12 @@
 ## Component 구조
 
 - `components/` 디렉터리가 존재하지 않는다. 모든 UI가 각 `page.tsx`에 인라인으로 작성됨 — 재사용 컴포넌트 없음
-- `formatPrice`/`formatDate` 포맷 함수가 `properties/page.tsx`와 `properties/[id]/page.tsx`에 각각 중복 정의되어 있음
+- `formatPrice`/`formatDate` 포맷 함수 중복 정의 — 2026-08-06(Sprint 18) 재확인 결과, 서로 다른
+  5곳 중 `search/ResultList.tsx`/`favorites/page.tsx`/`properties/recent/page.tsx` 3곳은
+  완전히 동일한 구현이라 `src/lib/format.ts`(신규)의 공용 `formatPrice()`로 통합함(동작 무변경,
+  Runtime QA로 확인). `properties/page.tsx`와 `properties/[id]/page.tsx`는 서로 다른 구현(단순
+  "억" 고정 표기 vs "만/억" 단계 표기)이라 통합하지 않고 그대로 둠 — 통합하려면 어느 표기를
+  기준으로 할지 UX 결정이 먼저 필요함(Spec 필요, 이번 Sprint 범위 밖)
 
 ## Layout 구조
 
@@ -70,8 +75,11 @@
 ## 알려진 문제점
 
 - **데이터 소스 불일치(`/properties`만 해당, 2026-08-05 기준 범위 축소)**: `/properties`(목록)와 `/properties/[id]`의 물건 목록 진입 경로는 여전히 Supabase 테이블 `properties`(컬럼: `title`, `bid_date`, `case_number`, `detail_info`, `status` 등 — `auction_item`과 이름·구조가 다름)를 직접 조회해 크롤러 데이터(`auction_item`)가 노출되지 않는다. 반면 `/search`, `/favorites`, `/properties/recent`와 `/properties/[id]`의 상세 데이터 자체는 FastAPI(`auction_item` 경유)를 사용하므로 이 문제는 `/properties` 목록 화면에 한정된다 — `docs/decision-log.md`의 "검색은 SQLite 기반" 결정과는 `/search`에서는 이미 일치, `/properties`에서는 여전히 어긋남
-- ~~등기부 열람 로직 이중 구현~~ → 2026-08-05 해소됨: `properties/[id]/actions.ts`(Supabase `view_counts`) 삭제, `api/v1/registry.py` 하나로 일원화. 단 그 정책 자체(평생 누적 5회)가 맞는지는 여전히 미확정(`docs/decision-log.md` Pending Decisions)
+- ~~등기부 열람 로직 이중 구현~~ → 2026-08-05 해소됨: `properties/[id]/actions.ts`(Supabase `view_counts`) 삭제, `api/v1/registry.py` 하나로 일원화. 정책 자체도 2026-08-06 확정됨(플랜별 월 단위: 베이직 5회/프로 10회) — 단 **코드는 아직 평생 누적 5회**라 반영 작업이 남아있음
+- ~~`PLAN_OPTIONS` 확정 Spec 미반영~~ → **2026-08-06 완료**: `properties/[id]/page.tsx`가 월/연 결제주기 토글 + 플랜 카드(베이직 12,900원·월5회 / 프로 22,900원·월10회)를 표시하고, 연 결제 시 프로는 정상가 274,800원 취소선 + 판매가 198,000원을 함께 노출한다. 결제 요청에 `billing_cycle`을 함께 보내며 금액은 서버(`PLAN_CATALOG`)가 재검증한다. 할인은 `listPrice`/`price` 분리 구조라 이벤트 적용 시 값만 교체하면 된다
 - `src/login/`(도달 불가)이 구 브랜드명을 쓰는 죽은 코드로 남아있음 — 사용 여부가 확실하지 않은 코드는 임의로 삭제하지 않는다는 프로젝트 규칙에 따라 그대로 둠
+- **[2026-08-06 Sprint 21 발견] 로그아웃 기능이 화면에 전혀 노출되지 않음**: `src/app/properties/LogoutButton.tsx`는 완성돼 있으나 어디에서도 import되지 않는다(저장소 전체 `grep` 결과 자기 정의 1줄뿐). `signOut()` 호출도 이 파일이 유일 — 로그인한 사용자가 앱 안에서 로그아웃할 방법이 없다(기능 공백). 컴포넌트 배치 위치가 화면 스펙 결정 사항이라 임의로 연결하지 않고 기록만 함 — 자세한 내용은 `docs/BUGS.md` #15 참고
+- `src/app/properties/SearchFilters.tsx`는 `properties/page.tsx`에서 실제로 사용 중이나, 자체 `SIDO_LIST`(정식 명칭 표기, 17개)·`SIGUNGU_MAP`(서울/부산/경기 3개 시도만 하드코딩)·`PRICE_OPTIONS`(10단계)를 갖고 있어 `/search` 화면의 `SearchForm.tsx`(축약 표기 시도, `GET /api/v1/search/regions` 실시간 조회, `PriceRangeSelect`의 60단계 프리셋)와 완전히 다른 데이터·정밀도를 쓴다. `/properties`가 Supabase 직접 조회라는 기존 데이터 소스 불일치(위 항목)와 같은 뿌리이며, `/properties` 목록의 향후 처리 방향이 정해지기 전에는 통합 대상이 아님(미결정, PM 확인 필요)
 - `app/layout.tsx` 메타데이터가 `create-next-app` 기본값 그대로 (title/description 미변경)
 - 색상/스타일이 각 페이지에 Tailwind 유틸리티 클래스로 하드코딩되어 있음 (`bg-blue-500`, `text-gray-400` 등). 별도 디자인 토큰 파일(`styles/auction-theme.css` 등)은 존재하지 않음 — `globals.css`는 `create-next-app` 기본값(배경/전경색 변수, 폰트)만 정의
 - ~~등기부 실제 발급(다운로드)은 여전히 없음~~ → 2026-08-05 완전히 해결됨: `status=COMPLETED`이면 "📥 등기부 다운로드" 버튼이 나타나고, 클릭 시 `GET /registry-requests/{id}/download`를 호출해 실제 파일을 브라우저 다운로드로 저장한다(`handleDownloadRegistry`, `fetch`+`blob`+`<a download>`). `FAILED`는 `reason`(백엔드가 노출)을 그대로 보여준다

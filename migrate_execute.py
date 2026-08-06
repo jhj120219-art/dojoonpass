@@ -36,19 +36,23 @@ def execute():
         logger.info("원본 데이터 로드: %d건", len(rows))
 
         # 1. auction_case UPSERT
+        # 식별키는 (court_code, case_no) 복합키다 — 법원마다 사건번호를 독립 채번하므로
+        # case_no 단독으로 dedup하면 서로 다른 법원의 동일 사건번호가 한 row로 병합된다
+        # (011_auction_case_court_code_unique.sql에서 해소한 Release Blocking 버그).
         logger.info("auction_case 마이그레이션 시작...")
         case_map = {}
         for row in rows:
-            case_no = row["case_no"]
-            if case_no not in case_map:
-                case_map[case_no] = row
+            key = (row["court_code"], row["case_no"])
+            if key not in case_map:
+                case_map[key] = row
 
-        for case_no, row in case_map.items():
+        for (court_code, case_no), row in case_map.items():
             conn.execute("""
                 INSERT OR IGNORE INTO auction_case
-                (case_no, court_name, case_type, filed_date, demand_deadline, created_at, updated_at)
-                VALUES (?, ?, NULL, NULL, NULL, ?, ?)
-            """, (case_no, row["court_name"], row["created_at"] or now, row["updated_at"] or now))
+                (case_no, court_code, court_name, case_type, filed_date, demand_deadline, created_at, updated_at)
+                VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
+            """, (case_no, court_code, row["court_name"],
+                  row["created_at"] or now, row["updated_at"] or now))
 
         logger.info("auction_case 완료: %d건", len(case_map))
 
@@ -63,9 +67,11 @@ def execute():
         item_inserted = 0
         item_updated = 0
         for row in rows:
+            # 조회도 복합키 기준이어야 한다 — case_no만으로 찾으면 동일 사건번호를 쓰는
+            # 다른 법원의 auction_case row를 잘못 연결하게 된다(위 UPSERT와 동일한 이유).
             case_id = conn.execute(
-                "SELECT id FROM auction_case WHERE case_no = ?",
-                (row["case_no"],)
+                "SELECT id FROM auction_case WHERE court_code = ? AND case_no = ?",
+                (row["court_code"], row["case_no"])
             ).fetchone()["id"]
 
             existing = conn.execute(
@@ -179,15 +185,19 @@ def execute():
         print(f"  auction_item        : {ai}건")
         print(f"  document_status     : {ds}건")
 
+        # 이모지(✅/❌)를 쓰지 않는다 — run_daily.bat이 stdout을 로그 파일로 리다이렉트하면
+        # 이 환경의 파이썬이 cp949로 인코딩하는데 이모지가 cp949에 없어 UnicodeEncodeError로
+        # 죽는다. 커밋은 이미 끝난 뒤라 데이터는 정상이지만 스크립트가 exit 1로 종료되어
+        # 매일 배치가 실패로 보고됐다(logs/migrate_execute.log에 11회 발생 실측).
         if ai == orig:
-            print("  ✅ auction_item 건수 일치")
+            print("  [OK] auction_item 건수 일치")
         else:
-            print(f"  ❌ auction_item 불일치: {ai} != {orig}")
+            print(f"  [FAIL] auction_item 불일치: {ai} != {orig}")
 
         if ds == orig * 3:
-            print("  ✅ document_status 건수 일치")
+            print("  [OK] document_status 건수 일치")
         else:
-            print(f"  ❌ document_status 불일치: {ds} != {orig * 3}")
+            print(f"  [FAIL] document_status 불일치: {ds} != {orig * 3}")
 
         print("")
         print("=== 샘플 확인 ===")

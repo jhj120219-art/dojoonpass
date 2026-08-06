@@ -20,11 +20,13 @@ API (api/v1/payments.py)
 
 Payment Provider (api/v1/payment_providers.py)
   - MockProvider (현재 사용, 항상 SUCCESS)
-  - TossProvider / PortOneProvider (자리만 있음, 호출 시 NotImplementedError — PG사 미확정)
+  - TossProvider / PortOneProvider (자리만 있음, 호출 시 NotImplementedError — PG사가
+    KG이니시스로 확정되어 폐기 예정. 삭제는 승인 필요 작업이라 코드에 그대로 남아있음)
+  - KGInicisProvider (확정된 PG사 — 아직 코드에 존재하지 않음, 신설 필요)
 
 ↓ (PG 실연동 시에만)
 
-PG사 (Toss/PortOne, 미연동)
+PG사 (KG이니시스 — 2026-08-06 확정, 실연동 미착수)
 
 ---
 
@@ -78,3 +80,7 @@ Frontend↔API 화살표에 포함된다(`properties/[id]/page.tsx`가 `payments
 여전히 SQLite에 직접 쓰고 읽으며(기존 아키텍처 그대로), Provider는 오직 "이 결제가
 승인됐는지"만 판단해 돌려주는 좁은 역할만 한다. 지금은 `MockProvider`만 실제로 쓰이고
 `TossProvider`/`PortOneProvider`는 이름과 자리만 있을 뿐 호출하면 에러가 난다.
+**2026-08-06 PG사가 KG이니시스로 확정**되었으므로 이 두 클래스는 폐기 예정이며, 확정된
+`KGInicisProvider`는 아직 코드에 없다(신설 + Interface v2 6개 메서드 구현이 남은 작업 —
+외부 API Key/계약 필요로 승인 대기). Provider 인터페이스 자체(v2)는 PG사와 무관하게 설계돼
+있어 KG이니시스 연동에도 그대로 재사용 가능하다.

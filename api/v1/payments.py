@@ -10,22 +10,119 @@ from api.v1.payment_providers import get_payment_provider
 router = APIRouter()
 
 # PG 실연동 전까지는 PAYMENT_PROVIDER=mock(기본값)으로 동작한다 — api/v1/payment_providers.py 참고.
-# 구독 기간 정책이 아직 확정되지 않아 30일 고정으로 둔다 (사용자 확인 필요).
-SUBSCRIPTION_PERIOD_DAYS = 30
 VALID_PAYMENT_TYPES = ("SUBSCRIPTION", "OVERAGE_USAGE")
-VALID_PLANS = ("BETA_EARLYBIRD", "STANDARD")
-# 구독 정책 문서(docs/backend.md "구독 정책") 기준 금액. OVERAGE_FEE와 동일한 방식으로
-# 서버에서 검증한다 — 클라이언트가 보낸 amount를 더 이상 그대로 신뢰하지 않는다.
-PLAN_PRICES = {
-    "BETA_EARLYBIRD": 9900,
-    "STANDARD": 22900,
+
+# 결제 주기. 구독 요금제가 월/연 2가지라 기간을 상수 하나로 고정하지 않고 주기별로 둔다.
+BILLING_MONTHLY = "MONTHLY"
+BILLING_YEARLY = "YEARLY"
+VALID_BILLING_CYCLES = (BILLING_MONTHLY, BILLING_YEARLY)
+BILLING_PERIOD_DAYS = {
+    BILLING_MONTHLY: 30,
+    BILLING_YEARLY: 365,
 }
+
+# 구독 요금제 카탈로그 (docs/decision-log.md "구독 정책 최종 확정" 기준).
+#
+# 가격을 단일 정수로 두지 않고 list_price(정상가) / sale_price(실판매가)로 나눠 둔다 —
+# 향후 할인 이벤트를 붙일 때 이 카탈로그의 값만 바꾸면 되고 결제/검증 로직은 손대지 않아도 된다.
+#
+# 각 가격 항목이 지원하는 필드(전부 선택, 없으면 정상가 청구):
+#   list_price       : 정상가(필수)
+#   sale_price       : 고정 할인가. 지정되면 이 값이 청구액
+#   discount_percent : 정률 할인(%). sale_price가 없을 때만 적용
+#   discount_start   : 할인 시작일 "YYYY-MM-DD" (생략 시 제한 없음)
+#   discount_end     : 할인 종료일 "YYYY-MM-DD" (그날까지 포함, 생략 시 제한 없음)
+#
+# 기간을 벗어나면 자동으로 정상가로 돌아가므로, 이벤트 종료 시 코드를 고칠 필요가 없다.
+# 계산은 전부 resolve_plan_price()가 담당한다 — 호출부는 가격 규칙을 알지 못한다.
+PLAN_CATALOG = {
+    "BASIC": {
+        "label": "베이직",
+        "registry_monthly_limit": 5,
+        "prices": {
+            BILLING_MONTHLY: {"list_price": 12900, "sale_price": None},
+            BILLING_YEARLY: {"list_price": 154800, "sale_price": None},
+        },
+    },
+    "PRO": {
+        "label": "프로",
+        "registry_monthly_limit": 10,
+        "prices": {
+            # 연간 할인 이벤트: 정상가 274,800원 → 판매가 198,000원
+            BILLING_MONTHLY: {"list_price": 22900, "sale_price": None},
+            BILLING_YEARLY: {"list_price": 274800, "sale_price": 198000},
+        },
+    },
+}
+VALID_PLANS = tuple(PLAN_CATALOG.keys())
+
+
+def _is_discount_active(price_entry: dict, at: datetime = None) -> bool:
+    """
+    할인 적용 기간인지 판단한다.
+
+    `discount_start`/`discount_end`(ISO 날짜 문자열, 둘 다 선택)가 없으면 기간 제한이 없는
+    상시 할인으로 본다. 한쪽만 지정하는 것도 허용한다(시작만 = 그 이후 계속,
+    종료만 = 그때까지). 종료일은 그날까지 포함한다(`<=` 비교).
+    """
+    start = price_entry.get("discount_start")
+    end = price_entry.get("discount_end")
+    if not start and not end:
+        return True
+    today = (at or datetime.now()).date().isoformat()
+    if start and today < start:
+        return False
+    if end and today > end:
+        return False
+    return True
+
+
+def resolve_plan_price(plan: str, billing_cycle: str, at: datetime = None) -> int | None:
+    """
+    플랜+결제주기로 실제 청구 금액을 결정한다(할인 적용 후 금액).
+
+    가격 정책이 바뀌어도 호출부는 수정하지 않도록, 카탈로그 해석은 전부 이 함수에 모은다.
+    알 수 없는 조합이면 None을 반환해 호출부가 거부하도록 한다.
+
+    할인 우선순위: sale_price(고정 할인가) > discount_percent(정률 할인) > list_price(정상가).
+    둘 다 지정되면 sale_price가 이긴다(명시적으로 적은 금액이 더 강한 의도이므로).
+    `discount_start`/`discount_end` 기간을 벗어나면 할인을 무시하고 정상가로 청구한다.
+    """
+    plan_entry = PLAN_CATALOG.get(plan)
+    if not plan_entry:
+        return None
+    price_entry = plan_entry["prices"].get(billing_cycle)
+    if not price_entry:
+        return None
+
+    list_price = price_entry["list_price"]
+    if not _is_discount_active(price_entry, at):
+        return list_price
+
+    sale_price = price_entry.get("sale_price")
+    if sale_price is not None:
+        return sale_price
+
+    percent = price_entry.get("discount_percent")
+    if percent:
+        # 원 단위 절사(내림) — 청구 금액이 정상가를 넘지 않도록 보수적으로 계산한다.
+        return int(list_price * (100 - percent) / 100)
+
+    return list_price
+
+
+def get_registry_monthly_limit(plan: str) -> int:
+    """플랜별 등기부 월 무료 한도. 알 수 없는 플랜이면 0(무료 제공 없음)."""
+    plan_entry = PLAN_CATALOG.get(plan)
+    return plan_entry["registry_monthly_limit"] if plan_entry else 0
 
 
 class PaymentCreateRequest(BaseModel):
     payment_type: str
     amount: int
     plan: str | None = None  # payment_type=SUBSCRIPTION일 때 필수
+    # 결제주기. 기존 호출(월 구독만 존재하던 시점)과의 호환을 위해 미지정 시 MONTHLY로 간주한다.
+    billing_cycle: str | None = None
 
 
 def row_to_payment(row) -> dict:
@@ -97,9 +194,10 @@ def create_payment_record(conn, user_id: str, payment_type: str, amount: int, pl
     return payment_id, result.status
 
 
-def create_subscription(conn, user_id: str, plan: str, price: int, now: str) -> int:
+def create_subscription(conn, user_id: str, plan: str, price: int, now: str,
+                        billing_cycle: str = BILLING_MONTHLY) -> int:
     started_at = now
-    expires_at = (datetime.now() + timedelta(days=SUBSCRIPTION_PERIOD_DAYS)).isoformat()
+    expires_at = (datetime.now() + timedelta(days=BILLING_PERIOD_DAYS[billing_cycle])).isoformat()
     subscription_id = conn.execute(
         """
         INSERT INTO subscriptions
@@ -115,13 +213,19 @@ def create_subscription(conn, user_id: str, plan: str, price: int, now: str) -> 
 def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current_user)):
     if req.payment_type not in VALID_PAYMENT_TYPES:
         return fail("지원하지 않는 결제 유형입니다")
+    billing_cycle = req.billing_cycle or BILLING_MONTHLY
     if req.payment_type == "SUBSCRIPTION":
         if req.plan not in VALID_PLANS:
             return fail("구독 플랜이 올바르지 않습니다")
+        if billing_cycle not in VALID_BILLING_CYCLES:
+            return fail("결제 주기가 올바르지 않습니다")
         # OVERAGE_FEE 검증과 동일한 방식: 클라이언트가 보낸 amount를 신뢰하지 않고
-        # 플랜별 고정 가격(PLAN_PRICES)과 비교한다.
-        if req.amount != PLAN_PRICES[req.plan]:
-            return fail(f"결제 금액이 올바르지 않습니다 ({PLAN_PRICES[req.plan]}원)")
+        # 서버 카탈로그가 계산한 금액(할인 적용 후)과 비교한다.
+        expected_amount = resolve_plan_price(req.plan, billing_cycle)
+        if expected_amount is None:
+            return fail("구독 플랜이 올바르지 않습니다")
+        if req.amount != expected_amount:
+            return fail(f"결제 금액이 올바르지 않습니다 ({expected_amount}원)")
     # OVERAGE_USAGE는 registry_requests에 저장된 별도 charged_amount 컬럼이 없어(등기부 신청
     # 응답에만 실리는 값), registry.py와 공유하는 OVERAGE_FEE 상수를 기준으로 정합성을 검증한다.
     if req.payment_type == "OVERAGE_USAGE" and req.amount != OVERAGE_FEE:
@@ -157,7 +261,7 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
 
             subscription_row = None
             if req.payment_type == "SUBSCRIPTION":
-                subscription_id = create_subscription(conn, user_id, req.plan, req.amount, now)
+                subscription_id = create_subscription(conn, user_id, req.plan, req.amount, now, billing_cycle)
                 subscription_row = conn.execute(
                     "SELECT * FROM subscriptions WHERE id=?", (subscription_id,)
                 ).fetchone()

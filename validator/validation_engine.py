@@ -4,28 +4,11 @@ import logging
 from datetime import datetime
 from typing import List, Dict
 from models.auction_item import AuctionItem
+# normalizer.py의 SIDO_PATTERNS와 이 모듈의 (구)SIDO_MAP은 완전히 동일한 내용의 별도
+# 정의였다(Duplicate Code) — 한쪽만 남기고 재사용한다. 값/동작은 그대로 유지.
+from normalizer.normalizer import SIDO_PATTERNS as SIDO_MAP
 
 logger = logging.getLogger(__name__)
-
-SIDO_MAP = {
-    "서울": ["서울특별시", "서울시", "서울"],
-    "경기": ["경기도", "경기"],
-    "인천": ["인천광역시", "인천시", "인천"],
-    "부산": ["부산광역시", "부산시", "부산"],
-    "대구": ["대구광역시", "대구시", "대구"],
-    "광주": ["광주광역시", "광주시", "광주"],
-    "대전": ["대전광역시", "대전시", "대전"],
-    "울산": ["울산광역시", "울산시", "울산"],
-    "세종": ["세종특별자치시", "세종시", "세종"],
-    "강원": ["강원도", "강원특별자치도", "강원"],
-    "충북": ["충청북도", "충북"],
-    "충남": ["충청남도", "충남"],
-    "전북": ["전라북도", "전북특별자치도", "전북"],
-    "전남": ["전라남도", "전남"],
-    "경북": ["경상북도", "경북"],
-    "경남": ["경상남도", "경남"],
-    "제주": ["제주특별자치도", "제주도", "제주"],
-}
 
 # 광역시-도 인접 허용 쌍 (addr_sido, appraisal_sido)
 ADJACENT_SIDO_PAIRS = {

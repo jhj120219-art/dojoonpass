@@ -2,6 +2,7 @@ import { redirect } from 'next/navigation'
 import { createServerSupabaseClient } from '@/lib/supabaseServer'
 import Link from 'next/link'
 import SearchFilters from './SearchFilters'
+import LogoutButton from './LogoutButton'
 import PrimaryNav from '@/components/PrimaryNav'
 
 type PropertiesPageProps = {
@@ -58,6 +59,7 @@ export default async function PropertiesPage({ searchParams }: PropertiesPagePro
         <div className="flex items-center gap-3">
           <PrimaryNav />
           <span className="text-xs text-gray-400">{user.email}</span>
+          <LogoutButton />
         </div>
       </div>
       <div className="px-4 py-4 space-y-3">

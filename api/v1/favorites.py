@@ -71,16 +71,34 @@ def remove_favorite(item_id: int, user_id: str = Depends(get_current_user)):
 def get_favorites(user_id: str = Depends(get_current_user)):
     conn = get_connection()
     try:
-        rows = conn.execute(
-            "SELECT item_id, created_at FROM favorites WHERE user_id=? ORDER BY created_at DESC",
-            (user_id,)
-        ).fetchall()
+        # get_item_summary()를 즐겨찾기 개수만큼 반복 호출하던 N+1 쿼리를 단일 JOIN으로 교체
+        # (recent_items.py:get_recent_items()와 동일한 패턴). 응답 필드/순서는 기존과 동일하게 유지.
+        rows = conn.execute("""
+            SELECT ai.*, f.created_at AS favorited_at
+            FROM favorites f
+            JOIN auction_item ai ON f.item_id = ai.id
+            WHERE f.user_id = ?
+            ORDER BY f.created_at DESC
+        """, (user_id,)).fetchall()
         items = []
         for row in rows:
-            summary = get_item_summary(conn, row["item_id"])
-            if summary:
-                summary["favorited_at"] = row["created_at"]
-                items.append(summary)
+            items.append({
+                "id": row["id"],
+                "case_no": row["case_no"],
+                "item_no": row["item_no"],
+                "court_name": row["court_name"],
+                "property_type": row["property_type"],
+                "sido": row["sido"],
+                "sigungu": row["sigungu"],
+                "full_address": row["full_address"],
+                "appraisal_price": row["appraisal_price"],
+                "minimum_bid_price": row["minimum_bid_price"],
+                "bid_rate": row["bid_rate"],
+                "auction_date": row["auction_date"],
+                "status": row["status"],
+                "fail_count": row["fail_count"],
+                "favorited_at": row["favorited_at"],
+            })
         return success(items)
     finally:
         conn.close()

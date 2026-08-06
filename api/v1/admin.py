@@ -1,3 +1,4 @@
+import hmac
 import os
 from datetime import datetime
 from typing import Optional
@@ -23,7 +24,9 @@ def require_admin(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")
     admin_key = os.getenv("ADMIN_API_KEY", "")
     if not admin_key:
         raise HTTPException(status_code=500, detail="관리자 키 미설정")
-    if not x_admin_key or x_admin_key != admin_key:
+    # 단순 문자열 비교(!=)는 앞에서부터 다르면 즉시 반환되어 비교 시간이 일치하는
+    # 접두 길이에 비례한다(타이밍 공격 여지). compare_digest로 상수 시간 비교한다.
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, admin_key):
         raise HTTPException(status_code=403, detail="관리자 권한이 없습니다")
 
 

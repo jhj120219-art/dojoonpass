@@ -68,7 +68,9 @@ backend.md
 - 진입점: `api_server.py`
 - 실행: `python api_server.py`
 - 포트: 8000
-- host: 0.0.0.0
+- host: 127.0.0.1(localhost 전용) — 2026-08-06 코드 재확인·정정. `api_server.py` 하단
+  `uvicorn.run(..., host="127.0.0.1", ...)` 하드코딩 확인(`git log -p`로 커밋 `bfefbf7`(인증
+  도입 시점)에서 `0.0.0.0` → `127.0.0.1`로 이미 변경된 이력 확인). 이전 버전 문서의 "0.0.0.0"은 stale
 - Swagger: `http://localhost:8000/docs`
 - CORS: 전체 허용 (개발 환경)
 - 라우터 prefix: `/api/v1`
@@ -107,20 +109,24 @@ backend.md
 | GET | /api/v1/admin/registry-requests | 목록 조회. `status`/`user_id`/`item_id`/`case_no`/`page`/`size` 필터 |
 | PATCH | /api/v1/admin/registry-requests/{id} | 상태 전이. 허용: PENDING→(PROCESSING,FAILED), PROCESSING→(COMPLETED,FAILED) |
 
-- 인증 방식이 다른 모든 API와 다르다: Supabase JWT를 쓰지 않고 `X-Admin-Key` 헤더를 서버 환경변수 `ADMIN_API_KEY`와 단순 비교한다(`api/v1/admin.py:require_admin`). 역할(role) 개념이 프로젝트 어디에도 없어 MVP로 도입한 임시 인증이며, 사용자별 권한 구분은 없다(키를 아는 사람은 전체 관리자 권한).
+- 인증 방식이 다른 모든 API와 다르다: Supabase JWT를 쓰지 않고 `X-Admin-Key` 헤더를 서버 환경변수 `ADMIN_API_KEY`와 비교한다(`api/v1/admin.py:require_admin`). 2026-08-06(Sprint 15)부터 `hmac.compare_digest()`로 상수 시간 비교(타이밍 공격 방어) — 이전에는 단순 `!=` 비교였음. 역할(role) 개념이 프로젝트 어디에도 없어 MVP로 도입한 임시 인증이며, 사용자별 권한 구분은 없다(키를 아는 사람은 전체 관리자 권한, 이 부분은 이번 수정 범위 밖).
 - `ADMIN_API_KEY`가 `.env`에 설정되어 있지 않으면 요청 자체가 `500 "관리자 키 미설정"`으로 막힌다 — 아직 `.env`에 값이 없다(운영 전 사용자가 직접 설정 필요, DB/env 변경 승인 정책상 임의로 넣지 않음).
 - `COMPLETED` 전이 시 `completed_at` 자동 기록, `FAILED` 전이 시 `reason`(필수) 저장 — `registry_requests.reason` 컬럼은 `010_add_registry_request_reason.sql`로 신규 추가됨.
 - `PAYMENT_REQUIRED`는 관리자가 직접 전이시킬 수 없다 — `POST /api/v1/payments`(OVERAGE_USAGE)가 성공할 때만 `PENDING`으로 자동 전환된다.
 
 ### GET /api/v1/search 파라미터
-sido, sigungu, property_type, court_name,
+case_no, sido, sigungu, dong, address_detail(자유텍스트, 아래 참고),
+property_type(콤마 다중선택), court_name, status,
 auction_date_from, auction_date_to,
 min_appraisal, max_appraisal,
+min_bid_price, max_bid_price,
 min_bid_rate, max_bid_rate,
 min_fail_count, max_fail_count,
-page(기본 1), size(기본 20, 최대 100)
+sort_by, sort_order(asc/desc),
+page(기본 1), size(기본 20, 최대 100),
+include_closed(기본 false)
 
-자유텍스트 주소 검색 미지원.
+전체 파라미터/필터 구조/정렬/인덱스의 상세 근거는 `docs/search-engine.md` 참고(2026-08-06 코드 기준 재동기화됨).
 
 ### 공통 응답 형식 (인증 필요 API 전용)
 ```json
@@ -151,25 +157,73 @@ GET /api/v1/item/{item_id} 호출 시 JWT가 있으면 recent_items 자동 기�
 JWT 없으면 기록 안 함 (에러 없음).
 
 ### 등기부 무료 횟수
-평생 누적 5회 무료(월 단위 리셋 로직 없음, 코드 기준 `api/v1/registry.py:get_free_count`). 초과 시 건당 1,000원.
-차감 시점: 신청 시점.
-판단 기준: registry_usage WHERE user_id=? AND is_free=1 COUNT (기간 조건 없음).
-`FREE_LIMIT`(=5) 초과 시 `registry_requests`에 `PAYMENT_REQUIRED` row 생성. 2026-08-05부터 `POST /api/v1/payments`(OVERAGE_USAGE)가 성공하면 가장 오래된 미결제 `PAYMENT_REQUIRED` 건을 찾아 `payment_id` 연결 + `status=PENDING`으로 자동 전환됨(아래 "결제(Payment)..." 참고) — 더 이상 미구현 아님.
-무료횟수 COUNT와 등록은 원자적 트랜잭션(`BEGIN IMMEDIATE`)으로 묶여 있어 동시 요청에도 5회를 초과할 수 없다(2026-08-05 Release Blocking 수정, 아래 "알려진 문제점" 참고).
+
+**확정 정책(2026-08-06 CTO 확정, `docs/decision-log.md` 참고)**: 플랜별 **월 단위** 무료 제공 —
+베이직 월 5회 / 프로 월 10회. 매월 리셋된다. 초과 시 건당 1,000원(`OVERAGE_FEE`).
+
+**구현 완료(2026-08-06)**
+- `get_free_count()`가 `used_at >= 이번 달 1일` 조건으로 **이번 달 사용분만** COUNT한다.
+  `used_at`이 ISO 8601 문자열이라 사전순 = 시간순이므로 문자열 비교로 월 경계를 나눌 수 있고,
+  월이 바뀌면 자동으로 0부터 다시 센다 — **별도 리셋 배치가 필요 없다**
+- `get_user_free_limit()`이 활성 구독의 `plan`을 조회해 `PLAN_CATALOG`의
+  `registry_monthly_limit`(베이직 5 / 프로 10)을 적용한다. 플랜을 해석할 수 없으면
+  보수적으로 `DEFAULT_FREE_LIMIT`(=5)을 쓴다
+- `payments.py` ↔ `registry.py` 순환 import를 피하려 `get_registry_monthly_limit`는
+  함수 내부에서 import한다(기존 `OVERAGE_FEE`가 반대 방향으로 이미 import되고 있기 때문)
+
+공통(정책 변경과 무관하게 유지되는 동작):
+- 차감 시점: 신청 시점
+- 한도 초과 시 `registry_requests`에 `PAYMENT_REQUIRED` row 생성. `POST /api/v1/payments`(OVERAGE_USAGE)가 성공하면 가장 오래된 미결제 `PAYMENT_REQUIRED` 건을 찾아 `payment_id` 연결 + `status=PENDING`으로 자동 전환(아래 "결제(Payment)..." 참고)
+- 무료횟수 COUNT와 등록은 원자적 트랜잭션(`BEGIN IMMEDIATE`)으로 묶여 있어 동시 요청에도 한도를 초과할 수 없다(2026-08-05 Release Blocking 수정)
 
 ### 구독 정책
-- 베타 얼리버드: 9,900원/월
-- 정가: 22,900원/월
-- 얼리버드 가입자 평생 9,900원 유지 (정책 확정)
-- 위 금액은 정책 문서 기준이며, `POST /api/v1/payments`는 서버에서 플랜별 가격을 검증하지 않고 클라이언트가 보낸 `amount`를 그대로 저장함 (알려진 문제점 참고)
-- 구독 기간(`expires_at`)은 `SUBSCRIPTION_PERIOD_DAYS=30`(코드 상수, `api/v1/payments.py`)로 임시 고정. 플랜별 차등 기간 정책 미확정
 
-### Payment Provider 구조 (2026-08-05, PG 실연동 준비)
-- `api/v1/payment_providers.py`(신규): `PaymentProvider`(인터페이스) → `MockProvider`(현재 사용, 항상 SUCCESS) / `TossProvider`·`PortOneProvider`(자리만 있음, `charge()` 호출 시 `NotImplementedError` — PG사 미확정이라 실제 승인 로직 없음)
+**확정 정책(2026-08-06 CTO 최종 확정, `docs/decision-log.md` 참고)**
+
+| 플랜 | 월 요금 | 연 정상가 | 연 판매가 | 등기부등본 |
+|---|---|---|---|---|
+| 베이직(BASIC) | 12,900원 | 154,800원 | 154,800원 | 월 5회 |
+| 프로(PRO) | 22,900원 | 274,800원 | **198,000원(할인)** | 월 10회 |
+
+기존 표기(`BETA_EARLYBIRD`/`STANDARD`, "얼리버드 평생 9,900원 유지", "평생 누적 5회")는 전부 폐기됨.
+
+**구현 완료(2026-08-06) — 할인 정책을 하드코딩하지 않는 구조**
+
+- `PLAN_CATALOG`가 플랜 → 결제주기 → 가격 항목 구조를 갖는다. 가격 항목이 지원하는 필드:
+
+  | 필드 | 필수 | 의미 |
+  |---|---|---|
+  | `list_price` | 필수 | 정상가 |
+  | `sale_price` | 선택 | 고정 할인가. 지정되면 이 값이 청구액 |
+  | `discount_percent` | 선택 | 정률 할인(%). `sale_price`가 없을 때만 적용 |
+  | `discount_start` | 선택 | 할인 시작일 `YYYY-MM-DD` (생략 시 제한 없음) |
+  | `discount_end` | 선택 | 할인 종료일 `YYYY-MM-DD` (그날까지 포함) |
+
+  현재 값이 채워진 것은 프로 연간뿐이다(`list_price=274800`, `sale_price=198000`, 기간 무제한).
+- `resolve_plan_price(plan, billing_cycle, at=None)`이 가격 해석의 **단일 진입점**이다 —
+  호출부(결제 라우터)는 가격 규칙을 전혀 모른다. 할인 우선순위는
+  `sale_price` > `discount_percent` > `list_price`이고, **기간을 벗어나면 자동으로 정상가로
+  복귀**하므로 이벤트 종료 시 코드를 고칠 필요가 없다(카탈로그 값만 넣고 빼면 된다)
+- 결제주기: `BILLING_MONTHLY`(30일) / `BILLING_YEARLY`(365일). `BILLING_PERIOD_DAYS`로 관리하며
+  요청에 `billing_cycle`이 없으면 월 결제로 간주한다(기존 호출 호환)
+- 금액 검증은 기존 방식 유지 — 서버가 계산한 금액과 요청 `amount`가 다르면 거부
+
+### 확정 Spec 미반영 항목 (2026-08-06 기준)
+
+1. ~~플랜 체계 교체~~ → **완료**(`BASIC`/`PRO`, 12,900/22,900원)
+2. ~~연 결제 도입~~ → **완료**(154,800/198,000원, 365일)
+3. ~~등기부 한도 월 리셋 + 플랜별 차등~~ → **완료**
+4. 기존 `BETA_EARLYBIRD` 구독 row 이관 방침 — **미정**(스키마 변경은 불필요. 운영 DB에 해당
+   row가 존재하는지 확인 후 처리 방침 결정 필요)
+5. `KGInicisProvider` 신설 — **미착수**(외부 API Key/계약 필요, 론칭 직전까지 연기. 아래 참고)
+
+### Payment Provider 구조 (2026-08-05, PG 실연동 준비 / 2026-08-06 PG사 확정 반영)
+- **PG사는 KG이니시스로 확정됨(2026-08-06 CTO 확정)**. 단 코드에는 아직 `KGInicisProvider`가 **존재하지 않는다** — `api/v1/payment_providers.py`에는 여전히 `TossProvider`/`PortOneProvider` 자리만 있고, `get_payment_provider()`의 `_PROVIDERS` 맵도 `mock`/`toss`/`portone` 3개만 인식한다. Provider 신설 + 실제 API 구현은 외부 API Key/계약이 필요해 승인 대기 상태
+- `api/v1/payment_providers.py`: `PaymentProvider`(인터페이스) → `MockProvider`(현재 사용, 항상 SUCCESS) / `TossProvider`·`PortOneProvider`(자리만 있음, 호출 시 `NotImplementedError`. **PG사 확정으로 이 두 클래스는 이제 폐기 예정 상태** — 삭제는 승인 필요 작업이라 코드에 그대로 남아있음)
 - `get_payment_provider()`가 환경변수 `PAYMENT_PROVIDER`(mock/toss/portone, 기본값 `mock`)로 어떤 Provider를 쓸지 결정. `.env`에 값이 없어도 기존과 동일하게 `mock`으로 동작(하위호환)
 - `payments.py`의 `create_payment_record()`가 `provider`의 결과(`status`/`pg_provider`/`pg_transaction_id`)를 그대로 `payments` row에 기록만 함 — router는 여전히 SQLite에 직접 쓰고, provider는 "결제 승인 여부"만 결정하는 좁은 역할(서비스/레포지토리 계층 아님). 2026-08-05부터 `charge()` 단일 호출 대신 `create_order()`→`confirm_payment()`→`verify_payment()` 순서로 호출(아래 "Payment Flow Migration" 참고)
 - `status != "SUCCESS"`(현재는 도달하지 않음, PG 실연동 시 사용)면 결제 실패로 기록하고 구독/등기부 연결 같은 후속 효과는 만들지 않음
-- ~~[2026-08-05 Payment Final Audit] 현재 인터페이스는 실제 Toss/PortOne 연동에 부족함~~ → **2026-08-05 Provider Interface v2로 확장 완료**. `PaymentProvider`에 5개 메서드 추가: `create_order()`(주문 생성) / `confirm_payment()`(결제 승인) / `cancel_payment()`(취소·환불) / `verify_payment()`(서버가 PG API로 재확인) / `handle_webhook()`(PG Webhook payload 정규화). `MockProvider`는 6개 메서드(기존 `charge()` 포함) 전부 구현, `TossProvider`/`PortOneProvider`는 여전히 자리만(base class의 `NotImplementedError` 상속)
+- ~~[2026-08-05 Payment Final Audit] 현재 인터페이스는 실제 PG 연동에 부족함~~ → **2026-08-05 Provider Interface v2로 확장 완료**. `PaymentProvider`에 5개 메서드 추가: `create_order()`(주문 생성) / `confirm_payment()`(결제 승인) / `cancel_payment()`(취소·환불) / `verify_payment()`(서버가 PG API로 재확인) / `handle_webhook()`(PG Webhook payload 정규화). `MockProvider`는 6개 메서드(기존 `charge()` 포함) 전부 구현 — 이 인터페이스는 KG이니시스 연동에도 그대로 재사용 가능
 - ~~이번 v2는 인터페이스 확장만 — payments.py는 아직 charge()만 호출~~ → **2026-08-05 Payment Flow Migration으로 연결 완료**(바로 아래 항목)
 
 ### Payment Flow Migration (2026-08-05)
@@ -180,7 +234,7 @@ JWT 없으면 기록 안 함 (에러 없음).
 
 ### 결제(Payment) → 구독(Subscription) → Premium → Registry (2026-08-05 완성, PG 미연동)
 - `POST /api/v1/payments`: PG 미연동 상태의 Mock 결제(`MockProvider`). 요청 즉시 `payments.status="SUCCESS"`로 기록(`pg_provider=null`, `pg_transaction_id="MOCK-<uuid>"`)
-- `payment_type="SUBSCRIPTION"`이면 같은 요청 안에서 `subscriptions` row를 함께 생성(`status="ACTIVE"`, `started_at=now`, `expires_at=now+30일`). 플랜별 가격(`amount`)은 2026-08-05부터 `PLAN_PRICES`(`BETA_EARLYBIRD`=9,900원, `STANDARD`=22,900원) 기준으로 서버에서 검증한다(`OVERAGE_FEE`와 동일한 방식)
+- `payment_type="SUBSCRIPTION"`이면 같은 요청 안에서 `subscriptions` row를 함께 생성(`status="ACTIVE"`, `started_at=now`, `expires_at=now + 결제주기별 기간`(월 30일 / 연 365일)). 금액(`amount`)은 서버가 `PLAN_CATALOG`로 계산한 값(`resolve_plan_price()`, 할인 적용 후)과 대조해 검증한다(`OVERAGE_FEE`와 동일한 방식) — 클라이언트가 보낸 금액을 신뢰하지 않는다
 - Premium 여부는 별도 테이블/플래그 없이 `registry.py`의 `has_active_subscription()`(status=ACTIVE AND expires_at > now)으로만 판정 — `subscriptions` row 존재가 곧 Premium
 - `payment_type="OVERAGE_USAGE"`(등기부 초과 건별 결제): `req.amount`가 `registry.py`의 `OVERAGE_FEE`(=1000) 상수와 다르면 결제 자체를 거부. 결제 성공 시 해당 유저의 가장 오래된 미결제 `PAYMENT_REQUIRED` 건을 찾아 `payment_id` 연결 + `status="PENDING"`으로 전환(같은 트랜잭션, 부분 성공 시 rollback). 결제할 대상이 없으면(이미 결제됨/애초에 없음) `payments` row 자체를 만들지 않고 즉시 거부
 - 프론트엔드는 `/api/v1/payments`, `/api/v1/registry-requests`를 실제로 호출한다(`src/app/properties/[id]/page.tsx`, 2026-08-05 연동) — 더 이상 "미호출" 아님
@@ -268,7 +322,7 @@ Task Scheduler (매일 06:00)
 - `search_presets`: conditions JSON
 
 ### 결제/등기부 테이블 (Phase 1)
-- `subscriptions`: plan(BETA_EARLYBIRD/STANDARD), status(ACTIVE/CANCELLED/EXPIRED)
+- `subscriptions`: plan(BASIC/PRO — 2026-08-06 확정. 컬럼은 CHECK 제약 없는 TEXT라 스키마 변경 없이 교체됨. 과거 BETA_EARLYBIRD/STANDARD row가 남아있을 수 있음), status(ACTIVE/CANCELLED/EXPIRED)
 - `registry_usage`: is_free, charged_amount
 - `payments`: payment_type(SUBSCRIPTION/OVERAGE_USAGE), pg_provider(미연동, null)
 - `registry_requests`: status(PENDING/PAYMENT_REQUIRED/PROCESSING/COMPLETED/FAILED)
@@ -309,7 +363,8 @@ Task Scheduler (매일 06:00)
 - ~~OVERAGE_USAGE 결제 → registry_requests 자동 연결~~ (2026-08-05 완료)
 - ~~관리자 페이지(등기부 신청 상태 관리)~~ (2026-08-05 MVP 완료, `api/v1/admin.py`)
 - ~~등기부 문서 전달 구조~~ (2026-08-05 완료 — 운영자가 파일을 `registry_documents/`에 배치 + Admin이 `doc_url` 연결하는 수동 방식. 대법원 인터넷등기소 등 실제 발급기관과의 자동 연동은 여전히 없음 — 아래 알려진 문제점 참고)
-- PG사 실연동 (Toss/PortOne 등, 여전히 미확정)
+- PG사 실연동 — **PG사는 KG이니시스로 확정(2026-08-06)**, `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현이 남음(외부 API Key/계약 필요, 승인 대기)
+- 확정된 구독 정책(베이직/프로, 연 결제, 등기부 월 리셋) 코드 반영 — 위 "확정 Spec 미반영 항목" 참고
 - registry_rights 테이블
 
 ### Phase 3
@@ -333,20 +388,27 @@ Task Scheduler (매일 06:00)
 
 ## 알려진 문제점
 
-- 외부 봇/스캐너 접근 중 (0.0.0.0:8000, 방화벽 미설정)
+- ~~외부 봇/스캐너 접근 중 (0.0.0.0:8000, 방화벽 미설정)~~ → 2026-08-06 코드/git 이력 재확인 결과
+  stale. `api_server.py`가 이미 `host="127.0.0.1"`(localhost 전용)로 바인딩되고 있어(커밋
+  `bfefbf7`에서 `0.0.0.0`→`127.0.0.1`로 변경됨), 이 코드 경로로 실행하는 한 외부에서 직접
+  접근할 수 없다. 다만 실제 운영 서버가 이 저장소의 `api_server.py`를 그대로(코드 수정/CLI
+  `--host` 오버라이드 없이) 실행 중인지는 이번 정정의 범위 밖 — 배포 방식 자체는 코드로
+  검증되지 않음(운영 환경 확인 필요, Non-blocking)
 - sido="" 데이터 1건 존재
-- 자유텍스트 주소 검색 미지원
+- ~~자유텍스트 주소 검색 미지원~~ → 2026-08-06 코드 재확인 결과 stale했음. `GET /api/v1/search`의 `address_detail` 파라미터로 이미 지원됨(`intent/analyzer.py` 기반 SIDO/SIGUNGU/DONG 구조화 시도 후, 구조화 불가능한 입력은 `full_address LIKE`로 폴백), 프론트(`SearchForm.tsx`)까지 연동 완료. 자세한 내용은 `docs/search-engine.md` "자유텍스트 주소 검색" 절 참고
 - ~~등기부 다운로드 501~~ → 2026-08-05 파일 전달 구조로 해결. 단 실제 등기부등본을 자동으로 수집/발급받는 기능은 없음 — 운영자가 대법원 인터넷등기소 등에서 수동으로 발급받아 `registry_documents/`에 넣어야 함(자동화 아님, 운영 부담 존재)
 - ~~SUPABASE_JWT_SECRET 미입력~~ → 2026-08-05 재확인 결과 값이 설정되어 있음(이 문서의 오래된 서술이었음)
 - auction.db 백업 없음
 - ~~`POST /api/v1/payments`가 `SUBSCRIPTION` 플랜별 가격을 서버에서 검증하지 않음~~ → 2026-08-05 해결. `OVERAGE_USAGE`(`OVERAGE_FEE`)와 `SUBSCRIPTION`(`PLAN_PRICES`) 둘 다 서버에서 금액을 검증한다
-- 구독 기간 30일 고정값은 정책 확정 전 임시 가정
-- 등기부 무료 한도가 코드(평생 누적 5회)와 구독 정책 문서(월 5회)로 여전히 불일치(`docs/decision-log.md` Pending Decisions 참고) — Admin/Payment 연결은 완성됐지만 이 정책 자체는 미확정
+- ~~구독 기간 30일 고정~~ → 2026-08-06 해결(`BILLING_PERIOD_DAYS`, 월 30일 / 연 365일)
+- ~~등기부 무료 한도 평생 누적~~ → 2026-08-06 해결(월 리셋 + 플랜별 차등)
+- ~~플랜명/가격 불일치~~ → 2026-08-06 해결(`BASIC` 12,900 / `PRO` 22,900, 연 결제 포함)
+- 기존 `BETA_EARLYBIRD`/`STANDARD` 플랜으로 생성된 `subscriptions` row가 있다면 새 플랜 체계로 해석되지 않는다 — `get_user_free_limit()`이 `DEFAULT_FREE_LIMIT`(5)로 폴백하므로 동작은 안전하나, 이관 방침은 미정
 - `ADMIN_API_KEY`가 `.env`에 아직 설정되어 있지 않음 — 설정 전까지 모든 `/api/v1/admin/*` 요청은 `500`
 - Admin 인증에 역할(role) 구분이 없음 — 키를 아는 사람은 누구나 전체 관리자 권한(MVP 한계, 사용자 확인 하에 채택)
 - ~~[Release Blocking] 등기부 무료횟수 레이스 컨디션~~ → **2026-08-05 수정 완료**. `registry.py:create_registry_request()`에서 `conn.isolation_level = None` + `BEGIN IMMEDIATE`로 무료횟수 확인(`get_free_count()`)과 INSERT를 하나의 원자적 트랜잭션으로 묶었다 — SQLite가 이 커넥션에 즉시 쓰기 락을 선점시켜, 동시 요청 중 하나가 커밋을 마칠 때까지 다른 요청은 자신의 COUNT를 다시 셀 수 없다. `payments.py`의 `OVERAGE_USAGE`(조건부 UPDATE+rowcount)와 목적은 같지만, 이쪽은 COUNT 집계값을 다루므로 row 단위 조건부 UPDATE로는 막을 수 없어 트랜잭션 자체를 직접 제어하는 방식을 썼다. 5/10/20 스레드 동시 요청 테스트 전부에서 정확히 5건만 무료 처리되고 나머지는 `PAYMENT_REQUIRED`로 정상 처리됨을 실증 확인(이전엔 5스레드만으로도 8건까지 초과됐었음)
 - SQLite FK(`REFERENCES`)가 `storage/database.py`에 `PRAGMA foreign_keys=ON`이 없어 DB 레벨에서 전혀 강제되지 않음(확인됨, 스키마 선언은 문서용). 현재는 어떤 테이블에도 DELETE 경로가 없어 실제 orphan row는 발생하지 않지만, 구조적으로는 무방비 상태(Non-blocking, 향후 삭제 기능 추가 시 재검토 필요)
-- `registry.py:create_registry_request()`는 다중 INSERT 앞뒤로 명시적 `try/except/rollback`이 없음(반면 `payments.py`/`admin.py`는 있음) — 실측 결과 `conn.commit()` 없이 `conn.close()`하면 SQLite가 자동으로 rollback하므로 현재는 안전하지만, 코드 일관성 문제로 남아있음(Non-blocking)
+- ~~`registry.py:create_registry_request()`는 다중 INSERT 앞뒤로 명시적 `try/except/rollback`이 없음~~ → 2026-08-06 코드 재확인 결과 stale한 서술이었음. Sprint 10(`BEGIN IMMEDIATE` 도입) 시점에 `except Exception: conn.rollback(); raise`가 이미 함께 추가되어 있어 `payments.py`/`admin.py`와 동일한 패턴을 따르고 있음(코드 확인 완료, 수정 불필요)
 - `payments.status`의 스키마 선언값(PENDING/SUCCESS/FAILED/REFUNDED) 중 `PENDING`은 컬럼 DEFAULT로만 존재(모든 INSERT가 status를 명시적으로 지정해 실제로는 절대 쓰이지 않음), `REFUNDED`는 이 값을 쓰는 코드가 전체 저장소에 0건(환불 기능 자체가 없음) — 둘 다 죽은 상태(Non-blocking, PG/환불 기능 설계 시 정리 필요)
 
 ---
@@ -355,7 +417,7 @@ Task Scheduler (매일 06:00)
 
 - 투자점수 / AI추천 / 수익률 계산 개발 금지
 - 방화벽 설정: 베타 공개 직전 별도 작업
-- PG 연동 코드 작성 금지 (PG사 미확정) — 여전히 유효, `pg_provider`는 계속 null
+- PG 연동 코드 작성 금지 — 2026-08-06 PG사는 KG이니시스로 확정됐으나, **실제 연동 코드 작성은 여전히 금지**(외부 API Key/계약이 필요한 승인 대상). `pg_provider`는 계속 null, `MockProvider` 동작 유지
 - ~~결제 성공 가정 Mock 로직 백엔드 작성 금지~~ → **2026-08-05 Sprint 1에서 예외적으로 구현됨** (`api/v1/payments.py`, CTO 승인). 기존 결정(`docs/decision-log.md`)을 이 범위에 한해 대체함. Payment↔Subscription↔Premium 내부 체인 검증 목적이며 PG 실연동과는 무관
 - ~~`registry_requests`의 PAYMENT_REQUIRED(등기부 초과분) 상태는 결제와 연결되지 않는다~~ → 2026-08-05 자동 연결 구현 완료(위 "결제(Payment)..." 참고)
 - property_type 코드: APARTMENT/OFFICETEL/LAND/FACTORY/COMMERCIAL/MULTI_FAMILY

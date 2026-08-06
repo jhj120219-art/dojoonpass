@@ -68,8 +68,9 @@ npm run lint      # eslint
 ```bash
 python api_server.py
 # or: uvicorn api_server:app --reload
-# serves on 0.0.0.0:8000, Swagger UI at /docs
+# serves on 127.0.0.1:8000 (localhost-only), Swagger UI at /docs
 ```
+2026-08-06 정정: `api_server.py`의 `if __name__ == "__main__":` 블록이 `uvicorn.run(..., host="127.0.0.1", ...)`으로 하드코딩되어 있음(`git log -p -- api_server.py` 확인 결과 커밋 `bfefbf7`(인증 도입 시점)에서 `0.0.0.0` → `127.0.0.1`로 이미 변경됨). `uvicorn api_server:app --reload` CLI 실행도 `--host` 미지정 시 uvicorn 자체 기본값이 `127.0.0.1`이라 결과는 동일. 이전 버전 문서의 "0.0.0.0:8000"은 stale — 자세한 내용은 `docs/backend.md` 참고.
 No `requirements.txt` exists — dependencies are inferred from imports (`fastapi`, `uvicorn`, `python-dotenv`, `python-jose`, `selenium`, `webdriver-manager`, `pandas`). Get explicit approval before installing anything (project rule above).
 
 ### Daily crawl pipeline (`run_daily.bat`, Task Scheduler job `LawAuctionDailyCrawl`)

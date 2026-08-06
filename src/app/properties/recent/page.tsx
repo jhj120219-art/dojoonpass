@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { fetchAuthedJSON, ApiError } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
+import { formatPrice } from '@/lib/format'
 import PrimaryNav from '@/components/PrimaryNav'
 
 interface RecentItem {
@@ -22,13 +23,6 @@ interface RecentItem {
   status: string | null
   fail_count: number
   viewed_at: string
-}
-
-function formatPrice(price: number) {
-  if (!price) return '-'
-  if (price >= 100000000) return (price / 100000000).toFixed(1) + '억'
-  if (price >= 10000) return Math.round(price / 10000) + '만'
-  return String(price)
 }
 
 export default function RecentItemsPage() {

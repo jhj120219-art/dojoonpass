@@ -22,7 +22,7 @@ export async function createServerSupabaseClient() {
             cookiesToSet.forEach(({ name, value, options }) => {
               cookieStore.set(name, value, options)
             })
-          } catch (error) {
+          } catch {
             // 서버 컴포넌트에서 쿠키 쓰기 제한 시 무시 (middleware가 처리)
           }
         },

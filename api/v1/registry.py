@@ -9,7 +9,9 @@ from api.auth import get_current_user, success, fail
 
 router = APIRouter()
 
-FREE_LIMIT = 5
+# 플랜을 알 수 없을 때(구독 정보 조회 실패 등) 적용할 보수적 기본 한도.
+# 실제 한도는 플랜별로 다르며 api/v1/payments.py의 PLAN_CATALOG가 단일 기준이다.
+DEFAULT_FREE_LIMIT = 5
 OVERAGE_FEE = 1000  # 무료 초과 시 건당 금액. api/v1/payments.py의 OVERAGE_USAGE 결제 검증이 이 값을 그대로 참조한다.
 
 # 등기부 실제 문서 저장 위치. api/v1/documents.py의 DOCUMENT_ROOT(크롤러가 수집하는
@@ -22,11 +24,44 @@ REGISTRY_DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "registry_documents")
 class RegistryRequest(BaseModel):
     item_id: int
 
+def get_month_start(now: datetime = None) -> str:
+    """이번 달 1일 00:00:00의 ISO 문자열. 무료 한도는 매월 리셋된다(정책 확정: 월 단위)."""
+    now = now or datetime.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
 def get_free_count(conn, user_id: str) -> int:
+    """
+    이번 달에 소진한 무료 등기부 횟수.
+
+    used_at은 datetime.now().isoformat() 형식으로 저장되므로 문자열 비교로 월 경계를 나눌 수
+    있다(ISO 8601은 사전순 = 시간순). 월이 바뀌면 자동으로 0부터 다시 센다 — 별도 리셋 배치 불요.
+    """
     return conn.execute(
-        "SELECT COUNT(*) FROM registry_usage WHERE user_id=? AND is_free=1",
-        (user_id,)
+        "SELECT COUNT(*) FROM registry_usage WHERE user_id=? AND is_free=1 AND used_at >= ?",
+        (user_id, get_month_start())
     ).fetchone()[0]
+
+
+def get_user_free_limit(conn, user_id: str) -> int:
+    """
+    이 사용자의 이번 달 무료 한도. 활성 구독의 plan에 따라 달라진다(베이직 5회 / 프로 10회).
+    구독이 없으면 애초에 신청 자체가 막히므로(has_active_subscription) 도달하지 않지만,
+    플랜명을 해석할 수 없는 경우에는 보수적으로 기본값을 쓴다.
+    """
+    from api.v1.payments import get_registry_monthly_limit
+
+    now = datetime.now().isoformat()
+    row = conn.execute("""
+        SELECT plan FROM subscriptions
+        WHERE user_id=? AND status='ACTIVE'
+        AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY started_at DESC LIMIT 1
+    """, (user_id, now)).fetchone()
+    if not row:
+        return DEFAULT_FREE_LIMIT
+    limit = get_registry_monthly_limit(row["plan"])
+    return limit if limit > 0 else DEFAULT_FREE_LIMIT
 
 def has_active_subscription(conn, user_id: str) -> bool:
     now = datetime.now().isoformat()
@@ -62,8 +97,10 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
         conn.execute("BEGIN IMMEDIATE")
         try:
             # 무료 횟수 확인 (이 지점부터는 쓰기 락을 쥐고 있어 다른 요청과 절대 겹치지 않는다)
+            # 한도는 플랜별로 다르고(베이직 5 / 프로 10), 사용량은 이번 달 것만 센다.
+            free_limit = get_user_free_limit(conn, user_id)
             free_used = get_free_count(conn, user_id)
-            is_free = free_used < FREE_LIMIT
+            is_free = free_used < free_limit
             charged_amount = 0 if is_free else OVERAGE_FEE
 
             # PAYMENT_REQUIRED 처리
@@ -104,7 +141,7 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
                 "item_id": req.item_id,
                 "status": "PENDING",
                 "is_free": True,
-                "free_remaining": FREE_LIMIT - free_used - 1,
+                "free_remaining": free_limit - free_used - 1,
                 "charged_amount": 0,
                 "requested_at": now,
             })

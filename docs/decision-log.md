@@ -243,12 +243,120 @@ Last Updated: 2026-08-05
 
 ---
 
+## PG사 확정 — KG이니시스 (2026-08-06, CTO 확정)
+
+결정
+
+- 결제대행사(PG)는 **KG이니시스**로 확정한다. Toss Payments/PortOne은 후보에서 제외한다.
+- 단, 이번 확정은 **의사결정만** 반영한다 — 실제 API 연동 코드는 이 시점에 작성하지 않는다.
+
+이유
+
+- 장기간 "PG사 미확정" 상태가 Critical Path를 막고 있어 CTO가 직접 확정함
+
+영향 (코드 현황 — 2026-08-06 기준, 의도적으로 미착수)
+
+- CTO 지시에 따라 **실제 API 연동·계약·API Key 입력·Webhook 연결·실결제 테스트는 론칭
+  직전까지 연기**한다. 현재는 `MockProvider`를 유지하며 Provider 구조만 KG이니시스 기준으로 둔다.
+- `api/v1/payment_providers.py`에는 여전히 `TossProvider`/`PortOneProvider` 자리만 있고
+  **`KGInicisProvider` 클래스는 존재하지 않는다**. `get_payment_provider()`의 `_PROVIDERS`
+  맵도 `mock`/`toss`/`portone` 3개만 인식한다(`PAYMENT_PROVIDER` 환경변수 허용값 동일)
+- 즉 "PG사 = KG이니시스"는 현재 **문서상 확정 / 코드 미반영** 상태다. Provider 클래스 신설과
+  Interface v2 6개 메서드의 실제 구현은 별도 Sprint(승인 필요 — 외부 API Key/계약 필요)
+- `pg_provider` 컬럼은 실연동 전까지 계속 null(MockProvider 동작 그대로)
+
+---
+
+## 구독 정책 확정 — 베이직/프로 2단계 (2026-08-06, CTO 최종 확정)
+
+결정
+
+| 플랜 | 월 요금 | 연 정상가 | 연 판매가 | 등기부등본 |
+|---|---|---|---|---|
+| 베이직(BASIC) | 12,900원 | 154,800원 | 154,800원(할인 없음) | **월 5회** |
+| 프로(PRO) | 22,900원 | 274,800원 | **198,000원(할인 적용)** | **월 10회** |
+
+- 연 정상가는 월 요금 × 12 (베이직 154,800 / 프로 274,800).
+- **프로 연간은 이벤트 할인가 198,000원으로 판매**한다(정상가 대비 76,800원 인하).
+- 가격은 하드코딩하지 않고 `list_price`(정상가) / `sale_price`(판매가)를 분리해 저장한다 —
+  향후 할인 기간(`discount_start`/`discount_end`)이나 `discount_percent` 같은 필드를 붙일 때
+  카탈로그만 확장하면 되고 결제/검증 로직은 손대지 않도록 설계한다.
+
+**구현 상태(2026-08-06 반영 완료)**
+
+- `api/v1/payments.py`: `PLAN_CATALOG`(플랜 → 결제주기 → 가격항목) 도입. 가격항목은
+  `list_price`/`sale_price`/`discount_percent`/`discount_start`/`discount_end`를 지원하며,
+  가격 해석은 `resolve_plan_price()` 단일 진입점에 모아 호출부가 가격 규칙을 알지 못하게 했다.
+  할인 우선순위는 `sale_price` > `discount_percent` > `list_price`이고, 지정한 기간을 벗어나면
+  자동으로 정상가로 복귀한다 — 이벤트 시작/종료 시 코드 수정이 필요 없다.
+- 결제주기: `BILLING_MONTHLY`(30일) / `BILLING_YEARLY`(365일). 요청의 `billing_cycle`이
+  없으면 기존 호출과의 호환을 위해 월 결제로 간주한다.
+- 등기부 한도: `PLAN_CATALOG[plan]["registry_monthly_limit"]`(베이직 5 / 프로 10)이 단일 기준.
+
+- 등기부 무료 한도는 **월 단위 리셋**으로 확정한다(기존 "평생 누적" 해석은 폐기).
+- 한도는 **플랜별로 다르다**(베이직 5회 / 프로 10회) — 단일 상수 정책이 아니다.
+- 연 결제를 새로 도입한다(베이직 154,800원 / 프로 198,000원).
+- 기존 표기 `BETA_EARLYBIRD`(베타 얼리버드) / `STANDARD`(스탠다드), "평생 9,900원 유지",
+  "평생 누적 5회", 그리고 중간 검토 단계에서 거론됐던 9,900원·19,800원·99,000원 안은
+  **전부 폐기**하고 위 표로 통일한다.
+
+이유
+
+- 요금제/한도가 문서마다 달라(9,900 vs 12,900 vs 22,900, 평생 vs 월) 정합성이 깨져 있었고,
+  Beta 출시 전 과금 기준을 하나로 확정할 필요가 있어 CTO가 직접 결정함
+
+영향 (2026-08-06 코드 반영 완료)
+
+- `api/v1/payments.py`: `VALID_PLANS = ("BASIC", "PRO")`, `PLAN_CATALOG`가 플랜×결제주기별
+  `list_price`/`sale_price`를 보유. 서버가 `resolve_plan_price()`로 계산한 금액과 요청 `amount`가
+  다르면 결제를 거부한다(기존 검증 방식 유지, 기준값만 카탈로그 기반으로 교체)
+- `api/v1/registry.py`: `get_free_count()`가 이번 달 사용분만 COUNT(`used_at >= 이번달 1일`),
+  `get_user_free_limit()`이 활성 구독의 plan으로 한도를 조회 — 월 리셋 + 플랜별 차등 동작
+- `src/app/properties/[id]/page.tsx`: 월/연 토글 + 플랜 카드(정상가 취소선 + 판매가) UI로 교체,
+  `billing_cycle`을 함께 전송
+- `storage/migrations/004_create_subscriptions.sql`: `plan`은 CHECK 제약 없는 TEXT라 **스키마
+  변경 없이 플랜명 교체 완료**. 다만 기존 `BETA_EARLYBIRD` row의 이관 방침은 여전히 미정
+  (현재 운영 DB에 해당 row가 있는지는 별도 확인 필요 — Pending Decisions 참고)
+
+---
+
+## auction_case UNIQUE 키 — (court_code, case_no) 복합키로 확정 (2026-08-06, CTO 확정)
+
+결정
+
+- `auction_case`의 `case_no` 단독 UNIQUE 제약을 **`(court_code, case_no)` 복합 UNIQUE**로
+  변경한다(`docs/BUGS.md` #14 Release Blocking의 해결 방향).
+- **2026-08-06 Migration 실행 완료** (CTO 승인). `storage/migrations/011_auction_case_court_code_unique.sql`
+
+이유
+
+- 법원마다 사건번호를 독립 채번하므로 전국 단일 UNIQUE는 구조적으로 충돌한다(실측 3건 확인).
+  식별자로는 법원 + 사건번호 조합이 유일하게 안전하다.
+
+실행 내역 / 결과 (2026-08-06)
+
+- `auction_case`에 `court_code` 컬럼이 없었으므로 신규 추가했다. SQLite는 기존 테이블의
+  UNIQUE 제약을 ALTER로 바꿀 수 없어, 새 테이블 생성 → 데이터 이관 → 교체(표준 재작성 패턴)로 처리
+- `court_code` 정본은 크롤러 원본 `auction.court_code`를 그대로 사용. 이 컬럼에는
+  `config/courts.py:ALL_COURTS`의 `code`(= 법원명 문자열)가 들어있고 NULL이 0건임을 실측 확인했다
+  (`config/settings.py:COURTS`의 `B000210` 형식과 다르지만, 실제 데이터의 정본은 전자다)
+- `migrate_execute.py`의 dedup 키와 조회 키도 `(court_code, case_no)`로 함께 변경 — 안 하면
+  매일 크롤링이 `court_code=NULL` row를 만들어 재오염된다
+- **검증 결과**: 사본 DB 리허설 후 실제 적용. `auction_case` 1,377 → 1,380건(충돌 3건이 법원별로
+  정확히 분리), `auction_item` 1,870건 불변, orphan `case_id` 0건,
+  **잘못된 법원 연결(court mismatch) 0건 — 원래 버그가 해소됨**. 실행 전 타임스탬프 백업 생성
+- 안전장치: `auction.db.backup_before_court_code_20260806_173734`
+
+---
+
 # Pending Decisions
 
 아직 결정되지 않음
 
-- PG사 (Mock 결제로 내부 체인은 검증됨, 2026-08-05 — 실연동 PG사 선정은 여전히 미정)
-- 등기부 무료 한도 정책: 코드는 평생 누적 5회, 문서(구독 정책)는 "월 5회"로 표기 — 어느 쪽이 맞는지 미확정
+- ~~PG사~~ → 2026-08-06 KG이니시스로 확정(위 참고)
+- ~~등기부 무료 한도 정책(평생 vs 월)~~ → 2026-08-06 월 단위 + 플랜별 차등으로 확정(위 참고)
+- 구독 플랜 변경/해지·환불 정책 (연 결제 도입으로 중도 해지 시 정산 기준 필요)
+- 기존 `BETA_EARLYBIRD` 구독 row의 신규 플랜 체계 이관 방침
 - 검색 인덱스
 - 문서 수집 구조
 - 권리분석 고도화

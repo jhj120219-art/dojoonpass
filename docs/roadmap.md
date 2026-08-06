@@ -65,7 +65,7 @@ Beta v1 Development
 - **등기부 다운로드 엔진 완료(Sprint 6)**: `GET /registry-requests/{id}/download`가 실제 파일을 서빙한다. Admin이 `COMPLETED` 전이 시 `doc_url`(필수)을 지정하면 `registry_documents/`(신규, `.gitignore`)에서 파일을 찾아 반환. 본인 신청만 다운로드 가능(소유권 검사), 경로 탐색 방지(`documents.py`와 동일 패턴). **자동 등기부 수집 엔진이 아니다** — 대법원 인터넷등기소 등 실제 발급기관과의 연동은 없고, 운영자가 수동으로 발급받아 파일을 배치하는 구조
 - **등기부 다운로드 UI 완료(Sprint 7)**: `properties/[id]/page.tsx`에 상태별 UI 완성 — `PAYMENT_REQUIRED`→결제 버튼, `PENDING`/`PROCESSING`→상태 표시, `FAILED`→`reason` 표시, `COMPLETED`→"📥 등기부 다운로드" 버튼(클릭 시 실제 파일이 브라우저로 저장됨, `fetch`+`blob`+`<a download>`). `GET /registry-requests`·`{id}` 응답에 `reason` 필드 추가, CORS에 `expose_headers=["Content-Disposition"]` 추가(파일명 노출용) — 실제 브라우저로 다운로드 완료까지 Runtime QA 확인
 - **PG Integration Preparation 완료(Sprint 8)**: `api/v1/payment_providers.py` 신규(`PaymentProvider`→`MockProvider`/`TossProvider`/`PortOneProvider`), `PAYMENT_PROVIDER` 환경변수로 선택. `SUBSCRIPTION` 플랜별 가격도 `PLAN_PRICES`로 서버 검증(`OVERAGE_FEE`와 동일 방식). 리팩터링 전후 Registry 체인 100% 동일 동작 Runtime QA 확인
-- 미완료: PG사 확정 + `TossProvider`/`PortOneProvider` 실제 구현, 구독 플랜 선택 UI, 등기부 무료한도 정책(평생 vs 월) 확정, 실제 발급기관 자동 연동 — 아래 "Next Priority" 참고
+- 미완료(2026-08-06 갱신): KG이니시스 실연동만 남음(계약·API Key 필요). 구독 플랜 UI/등기부 무료한도 정책은 확정 및 코드 반영 완료, 실제 발급기관 자동 연동은 Beta v2 범위
 
 ---
 
@@ -73,14 +73,20 @@ Beta v1 Development
 
 ## Frontend
 
-- 권리분석 화면 연동 (`rightsAnalysis.ts` REGISTRY 소스 하드코딩 해소 — 등기부 신청 카드와는 별개 화면)
-- 플랜 비교/선택 UI 신규 구현 (현재 구독 버튼은 베타 얼리버드 단일 옵션 고정)
+- 권리분석 화면 연동 (`rightsAnalysis.ts` REGISTRY 소스 하드코딩 해소) — 2026-08-06 조사 결과 **승인
+  필요(DB 스키마 변경)로 확인되어 보류**. `tenant_rights`/`rights_summary`는 STATUS/SPEC 문서
+  파싱 결과만 담는 테이블이고, 등기부(REGISTRY) 파싱 데이터를 저장할 테이블 자체가 없음(`docs/backend.md`
+  Phase 2의 `registry_rights` 테이블이 아직 미착수) — 등기부 PDF는 크롤러가 수집하지 않고 운영자가
+  수동 배치한 원본 파일일 뿐이라 파싱 로직도 없음. 새 테이블 추가(스키마 변경) + OCR/파싱 파이프라인
+  신규 구축이 선행되어야 하는 별도 규모의 작업이라 "하드코딩 해소" 한 줄로 될 수 없음 — 사용자 승인 후 별도 Sprint로 재계획 필요
+- ~~플랜 비교/선택 UI 신규 구현~~ (2026-08-06 완료 — `properties/[id]/page.tsx`, BASIC/PRO 비교 카드 + 월/연 토글 + 할인가 표시)
 
 ## Backend
 
-- 등기부 무료 한도 정책 확정 (코드=평생 누적 5회 vs 문서=월 5회, 불일치 상태 — Admin/Payment 연결은 끝났지만 이 정책 자체는 미확정)
+- ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정 + 코드 반영 완료**(플랜별 월 단위: 베이직 5회 / 프로 10회, 월 자동 리셋)
+- ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**: `BASIC` 12,900원/월·154,800원/년, `PRO` 22,900원/월·연 정상가 274,800원→판매가 198,000원. 할인은 `list_price`/`sale_price` 분리 구조
 - `ADMIN_API_KEY`를 `.env`에 설정 (Admin MVP는 완료됐으나 현재 키 미설정으로 전체 500)
-- `SUBSCRIPTION` 결제 금액 서버 검증 (`OVERAGE_USAGE`는 2026-08-05 검증 추가됨, `SUBSCRIPTION`은 아직 클라이언트 값 신뢰)
+- ~~`SUBSCRIPTION` 결제 금액 서버 검증~~ (2026-08-05 완료, 2026-08-06 `PLAN_CATALOG` 기준으로 교체 완료)
 
 ## Crawler
 
@@ -107,15 +113,16 @@ Priority 2 (대부분 완료, 2026-08-05)
 - ~~프론트엔드 결제 UI + `registry-requests` 연동~~ (완료 — `properties/[id]/page.tsx`)
 - ~~OVERAGE_USAGE 결제 → registry_requests 자동 연결~~ (완료)
 - ~~관리자 페이지(등기부 신청 상태 관리)~~ (MVP 완료, `ADMIN_API_KEY` 설정만 남음)
-- 등기부 무료 한도 정책 확정 (코드=평생 vs 문서=월, 여전히 미확정 — 남은 항목)
-- 권리분석 연동
+- ~~등기부 무료 한도 정책 확정~~ → 2026-08-06 확정 + 코드 반영 완료(플랜별 월 단위)
+- 권리분석 연동 — 2026-08-06 조사 결과 신규 DB 테이블(`registry_rights`) + OCR/파싱 파이프라인이
+  선행돼야 하는 스키마 변경 승인 대기 상태로 확인됨(위 "In Progress > Frontend" 참고)
 - 문서 수집 API
 
 Priority 3
 
 - ~~등기부 다운로드 엔진(수동 배치 방식)~~ (완료, Sprint 6 — 아래 Beta v2의 "실제 발급기관 자동 연동"과는 별개)
 - ~~Payment Provider 구조 분리~~ (완료, Sprint 8 — PG사 확정 전 기반 구조만)
-- PG사 확정 및 `TossProvider`/`PortOneProvider` 실제 구현 (PG사 미확정이 선행 블로커)
+- ~~PG사 확정~~ → **2026-08-06 KG이니시스로 확정(CTO)**. 남은 작업: `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현(외부 API Key/계약 필요 — 승인 대기). `TossProvider`/`PortOneProvider`는 폐기 예정
 - `ADMIN_API_KEY` 운영 값 설정 + 역할(role) 구분 도입 여부 결정(현재 단일 공유키)
 - 성능 최적화
 
@@ -132,7 +139,7 @@ Priority 3
 - 검색조건 저장
 - 회원가입
 - 로그인
-- 구독 UI (등기부 신청 카드 내 단일 버튼으로 구독 가능 — 별도 플랜 비교/선택 화면은 미착수)
+- 구독 UI (등기부 신청 카드 내에서 BASIC/PRO 두 플랜 + 월/연 결제주기를 비교·선택해 구독 가능, 2026-08-06 갱신 — 별도 페이지가 아니라 기존 카드 내 UI로 구현됨)
 - 등기부 신청 구조 (백엔드+프론트+Admin MVP+다운로드 엔진까지 완료 — 아래 Success Criteria 참고. 발급기관 자동 연동만 남음)
 
 제외
@@ -172,28 +179,79 @@ Priority 3
 - 문서 수집 안정화
 - 검색 최적화
 - DB 백업 체계 구축
-- `SUBSCRIPTION` 결제 금액 서버 검증 부재 (`OVERAGE_USAGE`는 검증 추가됨, `SUBSCRIPTION`은 클라이언트 `amount` 그대로 신뢰)
+- ~~`SUBSCRIPTION` 결제 금액 서버 검증 부재~~ → 2026-08-05 해결, 2026-08-06 `PLAN_CATALOG` 기반으로 갱신(할인가 포함 서버 재계산)
 - Admin 인증에 역할(role) 구분 없음 (`X-Admin-Key` 단일 공유키, MVP 한계)
 
 ---
 
 # Sprint Backlog
 
-## [P1] run_daily.bat 실패 은폐 구조 개선
+## [완료] Security/Type/Performance Review (Sprint 15, 2026-08-06)
+
+배경: Beta Release 품질 향상을 위해 처음으로 전용 Security Review를 수행. Sprint Backlog(P2)는
+UX/Spec 결정이 선행돼야 해 Skip(위 참고), Critical Path는 PG사 확정 대기라 Security Review로 진행.
+
+완료
+
+- `api/v1/*.py` 전체에서 f-string 기반 SQL 조립 지점을 재확인 — `search.py`/`admin.py`/`payments.py`
+  모두 컬럼명/연산자만 하드코딩 리터럴이고 실제 값은 전부 `?` 파라미터 바인딩(`params` 리스트)이라
+  SQL Injection 여지 없음을 재확인(수정 불필요)
+- **발견 및 수정**: `api/v1/admin.py:require_admin()`이 관리자 키를 `x_admin_key != admin_key`
+  단순 문자열 비교로 검증하고 있었음 — Python의 문자열 `!=`는 앞에서부터 다른 문자가 나오는
+  즉시 반환되어, 비교에 걸리는 시간이 일치하는 접두 길이에 비례하는 타이밍 사이드채널이 이론상
+  존재함. `hmac.compare_digest()`로 상수 시간 비교하도록 교체
+- `api/auth.py`의 JWT 검증(`algorithms=["HS256"]` 하드코딩)은 알고리즘 혼동 공격 여지 없음을 확인(수정 불필요)
+- `api/v1/documents.py`/`api/v1/registry.py`의 경로 탐색 방지(`commonpath` 검사)는 파일명이
+  DB 조회 결과의 화이트리스트 값으로만 결정되어 안전함을 재확인(수정 불필요)
+- `favorites.py`/`search_presets.py`/`recent_items.py`는 전부 `WHERE user_id=?` 소유권 검사+
+  파라미터 바인딩 확인(수정 불필요)
+- Runtime QA: `require_admin()`을 직접 호출해 (1) 올바른 키 → 통과, (2) 틀린 키 → 403,
+  (3) 키 미제공 → 403, (4) `ADMIN_API_KEY` 미설정 → 500, 4가지 시나리오 모두 수정 전과 동일한
+  결과임을 확인(로직 변화 없음, 비교 방식만 상수 시간으로 교체)
+- Compile/Import 확인: `python -m py_compile api/v1/admin.py` 통과, `api_server.py` 전체
+  import 및 라우트 등록(16개) 정상 확인
+- Admin 인증이 여전히 단일 공유키(role 구분 없음)라는 구조적 한계는 이번 Sprint 범위 밖(기존
+  MVP 결정 유지, `docs/decision-log.md` 참고) — 타이밍 공격 방어만 추가한 것으로, 키 자체가
+  유출되면 여전히 무방비임에 유의
+
+**같은 Sprint, Type 개선**: `src/app/login/actions.ts`의 `loginAction`/`signUpAction`이 쓰던
+`prevState: any` 2건을 `login/page.tsx`의 실제 `useActionState` 상태 모양에 맞춰 명시적 타입으로
+교체(런타임 동작 무변경, lint 오류 5→3건).
+
+**같은 Sprint, Performance Review**: `api/v1/favorites.py:get_favorites()`가 즐겨찾기 개수만큼
+`get_item_summary()`를 반복 호출하던 N+1 쿼리를 `recent_items.py`와 동일한 단일 JOIN 패턴으로
+교체. 롤백 트랜잭션 안에서 기존/신규 로직 출력이 완전히 일치함을 확인(Runtime QA), DB 영구
+변경 없음.
+
+---
+
+## [완료] run_daily.bat 실패 은폐 구조 개선 (Sprint 13, 2026-08-06)
 
 배경: migrate_execute.py 로그 파일 잠금 버그(2026-07-27 수정 완료) 조사 중, run_daily.bat가
 migrate_execute.py 실패 후에도 뒤따르는 echo 명령 때문에 배치 자체의 종료코드가 0(성공)으로
 남는 구조적 결함이 확인됨. Task Scheduler의 LastTaskResult가 실제 내부 실패를 반영하지 못함.
 
-목표
+완료
 
-- 현재 하위 프로세스(mvp_scraper.py / migrate_execute.py) 실패 시 BAT가 exit code 0으로
-  종료될 수 있는지 재확인
-- 실패 시 즉시 종료(다음 단계로 넘어가지 않음)
-- 적절한 exit code 반환(Task Scheduler가 실패를 인지 가능하도록)
-- 어느 단계에서 실패했는지 로그에 명확히 남기기
-
-이번 Sprint 범위: 등록만 함. 설계/구현은 다음 Sprint에서 진행.
+- 재확인: `run_daily.bat`는 `mvp_scraper.py`/`migrate_execute.py` 실행 줄 뒤에 조건 없는
+  `echo` 2줄이 항상 실행되는 구조라, 두 스크립트가 0이 아닌 exit code로 끝나도 배치의
+  마지막 명령(`echo`, 항상 성공)이 배치 전체 종료코드를 결정해 항상 0으로 남는 것을 확인함.
+  `migrate_execute.py`는 이미 `sys.exit(0)/sys.exit(1)`을 정확히 반환하고 있어 이 값을
+  bat가 그냥 확인만 안 하고 있었음
+- `mvp_scraper.py` 실행 직후 / `migrate_execute.py` 실행 직후 각각 `if errorlevel 1`으로
+  즉시 확인 → 실패 시 다음 단계로 진행하지 않고 `exit /b 1`로 즉시 종료
+- 실패한 스크립트명과 종료코드를 `logs\daily_run.log`에 `[FAILED] <script>.py exited with
+  code %errorlevel% at <timestamp>`로 명시 기록. 성공 시에도 `[SUCCESS] Finished at
+  <timestamp>`로 구분 기록
+- Runtime QA: 격리된 스크래치 디렉터리에서 동일 구조의 더미 배치 파일로 (1) 1단계 실패 → 2단계
+  건너뜀 + 배치 exit code 1 + 실패 로그 기록, (2) 전체 성공 → 배치 exit code 0 + 성공 로그
+  기록, 두 시나리오 모두 실제 cmd.exe 실행으로 재현·확인함(실제 크롤러는 courtauction.go.kr에
+  대한 실제 크롤링을 유발하므로 이번 QA에서 직접 실행하지 않음)
+- `run_doc_worker.bat`/`run_priority_refresh.bat`는 각각 파이썬 호출이 마지막 명령이라 이미
+  자신의 exit code가 배치 exit code로 정상 전파됨을 확인 — 수정 대상 아님
+- `mvp_scraper.py` 내부의 법원(court)별 개별 try/except(부분 실패 시에도 계속 진행)는 기존
+  설계 그대로 유지 — 이번 Sprint는 bat 구조 개선만 범위, 크롤러 내부 예외 처리 정책 변경은
+  범위 밖(변경 시 별도 Sprint 필요)
 
 ---
 
@@ -208,6 +266,13 @@ migrate_execute.py 실패 후에도 뒤따르는 echo 명령 때문에 배치 �
 - 현재 `/properties/*`를 게이트하는 middleware 인증 로직 재검토 필요 (docs/CLAUDE.md 참고)
 
 이번 Sprint 범위: 등록만 함. 구현하지 않음.
+
+2026-08-06(Sprint 15) 재확인: `/search`는 이미 비로그인 접근 가능(기존 구현, `middleware.ts`가
+`/properties/*`만 게이트). 남은 범위는 "상세(`/properties/[id]`) 진입 시 무엇을 보여줄지"인데
+— 전체 정보를 다 보여줄지, 일부만 보여주고 로그인 유도 배너를 띄울지, 로그인 모달로 막을지 등
+UX/정책이 확정되지 않은 상태. 이건 코드 구현 문제가 아니라 화면 스펙(Spec) 결정이 선행돼야
+하는 항목이라(이번 세션 원칙상 "Spec 변경 금지"), 임의로 범위를 정해 구현하지 않고 Skip함.
+PM이 "상세 페이지에서 비회원에게 무엇을 보여줄지" 결정하면 바로 착수 가능.
 
 ---
 
@@ -379,11 +444,13 @@ Webhook 서버, Frontend, DB 스키마는 이번 Sprint 범위에서 제외.
 - `registry-requests` POST가 이제 DB 전체 쓰기 락을 잠깐 선점한다(`BEGIN IMMEDIATE`) — 현재 트래픽 규모에선 문제 없으나, 등기부 신청이 폭증하면 다른 쓰기 요청과의 대기 시간 증가 가능성 있음(모니터링 필요, Non-blocking)
 - SQLite 단일 DB 운영
 - 문서 수집 실패 가능성
-- PG사 미확정으로 인한 Payment Mock 장기화 가능성
-- 등기부 무료한도 정책(평생 vs 월) 미확정 상태 장기화 시 사용자 혼란(정책은 통일됐으나 "어느 쪽이 맞는 정책인지"는 여전히 미결정)
+- ~~PG사 미확정으로 인한 Payment Mock 장기화~~ → 2026-08-06 KG이니시스 확정으로 의사결정 병목은 해소. 다만 계약/API Key 발급이라는 **외부 절차**가 새 병목이며, 그동안 Mock 상태는 계속 유지됨
+- ~~등기부 무료한도 정책(평생 vs 월) 미확정~~ → 2026-08-06 확정(플랜별 월 단위)
+- ~~확정 Spec과 코드의 불일치~~ → 2026-08-06 해소(구독 정책 코드 반영 완료). 다만 기존 `BETA_EARLYBIRD` 구독 row가 운영 DB에 있다면 새 플랜으로 해석되지 않아 `DEFAULT_FREE_LIMIT`(5)로 폴백한다 — 이관 방침 미정(동작은 안전)
 - ~~`SUBSCRIPTION` 결제 금액 서버 미검증~~ → 2026-08-05 해결(Sprint 8)
 - ~~Payment Provider 인터페이스가 실제 Toss/PortOne 흐름을 수용하지 못함~~ → 2026-08-05 Interface v2로 해결, 같은 날 `payments.py`가 `create_order`/`confirm_payment`/`verify_payment` 3개를 실제로 호출하도록 연결 완료(Sprint 12). `cancel_payment`/`handle_webhook`은 여전히 미호출(환불·Webhook 엔드포인트 자체가 없어 PG사 확정 후 작업)
-- Admin 인증이 단일 공유키(`X-Admin-Key`)라 유출 시 전체 Registry 상태를 조작당할 위험 — 운영 전 역할 구분/키 로테이션 정책 필요
+- Admin 인증이 단일 공유키(`X-Admin-Key`)라 유출 시 전체 Registry 상태를 조작당할 위험 — 운영 전 역할 구분/키 로테이션 정책 필요. 2026-08-06(Sprint 15) 키 비교 자체를 `hmac.compare_digest`로 타이밍 공격에는 방어했으나, 키가 유출되면 여전히 무방비(role 구분 없음 — 위험 자체는 그대로, 공격 벡터 하나만 줄어듦)
+- **[Release Blocking, 2026-08-06 Sprint 16 발견]** `auction_case.case_no` 전국 단일 UNIQUE 제약으로 서로 다른 법원의 동일 사건번호가 병합됨(실측 3건 충돌 확인). Schema 변경(UNIQUE 복합키) + Migration 필요 — 승인 대기, 자세한 내용은 `docs/BUGS.md` #14 · `docs/crawler.md` 알려진 문제점 6번 참고
 
 ---
 
@@ -431,35 +498,46 @@ Beta v1 출시 기준
 
 ## 전체 진행률(%)
 
-- Beta v1 Success Criteria 7개 항목 기준: **7/7 완료, Release Blocking 없음** — Registry의 레이스 컨디션이 Sprint 10에서 해소되어 현재 코드 기준으로 출시를 막는 알려진 버그가 없다(발급기관 자동 연동은 Beta v2 범위로 애초에 제외)
+- Beta v1 Success Criteria 7개 항목 기준: **7/7 완료**였으나, 2026-08-06 Sprint 16에서 새 Release Blocking 항목 발견(`auction_case.case_no` 전국 UNIQUE 충돌, 위 Risks/`docs/BUGS.md` #14 참고) — Search/Detail 화면 자체는 지금 당장 안전하지만(잠재적 데이터 오염이 아직 사용자에게 노출되는 필드에 닿지 않음), DB Schema 변경 승인이 있어야 코드로 해결 가능한 상태라 "완전히 알려진 버그 없음"이라고는 더 이상 말할 수 없음(발급기관 자동 연동은 Beta v2 범위로 애초에 제외, 이 항목과는 무관)
 - Payment 도메인을 "PG 실연동까지 포함한 완전한 결제 기능" 기준으로 보면: Mock 체인 **100% 동작**(동시성 안전 포함), 금액 검증(구독+초과분) **100% 완료**, Provider 인터페이스 확장(Interface v2) 완료, **`payments.py`가 실제 PG 흐름 순서(주문→승인→검증)로 provider를 호출하도록 연결 완료(Flow Migration)**. PG 실연동 포함 시 **약 90%**(이전 85%에서 상승 — 남은 건 사실상 "PG사 확정"이라는 의사결정과 `TossProvider`/`PortOneProvider`의 실제 API 호출 코드뿐, 엔드포인트 구조 자체는 더 손댈 곳이 없음)
 
 ## Beta 남은 작업
 
 1. `ADMIN_API_KEY`를 `.env`에 설정 (Admin MVP 자체는 완료, 이 값만 없으면 500)
-2. 등기부 무료 한도 정책 확정 (평생 5회 vs 월 5회 — 통일은 됐으나 "어느 정책이 맞는지"는 미결정)
-3. PG사 확정 (사용자/PM 의사결정 필요) → `TossProvider`/`PortOneProvider`가 Interface v2의 6개 메서드를 실제 API 호출로 구현
-4. 환불 엔드포인트(`cancel_payment` 호출부), Webhook 수신 엔드포인트(`handle_webhook` 호출부) 신규 구현 — 이 둘은 여전히 어디서도 호출되지 않음
-5. 구독 플랜 비교/선택 UI, Admin 역할(role) 구분
+2. ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정**(플랜별 월 단위: 베이직 5회/프로 10회). 남은 것은 **코드 반영**(현재 `FREE_LIMIT=5` 평생 누적)
+3. ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**(플랜명/가격/연 결제/등기부 월 리셋 전부 반영)
+4. ~~PG사 확정~~ → **2026-08-06 KG이니시스 확정**. 남은 것은 `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현(외부 API Key/계약 필요, 승인 대기)
+5. 환불 엔드포인트(`cancel_payment` 호출부), Webhook 수신 엔드포인트(`handle_webhook` 호출부) 신규 구현 — 이 둘은 여전히 어디서도 호출되지 않음
+5. ~~구독 플랜 비교/선택 UI~~ (2026-08-06 완료, Sprint 14), Admin 역할(role) 구분(여전히 미착수)
 6. (Beta v2) 등기부등본 실제 발급기관 자동 연동 — 현재는 운영자 수동 배치
 
 ## Critical Path
 
 ```
-[PG사 확정] (의사결정, 코드 작업 아님)
+[PG사 확정] ✅ 2026-08-06 KG이니시스로 확정 완료 (CTO)
      │
      ▼
-TossProvider 또는 PortOneProvider의 6개 메서드 실제 API 호출로 구현
+[KG이니시스 계약 + API Key 발급]  ← 현재 여기 (승인/외부 절차 필요)
+     │
+     ▼
+KGInicisProvider 신설 + Interface v2 6개 메서드 실제 API 호출로 구현
+(TossProvider/PortOneProvider는 폐기 예정)
      │
      ▼
 환불(cancel_payment)·Webhook(handle_webhook) 수신 엔드포인트 신규 구현
      │
      ▼
-PAYMENT_PROVIDER를 .env에 설정
+PAYMENT_PROVIDER를 .env에 설정(kginicis)
 ```
 
-Release Blocking 항목은 더 이상 없다. 등기부 무료횟수 레이스 컨디션(Sprint 9에서 발견, Sprint 10에서
-수정)이 이 Critical Path에서 완전히 빠졌다 — 남은 경로는 PG사 확정 이후의 실연동뿐이다.
+병렬 진행 가능(코드 작업, PG 계약과 무관): **확정 구독 정책 코드 반영** — 플랜명/가격/연 결제/
+등기부 월 리셋. 승인만 나면 외부 의존성 없이 즉시 착수 가능해 실질적으로 가장 먼저 처리 가능한 항목.
+
+등기부 무료횟수 레이스 컨디션(Sprint 9에서 발견, Sprint 10에서 수정)이 이 Payment Critical Path에서는
+완전히 빠졌다 — Payment 경로만 놓고 보면 남은 것은 PG사 확정 이후의 실연동뿐이다. 단, 2026-08-06
+Sprint 16에서 **별개의 새로운 Release Blocking 항목**이 발견됨(위 Risks 참고): `auction_case.case_no`
+전국 UNIQUE 충돌 — Search/Detail 자체는 지금 당장 안전하지만(`auction_item.court_name`은 정상),
+DB 스키마 변경 승인이 있어야 코드로 고칠 수 있는 상태라 이번 세션에서는 구현하지 않고 발견만 기록함.
 
 `ADMIN_API_KEY` 설정과 등기부 무료 한도 정책 확정은 위 경로와 무관하게 언제든 병행 가능하다
 (코드 작업이 거의 없는 운영/정책 결정). 이전 회차의 "프론트 결제 UI + registry-requests 연동",

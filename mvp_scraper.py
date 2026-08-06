@@ -8,12 +8,14 @@ from datetime import datetime
 from typing import List
 
 from config.settings import CourtInfo
-from config.courts import ALL_COURTS, get_courts_by_region
+from config.courts import ALL_COURTS
 from models.auction_item import AuctionItem
 from crawler.court_crawler import crawl_court
 from validator.validation_engine import ValidationEngine
 from normalizer.normalizer import normalize_batch
 from storage.database import init_db, upsert_batch, get_stats, enqueue_documents
+
+os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,

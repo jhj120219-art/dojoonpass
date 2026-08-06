@@ -15,7 +15,7 @@ function sanitizeRedirectPath(value: FormDataEntryValue | null): string {
   return value
 }
 
-export async function loginAction(prevState: any, formData: FormData) {
+export async function loginAction(prevState: { error: string } | null, formData: FormData) {
   const supabase = await createServerSupabaseClient()
 
   const email = formData.get('email') as string
@@ -33,7 +33,10 @@ export async function loginAction(prevState: any, formData: FormData) {
   redirect(sanitizeRedirectPath(formData.get('redirect')))
 }
 
-export async function signUpAction(prevState: any, formData: FormData) {
+export async function signUpAction(
+  prevState: { error: string } | { message: string } | null,
+  formData: FormData
+) {
   const supabase = await createServerSupabaseClient()
 
   const email = formData.get('email') as string
