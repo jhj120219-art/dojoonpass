@@ -43,7 +43,7 @@
       conn = sqlite3.connect(DB_PATH)
   ```
 - `DB_PATH`는 상대경로. 실제 연결 대상은 프로세스 실행 시점의 Working Directory에 의해 결정됨
-- 자동 실행 시 활성 DB: `C:\Users\Administrator\Desktop\dojoonpass\auction.db` (2026-07-26 경로 통합 이전에는 존재하지 않는 `dojun-pass` 경로를 가리키고 있어 Task Scheduler 실행이 매번 실패했음 — 아래 "알려진 문제점" 참고)
+- 자동 실행 시 활성 DB: `C:\Users\jhj12\OneDrive\Desktop\dojoonpass\auction.db` (2026-07-26 경로 통합 이전에는 존재하지 않는 `dojun-pass` 경로를 가리키고 있어 Task Scheduler 실행이 매번 실패했음 — 아래 "알려진 문제점" 참고)
 - `Desktop\기타\dojun-pass\auction.db` 별도 존재. 스키마 다름(`auction_item` 테이블 없음), 최종 수정 2026-07-08, 자동 실행 경로와 무관
 - `api/v1/*.py`, `filter/*.py`, `storage/migrations/*.py`, `api_server.py` 등 대부분 모듈이 동일 `get_connection()` 경유
 - `api_server.py` 실행 시 Working Directory: 아직 결정되지 않음 (크롤러와 API가 동일 DB를 보는지 미확정)
@@ -51,7 +51,7 @@
 ## 스케줄링 방식
 
 - Windows Task Scheduler, 작업명 `LawAuctionDailyCrawl`
-- 실행 대상: `C:\Users\Administrator\Desktop\dojoonpass\run_daily.bat` (2026-07-26 수정, 이전에는 존재하지 않는 `dojun-pass` 경로를 가리켜 실행이 실패했음)
+- 실행 대상: `C:\Users\jhj12\OneDrive\Desktop\dojoonpass\run_daily.bat` (2026-07-26 수정, 이전에는 존재하지 않는 `dojun-pass` 경로를 가리켜 실행이 실패했음)
   ```bat
   @echo off
   cd /d %~dp0
@@ -102,6 +102,13 @@
 아직 결정되지 않음 (상대경로 DB_PATH 설계, auction/auction_item 분리 설계의 의도된 이유는 이 대화에서 확인되지 않음)
 
 ## 알려진 문제점
+
+0. **[2026-08-07 발견, 데이터 소실] `auction` 테이블 UNIQUE 키에 법원이 없다.**
+   `UNIQUE(case_no, item_no)`라 서로 다른 법원이 같은 사건번호+물건번호를 쓰면
+   `storage/database.py:upsert_batch()`의 UPDATE가 앞선 법원 물건을 통째로 교체한다(병합 아님).
+   법원 간 사건번호 공유 3건 실측, 사본 DB로 소실 재현 완료 — 자세한 내용은 `docs/BUGS.md` #18.
+   완화(경고 로그 / `migrate_execute.py` 식별키 차단 / 감시 테스트)는 적용했고
+   근본 수정(`UNIQUE(court_code, case_no, item_no)`)은 스키마 변경이라 승인 대기.
 
 1. ~~`auction` 1,010 / `auction_item` 710, 차이 300건~~ → 2026-08-06 재확인 결과 `auction`
    1,870건 / `auction_item` 1,870건으로 **차이 0건**, `run_daily.bat`가 매일 두 스크립트를

@@ -661,3 +661,479 @@ Release Blocking 해소 이후 Beta 품질 향상·운영 안정화를 목표로
   삭제는 이번 세션 원칙상 수행하지 않고 기록만 함
 
 문서 동기화 (ENVIRONMENT_VARIABLES 시점별 분류 A/B/C 추가 / CHANGELOG)
+
+---
+
+2026-08-07 (Sprint 26 — PG 명칭 정리 / Admin·Release Audit / 기술부채·회귀 확대)
+
+**[PG] KG이니시스 기준으로 Provider 구조 정리 (실연동은 여전히 Skip)**
+- `api/v1/payment_providers.py`에 `KGInicisProvider` 신설 — Interface v2 6개 메서드
+  (`charge`/`create_order`/`confirm_payment`/`cancel_payment`/`verify_payment`/`handle_webhook`)
+  전부 `NotImplementedError`인 자리 구현. 실제 API 호출은 계약/키 발급 필요로 미착수(승인 대기)
+- `_PROVIDERS`/`PAYMENT_PROVIDER` 허용값에 `kginicis` 추가. `toss`/`portone`은 **폐기 예정**으로
+  명시하고 선택 시 경고 로그를 남긴다(삭제는 승인 필요라 클래스는 유지, 하위호환 보존)
+- 알 수 없는 `PAYMENT_PROVIDER` 값이면 허용값 목록을 포함한 `ValueError`로 즉시 실패
+- 모듈 주석·`docs/architecture.md`·`backend.md`·`BUGS.md`·`CURRENT_STATE.md`·`decision-log.md`·
+  `roadmap.md`·`ENVIRONMENT_VARIABLES.md`의 Toss 기준 서술을 KG이니시스 기준으로 갱신
+  (CHANGELOG/roadmap의 과거 Sprint 기록은 사료라 그대로 둠)
+
+**[Bug] 플랜 업그레이드 직후 등기부 무료한도가 옛 플랜으로 계산될 수 있었음**
+- `registry.py:get_user_free_limit()`의 `ORDER BY started_at DESC`가 전순서가 아니었다.
+  `started_at`은 `datetime.now().isoformat()`인데 Windows 시계 분해능(~15.6ms)상 짧은 간격의
+  두 결제가 **완전히 같은 문자열**을 가질 수 있어, 베이직→프로 업그레이드 후에도 베이직(5회)
+  한도가 적용될 수 있었다. 회귀 테스트가 실제로 이 조합에서 한 번 실패해 발견됨
+- `ORDER BY started_at DESC, id DESC`로 tie-break 추가 — 나중에 INSERT된 구독이 항상 이긴다
+- 같은 뿌리의 정렬 비결정성을 전 도메인에 일괄 수정: `payments`(목록/초과결제 대상 선택),
+  `favorites`, `recent_items`, `registry_requests`(사용자/Admin), `search_presets`.
+  특히 **Admin 목록은 offset 페이지네이션이라** 동률 행이 두 페이지에 나오거나 빠질 수 있었다
+
+**[Lint] react-hooks/set-state-in-effect 2건 해소 — Lint 오류 2 → 0**
+- `properties/[id]/page.tsx`: 문서 존재확인 결과를 `물건id:문서종류` 키 맵으로 보관하고
+  `'checking'`은 렌더 중 파생. 이전 문서의 늦은 응답이 현재 문서 상태를 덮어쓰던 경쟁 상태도 함께 해소
+- `search/SearchForm.tsx`: `sigunguOptions`/`Loading`/`Error` 3개 상태를 "어떤 조회의 결과인지"를
+  담은 단일 상태로 합치고 나머지는 렌더 중 파생. 로딩 중 이전 시/도의 시/군/구가 잠깐 보이던 문제도 사라짐
+
+**[기술부채]**
+- bare `except:` 2건 제거(`item.py`/`search.py`) — `JWTError`만 잡고 debug 로그를 남긴다
+  (기존에는 `KeyboardInterrupt`/`SystemExit`까지 삼키고 원인도 남지 않았음)
+- `item.py`: 최근조회 기록 실패가 상세 조회를 막지 않도록 분리 + 실패 시 warning 로그
+- `favorites.py`: `except Exception` → `sqlite3.IntegrityError`. DB 잠금/디스크 오류까지
+  "이미 관심물건으로 등록되어 있습니다"로 잘못 안내하던 문제 해소, rollback 추가
+- `registry.py`: 미사용 지역변수 `charged_amount`를 실제 단일 기준값으로 사용(하드코딩 0/OVERAGE_FEE 제거)
+- `search_presets.py`: 함수 내부 `import json` 2건을 모듈 최상단으로
+- `item.py`/`search.py`: 요청마다 반복되던 함수 내부 `from ... import`를 모듈 최상단으로
+
+**[Performance]**
+- `doc_stats.py`: `document_status`를 (doc_type,status) 조합마다 6번 스캔하던 COUNT 쿼리를
+  단일 `GROUP BY` 1회로 교체(응답 필드/값 동일)
+
+**[Security]**
+- `api_server.py`: CORS 허용 Origin을 `CORS_ALLOW_ORIGINS` 환경변수로 제한 가능하게 함.
+  **미설정 시 기존과 동일하게 `*`** — 하위호환 유지, 운영 배포 시에만 값 지정
+- `search_presets.py`: 서버측 입력 검증 신설 — 이름 공백/100자 초과 거부, 조건 JSON 4000자
+  초과 거부, 사용자당 100개 상한. 프론트의 `maxLength=50`에만 의존하던 상태 해소
+- `admin.py`: 인증 실패 시 warning 로그(키 값은 절대 기록하지 않음), 상태 전이 성공 시
+  `id / 이전상태 → 새상태 / reason / doc_url` info 로그 — 스키마 변경 없이 사후 추적 가능하게 함
+- `documents.py`: `court_name`/`case_no`가 NULL이면 `os.path.join` TypeError로 500이 나던 것을 404로
+
+**[UX/Release] `app/layout.tsx` 메타데이터가 `create-next-app` 기본값이던 문제 해결**
+- `title: "Create Next App"` → `"콕찰 — 법원경매 검색"`, description도 교체, `<html lang>` `en` → `ko`
+
+**[Test] 회귀 테스트 확대 — 118 → 163 검사**
+- 12. Payment Provider 레지스트리: `kginicis` 선택 확인 + 6개 메서드가 **조용히 성공하지 않고**
+  전부 `NotImplementedError`임을 확인(실연동 전 결제가 성공한 것처럼 보이는 사고 방지),
+  폐기 후보 2종·알 수 없는 값·미설정 기본값까지
+- 13. 정렬 결정성: 완전히 같은 타임스탬프 행 3개를 직접 넣고 목록 순서가 호출마다 동일한지,
+  동률 구간이 `id` 내림차순 전순서인지 확인
+- 14. 구독 플랜 tie-break: 같은 `started_at`의 BASIC→PRO 업그레이드에서 한도 10이 나오는지 확인
+- 7. 검색조건 저장: 공백/초과 길이 이름, 초과 크기 조건, 서버측 trim, 개수 상한 검증 추가
+
+**[문서 정합성 — 코드와 어긋난 서술 정정]**
+- `docs/CLAUDE.md`: "`docs/architecture.md`가 저장소에 없다"는 안내는 stale — 파일은 존재함
+- `docs/backend.md`: `auction.db` 경로가 존재하지 않는 `C:\Users\Administrator\...`로 기재돼
+  있던 것을 실제 값(상대경로 `auction.db`)으로 정정. **"개발용 임시 헤더 `X-Test-User-Id`"는
+  코드에 존재하지 않음**을 명시(저장소 전체 grep 0건 — 인증 우회 수단은 없다)
+- `docs/crawler.md`: Task Scheduler/DB 절대경로를 실제 경로로 정정
+- `docs/frontend.md`: "`components/` 디렉터리가 존재하지 않는다 / 재사용 컴포넌트 없음"은 stale —
+  5개 공용 컴포넌트가 실제로 사용 중임을 반영. "플랜 선택 UI·검색조건 저장 UI 미구현", "등기부
+  한도가 아직 평생 누적 5회", "로그아웃 미노출"도 전부 해결 완료 상태로 정정
+
+**[발견 — 이번에 고치지 않고 기록만]**
+- `/properties`(로그인 후 첫 화면)가 Supabase `properties` 테이블을 직접 조회하면서 링크는
+  `/properties/{id}`(FastAPI `auction_item`)로 보낸다 — **두 id 채번 체계가 달라 엉뚱한 물건이
+  열리거나 404**. 화면 처리 방향(FastAPI 전환 vs 폐지)이 Spec 결정 사항이라 미착수
+- 같은 파일의 지역 `formatPrice`가 공용 구현과 다르게 동작(0 → `"0.0억"`)
+- 유일한 로그아웃 경로가 그 `/properties` 화면에만 있음(`PrimaryNav`에는 없음)
+- `src/login/`(라우팅되지 않는 죽은 코드)이 금지된 옛 브랜드명 "도준 경매 패스"를 사용 중 —
+  삭제는 승인 필요
+- Admin은 API만 있고 화면이 없음, 단일 공유키라 역할 구분·감사 주체 식별 불가
+- 전 API에 Rate Limit 없음(패키지 설치 필요로 미착수)
+
+문서 동기화 (architecture / backend / frontend / crawler / CLAUDE / BUGS / CURRENT_STATE /
+decision-log / roadmap / ENVIRONMENT_VARIABLES / CHANGELOG)
+
+---
+
+2026-08-07 (같은 날, Sprint 26 후반 — API KEY Checklist / Architecture·Performance Audit)
+
+**[신규 문서] docs/API_KEY_CHECKLIST.md — 코드 기준 키/시크릿 사실 대장**
+- 요청받은 카테고리(API KEY / ENV / Secret / Client ID / Webhook Secret / Redirect URL /
+  Callback URL / OAuth / SMTP / Storage / Analytics / Monitoring / SNS / OCR / 지도 / 메일)를
+  **전부 코드에서 검색**해 참조 지점(파일:라인)까지 기록. 참조가 0건이면 0건이라고 적는다
+- 결론: 코드가 실제로 읽는 환경변수는 **8개뿐**. OAuth/SMTP/Storage/Analytics/Monitoring/
+  SNS/OCR/지도/메일은 전부 **참조 0건** — 지금 발급받을 키가 없다
+- `document_status`의 `OCR` 문자열은 **상태값 이름일 뿐** 실제 OCR 코드가 아님을 명시(오독 방지)
+- **env 드리프트 실측**: `.env`의 `SUPABASE_URL`/`SUPABASE_ANON_KEY`는 **어떤 Python 코드도 읽지
+  않는다**(백엔드는 Supabase에 접속하지 않고 JWT 서명만 검증). 무해한 잔재이며 삭제는 승인 필요
+- env가 아니라 **대시보드 설정**이라 놓치기 쉬운 항목을 별도 절로 분리 — 특히 Supabase
+  **Site URL / Redirect URLs**가 `localhost:3000`인 채로 배포되면 **운영 사용자가 회원가입을
+  완료할 수 없다**(가입 확인 메일 링크가 이 설정을 따라감)
+
+**[Bug] API 서버에 로깅 설정이 아예 없어 감사 로그가 버려지고 있었음**
+- 크롤러 계열(`mvp_scraper`/`doc_worker`/`migrate_execute`/`collect_documents`)은 전부
+  `logging.basicConfig`를 호출하는데 **`api_server.py`만 빠져 있었다** → root logger에 핸들러가
+  없고 기본 레벨이 WARNING이라, 같은 날 추가한 **Admin 상태 전이 감사 로그(`logger.info`)가
+  통째로 버려지고** 인증 실패 warning조차 timestamp·모듈명 없이 lastResort로만 찍혔다
+- 크롤러와 같은 포맷으로 `basicConfig` 추가(+`%(name)s`), 레벨은 `LOG_LEVEL`로 조절(기본 INFO)
+- `httpx`/`httpcore`/`urllib3`는 요청마다 INFO를 뱉으므로 WARNING으로 낮춤
+- 확인: 수정 전 `logger.info` 미출력 → 수정 후 `2026-08-07 ... [INFO] api.v1.admin: Admin 상태
+  전이: registry_request id=... PENDING -> PROCESSING` 정상 출력
+
+**[Bug] OpenAPI Duplicate Operation ID 경고**
+- `documents.py`가 `api_route(methods=["GET","HEAD"])` 하나로 두 메서드를 처리해 FastAPI가
+  **같은 operationId를 두 번** 생성 → `/openapi.json`을 그릴 때마다 `UserWarning: Duplicate
+  Operation ID ...`가 나고 OpenAPI 클라이언트 생성이 깨졌다
+- GET/HEAD를 별도 라우트로 분리하고 HEAD는 `include_in_schema=False` — 동작은 동일
+  (Starlette가 HEAD 응답 본문을 자동으로 버린다). 스키마 엔드포인트 24 → 23
+
+**[Architecture Audit]**
+- AST 기반 미사용 import 전수 재조사(47개 모듈) → **2건 발견·제거**:
+  `storage/database.py`의 `os`, `filter/filter_engine.py`의 `Optional`. 재조사 결과 잔여 0건
+- 미사용 Component/Type **0건** 재확인(프론트 5개 공용 컴포넌트 + 라우트별 컴포넌트 전부 사용 중,
+  `search/types.ts`의 3개 타입 전부 import됨)
+- 미사용 API: 프론트가 호출하지 않는 엔드포인트는 `/`(health), `/api/v1/stats`,
+  `/api/v1/document-stats`, `GET /payments/{id}`, `GET /registry-requests/{id}`, Admin 2종.
+  전부 **운영/테스트/향후 Admin UI용으로 의도된 것**이라 제거 대상 아님(회귀 16번이 집합을 고정)
+
+**[Performance Audit] 실행계획 실측**
+- N+1 **0건**(AST 스캔의 `doc_stats.py` 2건은 단일 `GROUP BY` 결과를 순회하는 dict 컴프리헨션 —
+  오탐으로 확인)
+- 인덱스 적중 확인: 검색 기본 정렬 → `idx_auction_item_default_sort`,
+  최근조회 → `idx_recent_items_viewed_at`, 월 무료횟수 → `idx_registry_usage_user_id`
+- **개선 여지(스키마 변경 필요라 미착수)**: 활성 구독 조회와 초과결제 대상 선택이
+  `user_id` 인덱스가 아니라 `status` 인덱스를 타고 TEMP B-TREE 정렬을 만든다 —
+  `(user_id, status)` 복합 인덱스가 적합하나 승인 필요
+- **응답 크기 상한 없음**: `favorites`/`payments`/`registry-requests` 목록에 LIMIT이 없다
+  (현재 최대 보유 행 0건이라 실제 문제는 없음). 페이지네이션 도입은 응답 구조 변경이라 승인 필요
+
+**[Test] 회귀 145 → 163 검사**
+- 16. **API 표면 고정** — 엔드포인트 23개 집합을 명시 선언해 사라짐/추가를 둘 다 검출,
+  OpenAPI 생성 경고 0건 확인, HEAD 프로브가 GET과 동일 상태코드인지 확인
+- 17. **응답 envelope 계약** — 인증 라우트 5종이 `{success,data,message}`를 유지하는지,
+  공개 라우트(search)는 flat 형태를 유지하는지(`docs/backend.md` "절대 변경하면 안 되는 것")
+- 18. **CORS 설정** — 미설정 시 `*`, 환경변수 지정 시 그 목록만 파싱
+
+**[문서]** ENVIRONMENT_VARIABLES에 `LOG_LEVEL` 추가 + API_KEY_CHECKLIST 상호 참조,
+TEST_PLAN에 16~18번 및 "selenium 미설치로 실행 불가한 테스트" 명시, docs/README 색인 갱신
+
+문서 동기화 (API_KEY_CHECKLIST(신규) / ENVIRONMENT_VARIABLES / TEST_PLAN / CHANGELOG /
+CURRENT_STATE / roadmap / BETA_RELEASE_CHECKLIST / README)
+
+---
+
+2026-08-07 (같은 날, Sprint 26 마무리 — TODO 탐색 / 크롤러 데이터 무결성)
+
+**[Critical 발견] 레거시 `auction` 테이블이 매일 물건을 소실시키고 있음 (docs/BUGS.md #18)**
+
+`migrate_execute.py`의 "Critical TODO로 별도 기록"이라는 주석을 추적하다 발견했다.
+
+- `auction` 테이블 제약이 `UNIQUE(case_no, item_no)`로 **법원(court_code)이 빠져 있다.**
+  `storage/database.py:upsert_batch()`가 이 키로 기존 행을 찾아 `court_code`/`court_name`/주소/
+  가격을 전부 UPDATE하므로, 서로 다른 법원이 같은 사건번호+물건번호를 쓰면 **병합이 아니라
+  앞선 법원의 물건이 통째로 교체되어 사라진다**
+- **실측**: 법원 간 사건번호 공유 3건. 세 건 모두 한쪽이 `item_no=1`을 차지하고 다른 쪽 목록에서
+  정확히 `item_no=1`만 결번 — 이미 소실이 일어났을 가능성이 높다(제약 특성상 사후 확인 불가)
+- **재현**: `auction.db` 사본에서 부산지방법원 `2024타경3700 item_no=1`에 수원지방법원 같은 키를
+  upsert → `updated=1`, 조회 시 부산 물건이 수원 것으로 대체됨을 확인(**실제 DB 무변경**)
+
+승인 없이 가능한 완화 3가지를 적용했다(근본 수정인 스키마 변경은 승인 대기):
+
+1. `storage/database.py:upsert_batch()` — 덮어쓰기 직전 기존 행의 `court_code`가 다르면
+   **WARNING 로그**. 막지는 못하지만 조용한 소실이 로그로 드러난다
+2. `migrate_execute.py` — `auction_item` 조회/갱신 식별키를 `(case_no, item_no)` →
+   **`(case_id, item_no)`** 로 변경. `case_id`는 `(court_code, case_no)`로 구한 값이라 이미
+   법원이 특정되어 있어, 스키마 변경 없이 하위 단계의 동일 결함을 차단한다.
+   기존 주석의 "Critical TODO" 남은 절반을 해소한 것
+   **검증**: 사본 DB 2개에 구/신 로직을 각각 적용 → `auction_item` 1,870행 전 컬럼 비교
+   **차이 0건**(현재 데이터에서 동작 동일, 잠재 결함만 제거)
+3. `test_subscription_policy.py` 7번 신설 — 법원 간 공유 `case_no` 개수를 계속 출력·감시하고,
+   `auction_item`에 실제 중복이 생기면 실패. 스키마가 복합키로 바뀌면 이 검사가 실패하므로
+   그때 #18을 해결 처리하면 된다
+
+**[TODO 탐색] 코드 전체 TODO/FIXME/HACK 스윕**
+- 실제 남은 TODO는 프론트 4건뿐이며 전부 **백엔드 미지원 컬럼**에 대한 정직한 표기로 확인:
+  건물/토지 면적(`auction_item`에 컬럼 없음), `special_conditions`, `specialSearchType`,
+  조회수. FastAPI가 알 수 없는 쿼리 파라미터를 무시하므로 동작상 무해하다 —
+  컬럼 추가는 스키마 변경이라 미착수
+- `SearchForm.tsx:244`의 "단일 선택시에만 API 연동" TODO는 **stale** — 백엔드 `search.py`가
+  이미 콤마 구분 다중 `property_type`을 OR 조건으로 처리한다
+
+**[Test] 회귀 163 + 28 → 163 + 33 검사**
+
+문서 동기화 (BUGS #18 / BETA_RELEASE_CHECKLIST P1-0 / CURRENT_STATE / CHANGELOG)
+
+---
+
+2026-08-07 (Sprint 27 — CTO 승인 6건 반영)
+
+CTO가 승인한 6개 항목을 전부 구현했다. 보류 지정 항목(Sentry / Rate Limit / Selenium /
+Monitoring / Analytics / OCR / 지도 / SNS / Storage 확장 / 외부 연동 / 패키지 설치)은 착수하지 않았다.
+
+**[승인 1] BUG #18 — auction 식별 구조 해결 (Migration 012/013)**
+- `auction` : `UNIQUE(case_no, item_no)` → **`UNIQUE(court_code, case_no, item_no)`**
+- `auction_item` : `UNIQUE(case_no, item_no)` → **`UNIQUE(case_id, item_no)`**
+  (CTO 지시대로 **case_id 기반**. `case_id`가 가리키는 `auction_case`는 이미
+  `UNIQUE(court_code, case_no)`라 법원이 특정돼 있어, court_code를 또 복제하지 않고도
+  "법원+사건번호+물건번호"와 동치가 된다 — `auction_case`와 일관성 유지)
+- **id 보존이 필수였다**: `auction_item.id`를 favorites/recent_items/registry_requests/
+  registry_usage/document_status/doc_raw/parsed_document/tenant_rights/rights_summary/
+  rights_analysis_history/document_collect_failures **11개 테이블**이 참조한다
+- 검증: 사본 리허설 → 실제 적용. 1,870/1,870행 **id·전 컬럼 값 100% 보존**, 인덱스 43개 재생성,
+  orphan 0건, 충돌 주입 시 두 법원 행 공존 확인. 백업
+  `auction.db.backup_before_auction_unique_20260807_095423`
+- 함께 수정: `upsert_batch()`(조회·갱신 키), `init_db()`/`migrate_v4_1.py`의 CREATE TABLE
+  (fresh clone도 같은 제약), `migrate_execute.py`
+
+**[승인 2] Plan API 서버화 — `GET /api/v1/plans`**
+- 서버가 플랜명/정상가/할인가/연간가격/등기부 한도/할인기간/결제주기/초과요금을 전부 내려준다.
+  `price`는 항상 `resolve_plan_price()` 결과라 **표시 금액과 검증 금액이 같은 함수에서 나온다**
+- 프론트 `properties/[id]/page.tsx`의 `PLAN_OPTIONS` 상수와 `REGISTRY_OVERAGE_FEE`를 **제거**하고
+  서버 응답만 사용하도록 교체. 카탈로그 도착 전에는 구독 버튼을 비활성화한다(금액을 모른 채
+  결제를 보내면 서버가 거절하므로)
+- 회귀 15번을 "프론트 미러 파싱"에서 **"서버 계약 검증 + 프론트에 가격 하드코딩이 되살아나지
+  않았는지 확인"** 으로 교체
+
+**[승인 3] ID 체계 전수 Audit**
+- 선언 FK 15개, 암묵 참조 10종, 논리 일관성 5종, 식별키 중복 5종, 타입 혼용 전수 조사
+- 결과: **orphan 0 / 중복 0 / 불일치 0**. `payments.pg_transaction_id`가 TEXT인 것은
+  PG 발급 문자열이라 의도된 것(오탐)
+- **발견**: `PRAGMA foreign_keys = 0` — FK가 선언만 되고 런타임에 강제되지 않는다.
+  현재 orphan이 0이라 실피해는 없으나 구조적 공백이므로 P2로 등록(활성화 시 마이그레이션의
+  DROP TABLE 동작에 영향이 있어 별도 검증이 필요하다)
+
+**[승인 4] Admin 권한 2단계 — SUPER_ADMIN / ADMIN**
+- `resolve_admin_role()`이 제시된 키로 등급을 판정한다. 두 키 비교 모두 `hmac.compare_digest`
+- `require_admin`(ADMIN 이상) / `require_super_admin`(SUPER_ADMIN 전용) 의존성 분리.
+  **기존 `ADMIN_API_KEY`는 그대로 ADMIN 등급으로 동작해 하위호환이 깨지지 않는다**
+- 과금에 직접 영향을 주는 조작(등기부 한도 조정)만 SUPER_ADMIN 전용. Operator 등급은 두지 않음
+- 상태 전이 감사 로그에 수행 등급(`by=ADMIN`)을 함께 기록
+
+**[승인 5] 결제 로그 구조 (Table/Model/Repository/Interface/Mock/테스트/문서)**
+- `payment_logs` : 결제 생명주기(CREATE_ORDER/CONFIRM/VERIFY/CANCEL/WEBHOOK)를 append-only 기록.
+  `payments`는 최종 상태 한 줄뿐이라 분쟁 시 궤적을 재구성할 수 없던 문제를 해소
+- `payment_webhooks` : PG 노티 원문 보관. `event_id` UNIQUE로 **멱등성** 보장(PG는 응답이 늦으면
+  같은 노티를 여러 번 보낸다), 서명 검증 여부를 별도 컬럼으로 관리
+- `mask_sensitive()` : 카드번호/CVC/생년월일/토큰 등을 저장 전에 재귀 마스킹.
+  로그는 폭넓게 열람되는 데이터라 민감정보가 남으면 안 된다
+- `payments.py`가 실제로 3단계를 기록하도록 연결 + `GET /payments/{id}/logs`(본인 것만) 신설
+- **실제 API Key 연결·PG 호출은 하지 않았다**(승인 범위대로)
+
+**[승인 6] registry_credit — 관리자 등기부 무료횟수 조정**
+- **잔액 컬럼을 두지 않고 조정 원장(ledger)** 으로 설계했다.
+  `유효 한도 = 플랜 월 한도 + 이번 달 조정 합계`
+  잔액 컬럼을 만들면 `registry_usage` 기반 사용량 계산과 상태가 이중화되어 반드시 어긋난다
+  (decision-log의 Premium 판정이 별도 테이블을 거부한 것과 같은 이유). 원장은 (1) 누가/언제/왜
+  바꿨는지 남고 (2) 월이 바뀌면 자연히 초기화되며 (3) 동기화 버그가 원천적으로 불가능하다
+- `GRANT`(추가) / `DEDUCT`(차감) / `RESET`(그 달 이전 조정 무효화). 부호는 서버가 정하므로
+  호출부가 음수를 넘겨 GRANT가 차감이 되는 사고가 없다. 1회 조정 상한 100(오타 방어)
+- `GET /admin/registry-credits/{user_id}`(ADMIN 조회) / `POST /admin/registry-credits`(SUPER_ADMIN)
+- `registry.py`의 한도 계산에 연결. 차감이 과해도 한도는 0에서 멈춘다(음수 한도는 의미 없음)
+
+**[Test] 회귀 163+33 → 227+48 = 275 검사**
+- 신규: Plan API 계약(15) / Admin 권한 2단계(19) / registry_credit 원장(20) /
+  결제 로그·Webhook 멱등성·마스킹(21) / 크롤러 식별키(22) / credit ledger 정책(policy 8)
+- 어제 넣어둔 "#18 위험 감시" 테스트가 예정대로 실패 → **해결 상태 고정 테스트로 전환**
+
+**[문서]** BUGS #18 해결 처리, CHANGELOG/CURRENT_STATE/roadmap/backend/frontend/architecture/
+decision-log/BETA_RELEASE_CHECKLIST/API_KEY_CHECKLIST/ENVIRONMENT_VARIABLES/TEST_PLAN 동기화
+
+---
+
+2026-08-07 (Sprint 28 — CTO 추가 승인 10건 반영)
+
+보류 지정(KG 실연동 / API Key / Webhook 실서버 / Sentry / Analytics / OCR / Monitoring /
+Rate Limit / 외부 서비스 / 패키지 / Docker / OS / GitHub 설정)은 착수하지 않았다.
+
+**[승인 1] SQLite FK 런타임 강제**
+- `get_connection()`이 커넥션마다 `PRAGMA foreign_keys = ON`을 건다. SQLite는 `REFERENCES`를
+  선언해도 이걸 켜지 않으면 **아무 검사도 하지 않는다**(기본 OFF) — 15개 FK가 전부 무시되고
+  있었다. 존재하지 않는 `item_id`로 즐겨찾기를 넣어도 DB가 막지 않던 상태
+- 마이그레이션만 `get_connection(enforce_foreign_keys=False)`를 쓴다. UNIQUE 제약을 바꾸는
+  "새 테이블 → 이관 → DROP → RENAME" 패턴은 중간에 자식 행이 잠시 고아가 되므로 FK를 켜면
+  마이그레이션 자체가 실패한다
+- 실측: 고아 INSERT가 `IntegrityError`로 차단됨을 확인. 기존 데이터의 orphan은 0건이라
+  켜도 아무것도 깨지지 않았다(회귀 340검사 통과)
+
+**[승인 2] Payment State Machine 확장**
+- `CREATED / READY / REQUESTED / PAID / FAILED / EXPIRED / CANCELLED / PARTIAL_REFUND / REFUNDED`
+- `api/v1/state_machines.py`에 허용 전이만 선언하고 나머지는 전부 거부.
+  건너뛰기(`CREATED→PAID`), 되돌리기(`REFUNDED→PAID`), 종결 상태에서의 이동 전부 차단
+- **레거시 `SUCCESS`는 제거하지 않았다** — 기존 `payments` 행과 `MockProvider`가 쓰고 있어
+  없애면 데이터 해석이 불가해진다. `PAID`와 동일한 전이 규칙을 주고 `is_paid()`가 둘 다 인정한다
+- 지금 흐름에는 개입하지 않는다(Mock은 여전히 즉시 SUCCESS). 앞으로 상태를 바꾸려는
+  코드가 반드시 통과해야 할 관문이다
+
+**[승인 3] Subscription Lifecycle**
+- `ACTIVE / GRACE_PERIOD / PAUSED / EXPIRED / CANCELLED`
+- **자동 만료를 배치에 의존하지 않는다.** 상시 스케줄러가 크롤링 배치뿐이라 만료를 거기
+  얹으면 "배치가 안 돌아서 만료가 안 됨"이 곧 과금 사고가 된다. `resolve_expected_status()`가
+  순수 함수로 계산하고 조회 시점에 DB도 맞춘다(lazy sync)
+- 유예 기간 3일 — 결제 실패 즉시 차단하면 카드 갱신 중인 정상 사용자가 끊긴다
+- `PAUSED`/`CANCELLED`는 시간과 무관하게 유지, `expires_at` 파싱 실패 시 상태를 바꾸지 않는다
+  (파싱 실패를 만료로 해석하면 정상 구독자가 끊긴다)
+- 갱신은 만료 전이면 기존 만료시각에서 이어 붙이고, 지났으면 지금부터 센다
+- 무료 등기부 초기화는 별도 작업 불요 — 월 경계 계산이 이미 그 역할을 한다
+
+**[승인 4] registry_credit_logs**
+- `registry_credits`(한도 계산에 반영되는 관리자 조정)와 **별도**로, 무료 횟수가 움직인
+  **모든 사건**(지급/사용/회수/이벤트/환불/기타)을 추적한다
+- 사용(USAGE)을 한도 계산에 넣으면 `registry_usage`가 이미 세는 사용량과 이중 차감이 된다 —
+  로그에만 남기고 계산에서는 뺀다(`ADJUSTMENT_REASONS`)
+- `balance_after` 스냅샷으로 "그 시점에 얼마였는지"를 재계산 없이 조회 가능
+- `GET /admin/registry/credit-logs/{user_id}`
+
+**[승인 5] audit_logs**
+- `admin_id / action / target_type / target_id / before / after / created_at`
+- 등기부 상태 전이, 등기부 한도 조정, 구독 상태 변경이 전부 기록된다.
+  `before`/`after`는 **바뀐 필드만** 담는다(전체 행을 넣으면 무엇이 바뀌었는지 오히려 안 보인다)
+- 업무 트랜잭션과 같은 커밋에 넣어 "업무만 되고 감사는 빠지는" 상황이 없게 했다
+- `GET /admin/audit-logs` (target_type/target_id/admin_id/action 필터)
+
+**[승인 6] Soft Delete**
+- **실제로 DELETE가 일어나는 테이블에만** 적용: `favorites`, `search_presets`에
+  `deleted_at`/`deleted_by` 컬럼 추가
+- `payments`/`subscriptions`/`registry_*`는 삭제 경로가 애초에 없어 제외했다 — 컬럼만 늘리면
+  모든 조회에 `deleted_at IS NULL`을 붙여야 해 실익 없이 회귀 위험만 커진다
+- 이번 범위는 **컬럼 추가까지**다. 실제 soft delete 전환은 `UNIQUE(user_id,item_id)` 때문에
+  재등록이 막히는 문제를 먼저 풀어야 해 별도 판단으로 남겼다(기존 DELETE 동작 무변경)
+
+**[승인 7] Admin REST 구조 개선**
+- 신규: `/admin/users`, `/admin/payments`, `/admin/payments/{id}/logs`,
+  `/admin/subscriptions`(+PATCH), `/admin/registry/requests`,
+  `/admin/registry/credit-logs/{user_id}`, `/admin/audit-logs`
+- **기존 경로(`/admin/registry-requests`, `/admin/registry-credits`)는 그대로 유지**한다 —
+  운영 문서·테스트가 참조하고 있어 없애면 Breaking Change다. 새 구조는 추가로 제공한다
+- `/admin/users`: 이 저장소에 users 테이블이 없어(인증은 Supabase `auth.users`)
+  **서비스 활동이 있는 user_id를 집계**해 보여준다. 개인정보는 노출하지 않는다
+- 구독 상태 변경만 쓰기이고 나머지는 전부 읽기 전용
+
+**[승인 8] API Response 표준화**
+- `{success, data, error, meta, message}` — `error`(도메인 코드)와 `meta`(페이지네이션)를 **추가**
+- **`message`는 제거하지 않았다.** 프론트가 `result.message`를 읽고 있어 없애면 Breaking Change다
+- Admin의 `HTTPException` 기반 실패는 그대로 뒀다 — 클라이언트가 `status_code`로 분기하고
+  있어 envelope로 바꾸는 것은 Spec 결정 사항이라 **Skip**
+
+**[승인 9] Error Code 표준화 — `docs/ERROR_CODES.md` 신설**
+- `AUTH/PAY/SEARCH/REGISTRY/ADMIN/SUBSCRIPTION/FAVORITE/ITEM/INTERNAL` 9개 도메인, 40개 코드
+- `payments`/`registry`/`favorites`/`search_presets`의 실패 응답에 실제로 연결
+- 클라이언트는 문구가 아니라 코드로 분기해야 한다(한국어 메시지는 언제든 바뀐다)
+
+**[승인 10] Enum / Constant 통합 — `api/constants.py` 신설**
+- `PaymentStatus`/`SubscriptionStatus`/`RegistryRequestStatus`/`PaymentType`/`BillingCycle`/
+  `PlanCode`/`DocumentStatus`/`DocumentType`/`AdminRole`/`AuditAction`/`AuditTargetType`/
+  `RegistryCreditReason`/`ErrorCode`
+- `str, Enum` 상속이라 SQLite 바인딩·JSON 직렬화에서 문자열처럼 동작한다 —
+  기존 코드가 문자열을 그대로 써도 깨지지 않는다
+- **문자열 값은 지금 DB에 있는 값 그대로다.** 정의 위치만 모았고 값은 하나도 바꾸지 않았다
+
+**[Test] 회귀 227+48 → 340+48 = 388 검사**
+- 23 FK 강제 / 24 Payment 상태머신 / 25 Subscription lifecycle /
+  26 audit·credit 로그 / 27 Admin REST 구조 / 28 Soft Delete 컬럼
+- envelope 계약 테스트를 새 표준(error/meta 추가, message 유지)으로 갱신
+
+**[문서]** `ERROR_CODES.md`·`STATE_MACHINES.md` 신설, decision-log/backend/CURRENT_STATE/
+roadmap/BETA_RELEASE_CHECKLIST/API_KEY_CHECKLIST/TEST_PLAN/README 동기화
+
+---
+
+2026-08-07 (Sprint 28 후속 — 승인 항목 연결 누락 2건 수정)
+
+승인 내용을 구현한 뒤 **실제 사용 경로에 연결됐는지**를 자체 감사하다 두 건을 발견했다.
+둘 다 "구조는 만들었는데 아무도 쓰지 않는" 형태라 테스트만으로는 드러나지 않았다.
+
+**[누락 1] 무료 횟수 "사용(USAGE)"이 추적 로그에 남지 않았음**
+- 승인 4번의 기록 대상은 `관리자 지급 / 사용 / 회수 / 이벤트 지급 / 환불 / 기타`인데,
+  실제로는 `add_credit()`을 거치는 **관리자 조정만** 기록되고 있었다.
+  사용자가 무료 횟수를 소진하는 경로(`registry.py`)에는 로깅이 없었다
+- `create_registry_request()`의 무료 사용 지점에 `log_credit_event(USAGE, -1)` 연결.
+  `related_usage_id`로 `registry_usage` 행과 이어지고, `balance_after`에 잔여 횟수를 남긴다
+- **한도 계산에는 반영하지 않는다** — `registry_usage`가 이미 세고 있어 넣으면 이중 차감
+- 회귀: 사용 후 로그 1건 생성 / delta -1 / actor USER / 조정 합계·유효 한도 불변 / 사용량 +1
+
+**[누락 2] Subscription Lifecycle이 이용권 게이트에 연결되지 않았음**
+- 승인 3번으로 `GRACE_PERIOD`(유예 3일)를 정의했지만, 정작 Premium 판정
+  `has_active_subscription()`은 여전히 `status='ACTIVE'`만 봤다 —
+  **승인된 유예 정책이 코드에서 한 번도 작동하지 않는 상태**였다
+- 게다가 `is_entitled()` 자체에도 결함이 있었다: `GRACE_PERIOD`인데도 `expires_at > now`를
+  요구했는데, 유예는 **정의상 만료 시각을 지난 뒤**의 상태다. 즉 이 함수는 GRACE_PERIOD를
+  절대 통과시킬 수 없었다. 유예의 기한은 `expires_at + GRACE_PERIOD_DAYS`다
+- `is_entitled()`가 만료 시각을 직접 비교하지 않고 `resolve_expected_status()`에 판정을
+  위임하도록 변경(규칙이 두 곳에 있으면 반드시 어긋난다)
+- `registry.py`에 `get_entitled_subscription()` 신설 — Premium 판정과 플랜 한도 조회가
+  이 함수 하나만 본다. **SQL이 아니라 Python에서 판정**하는데, `sync_expired_status()`를
+  부르면 커밋이 일어나 `create_registry_request()`의 `BEGIN IMMEDIATE`가 끊기기 때문이다
+- 실효 변화: 만료 후 3일 이내 사용자가 서비스를 계속 이용할 수 있게 됐다(승인된 정책대로).
+  `PAUSED`/`CANCELLED`/유예 초과는 그대로 차단
+- 회귀: 게이트 6종(active/grace/expired/paused/cancelled/none) + 유예 중 플랜 한도 유지
+
+**[빌드]** `npm run build`를 막던 `.next/static` 잔여 아티팩트(이전 빌드 매니페스트 3개)를
+**삭제하지 않고** 스크래치패드로 이동해 빌드 통과 확인.
+
+**[Test] 340 → 361 검사**
+
+---
+
+2026-08-07 (Sprint 28 후속 2 — 커밋 경계 정리 / 테스트 Audit)
+
+**[P2 해소] `sync_expired_status()`의 커밋 경계**
+- 이 함수는 UPDATE를 하는데 커밋 시점이 호출 맥락에 따라 정반대다: 읽기 경로에서는 여기서
+  커밋해야 변경이 남고, 쓰기 트랜잭션 안에서는 커밋하면 **호출부 트랜잭션이 끊긴다**
+  (`create_registry_request()`의 `BEGIN IMMEDIATE`가 대표적 — 무료횟수 확인과 INSERT의
+  원자성이 깨져 동시성 버그가 되살아난다)
+- `commit`을 **키워드 전용 + 기본값 없음**으로 바꿔 호출부가 반드시 명시하게 했다.
+  어느 쪽을 기본으로 삼아도 반대 맥락에서 조용히 틀리고, 그 실패는 테스트로 잡기 어렵다
+- 회귀: 기본값 호출이 `TypeError`로 막히는지 검증
+
+**[테스트 Audit] 변이(mutation) 검증 — "통과"가 아니라 "잡아내는가"를 확인**
+회귀 테스트가 실제로 결함을 막고 있는지 확인하려고, 코드를 일부러 8가지로 망가뜨려
+테스트가 실패하는지 측정했다(각 변이는 적용 후 즉시 원복).
+
+| 변이 | 결과 |
+|---|---|
+| 유예 판정을 만료시각 비교로 되돌림 | 검출(5건 실패) |
+| 이용권 게이트를 ACTIVE 단독으로 되돌림 | **최초에는 미검출 → 테스트 보강 후 검출** |
+| 결제 상태 전이 검증 무력화 | 검출(6건) |
+| 구독 정렬 tie-break 제거 | 검출(3건) |
+| USAGE 로깅 제거 | 검출(1건) |
+| 감사 로그 기록 제거 | 검출(1건) |
+| FK 강제 해제 | 검출(2건) |
+| 응답 envelope에서 `error` 제거 | 검출(예외 중단) |
+
+**발견된 테스트 공백 1건**: 이용권 게이트 테스트가 전부 `status='ACTIVE'` + 과거 만료시각
+행만 썼다. 그래서 조회 조건에서 `GRACE_PERIOD`를 빼먹어도 Python 판정이 커버해 테스트가
+통과했다. **DB에 `GRACE_PERIOD`로 저장된 행**(lazy sync가 이미 돈 뒤의 실제 상태)을 쓰는
+케이스를 추가해 공백을 막았다. 재측정 결과 **8/8 전부 검출**.
+
+**[Test] 361 → 365 검사**
+
+---
+
+2026-08-07 (Sprint 28 후속 3 — 프론트엔드 Audit / 성능)
+
+이번 회차는 그동안 lint만 돌리고 코드 감사를 한 적이 없던 **프론트엔드**를 봤다.
+
+**[Bug] 즐겨찾기 토글이 서버 실패에도 상태를 뒤집었음**
+- `search/FavoriteButton.tsx`와 `properties/[id]/page.tsx` 둘 다
+  `setFavorited(...)`를 응답 성공 여부와 무관하게 실행하고, 그 뒤에 실패 메시지를 띄웠다 —
+  **하트는 빨갛게 변하는데 그 아래 "등록에 실패했습니다"가 함께 뜨는** 모순된 화면
+- 상태는 "서버 기준으로 그렇게 됐을 때만" 바꾸도록 수정. 다만 중복 등록/이미 삭제됨은
+  실패가 아니라 **의도가 이미 이뤄진 것**이므로 상태만 맞추고 에러는 띄우지 않는다
+- 이 구분이 가능한 이유가 어제 도입한 도메인 Error Code다
+  (`FAVORITE_ALREADY_EXISTS` / `FAVORITE_NOT_FOUND`). 메시지 문구로 분기했다면 문구가
+  바뀌는 순간 깨졌을 것이다 — Error Code의 첫 실사용 사례
+- `src/lib/api.ts`의 `ApiEnvelope`에 `error`/`meta` 추가, `ERROR_CODES` 상수 신설
+- 회귀: 중복 등록·재삭제 시 응답의 `error` 코드를 고정
+
+**[Performance] `/admin/users`의 집계가 전체 사용자에 대해 실행되던 문제**
+- 집계 서브쿼리를 바깥에 둬서 SQLite가 **전체 사용자**에 4개 서브쿼리를 실행한 뒤에야
+  ORDER BY/LIMIT를 적용했다 — 사용자 N명이면 페이지 크기와 무관하게 4N번 인덱스 탐색
+- 페이지를 먼저 자르고 그 결과에만 집계를 걸도록 변경(4×size). 정렬 기준과 반환 행은 동일
+- 회귀: 집계값 정확성 + 페이지를 잘라도 집계가 흐트러지지 않는지
+
+**[Audit 결과 — 이상 없음 확인]**
+- `localStorage`/`sessionStorage` 사용 0건(토큰을 브라우저 저장소에 두지 않는다)
+- `dangerouslySetInnerHTML` 0건, 사용자 입력이 직접 `href`로 들어가는 지점 0건
+- 모든 `fetch` 호출에 에러 처리 존재, `.map()` 36곳 전부 `key` 지정
+- Open Redirect 방어(`sanitizeRedirectPath`) 유지 확인
+
+**[Test] 365 → 377 검사**

@@ -215,12 +215,13 @@ JWT 없으면 기록 안 함 (에러 없음).
 3. ~~등기부 한도 월 리셋 + 플랜별 차등~~ → **완료**
 4. 기존 `BETA_EARLYBIRD` 구독 row 이관 방침 — **미정**(스키마 변경은 불필요. 운영 DB에 해당
    row가 존재하는지 확인 후 처리 방침 결정 필요)
-5. `KGInicisProvider` 신설 — **미착수**(외부 API Key/계약 필요, 론칭 직전까지 연기. 아래 참고)
+5. ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**(클래스 + `PAYMENT_PROVIDER=kginicis` 경로).
+   남은 것은 6개 메서드의 **실제 KG이니시스 API 호출 구현**뿐 — 외부 API Key/계약 필요로 승인 대기
 
 ### Payment Provider 구조 (2026-08-05, PG 실연동 준비 / 2026-08-06 PG사 확정 반영)
-- **PG사는 KG이니시스로 확정됨(2026-08-06 CTO 확정)**. 단 코드에는 아직 `KGInicisProvider`가 **존재하지 않는다** — `api/v1/payment_providers.py`에는 여전히 `TossProvider`/`PortOneProvider` 자리만 있고, `get_payment_provider()`의 `_PROVIDERS` 맵도 `mock`/`toss`/`portone` 3개만 인식한다. Provider 신설 + 실제 API 구현은 외부 API Key/계약이 필요해 승인 대기 상태
-- `api/v1/payment_providers.py`: `PaymentProvider`(인터페이스) → `MockProvider`(현재 사용, 항상 SUCCESS) / `TossProvider`·`PortOneProvider`(자리만 있음, 호출 시 `NotImplementedError`. **PG사 확정으로 이 두 클래스는 이제 폐기 예정 상태** — 삭제는 승인 필요 작업이라 코드에 그대로 남아있음)
-- `get_payment_provider()`가 환경변수 `PAYMENT_PROVIDER`(mock/toss/portone, 기본값 `mock`)로 어떤 Provider를 쓸지 결정. `.env`에 값이 없어도 기존과 동일하게 `mock`으로 동작(하위호환)
+- **PG사는 KG이니시스로 확정됨(2026-08-06 CTO 확정)**. **2026-08-07 기준 `KGInicisProvider` 클래스와 `PAYMENT_PROVIDER=kginicis` 경로는 코드에 반영 완료**됐다 — 다만 6개 메서드 전부 `NotImplementedError`인 자리 구현이며, 실제 API 호출 코드는 외부 API Key/계약이 필요해 승인 대기 상태다
+- `api/v1/payment_providers.py`: `PaymentProvider`(인터페이스) → `MockProvider`(현재 사용, 항상 SUCCESS) / `KGInicisProvider`(확정 PG사, 자리만) / `TossProvider`·`PortOneProvider`(**폐기 예정 후보**, 호출 시 `NotImplementedError` — 삭제는 승인 필요 작업이라 코드에 그대로 남아있음)
+- `get_payment_provider()`가 환경변수 `PAYMENT_PROVIDER`(mock/kginicis/toss/portone, 기본값 `mock`)로 어떤 Provider를 쓸지 결정. `.env`에 값이 없어도 기존과 동일하게 `mock`으로 동작(하위호환). 폐기 예정값(`toss`/`portone`) 선택 시 경고 로그를 남기고, 알 수 없는 값이면 허용값 목록을 포함한 `ValueError`로 즉시 실패한다
 - `payments.py`의 `create_payment_record()`가 `provider`의 결과(`status`/`pg_provider`/`pg_transaction_id`)를 그대로 `payments` row에 기록만 함 — router는 여전히 SQLite에 직접 쓰고, provider는 "결제 승인 여부"만 결정하는 좁은 역할(서비스/레포지토리 계층 아님). 2026-08-05부터 `charge()` 단일 호출 대신 `create_order()`→`confirm_payment()`→`verify_payment()` 순서로 호출(아래 "Payment Flow Migration" 참고)
 - `status != "SUCCESS"`(현재는 도달하지 않음, PG 실연동 시 사용)면 결제 실패로 기록하고 구독/등기부 연결 같은 후속 효과는 만들지 않음
 - ~~[2026-08-05 Payment Final Audit] 현재 인터페이스는 실제 PG 연동에 부족함~~ → **2026-08-05 Provider Interface v2로 확장 완료**. `PaymentProvider`에 5개 메서드 추가: `create_order()`(주문 생성) / `confirm_payment()`(결제 승인) / `cancel_payment()`(취소·환불) / `verify_payment()`(서버가 PG API로 재확인) / `handle_webhook()`(PG Webhook payload 정규화). `MockProvider`는 6개 메서드(기존 `charge()` 포함) 전부 구현 — 이 인터페이스는 KG이니시스 연동에도 그대로 재사용 가능
@@ -235,7 +236,7 @@ JWT 없으면 기록 안 함 (에러 없음).
 ### 결제(Payment) → 구독(Subscription) → Premium → Registry (2026-08-05 완성, PG 미연동)
 - `POST /api/v1/payments`: PG 미연동 상태의 Mock 결제(`MockProvider`). 요청 즉시 `payments.status="SUCCESS"`로 기록(`pg_provider=null`, `pg_transaction_id="MOCK-<uuid>"`)
 - `payment_type="SUBSCRIPTION"`이면 같은 요청 안에서 `subscriptions` row를 함께 생성(`status="ACTIVE"`, `started_at=now`, `expires_at=now + 결제주기별 기간`(월 30일 / 연 365일)). 금액(`amount`)은 서버가 `PLAN_CATALOG`로 계산한 값(`resolve_plan_price()`, 할인 적용 후)과 대조해 검증한다(`OVERAGE_FEE`와 동일한 방식) — 클라이언트가 보낸 금액을 신뢰하지 않는다
-- Premium 여부는 별도 테이블/플래그 없이 `registry.py`의 `has_active_subscription()`(status=ACTIVE AND expires_at > now)으로만 판정 — `subscriptions` row 존재가 곧 Premium
+- Premium 여부는 별도 테이블/플래그 없이 `registry.py`의 `has_active_subscription()`으로만 판정. **2026-08-07부터 판정 기준이 Lifecycle과 일치한다** — `get_entitled_subscription()`이 `ACTIVE` + `GRACE_PERIOD`(만료 후 3일)를 이용 가능으로 보고, `PAUSED`/`CANCELLED`/유예 초과는 차단한다(`docs/STATE_MACHINES.md`)
 - `payment_type="OVERAGE_USAGE"`(등기부 초과 건별 결제): `req.amount`가 `registry.py`의 `OVERAGE_FEE`(=1000) 상수와 다르면 결제 자체를 거부. 결제 성공 시 해당 유저의 가장 오래된 미결제 `PAYMENT_REQUIRED` 건을 찾아 `payment_id` 연결 + `status="PENDING"`으로 전환(같은 트랜잭션, 부분 성공 시 rollback). 결제할 대상이 없으면(이미 결제됨/애초에 없음) `payments` row 자체를 만들지 않고 즉시 거부
 - 프론트엔드는 `/api/v1/payments`, `/api/v1/registry-requests`를 실제로 호출한다(`src/app/properties/[id]/page.tsx`, 2026-08-05 연동) — 더 이상 "미호출" 아님
 
@@ -254,7 +255,7 @@ JWT 없으면 기록 안 함 (에러 없음).
 ## Database 연동 방식
 
 - 종류: SQLite
-- 파일: `C:\Users\Administrator\Desktop\dojoonpass\auction.db`
+- 파일: 저장소 루트의 `auction.db` (2026-08-07 정정 — `storage/database.py:DB_PATH = "auction.db"`는 **상대경로**라 프로세스의 작업 디렉터리 기준으로 열린다. 이전 문서의 `C:\Users\Administrator\Desktop\...` 절대경로는 이 PC에 존재하지 않는 옛 프로필 경로로 stale이었다. 현재 실제 위치는 `C:\Users\jhj12\OneDrive\Desktop\dojoonpass\auction.db`)
 - 연결: `storage/database.py` → `get_connection()`
 - DB_PATH: `"auction.db"` (상대경로)
 - 크롤러(mvp_scraper.py)와 API 서버(api_server.py) 동일 DB 파일 사용 확인됨
@@ -279,13 +280,17 @@ JWT 없으면 기록 안 함 (에러 없음).
 SUPABASE_URL=
 SUPABASE_ANON_KEY=
 SUPABASE_JWT_SECRET= (값 설정됨, 2026-08-05 재확인 — 이전 버전 문서의 "미입력 상태"는 stale했음)
-PAYMENT_PROVIDER= (2026-08-05 신규, 선택: mock/toss/portone. 미설정 시 mock — 아직 `.env`에 값 없음, 없어도 기존과 동일하게 동작)
-ADMIN_API_KEY= (Admin MVP용, 여전히 `.env`에 값 없음 — 설정 전까지 `/api/v1/admin/*` 전체 500)
+PAYMENT_PROVIDER= (2026-08-05 신규, 선택: mock/kginicis/toss/portone. 미설정 시 mock — 아직 `.env`에 값 없음, 없어도 기존과 동일하게 동작. `kginicis`는 확정 PG사지만 아직 자리 구현이라 선택 시 결제가 전부 실패한다 — 실연동 완료 전까지 `mock` 유지)
+ADMIN_API_KEY= (Admin MVP용, 여전히 `.env`에 값 없음 — 설정 전까지 `/api/v1/admin/*` 전체 500). 2026-08-07부터 **ADMIN 등급**
+SUPER_ADMIN_API_KEY= (2026-08-07 신규, 선택. 설정 시 그 키가 **SUPER_ADMIN 등급** — 등기부 한도 조정 등 과금 영향 조작 전용)
+CORS_ALLOW_ORIGINS= (2026-08-07 신규, 선택: 콤마 구분 Origin 목록. 미설정 시 기존과 동일하게 `*` 전체 허용. 운영 배포 시 프론트 도메인만 지정 권장)
 
-### 개발용 임시 헤더
-JWT 미설정 시에만 동작:
+### 개발용 임시 헤더 — 존재하지 않음 (2026-08-07 정정)
 
-X-Test-User-Id: {user_id}
+이전 문서는 "JWT 미설정 시 `X-Test-User-Id: {user_id}` 헤더로 우회 가능"이라고 기술했으나,
+**저장소 전체에 해당 헤더를 읽는 코드가 없다**(`api/auth.py`는 `HTTPBearer` + JWT 검증만 한다).
+인증을 우회할 방법은 없으며, 테스트는 `test_api_regression.py`처럼 실제 서명된 HS256 토큰을
+만들어 사용해야 한다.
 
 
 ---
@@ -317,15 +322,29 @@ Task Scheduler (매일 06:00)
 - `document_collect_failures`: 수집 실패 로그
 
 ### 사용자 테이블 (Phase 1)
-- `favorites`: UNIQUE(user_id, item_id)
+- `favorites`: UNIQUE(user_id, item_id) + `deleted_at`/`deleted_by`(2026-08-07 추가, 아직 미사용)
 - `recent_items`: UNIQUE(user_id, item_id), viewed_at 갱신
-- `search_presets`: conditions JSON
+- `search_presets`: conditions JSON + `deleted_at`/`deleted_by`(2026-08-07 추가, 아직 미사용)
 
 ### 결제/등기부 테이블 (Phase 1)
-- `subscriptions`: plan(BASIC/PRO — 2026-08-06 확정. 컬럼은 CHECK 제약 없는 TEXT라 스키마 변경 없이 교체됨. 과거 BETA_EARLYBIRD/STANDARD row가 남아있을 수 있음), status(ACTIVE/CANCELLED/EXPIRED)
+- `subscriptions`: plan(BASIC/PRO — 2026-08-06 확정. 컬럼은 CHECK 제약 없는 TEXT라 스키마 변경 없이 교체됨. 과거 BETA_EARLYBIRD/STANDARD row가 남아있을 수 있음),
+  status(**ACTIVE / GRACE_PERIOD / PAUSED / EXPIRED / CANCELLED** — 2026-08-07 Lifecycle 확장, `docs/STATE_MACHINES.md`)
 - `registry_usage`: is_free, charged_amount
-- `payments`: payment_type(SUBSCRIPTION/OVERAGE_USAGE), pg_provider(미연동, null)
+- `payments`: payment_type(SUBSCRIPTION/OVERAGE_USAGE), pg_provider(미연동, null),
+  status(**CREATED/READY/REQUESTED/PAID/FAILED/EXPIRED/CANCELLED/PARTIAL_REFUND/REFUNDED** +
+  레거시 `SUCCESS` — 2026-08-07 상태머신 확장)
 - `registry_requests`: status(PENDING/PAYMENT_REQUIRED/PROCESSING/COMPLETED/FAILED)
+
+### 감사·이력 테이블 (2026-08-07 신규, Sprint 27~28)
+- `payment_logs`: 결제 생명주기 단계별 append-only 기록. `payment_id`는 nullable(주문 생성
+  실패도 남겨야 하므로). 민감정보는 저장 전 마스킹
+- `payment_webhooks`: PG 노티 원문. `event_id` UNIQUE로 멱등, `signature_verified` 별도 관리.
+  **수신 엔드포인트는 아직 없다**(구조만 준비)
+- `registry_credits`: 무료 횟수 **조정 원장**(GRANT/DEDUCT/RESET). 잔액 컬럼 없음 —
+  유효 한도 = 플랜 월 한도 + 이번 달 조정 합계
+- `registry_credit_logs`: 무료 횟수가 움직인 **모든 사건**(지급/사용/회수/이벤트/환불).
+  사용(USAGE)은 여기에만 남고 한도 계산에는 안 들어간다(`registry_usage`와 이중 차감 방지)
+- `audit_logs`: Admin 작업 이력(admin_id/action/target_type/target_id/before/after/created_at)
 
 ### 마이그레이션 관리
 `migration_history` 테이블로 적용 이력 관리.
@@ -363,7 +382,7 @@ Task Scheduler (매일 06:00)
 - ~~OVERAGE_USAGE 결제 → registry_requests 자동 연결~~ (2026-08-05 완료)
 - ~~관리자 페이지(등기부 신청 상태 관리)~~ (2026-08-05 MVP 완료, `api/v1/admin.py`)
 - ~~등기부 문서 전달 구조~~ (2026-08-05 완료 — 운영자가 파일을 `registry_documents/`에 배치 + Admin이 `doc_url` 연결하는 수동 방식. 대법원 인터넷등기소 등 실제 발급기관과의 자동 연동은 여전히 없음 — 아래 알려진 문제점 참고)
-- PG사 실연동 — **PG사는 KG이니시스로 확정(2026-08-06)**, `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현이 남음(외부 API Key/계약 필요, 승인 대기)
+- PG사 실연동 — **PG사는 KG이니시스로 확정(2026-08-06)**, `KGInicisProvider` **클래스는 2026-08-07 신설 완료**. Interface v2 6개 메서드의 실제 API 호출 구현만 남음(외부 API Key/계약 필요, 승인 대기)
 - 확정된 구독 정책(베이직/프로, 연 결제, 등기부 월 리셋) 코드 반영 — 위 "확정 Spec 미반영 항목" 참고
 - registry_rights 테이블
 
@@ -375,8 +394,10 @@ Task Scheduler (매일 06:00)
 
 ## 절대 변경하면 안 되는 것
 
-- `auction.db` 경로: `C:\Users\Administrator\Desktop\dojoonpass\auction.db`
-- `auction` 테이블 구조 (크롤러 원본)
+- `auction.db` 경로: 저장소 루트의 상대경로 `auction.db` (`storage/database.py:DB_PATH`). 절대경로로 바꾸지 않는다 — 크롤러와 API 서버가 같은 작업 디렉터리에서 실행되는 것을 전제로 한다
+- `auction` 테이블 **컬럼 구성** (크롤러 원본). 단 UNIQUE 제약은 2026-08-07 CTO 승인 하에
+  `(case_no, item_no)` → **`(court_code, case_no, item_no)`** 로 강화했다(Migration 012,
+  `docs/BUGS.md` #18 — 법원 구분이 없어 다른 법원 물건이 소실되고 있었음). 컬럼은 그대로다
 - `auction_item.id` (프론트 라우팅 /auction/{itemId} 기준 PK, 정수형)
 - GET /api/v1/search 응답 필드명 (프론트 연동 완료)
 - GET /api/v1/item/{item_id} 응답 필드명 (프론트 연동 완료)
@@ -423,3 +444,102 @@ Task Scheduler (매일 06:00)
 - property_type 코드: APARTMENT/OFFICETEL/LAND/FACTORY/COMMERCIAL/MULTI_FAMILY
 - payments.pg_provider: 현재 null (Mock 결제이므로)
 - Admin MVP(`api/v1/admin.py`) 도입: `X-Admin-Key` 인증, `registry_requests.reason` 컬럼 추가(`010_add_registry_request_reason.sql`) — 스키마 변경 사용자 승인 완료
+
+
+---
+
+## 2026-08-07 추가 (CTO 승인 6건)
+
+### Plan API — 가격/플랜의 단일 Source of Truth
+- `GET /api/v1/plans` (인증 불필요, envelope 사용): 플랜명·label·등기부 월 한도 +
+  결제주기별 `list_price`/`price`(실청구액)/`discounted`/`discount_amount`/`discount_start`/
+  `discount_end`/`period_days`, 그리고 `billing_cycles`·`overage_fee`
+- `price`는 항상 `resolve_plan_price()` 결과다 — **표시 금액과 검증 금액이 같은 함수에서 나오므로
+  구조적으로 어긋날 수 없다**. 프론트는 값을 갖지 않고 응답을 그대로 표시·전송만 한다
+
+### Admin 권한 2단계 (Operator 없음)
+| 등급 | 키 | 가능한 것 |
+|---|---|---|
+| `ADMIN` | `ADMIN_API_KEY` | 등기부 신청 목록 조회·상태 전이, credit **조회** |
+| `SUPER_ADMIN` | `SUPER_ADMIN_API_KEY` | ADMIN 전부 + 등기부 무료횟수 **조정** |
+
+- `resolve_admin_role()`이 제시된 키로 등급을 판정(둘 다 `hmac.compare_digest` 상수시간 비교)
+- 두 키 모두 미설정이면 기존과 동일하게 `500 "관리자 키 미설정"`
+- **기존 `ADMIN_API_KEY`만 설정된 환경도 그대로 동작한다**(ADMIN 등급, 하위호환)
+- 한계: 여전히 키 기반이라 **개별 운영자를 특정할 수 없다** — 감사 로그에는 등급만 남는다
+
+### 결제 로그 (`payment_logs` / `payment_webhooks`)
+- `payments`는 최종 상태 한 줄뿐이라 결제 분쟁 시 궤적 재구성이 불가능했다
+- `payment_logs`: `CREATE_ORDER`/`CONFIRM`/`VERIFY`/`CANCEL`/`WEBHOOK` 단계를 append-only 기록.
+  `create_payment_record()`가 앞 3단계를 실제로 남기고, `payments` row 생성 후 `payment_id`를 연결
+- `payment_webhooks`: PG 노티 원문 보관. `event_id` UNIQUE로 **멱등** 처리
+  (PG는 응답이 늦으면 같은 노티를 재전송한다), `signature_verified`로 서명 검증 여부 관리
+- `mask_sensitive()`가 카드번호/CVC/생년월일/토큰 등을 저장 전에 재귀 마스킹
+- `GET /api/v1/payments/{id}/logs` — 본인 결제만 조회(타인은 404)
+- **실제 PG API 호출·API Key 연결은 없다**(승인 범위대로 론칭 직전까지 연기)
+
+### 등기부 무료횟수 조정 (`registry_credits`)
+- **잔액 컬럼 없음.** 조정 원장만 쌓고 `유효 한도 = 플랜 월 한도 + 이번 달 조정 합계`로 계산한다.
+  잔액 컬럼은 `registry_usage` 기반 사용량과 상태가 이중화되어 반드시 어긋난다
+- `GRANT`(+) / `DEDUCT`(−) / `RESET`(그 달 이전 조정 무효화). 부호는 서버가 정한다.
+  1회 조정 상한 100(오타 방어). 차감이 과해도 유효 한도는 **0에서 멈춘다**
+- `GET /api/v1/admin/registry-credits/{user_id}` (ADMIN) — 플랜 한도/조정/유효 한도/사용량/이력
+- `POST /api/v1/admin/registry-credits` (**SUPER_ADMIN 전용**)
+- 월이 바뀌면 조정도 자연히 초기화된다(기존 월 리셋 정책과 같은 경계)
+
+
+---
+
+## 2026-08-07 추가 (CTO 추가 승인 10건, Sprint 28)
+
+### FK 런타임 강제
+- `storage/database.py:get_connection()`이 커넥션마다 `PRAGMA foreign_keys = ON`.
+  SQLite는 `REFERENCES`를 선언해도 이걸 켜지 않으면 **아무 검사도 하지 않는다**(기본 OFF).
+  이 저장소는 15개 FK를 선언해 두고 전부 무시되던 상태였다
+- 마이그레이션만 `get_connection(enforce_foreign_keys=False)` — 테이블 재작성 패턴이
+  중간에 자식 행을 잠시 고아로 만들기 때문(`storage/migrations/run_migrations.py`)
+
+### 상태 머신
+`api/constants.py`(상태값) + `api/v1/state_machines.py`(전이 규칙).
+자세한 다이어그램과 근거는 **`docs/STATE_MACHINES.md`** 참고.
+
+- Payment: `CREATED/READY/REQUESTED/PAID/FAILED/EXPIRED/CANCELLED/PARTIAL_REFUND/REFUNDED`.
+  레거시 `SUCCESS`는 `PAID`와 동의어로 유지(기존 데이터 호환) — `is_paid()`가 둘 다 인정
+- Subscription: `ACTIVE/GRACE_PERIOD/PAUSED/EXPIRED/CANCELLED`, 유예 3일.
+  자동 만료는 **배치가 아니라 조회 시점 lazy sync**(`api/v1/subscriptions.py`)
+
+### 감사·이력 테이블
+- `audit_logs` — Admin 작업(admin_id/action/target_type/target_id/before/after/created_at).
+  업무 트랜잭션과 같은 커밋에 넣는다
+- `registry_credit_logs` — 무료 횟수가 움직인 **모든 사건**. `registry_credits`(한도 계산에
+  반영되는 관리자 조정)와 역할이 다르다. 사용(USAGE)은 로그에만 남긴다 —
+  계산에 넣으면 `registry_usage`와 이중 차감
+- `payment_logs` / `payment_webhooks` — Sprint 27 참고
+
+### Soft Delete
+- `favorites`/`search_presets`에 `deleted_at`/`deleted_by` 컬럼 추가(**실제 DELETE가 있는 곳만**)
+- 이번 범위는 컬럼 추가까지. 전환하려면 `UNIQUE(user_id,item_id)` 때문에 재등록이 막히는
+  문제를 먼저 풀어야 한다 — 기존 DELETE 동작은 그대로다
+
+### 공통 응답 형식
+```
+{ "success": bool, "data": any, "error": str|null, "meta": dict|null, "message": str|null }
+```
+- `error`(도메인 코드, `docs/ERROR_CODES.md`)와 `meta`(페이지네이션)는 **추가** 필드
+- **`message`는 유지한다** — 프론트가 `result.message`를 읽고 있어 제거하면 Breaking Change
+- Admin의 `HTTPException` 기반 실패(`{"detail": ...}`)는 그대로 뒀다(Spec 결정 사항이라 Skip)
+
+### Admin 엔드포인트 (2026-08-07 기준 전체)
+| 경로 | 메서드 | 권한 |
+|---|---|---|
+| `/admin/registry-requests` | GET, PATCH | ADMIN |
+| `/admin/registry/requests` | GET | ADMIN (위와 동일 동작, 새 구조 경로) |
+| `/admin/registry-credits/{user_id}` | GET | ADMIN |
+| `/admin/registry-credits` | POST | **SUPER_ADMIN** |
+| `/admin/registry/credit-logs/{user_id}` | GET | ADMIN |
+| `/admin/users` | GET | ADMIN |
+| `/admin/payments` | GET | ADMIN |
+| `/admin/payments/{id}/logs` | GET | ADMIN |
+| `/admin/subscriptions` | GET | ADMIN |
+| `/admin/subscriptions/{id}` | PATCH | **SUPER_ADMIN** |
+| `/admin/audit-logs` | GET | ADMIN |

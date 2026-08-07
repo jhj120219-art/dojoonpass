@@ -246,35 +246,40 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
 
   // 시/도에 종속된 시/군/구 목록 — GET /api/v1/search/regions?sido=에서 실제 auction_item
   // 데이터 기준으로 가져온다. sido가 바뀔 때마다(초기 URL 복원 포함) 다시 조회한다.
-  const [sigunguOptions, setSigunguOptions] = useState<string[]>([])
-  const [sigunguLoading, setSigunguLoading] = useState(false)
-  const [sigunguError, setSigunguError] = useState(false)
   const [sigunguRetryKey, setSigunguRetryKey] = useState(0)
+  // "어떤 조회의 결과인지"를 key로 함께 들고 있는 단일 상태. loading/error/options 3개를
+  // 따로 두고 effect 안에서 곧바로 setSigunguLoading(true)를 호출하던 기존 구조는
+  // cascading render를 일으켜 react-hooks/set-state-in-effect lint 오류였다.
+  // 결과 하나만 저장하고 나머지는 렌더 중에 파생시키면 effect가 동기 setState를 하지 않는다.
+  // 부수 효과로, 로딩 중에 이전 시/도의 시/군/구 목록이 잠깐 남아 보이던 문제도 사라진다.
+  const [sigunguResult, setSigunguResult] = useState<{ key: string; options: string[]; error: boolean } | null>(null)
+  const sigunguKey = `${form.sido}#${sigunguRetryKey}`
+  const sigunguReady = sigunguResult?.key === sigunguKey
+  const sigunguLoading = Boolean(form.sido) && !sigunguReady
+  const sigunguError = sigunguReady ? sigunguResult.error : false
+  const sigunguOptions = sigunguReady ? sigunguResult.options : []
 
   useEffect(() => {
-    // sido가 비어있으면 조회할 대상이 없다 — 화면에는 sigunguOptions를 그대로 두지 않고
-    // 렌더링 시점에 `form.sido ? sigunguOptions : []`로 파생시켜 표시한다(별도 초기화 불요).
+    // sido가 비어있으면 조회할 대상이 없다 — 화면에는 렌더링 시점에
+    // `form.sido ? sigunguOptions : []`로 파생시켜 표시한다(별도 초기화 불요).
     if (!form.sido) return
     let cancelled = false
-    setSigunguLoading(true)
-    setSigunguError(false)
+    const key = sigunguKey
     fetchJSON<{ sido: string; sigungu: string[] }>(
       `/api/v1/search/regions?sido=${encodeURIComponent(form.sido)}`
     )
       .then((data) => {
-        if (!cancelled) setSigunguOptions(data.sigungu ?? [])
+        if (!cancelled) setSigunguResult({ key, options: data.sigungu ?? [], error: false })
       })
       .catch(() => {
-        if (!cancelled) setSigunguError(true)
-      })
-      .finally(() => {
-        if (!cancelled) setSigunguLoading(false)
+        if (!cancelled) setSigunguResult({ key, options: [], error: true })
       })
     return () => {
       cancelled = true
     }
-    // form.sido 값 자체만 기준으로 재조회한다 — sigunguRetryKey는 같은 sido로 재시도할 때만 쓰는 트리거.
-  }, [form.sido, sigunguRetryKey])
+    // sigunguKey는 form.sido + sigunguRetryKey를 합친 값이라 재조회 조건은 기존과 동일하다
+    // (sigunguRetryKey는 같은 sido로 재시도할 때만 쓰는 트리거).
+  }, [form.sido, sigunguKey])
 
   function update<K extends keyof SearchFormState>(key: K, value: SearchFormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }))

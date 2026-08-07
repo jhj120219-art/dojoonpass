@@ -1,14 +1,19 @@
+import logging
 from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
 from typing import Optional
 from datetime import date
 from storage.database import get_connection
+from api.auth import SUPABASE_JWT_SECRET
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
     analyze_intent,
     INTENT_SIDO, INTENT_SIGUNGU, INTENT_DONG, INTENT_LOT_NUMBER,
     INTENT_FULL_ADDRESS, INTENT_MIXED,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 # item.py와 동일한 선택적 인증 패턴 — 로그인 안 해도 검색은 그대로 동작하고,
@@ -135,14 +140,14 @@ def search(
     # 검색 자체는 그대로 진행한다(검증 실패가 검색 API를 막으면 안 됨).
     user_id = None
     if credentials:
+        # 예전에는 bare except라 KeyboardInterrupt/SystemExit까지 삼켰고 원인도 남지 않았다.
         try:
-            from api.auth import SUPABASE_JWT_SECRET
-            from jose import jwt
             payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
                 algorithms=["HS256"], options={"verify_aud": False})
             user_id = payload.get("sub")
-        except:
-            pass
+        except JWTError:
+            logger.debug("search: 토큰 검증 실패 — 비로그인으로 처리")
+            user_id = None
 
     conn = get_connection()
     try:

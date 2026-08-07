@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict
 from storage.database import get_connection
 
 logger = logging.getLogger(__name__)

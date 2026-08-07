@@ -13,12 +13,24 @@ export class ApiError extends Error {
 }
 
 // Backend가 인증 필요 라우트(favorites 등)에서 공통으로 쓰는 응답 포맷
-// ({"success", "data", "message"} — api/auth.py의 success()/fail())
+// (api/auth.py의 success()/fail()/error_response())
+//
+// `error`는 도메인 Error Code(docs/ERROR_CODES.md)다. **분기는 message가 아니라 error로 한다** —
+// message는 사용자에게 보여줄 한국어 문구라 언제든 바뀌고, 문구 비교는 조용히 깨진다.
+// `message`는 하위호환을 위해 유지된다.
 export interface ApiEnvelope<T> {
   success: boolean
   data: T | null
+  error: string | null
+  meta: Record<string, unknown> | null
   message: string | null
 }
+
+// 클라이언트가 분기에 쓰는 Error Code. 서버 `api/constants.py:ErrorCode`와 값이 같아야 한다.
+export const ERROR_CODES = {
+  FAVORITE_ALREADY_EXISTS: 'FAVORITE_ALREADY_EXISTS',
+  FAVORITE_NOT_FOUND: 'FAVORITE_NOT_FOUND',
+} as const
 
 export async function fetchJSON<T>(path: string, token?: string): Promise<T> {
   const headers: HeadersInit | undefined = token ? { Authorization: `Bearer ${token}` } : undefined

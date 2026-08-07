@@ -22,7 +22,7 @@ def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
     return os.path.join(DOCUMENT_ROOT, court_name, safe_case_no, safe_item_no)
 
 
-@router.api_route("/item/{item_id}/documents/{doc_type}", methods=["GET", "HEAD"])
+@router.get("/item/{item_id}/documents/{doc_type}")
 def get_document(item_id: int, doc_type: str):
     if doc_type not in DOC_TYPE_FILES:
         raise HTTPException(status_code=400, detail="지원하지 않는 문서 종류입니다")
@@ -37,6 +37,11 @@ def get_document(item_id: int, doc_type: str):
             raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
     finally:
         conn.close()
+
+    # court_name/case_no는 nullable 컬럼이라 NULL이면 아래 os.path.join이 TypeError로
+    # 터져 500이 된다 — 문서 경로를 만들 수 없는 상태이므로 404로 정직하게 응답한다.
+    if not row["court_name"] or not row["case_no"]:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
 
     filename, media_type = DOC_TYPE_FILES[doc_type]
     doc_dir = get_doc_dir(row["court_name"], row["case_no"], row["item_no"])
@@ -57,3 +62,14 @@ def get_document(item_id: int, doc_type: str):
         filename=filename,
         content_disposition_type="inline",
     )
+
+
+# HEAD는 프론트(`properties/[id]/page.tsx`)가 문서 뷰어를 열기 전에 "파일이 실제로 있는지"만
+# 확인하는 용도다. 예전에는 `api_route(methods=["GET","HEAD"])` 하나로 처리했는데, FastAPI가
+# 두 메서드에 **같은 operationId**를 만들어 `/openapi.json`을 그릴 때마다
+# `UserWarning: Duplicate Operation ID ...`가 나고 OpenAPI 클라이언트 생성도 깨졌다.
+# GET/HEAD를 별도 라우트로 나누고 HEAD는 스키마에서 제외해 중복을 없앤다 —
+# 동작은 동일하다(Starlette가 HEAD 응답의 본문을 자동으로 버린다).
+@router.head("/item/{item_id}/documents/{doc_type}", include_in_schema=False)
+def head_document(item_id: int, doc_type: str):
+    return get_document(item_id, doc_type)

@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
-import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiError, API_BASE_URL } from '@/lib/api'
+import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { formatDday } from '@/app/search/ResultList'
@@ -68,7 +68,11 @@ const VALIDATION_STATUS_LABEL: Record<string, string> = {
 }
 
 // api/v1/registry.py의 실제 status 값(PENDING/PAYMENT_REQUIRED/PROCESSING/COMPLETED/FAILED) 그대로 표시한다.
-// 발급 자동화(다운로드)는 백엔드에 아직 없어(501) PENDING/PROCESSING도 "접수/처리 중"까지만 안내한다 — 거짓 완료 표시 금지.
+// 다운로드 엔드포인트 자체는 구현 완료다(GET /registry-requests/{id}/download가 실제 파일을 서빙).
+// 다만 **발급이 자동화된 것은 아니라서** — 운영자가 등기부를 직접 발급받아 registry_documents/에
+// 배치하고 Admin API로 doc_url을 연결해야 COMPLETED가 된다 — PENDING/PROCESSING은 "접수/처리 중"
+// 까지만 안내한다(거짓 완료 표시 금지). PAYMENT_REQUIRED는 아래 JSX에서 결제 버튼 분기로
+// 따로 처리하므로 이 표에는 없다.
 const REGISTRY_STATUS_LABEL: Record<string, string> = {
   PENDING: '신청 접수됨 (발급 처리 대기 — 아직 자동화되지 않음)',
   PROCESSING: '처리 중',
@@ -76,42 +80,32 @@ const REGISTRY_STATUS_LABEL: Record<string, string> = {
   FAILED: '신청 실패',
 }
 
-// api/v1/registry.py:9 FREE_LIMIT 초과 시 건당 금액과 동일(registry.py의 charged_amount 하드코딩값).
-// GET /registry-requests 목록 응답에는 charged_amount가 없어(POST 응답에만 존재) 표시용으로 고정값을 둔다.
-const REGISTRY_OVERAGE_FEE = 1000
-
-// api/v1/payments.py의 PLAN_CATALOG와 동일한 값(표시/전송용 미러) — 실제 금액 검증은 서버가 한다.
-// listPrice(정상가)와 price(실판매가)를 나눠 두어, 할인 이벤트가 붙어도 표시 로직을 바꾸지 않고
-// 값만 교체하면 되도록 한다(서버 카탈로그와 동일한 구조).
-type SubscriptionPlan = 'BASIC' | 'PRO'
+// 플랜/가격/한도는 **서버(GET /api/v1/plans)가 단일 Source of Truth**다 (2026-08-07 CTO 승인 2번).
+// 예전에는 여기에 PLAN_CATALOG를 복사한 PLAN_OPTIONS 상수가 있었는데, 한쪽만 고치면 사용자가 본
+// 금액으로 결제를 눌렀을 때 서버가 "결제 금액이 올바르지 않습니다"로 거절하는 상태가 됐다.
+// 이제 프론트는 값을 갖지 않고 응답을 그대로 표시·전송만 한다.
+type SubscriptionPlan = string
 type BillingCycle = 'MONTHLY' | 'YEARLY'
-type PlanOption = {
+interface PlanPrice {
+  list_price: number
+  price: number
+  discounted: boolean
+  discount_amount: number
+  discount_start: string | null
+  discount_end: string | null
+  period_days: number
+}
+interface PlanOption {
   plan: SubscriptionPlan
   label: string
-  registryLimit: number
-  prices: Record<BillingCycle, { listPrice: number; price: number }>
+  registry_monthly_limit: number
+  prices: Record<string, PlanPrice>
 }
-const PLAN_OPTIONS: PlanOption[] = [
-  {
-    plan: 'BASIC',
-    label: '베이직',
-    registryLimit: 5,
-    prices: {
-      MONTHLY: { listPrice: 12900, price: 12900 },
-      YEARLY: { listPrice: 154800, price: 154800 },
-    },
-  },
-  {
-    plan: 'PRO',
-    label: '프로',
-    registryLimit: 10,
-    prices: {
-      MONTHLY: { listPrice: 22900, price: 22900 },
-      // 연간 할인 이벤트: 정상가 274,800원 -> 판매가 198,000원
-      YEARLY: { listPrice: 274800, price: 198000 },
-    },
-  },
-]
+interface PlanCatalog {
+  plans: PlanOption[]
+  billing_cycles: BillingCycle[]
+  overage_fee: number
+}
 
 interface RegistryRequestSummary {
   id: number
@@ -157,20 +151,52 @@ export default function PropertyDetailPage() {
   const [registryBusy, setRegistryBusy] = useState(false)
   const [registryMessage, setRegistryMessage] = useState<string | null>(null)
   const [viewingDoc, setViewingDoc] = useState<string | null>(null)
-  const [docAvailable, setDocAvailable] = useState<'checking' | 'ok' | 'notfound'>('checking')
+  // 문서 존재 확인(HEAD) 결과를 "물건id:문서종류" 키로 보관하고, 아직 결과가 없으면 렌더
+  // 중에 'checking'으로 파생시킨다. effect 안에서 곧바로 setDocAvailable('checking')을
+  // 호출하던 기존 구조는 cascading render를 일으켜 react-hooks/set-state-in-effect lint
+  // 오류였다. 키를 함께 저장하므로 이전 문서의 늦은 응답이 현재 문서 상태를 덮어쓰지 않는다.
+  const [docCheckResult, setDocCheckResult] = useState<Record<string, 'ok' | 'notfound'>>({})
   const [accessToken, setAccessToken] = useState<string | null>(null)
   const [favorited, setFavorited] = useState(false)
   const [favBusy, setFavBusy] = useState(false)
   const [favError, setFavError] = useState<string | null>(null)
   const [selectedPlan, setSelectedPlan] = useState<SubscriptionPlan>('BASIC')
   const [billingCycle, setBillingCycle] = useState<BillingCycle>('MONTHLY')
+  // 서버가 내려주는 플랜 카탈로그. 도착 전에는 플랜 카드를 그리지 않는다 —
+  // 임시값을 보여줬다가 서버 값으로 바뀌면 사용자가 본 금액과 청구액이 달라 보인다.
+  const [planCatalog, setPlanCatalog] = useState<PlanCatalog | null>(null)
   useEffect(() => {
-    if (!viewingDoc) return
-    setDocAvailable('checking')
+    let cancelled = false
+    fetchJSON<{ success: boolean; data: PlanCatalog | null }>('/api/v1/plans')
+      .then((res) => {
+        if (!cancelled && res.data) setPlanCatalog(res.data)
+      })
+      .catch(() => {
+        // 카탈로그를 못 받으면 구독 UI만 뜨지 않는다. 등기부 신청/다운로드 등 나머지
+        // 기능은 그대로 동작해야 하므로 화면 전체를 실패로 만들지 않는다.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  const planOptions = planCatalog?.plans ?? []
+  const overageFee = planCatalog?.overage_fee ?? null
+  // 현재 선택된 플랜+주기의 가격. 카탈로그가 아직 없거나 선택값이 카탈로그에 없으면 null이며,
+  // 그때는 구독 버튼을 비활성화한다 — 금액을 모른 채 결제를 보내면 서버가 거절한다.
+  const selectedPlanPrice =
+    planOptions.find((p) => p.plan === selectedPlan)?.prices[billingCycle] ?? null
+  const docCheckKey = viewingDoc ? `${id}:${viewingDoc}` : null
+  const docAvailable: 'checking' | 'ok' | 'notfound' =
+    docCheckKey ? (docCheckResult[docCheckKey] ?? 'checking') : 'checking'
+  useEffect(() => {
+    if (!docCheckKey || !viewingDoc) return
+    // 이미 확인한 문서는 다시 묻지 않는다(같은 페이지 세션 안에서만 유효한 캐시).
+    if (docCheckResult[docCheckKey]) return
+    const key = docCheckKey
     fetch(`${API_BASE_URL}/api/v1/item/${id}/documents/${viewingDoc}`, { method: 'HEAD' })
-      .then((res) => setDocAvailable(res.ok ? 'ok' : 'notfound'))
-      .catch(() => setDocAvailable('notfound'))
-  }, [viewingDoc, id])
+      .then((res) => setDocCheckResult((prev) => ({ ...prev, [key]: res.ok ? 'ok' : 'notfound' })))
+      .catch(() => setDocCheckResult((prev) => ({ ...prev, [key]: 'notfound' })))
+  }, [docCheckKey, viewingDoc, id, docCheckResult])
   useEffect(() => {
     async function fetchData() {
       // 이전/다음 물건 이동은 같은 라우트([id])의 파라미터만 바뀌는 클라이언트 전환이라
@@ -264,11 +290,15 @@ export default function PropertyDetailPage() {
 
   // Mock 구독 결제(api/v1/payments.py, PG 미연동) — 성공하면 subscriptions가 생성되어
   // has_active_subscription()이 true가 되므로, 곧바로 등기부 신청을 재시도한다.
-  // amount는 PLAN_OPTIONS(프론트 미러값)에서 가져오되, 서버가 PLAN_CATALOG로 다시 검증한다.
+  // amount는 서버가 내려준 카탈로그 값을 그대로 되돌려 보내고, 서버가 PLAN_CATALOG로 다시 검증한다.
   async function handleSubscribe(plan: SubscriptionPlan, cycle: BillingCycle) {
     const token = await requireToken()
     if (!token) return
-    const planOption = PLAN_OPTIONS.find((p) => p.plan === plan) ?? PLAN_OPTIONS[0]
+    const planOption = planOptions.find((p) => p.plan === plan)
+    if (!planOption || !planOption.prices[cycle]) {
+      setRegistryMessage('요금제 정보를 불러오지 못했습니다. 잠시 후 다시 시도해주세요')
+      return
+    }
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
@@ -305,7 +335,7 @@ export default function PropertyDetailPage() {
     try {
       const result = await postJSON<{ registry_request: RegistryRequestSummary | null }>(
         '/api/v1/payments',
-        { payment_type: 'OVERAGE_USAGE', amount: registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE },
+        { payment_type: 'OVERAGE_USAGE', amount: registryRequest.charged_amount ?? overageFee },
         token
       )
       if (!result.success || !result.data) {
@@ -374,16 +404,27 @@ export default function PropertyDetailPage() {
     setFavBusy(true)
     setFavError(null)
     try {
+      // 서버가 실패를 반환했는데도 하트를 뒤집으면 아이콘과 에러 메시지가 서로 모순된다.
+      // 상태는 "서버 기준으로 그렇게 됐을 때만" 바꾼다. 다만 이미 원하는 상태인 경우
+      // (중복 등록 / 이미 삭제됨)는 실패가 아니라 의도가 이미 이뤄진 것이므로 상태만 맞추고
+      // 에러는 띄우지 않는다 — 이 구분이 가능한 이유가 도메인 Error Code다.
+      // (search/FavoriteButton.tsx와 동일한 규칙)
       if (favorited) {
         const result = await deleteJSON<{ item_id: number }>(`/api/v1/favorites/${property.id}`, token)
         if (idRef.current !== requestId) return
-        setFavorited(false)
-        if (!result.success) setFavError(result.message ?? '즐겨찾기 삭제에 실패했습니다')
+        if (result.success || result.error === ERROR_CODES.FAVORITE_NOT_FOUND) {
+          setFavorited(false)
+        } else {
+          setFavError(result.message ?? '즐겨찾기 삭제에 실패했습니다')
+        }
       } else {
         const result = await postJSON<{ item_id: number; created_at: string }>('/api/v1/favorites', { item_id: property.id }, token)
         if (idRef.current !== requestId) return
-        setFavorited(true)
-        if (!result.success) setFavError(result.message ?? '즐겨찾기 등록에 실패했습니다')
+        if (result.success || result.error === ERROR_CODES.FAVORITE_ALREADY_EXISTS) {
+          setFavorited(true)
+        } else {
+          setFavError(result.message ?? '즐겨찾기 등록에 실패했습니다')
+        }
       }
     } catch (err) {
       if (idRef.current !== requestId) return
@@ -768,9 +809,9 @@ export default function PropertyDetailPage() {
           ) : registryMessage === '구독이 필요합니다' ? (
             <div className="py-4">
               <p className="text-sm text-gray-400 mb-3 text-center">등기부등본 신청은 구독 후 이용할 수 있습니다</p>
-              {/* 월/연 결제주기 토글 */}
+              {/* 월/연 결제주기 토글. 결제주기 목록도 서버(GET /api/v1/plans)가 정한다. */}
               <div className="flex rounded-full overflow-hidden border border-gray-200 mb-3">
-                {(['MONTHLY', 'YEARLY'] as BillingCycle[]).map((cycle) => (
+                {(planCatalog?.billing_cycles ?? []).map((cycle) => (
                   <button
                     key={cycle}
                     type="button"
@@ -785,9 +826,9 @@ export default function PropertyDetailPage() {
                 ))}
               </div>
               <div className="space-y-2 mb-3">
-                {PLAN_OPTIONS.map((opt) => {
+                {planOptions.map((opt) => {
                   const p = opt.prices[billingCycle]
-                  const discounted = p.price < p.listPrice
+                  if (!p) return null
                   return (
                     <button
                       key={opt.plan}
@@ -804,41 +845,43 @@ export default function PropertyDetailPage() {
                       <div className="flex justify-between items-center">
                         <span className="text-sm font-semibold text-gray-900">{opt.label}</span>
                         <span className="text-sm font-bold text-blue-500">
-                          {discounted && (
+                          {p.discounted && (
                             <span className="mr-1.5 text-xs font-normal text-gray-400 line-through">
-                              {p.listPrice.toLocaleString()}원
+                              {p.list_price.toLocaleString()}원
                             </span>
                           )}
                           {p.price.toLocaleString()}원{billingCycle === 'MONTHLY' ? '/월' : '/년'}
                         </span>
                       </div>
-                      <p className="text-xs text-gray-400 mt-1">등기부등본 월 {opt.registryLimit}회 제공</p>
+                      <p className="text-xs text-gray-400 mt-1">등기부등본 월 {opt.registry_monthly_limit}회 제공</p>
                     </button>
                   )
                 })}
               </div>
               <button
                 onClick={() => handleSubscribe(selectedPlan, billingCycle)}
-                disabled={registryBusy}
+                disabled={registryBusy || !selectedPlanPrice}
                 className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
               >
                 {registryBusy
                   ? '처리 중...'
-                  : `구독하기 (${(PLAN_OPTIONS.find((p) => p.plan === selectedPlan) ?? PLAN_OPTIONS[0]).prices[billingCycle].price.toLocaleString()}원${billingCycle === 'MONTHLY' ? '/월' : '/년'})`}
+                  : selectedPlanPrice
+                    ? `구독하기 (${selectedPlanPrice.price.toLocaleString()}원${billingCycle === 'MONTHLY' ? '/월' : '/년'})`
+                    : '요금제를 불러오는 중...'}
               </button>
             </div>
           ) : registryRequest?.status === 'PAYMENT_REQUIRED' ? (
             <div className="text-center py-4">
               <p className="text-sm text-gray-400 mb-2">무료 열람 횟수를 모두 사용했습니다</p>
               <p className="text-xs text-gray-300 mb-5">
-                건당 {(registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE).toLocaleString()}원 결제가 필요합니다
+                건당 {(registryRequest.charged_amount ?? overageFee ?? 0).toLocaleString()}원 결제가 필요합니다
               </p>
               <button
                 onClick={handlePayOverage}
                 disabled={registryBusy}
                 className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
               >
-                {registryBusy ? '처리 중...' : `${(registryRequest.charged_amount ?? REGISTRY_OVERAGE_FEE).toLocaleString()}원 결제하기`}
+                {registryBusy ? '처리 중...' : `${(registryRequest.charged_amount ?? overageFee ?? 0).toLocaleString()}원 결제하기`}
               </button>
             </div>
           ) : registryRequest?.status === 'COMPLETED' ? (

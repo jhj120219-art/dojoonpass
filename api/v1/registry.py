@@ -5,7 +5,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection
-from api.auth import get_current_user, success, fail
+from api.auth import get_current_user, success, error_response
+from api.constants import (
+    ErrorCode, RegistryRequestStatus, RegistryCreditReason, SubscriptionStatus,
+)
+from api.v1.registry_credits import log_credit_event
 
 router = APIRouter()
 
@@ -43,34 +47,82 @@ def get_free_count(conn, user_id: str) -> int:
     ).fetchone()[0]
 
 
-def get_user_free_limit(conn, user_id: str) -> int:
+def get_entitled_subscription(conn, user_id: str, at: datetime = None):
+    """지금 서비스를 이용할 수 있는 구독 행. 없으면 None.
+
+    **판정을 SQL이 아니라 Python에서 한다.** 이유가 두 가지 있다:
+
+    1) 유예 기간(GRACE_PERIOD)은 "만료시각 + 3일"이라 SQL 비교식만으로는 표현이 지저분하다.
+       `state_machines.resolve_expected_status()`가 이미 그 규칙의 단일 기준이므로 재사용한다.
+    2) DB에 저장된 status가 최신이 아닐 수 있다(자동 만료는 lazy sync 방식이라 조회 시점에
+       맞춰진다). 여기서 `sync_expired_status()`를 부르면 **커밋이 일어나** 이 함수를
+       호출하는 `create_registry_request()`의 `BEGIN IMMEDIATE` 트랜잭션이 중간에 끊긴다.
+       그래서 DB는 건드리지 않고 "지금 있어야 할 상태"만 계산해 판정한다.
+
+    정렬 tie-break(`id DESC`): `started_at`은 `datetime.now().isoformat()`인데 Windows의
+    시계 분해능(~15.6ms)상 짧은 간격의 두 결제가 **완전히 같은 문자열**을 가질 수 있다.
+    그러면 `ORDER BY started_at DESC`만으로는 어느 구독이 뽑힐지 정해지지 않아, 플랜
+    업그레이드(베이직→프로) 직후 한도가 옛 플랜으로 잘못 계산될 수 있었다(docs/BUGS.md #16).
     """
-    이 사용자의 이번 달 무료 한도. 활성 구독의 plan에 따라 달라진다(베이직 5회 / 프로 10회).
-    구독이 없으면 애초에 신청 자체가 막히므로(has_active_subscription) 도달하지 않지만,
+    from api.v1.state_machines import is_entitled, resolve_expected_status
+
+    now = at or datetime.now()
+    rows = conn.execute("""
+        SELECT * FROM subscriptions
+        WHERE user_id=? AND status IN (?, ?)
+        ORDER BY started_at DESC, id DESC
+    """, (user_id, SubscriptionStatus.ACTIVE.value,
+          SubscriptionStatus.GRACE_PERIOD.value)).fetchall()
+
+    for row in rows:
+        effective = resolve_expected_status(row["status"], row["expires_at"], now)
+        if is_entitled(effective, row["expires_at"], now):
+            return row
+    return None
+
+
+def get_plan_free_limit(conn, user_id: str) -> int:
+    """
+    플랜이 정하는 이번 달 무료 한도(관리자 조정 전 값).
+    이용 가능한 구독의 plan에 따라 달라진다(베이직 5회 / 프로 10회).
+    구독이 없으면 애초에 신청 자체가 막히므로 도달하지 않지만,
     플랜명을 해석할 수 없는 경우에는 보수적으로 기본값을 쓴다.
     """
     from api.v1.payments import get_registry_monthly_limit
 
-    now = datetime.now().isoformat()
-    row = conn.execute("""
-        SELECT plan FROM subscriptions
-        WHERE user_id=? AND status='ACTIVE'
-        AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY started_at DESC LIMIT 1
-    """, (user_id, now)).fetchone()
+    row = get_entitled_subscription(conn, user_id)
     if not row:
         return DEFAULT_FREE_LIMIT
     limit = get_registry_monthly_limit(row["plan"])
     return limit if limit > 0 else DEFAULT_FREE_LIMIT
 
+
+def get_user_free_limit(conn, user_id: str) -> int:
+    """
+    실제로 적용되는 이번 달 무료 한도 = 플랜 한도 + 관리자 조정 합계.
+
+    관리자 조정(api/v1/registry_credits.py)은 잔액 컬럼이 아니라 원장으로 관리되며,
+    월이 바뀌면 자연히 초기화된다(기존 월 리셋 정책과 동일한 경계).
+    차감이 과해 음수가 되면 0으로 막는다 — 무료 한도가 음수라는 상태는 의미가 없고,
+    아래 `free_used < free_limit` 비교가 항상 거짓이 되어 전부 유료로 처리되면 충분하다.
+    """
+    from api.v1.registry_credits import get_credit_adjustment
+
+    base = get_plan_free_limit(conn, user_id)
+    return max(0, base + get_credit_adjustment(conn, user_id))
+
 def has_active_subscription(conn, user_id: str) -> bool:
-    now = datetime.now().isoformat()
-    row = conn.execute("""
-        SELECT id FROM subscriptions
-        WHERE user_id=? AND status='ACTIVE'
-        AND (expires_at IS NULL OR expires_at > ?)
-    """, (user_id, now)).fetchone()
-    return row is not None
+    """Premium 판정(docs/decision-log.md "Premium").
+
+    2026-08-07: 판정 기준을 Lifecycle과 일치시켰다. 예전에는 `status='ACTIVE'`만 봐서,
+    승인된 유예 기간(GRACE_PERIOD) 정책이 정의만 되고 실제 이용권 게이트에는 반영되지
+    않는 상태였다 — 만료 직후 결제 재시도 중인 사용자가 즉시 차단됐다.
+    이제 `get_entitled_subscription()` 하나가 유일한 판정 기준이다.
+
+    함수명은 그대로 둔다 — `docs/decision-log.md`/`docs/backend.md`가 이 이름으로
+    Premium 판정을 설명하고 있고, 이름을 바꾸면 문서·주석이 전부 어긋난다.
+    """
+    return get_entitled_subscription(conn, user_id) is not None
 
 @router.post("/registry-requests")
 def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_current_user)):
@@ -90,7 +142,7 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
 
         # 구독 확인
         if not has_active_subscription(conn, user_id):
-            return fail("구독이 필요합니다")
+            return error_response(ErrorCode.REGISTRY_SUBSCRIPTION_REQUIRED, "구독이 필요합니다")
 
         now = datetime.now().isoformat()
 
@@ -101,6 +153,7 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
             free_limit = get_user_free_limit(conn, user_id)
             free_used = get_free_count(conn, user_id)
             is_free = free_used < free_limit
+            # 청구액은 여기서 한 번만 정한다 — 아래 두 분기의 응답/기록이 같은 값을 쓴다.
             charged_amount = 0 if is_free else OVERAGE_FEE
 
             # PAYMENT_REQUIRED 처리
@@ -109,15 +162,15 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
                     INSERT INTO registry_requests
                     (user_id, item_id, status, requested_at)
                     VALUES (?,?,?,?)
-                """, (user_id, req.item_id, "PAYMENT_REQUIRED", now)).lastrowid
+                """, (user_id, req.item_id, RegistryRequestStatus.PAYMENT_REQUIRED.value, now)).lastrowid
                 conn.commit()
                 return success({
                     "id": req_id,
                     "item_id": req.item_id,
-                    "status": "PAYMENT_REQUIRED",
+                    "status": RegistryRequestStatus.PAYMENT_REQUIRED.value,
                     "is_free": False,
                     "free_remaining": 0,
-                    "charged_amount": OVERAGE_FEE,
+                    "charged_amount": charged_amount,
                     "requested_at": now,
                 })
 
@@ -126,23 +179,35 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
                 INSERT INTO registry_usage
                 (user_id, item_id, is_free, charged_amount, used_at)
                 VALUES (?,?,?,?,?)
-            """, (user_id, req.item_id, 1, 0, now)).lastrowid
+            """, (user_id, req.item_id, 1, charged_amount, now)).lastrowid
+
+            # 무료 횟수 변동 추적 로그(CTO 승인 4번 — 기록 대상에 "사용"이 포함된다).
+            # ★ 이 로그는 한도 계산에 반영되지 않는다. 사용량은 registry_usage가 이미 세고
+            # 있어서(get_free_count) 조정 원장에도 넣으면 이중 차감이 된다 —
+            # registry_credit_logs는 "무엇이 언제 왜 움직였는가"를 보는 추적 전용이다.
+            # balance_after에는 이 사용을 반영한 잔여 무료 횟수를 남긴다.
+            log_credit_event(
+                conn, user_id, RegistryCreditReason.USAGE, -1,
+                reason=f"등기부 신청 (item_id={req.item_id})",
+                actor="USER", related_usage_id=usage_id,
+                balance_after=free_limit - free_used - 1,
+            )
 
             # 신청 생성
             req_id = conn.execute("""
                 INSERT INTO registry_requests
                 (user_id, item_id, usage_id, status, requested_at)
                 VALUES (?,?,?,?,?)
-            """, (user_id, req.item_id, usage_id, "PENDING", now)).lastrowid
+            """, (user_id, req.item_id, usage_id, RegistryRequestStatus.PENDING.value, now)).lastrowid
 
             conn.commit()
             return success({
                 "id": req_id,
                 "item_id": req.item_id,
-                "status": "PENDING",
+                "status": RegistryRequestStatus.PENDING.value,
                 "is_free": True,
                 "free_remaining": free_limit - free_used - 1,
-                "charged_amount": 0,
+                "charged_amount": charged_amount,
                 "requested_at": now,
             })
         except Exception:
@@ -160,7 +225,7 @@ def get_registry_requests(user_id: str = Depends(get_current_user)):
             FROM registry_requests rr
             JOIN auction_item ai ON rr.item_id = ai.id
             WHERE rr.user_id = ?
-            ORDER BY rr.requested_at DESC
+            ORDER BY rr.requested_at DESC, rr.id DESC
         """, (user_id,)).fetchall()
         return success([{
             "id": r["id"],
@@ -212,13 +277,13 @@ def download_registry(request_id: int, user_id: str = Depends(get_current_user))
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="신청을 찾을 수 없습니다")
-        if row["status"] != "COMPLETED":
+        if row["status"] != RegistryRequestStatus.COMPLETED.value:
             # PENDING/PAYMENT_REQUIRED/PROCESSING/FAILED 등 실제 상태를 그대로 알려준다(거짓 UI 금지).
-            return fail(f"발급이 완료되지 않았습니다 (현재 상태: {row['status']})")
+            return error_response(ErrorCode.REGISTRY_NOT_COMPLETED, f"발급이 완료되지 않았습니다 (현재 상태: {row['status']})")
         if not row["doc_url"]:
             # COMPLETED인데 doc_url이 없는 경우는 admin.py가 COMPLETED 전이 시 doc_url을 필수로
             # 받으므로 정상 경로로는 발생하지 않지만, 방어적으로 처리한다.
-            return fail("발급된 문서를 찾을 수 없습니다")
+            return error_response(ErrorCode.REGISTRY_DOCUMENT_NOT_FOUND, "발급된 문서를 찾을 수 없습니다")
 
         # 경로 탐색 방지: api/v1/documents.py:get_document()와 동일한 방식(commonpath 검사).
         file_path = os.path.join(REGISTRY_DOCUMENT_ROOT, row["doc_url"])

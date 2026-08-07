@@ -60,8 +60,17 @@ def execute():
         # Sprint: auction -> auction_item 최신화 동기화.
         # 기존 INSERT OR IGNORE는 최초 삽입 이후 재크롤링 값(가격/기일/상태/유찰횟수)이
         # 영원히 반영되지 않는 문제가 있어, 기존 row는 UPDATE로 갱신한다.
-        # 단, 크롤링 값이 빈 문자열/0(파싱 실패 등)이면 기존 정상값을 지우지 않고 유지한다
-        # (court_code+case_no+item_no 식별키 문제는 이번 STEP에서 다루지 않음 - Critical TODO로 별도 기록).
+        # 단, 크롤링 값이 빈 문자열/0(파싱 실패 등)이면 기존 정상값을 지우지 않고 유지한다.
+        #
+        # 2026-08-07: 위 "Critical TODO"(court_code+case_no+item_no 식별키)의 남은 절반을 해소한다.
+        # auction_case는 2026-08-06 Migration으로 (court_code, case_no) 복합키가 됐지만,
+        # auction_item 조회/갱신은 여전히 `WHERE case_no=? AND item_no=?`로 **법원 구분이 없었다**.
+        # 법원마다 사건번호를 독립 채번하므로 서로 다른 법원이 같은 (case_no, item_no)를 쓰면
+        # 매일 크롤링이 한쪽 법원 데이터로 다른 법원 row를 덮어쓴다(docs/BUGS.md #14와 같은 계열).
+        # 실측 결과 현재 그런 쌍은 0건이지만(사건번호 충돌 3건이 마침 item_no가 달랐다),
+        # 사건번호 충돌 자체는 이미 존재하므로 언제든 터질 수 있는 잠재 결함이다.
+        # 바로 위에서 (court_code, case_no)로 구한 case_id는 이미 법원까지 특정된 값이므로,
+        # 식별키를 (case_id, item_no)로 바꾸면 스키마 변경 없이 법원 구분이 생긴다.
         logger.info("auction_item 마이그레이션 시작...")
         item_count = 0
         item_inserted = 0
@@ -75,8 +84,8 @@ def execute():
             ).fetchone()["id"]
 
             existing = conn.execute(
-                "SELECT * FROM auction_item WHERE case_no=? AND item_no=?",
-                (row["case_no"], row["item_no"])
+                "SELECT * FROM auction_item WHERE case_id=? AND item_no=?",
+                (case_id, row["item_no"])
             ).fetchone()
 
             if existing:
@@ -103,14 +112,14 @@ def execute():
                         minimum_bid_price=?, auction_date=?, status=?,
                         fail_count=?, bid_rate=?, validation_status=?,
                         crawl_date=?, updated_at=?
-                    WHERE case_no=? AND item_no=?
+                    WHERE case_id=? AND item_no=?
                 """, (
                     court_name, property_type, sido, sigungu, dong,
                     lot_number, full_address, appraisal_price,
                     minimum_bid_price, auction_date, status,
                     fail_count, bid_rate, validation_status,
                     crawl_date, now,
-                    row["case_no"], row["item_no"],
+                    case_id, row["item_no"],
                 ))
                 item_updated += 1
             else:

@@ -1,12 +1,16 @@
 # 환경변수 가이드 (Environment Variables)
 
 Status: Active
-Last Updated: 2026-08-06
+Last Updated: 2026-08-07
 Owner: CTO
 
 ---
 
 ## 이 문서의 목적
+
+> **함께 보는 문서**: `docs/API_KEY_CHECKLIST.md`(2026-08-07 신설)는 "지금 코드가 실제로 무엇을
+> 읽는가"를 참조 지점(파일:라인)까지 적은 **코드 기준 사실 대장**이다. 이 문서는 각 변수의
+> **발급 방법·예시 값·설정 절차**를 다룬다. 둘이 어긋나면 코드가 기준이다.
 
 이 저장소를 실행/배포할 때 필요한 모든 환경변수를 한 곳에 정리한다.
 **Claude Code가 그대로 참고할 수 있는 개발 문서**를 목표로 하며, 각 항목마다
@@ -23,12 +27,12 @@ Owner: CTO
 - **Next.js에서 `NEXT_PUBLIC_` 접두사가 붙은 값은 브라우저에 그대로 노출된다.**
   비밀키에는 절대 이 접두사를 붙이지 않는다.
 
-## 현재 상태 요약 (2026-08-06 코드 기준)
+## 현재 상태 요약 (2026-08-07 코드 기준)
 
 | 상태 | 항목 |
 |---|---|
 | ✅ 설정 완료·동작 중 | `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
-| ⚠️ 코드는 완성, 값 미설정 | `ADMIN_API_KEY` (미설정 시 `/api/v1/admin/*` 전체 500) |
+| ⚠️ 코드는 완성, 값 미설정 | `ADMIN_API_KEY` (미설정 시 `/api/v1/admin/*` 전체 500), `SUPER_ADMIN_API_KEY` (미설정 시 등기부 한도 조정 403) |
 | 🕓 론칭 직전 필요 | KG이니시스 4종, Mail, SMS, GA4, Sentry, Slack |
 | 💤 지금 Skip 가능 | 코드에 참조 지점이 아직 없는 항목 전부(아래 "코드 참조 여부" 열 확인) |
 
@@ -41,7 +45,8 @@ Owner: CTO
 | `SUPABASE_JWT_SECRET` | ✅ 설정됨 | 인증 필요 API 전부 `500 "JWT Secret 미설정"` |
 | `NEXT_PUBLIC_SUPABASE_URL` | ✅ 설정됨 | 로그인/회원가입 불가 |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 설정됨 | 로그인/회원가입 불가 |
-| `ADMIN_API_KEY` | ❌ **미설정** | `/api/v1/admin/*` 전체 `500 "관리자 키 미설정"` — 등기부 신청 상태 관리 불가 |
+| `ADMIN_API_KEY` | ❌ **미설정** | `/api/v1/admin/*` 전체 `500 "관리자 키 미설정"` — 등기부 신청 상태 관리 불가. 2026-08-07부터 **ADMIN 등급** |
+| `SUPER_ADMIN_API_KEY` | ❌ **미설정** | 등기부 무료횟수 조정(`POST /admin/registry-credits`) 403 — CS 대응 불가. 나머지 Admin 기능은 정상 |
 
 ### B. 론칭 직전 필요 — 결제/모니터링 개시 시점
 
@@ -49,7 +54,7 @@ Owner: CTO
 |---|---|
 | `KG_MID` / `KG_API_KEY` / `KG_SECRET_KEY` | KG이니시스 사업자 계약·심사 완료 |
 | `KG_WEBHOOK_SECRET` | Webhook 수신 엔드포인트 구현 후 |
-| `PAYMENT_PROVIDER=kginicis` | `KGInicisProvider` 신설 후 (현재 값 없으면 안전하게 `mock`) |
+| `PAYMENT_PROVIDER=kginicis` | `KGInicisProvider` **실구현** 완료 후 (클래스 자리는 2026-08-07 신설 완료. 현재 값 없으면 안전하게 `mock`) |
 | `SENTRY_DSN` | 실사용자 트래픽 전 예외 수집 시작 |
 | `GA4_MEASUREMENT_ID` | 개인정보처리방침에 분석도구 고지 후 |
 
@@ -61,6 +66,8 @@ Owner: CTO
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | 등기부 발급 완료·영수증·구독 만료 안내 메일을 자체 발송할 때 |
 | `SMS_API_KEY` / `SMS_SECRET` | 매각기일 임박 등 실시간 알림을 붙일 때 |
 | `SUPABASE_SERVICE_ROLE_KEY` | 서버가 RLS를 우회해 Supabase 데이터를 직접 조작해야 할 때 |
+| `CORS_ALLOW_ORIGINS` | 운영 배포 시 API를 프론트 도메인으로만 제한할 때(미설정 = 기존 `*`) |
+| `LOG_LEVEL` | API 서버 로그 레벨 조절이 필요할 때(미설정 = `INFO`) |
 
 ---
 
@@ -148,9 +155,23 @@ Owner: CTO
 | 언제 필요한지 | 등기부 신청 상태 관리(목록 조회, PENDING→PROCESSING→COMPLETED 전이, `doc_url` 등록) |
 | 현재 필요한가 | **예 — 지금 미설정 상태라 Admin API 전체가 `500 "관리자 키 미설정"`으로 막혀 있다** |
 | 발급 위치 | 외부 발급 없음. **직접 생성**(예: `python -c "import secrets; print(secrets.token_urlsafe(32))"`) |
-| 코드 참조 여부 | `api/v1/admin.py:23` (`require_admin`) |
-| 비고 | 역할(role) 구분이 없어 키를 아는 사람은 전체 관리자 권한을 갖는다(MVP 한계). 유출 시 즉시 교체 필요 |
+| 코드 참조 여부 | `api/v1/admin.py:resolve_admin_role()` / `require_admin()` |
+| 비고 | 2026-08-07부터 이 키는 **ADMIN 등급**이다(SUPER_ADMIN은 아래 별도 키). 같은 등급 안에서는 사용자 구분이 없어 키를 아는 사람이 동일 권한을 갖는다. 유출 시 즉시 교체 |
 | 예시 | `ADMIN_API_KEY=Xy9-3fQz...랜덤32바이트...` |
+
+## SUPER_ADMIN_API_KEY (2026-08-07 신규)
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Admin |
+| 설명 | Admin 권한 2단계 중 **SUPER_ADMIN**. 과금에 직접 영향을 주는 조작 전용 |
+| 필수 여부 | 선택(없으면 SUPER_ADMIN 전용 기능만 막힌다) |
+| 언제 필요한지 | 등기부 무료횟수 추가/차감/초기화(CS 보상 등) |
+| 현재 필요한가 | 운영 개시와 함께 필요 — CS 대응 수단이다 |
+| 발급 위치 | 외부 발급 없음. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| 코드 참조 여부 | `api/v1/admin.py:resolve_admin_role()` |
+| 비고 | **`ADMIN_API_KEY`와 반드시 다른 값**으로 설정해야 등급 분리가 의미를 갖는다. 같으면 SUPER_ADMIN으로 승격된다 |
+| 예시 | `SUPER_ADMIN_API_KEY=Qz1-8wKp...랜덤32바이트...` |
 
 ---
 
@@ -160,8 +181,11 @@ Owner: CTO
 단 실제 API 연동·계약·키 입력·Webhook 연결·실결제 테스트는 **론칭 직전까지 연기**한다.
 현재는 `MockProvider`로 동작하며, 아래 4개 변수는 **지금 전부 Skip 가능**하다.
 
-> 현재 코드 상태: `api/v1/payment_providers.py`에 `KGInicisProvider`가 **아직 없다**.
-> `get_payment_provider()`는 `PAYMENT_PROVIDER`(mock/toss/portone)만 인식하며 기본값은 `mock`이다.
+> 현재 코드 상태(2026-08-07 갱신): `api/v1/payment_providers.py`에 `KGInicisProvider` **클래스가
+> 신설**됐고 `get_payment_provider()`는 `PAYMENT_PROVIDER`(mock/kginicis/toss/portone)를 인식한다
+> (기본값 `mock`). 단 `KGInicisProvider`의 6개 메서드는 전부 `NotImplementedError`인 **자리
+> 구현**이므로, `PAYMENT_PROVIDER=kginicis`로 바꾸면 모든 결제가 즉시 실패한다 — 실제 API 호출
+> 구현(승인 필요)이 끝나기 전까지는 값을 설정하지 않고 `mock`을 유지해야 한다.
 
 ## PAYMENT_PROVIDER (기존 변수, 참고)
 
@@ -171,8 +195,9 @@ Owner: CTO
 | 설명 | 사용할 결제 Provider 선택 |
 | 필수 여부 | 선택 (미설정 시 `mock`) |
 | 현재 필요한가 | **아니오 — 미설정 상태 유지 권장**(설정하지 않으면 Mock으로 안전하게 동작) |
-| 코드 참조 여부 | `api/v1/payment_providers.py:132` |
-| 비고 | 론칭 시 `kginicis` 값을 추가하려면 `_PROVIDERS` 맵에 Provider 등록이 선행돼야 한다 |
+| 코드 참조 여부 | `api/v1/payment_providers.py:get_payment_provider()` |
+| 허용값 | `mock`(기본) / `kginicis`(확정 PG사, 자리 구현) / `toss`·`portone`(**폐기 예정**, 선택 시 경고 로그). 그 외 값은 허용값 목록을 포함한 `ValueError`로 즉시 실패 |
+| 비고 | `_PROVIDERS` 맵 등록은 2026-08-07 완료. 실제 값 설정은 `KGInicisProvider` 실구현 완료 후 |
 | 예시 | `PAYMENT_PROVIDER=mock` |
 
 ## KG_MID
@@ -230,6 +255,36 @@ Owner: CTO
 | 코드 참조 여부 | **없음.** `PaymentProvider.handle_webhook()` 인터페이스는 있으나 호출하는 엔드포인트가 없다 |
 | 비고 | 서명 검증 없이 Webhook을 신뢰하면 결제 위조가 가능하다 — 구현 시 반드시 검증 먼저 |
 | 예시 | `KG_WEBHOOK_SECRET=whsec_<랜덤문자열>` |
+
+---
+
+# 4-1. CORS (API 서버)
+
+## CORS_ALLOW_ORIGINS
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | API 서버 |
+| 설명 | FastAPI가 허용할 Origin 목록(콤마 구분). 미설정 시 기존과 동일하게 `*`(전체 허용) |
+| 필수 여부 | 선택 (개발 중에는 불필요) |
+| 언제 필요한지 | **운영 배포 시** — 프론트 도메인만 남기고 나머지를 닫을 때 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능**(미설정 = 기존 동작 `*`) |
+| 코드 참조 여부 | `api_server.py` (2026-08-07 신규) |
+| 비고 | 인증이 쿠키가 아니라 `Authorization: Bearer`라 CSRF 위험은 없지만, 운영에서 전 도메인에 API를 열어둘 이유도 없다. 값을 넣으면 그 목록만 허용된다 |
+| 예시 | `CORS_ALLOW_ORIGINS=https://kokchal.com,https://www.kokchal.com` |
+
+## LOG_LEVEL
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | API 서버 |
+| 설명 | FastAPI 서버의 로그 레벨. `logging.basicConfig(level=...)`에 그대로 들어간다 |
+| 필수 여부 | 선택 (미설정 시 `INFO`) |
+| 언제 필요한지 | 운영에서 로그량을 줄이고 싶을 때(`WARNING`), 문제 추적 시 늘리고 싶을 때(`DEBUG`) |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능**(미설정 = `INFO`가 적정) |
+| 코드 참조 여부 | `api_server.py` (2026-08-07 신규) |
+| 비고 | 비밀값 아님. 알 수 없는 값이면 `INFO`로 폴백. **2026-08-07 이전에는 API 서버에 로깅 설정 자체가 없어 `logger.info`가 전부 버려졌다**(Admin 감사 로그 포함) |
+| 예시 | `LOG_LEVEL=INFO` |
 
 ---
 

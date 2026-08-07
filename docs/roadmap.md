@@ -4,7 +4,7 @@ Status: Beta v1
 
 Owner: Project Management
 
-Last Updated: 2026-08-05
+Last Updated: 2026-08-07
 
 ---
 
@@ -122,7 +122,7 @@ Priority 3
 
 - ~~등기부 다운로드 엔진(수동 배치 방식)~~ (완료, Sprint 6 — 아래 Beta v2의 "실제 발급기관 자동 연동"과는 별개)
 - ~~Payment Provider 구조 분리~~ (완료, Sprint 8 — PG사 확정 전 기반 구조만)
-- ~~PG사 확정~~ → **2026-08-06 KG이니시스로 확정(CTO)**. 남은 작업: `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현(외부 API Key/계약 필요 — 승인 대기). `TossProvider`/`PortOneProvider`는 폐기 예정
+- ~~PG사 확정~~ → **2026-08-06 KG이니시스로 확정(CTO)**, ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**. 남은 작업: Interface v2 6개 메서드의 실제 API 호출 구현(외부 API Key/계약 필요 — 승인 대기). `TossProvider`/`PortOneProvider`는 폐기 예정 표기 완료
 - `ADMIN_API_KEY` 운영 값 설정 + 역할(role) 구분 도입 여부 결정(현재 단일 공유키)
 - 성능 최적화
 
@@ -180,11 +180,119 @@ Priority 3
 - 검색 최적화
 - DB 백업 체계 구축
 - ~~`SUBSCRIPTION` 결제 금액 서버 검증 부재~~ → 2026-08-05 해결, 2026-08-06 `PLAN_CATALOG` 기반으로 갱신(할인가 포함 서버 재계산)
-- Admin 인증에 역할(role) 구분 없음 (`X-Admin-Key` 단일 공유키, MVP 한계)
+- Admin 인증에 역할(role) 구분 없음 (`X-Admin-Key` 단일 공유키, MVP 한계). 2026-08-07 상태 전이
+  **감사 로그**는 추가했으나 단일 키라 개별 운영자를 특정할 수는 없다
+- ~~bare `except:` / 과잉 `except Exception` / 미사용 import / 함수 내부 import~~ → 2026-08-07 정리 완료
+  (AST 전수 재조사 결과 미사용 import 잔여 **0건**)
+- ~~API 서버 로깅 설정 부재~~ → 2026-08-07 해소(`logging.basicConfig` + `LOG_LEVEL`)
+- ~~프론트/서버 정렬 비결정성~~ → 2026-08-07 전 도메인 `id` tie-break 적용
+- **`PLAN_OPTIONS`(프론트) ↔ `PLAN_CATALOG`(서버) 이중 관리** — 드리프트는 회귀 15번이 감지하지만
+  구조적으로는 서버가 카탈로그를 내려주는 편이 맞다
+- **목록 엔드포인트 LIMIT 부재**(`favorites`/`payments`/`registry-requests`) — 응답 구조 변경 필요
+- **`(user_id, status)` 복합 인덱스 부재** — 구독/초과결제 조회가 `status` 인덱스를 타고
+  TEMP B-TREE 정렬을 만든다(2026-08-07 실행계획 실측)
+- **외부 예외/로그 수집 없음**(Sentry 등) — 운영에서 과거 로그 추적 불가
+- **selenium 미설치** — 크롤러 계열 테스트를 현재 환경에서 실행할 수 없다
 
 ---
 
 # Sprint Backlog
+
+## [완료] PG 명칭 정리 / Admin·Release Audit / 기술부채·회귀 확대 (Sprint 26, 2026-08-07)
+
+배경: KG이니시스 확정(2026-08-06) 이후 코드/문서에 남아있던 Toss 기준 서술을 정리하고,
+Beta 출시 기준으로 Admin·전 도메인·성능·보안·문서를 전수 감사한다. 승인이 필요한 작업
+(실연동, `.env` 수정, 스키마 변경, 패키지 설치, 파일 삭제)은 전부 Skip하고 기록만 한다.
+
+완료
+
+- **PG**: `KGInicisProvider` 신설(6개 메서드 자리 구현), `PAYMENT_PROVIDER=kginicis` 허용값 추가,
+  `toss`/`portone`은 폐기 예정 표기 + 선택 시 경고 로그, 알 수 없는 값은 허용값 목록과 함께 즉시 실패.
+  문서 7종의 Toss 기준 서술을 KG이니시스 기준으로 갱신
+- **Bug(신규 발견·수정)**: 정렬 비결정성 — `get_user_free_limit()`의 `ORDER BY started_at DESC`가
+  전순서가 아니라 플랜 업그레이드 직후 옛 플랜 한도가 적용될 수 있었다(`docs/BUGS.md` #16).
+  전 도메인 6개 쿼리에 `id` tie-break 일괄 적용. **Admin 목록은 offset 페이지네이션이라
+  동률 행 중복/누락까지 가능했던 지점**
+- **Lint 2 → 0**: `react-hooks/set-state-in-effect` 2건을 파생 상태 방식으로 해소.
+  부수적으로 문서 뷰어의 늦은 응답 경쟁 상태, 시/군/구 로딩 중 이전 값 잔상도 함께 사라짐
+- **기술부채**: bare `except:` 2건 제거, `favorites.py`의 과잉 `except Exception`(DB 오류를
+  "이미 등록됨"으로 오안내) 수정, 미사용 지역변수 제거, 함수 내부 import 4건을 모듈 최상단으로
+- **Performance**: `doc_stats.py`의 6회 COUNT 스캔 → 단일 `GROUP BY` 1회
+- **Security**: CORS 허용 Origin을 `CORS_ALLOW_ORIGINS`로 제한 가능(미설정 시 기존 `*` 유지),
+  검색조건 저장 서버측 입력 검증(이름/크기/개수 상한), Admin 인증 실패·상태 전이 감사 로그,
+  `documents.py`의 NULL 컬럼 500 → 404
+- **UX/Release**: `layout.tsx` 메타데이터가 `create-next-app` 기본값이던 문제 해결(`콕찰`, `lang="ko"`)
+- **Test**: 회귀 118 → **163 검사**(Provider 레지스트리 / 정렬 결정성 / 플랜 tie-break / 입력 검증
+  / **API 표면 고정** / **응답 envelope 계약** / CORS 설정)
+- **문서**: `docs/API_KEY_CHECKLIST.md` 신설 — 요청 카테고리 16종을 전부 코드에서 검색해
+  참조 지점까지 기록. 실제로 읽는 env는 8개뿐이고 OAuth/SMTP/Storage/Analytics/Monitoring/
+  SNS/OCR/지도/메일은 참조 0건임을 확정. env 드리프트 실측(`.env`의 `SUPABASE_URL`/
+  `SUPABASE_ANON_KEY`는 코드가 읽지 않음)
+- **Bug(추가 발견·수정) 2건**:
+  (1) **API 서버에 로깅 설정 자체가 없어** 같은 날 추가한 Admin 감사 로그(`logger.info`)가
+  전량 유실되고 있었다 — 크롤러와 같은 포맷으로 `basicConfig` 추가, `LOG_LEVEL` 도입
+  (2) `documents.py`의 GET/HEAD 겸용 라우트가 **같은 operationId를 생성**해 `/openapi.json`
+  생성 시마다 경고가 나고 클라이언트 생성이 깨졌다 — 라우트 분리로 해소
+- **Architecture**: AST 미사용 import 재조사(47모듈) → 2건 제거 후 잔여 0건.
+  미사용 Component/Type 0건 재확인. 프론트 미호출 엔드포인트는 전부 운영/테스트/Admin UI용으로
+  의도된 것임을 확인하고 회귀 16번으로 집합을 고정
+- **Performance**: 실행계획 실측 — 검색/최근조회/무료횟수는 인덱스 적중. 구독·초과결제 쿼리가
+  `status` 인덱스를 타는 문제와 목록 LIMIT 부재는 **스키마/응답 구조 변경이라 미착수·기록**
+- **문서 정합성**: CLAUDE(architecture.md 위치), backend(DB 절대경로, **존재하지 않는
+  `X-Test-User-Id` 헤더 안내 삭제**), crawler(절대경로), frontend(`components/` 부재·플랜 UI·
+  검색조건 저장 UI·평생 누적 한도·로그아웃 미노출 — 전부 stale이었음) 정정
+
+- **Critical 발견**: 레거시 `auction` 테이블의 `UNIQUE(case_no, item_no)`에 법원이 빠져 있어
+  다른 법원 물건이 매일 크롤링에서 **소실**된다(`docs/BUGS.md` #18, 사본 DB로 재현).
+  승인 없이 가능한 완화 3종 적용(덮어쓰기 WARNING 로그 / `migrate_execute.py` 식별키를
+  `(case_id, item_no)`로 차단 / 위험 규모 감시 테스트). 근본 수정인 스키마 변경은 승인 대기
+- **TODO 탐색**: 코드 전체 스윕 결과 실제 TODO는 프론트 4건뿐이며 전부 백엔드 미지원 컬럼에
+  대한 정직한 표기. `SearchForm.tsx`의 "단일 선택시에만 API 연동" TODO는 stale로 확인(정정)
+
+Skip (승인 필요 — 기록만)
+
+- **`auction` 테이블 `UNIQUE(court_code, case_no, item_no)` 스키마 변경 (#18)** — 데이터 소실 중
+- KG이니시스 실연동 6개 메서드 구현 (계약·API Key·Webhook)
+- `ADMIN_API_KEY` `.env` 설정
+- `src/login/` 죽은 디렉터리 삭제(금지된 옛 브랜드명 사용 중)
+- Rate Limit 도입(패키지 설치 필요)
+- `registry_requests` 감사 컬럼 추가(스키마 변경)
+- `/properties` 화면 처리 방향(Spec), Admin UI 신설(Spec)
+
+---
+
+## [다음 Sprint 후보] Beta 출시 직전 정리 (Sprint 27)
+
+승인 없이 착수 가능한 것부터. 위 Skip 항목의 결정이 나면 그쪽이 우선한다.
+**단 `docs/BUGS.md` #18(레거시 `auction` 키로 인한 물건 소실)은 매일 재발하고 되돌릴 수 없으므로
+승인만 나면 아래 어느 항목보다 먼저 처리한다.**
+
+1. ~~`properties/[id]/page.tsx`의 stale 주석 정리~~ → **Sprint 26에서 함께 처리**
+   (다운로드 501 서술, 존재하지 않는 `registry.py:9 FREE_LIMIT` 참조 정정)
+2. ~~`PLAN_OPTIONS` ↔ `PLAN_CATALOG` 정합성 회귀 테스트~~ → **Sprint 26에서 함께 처리**
+   (`test_api_regression.py` 15번 — 한도/정상가/청구액 6항목 × 2플랜)
+3. ~~`TEST_PLAN.md` / `README.md` 정합성~~ → **Sprint 26에서 함께 처리**.
+   `search-engine.md`/`AI_CONTEXT.md`는 감사 결과 코드와 일치해 수정 없음
+4. `admin.py`/`search.py`의 `LIKE` 필터에서 사용자 입력의 `%`/`_` 이스케이프 처리 —
+   **Sprint 26에서 의도적으로 보류**. 보안 취약점은 아니고(파라미터 바인딩이라 인젝션 불가)
+   와일드카드 의미론만 바뀌는 문제인데, `search.py`의 8개 조건 전체를 바꾸면 사용자가 체감하는
+   검색 동작이 달라진다 — "Spec 변경 금지" 원칙상 PM 확인 후 착수
+5. Admin 목록의 `JOIN auction_item`이 INNER라 물건이 사라진 신청이 목록에서 통째로 빠지는 문제
+   (LEFT JOIN 전환 검토 — 현재 DELETE 경로가 없어 실제 발생은 안 하지만 구조적 사각지대)
+6. `PLAN_OPTIONS` 미러 자체를 없애는 방향 검토 — 서버가 카탈로그를 반환하는 엔드포인트를 두면
+   프론트/서버 이중 관리가 사라진다(현재는 회귀 15번으로 드리프트만 감지)
+7. **(승인 필요)** `(user_id, status)` 복합 인덱스 추가 — 활성 구독 조회와 초과결제 대상 선택이
+   `status` 인덱스를 타고 TEMP B-TREE 정렬을 만드는 것을 실행계획으로 실측함. 사용자·구독 수가
+   늘수록 나빠지는 구조라 Beta 트래픽이 붙기 전에 결정하는 편이 좋다(스키마 변경)
+8. **(승인 필요)** `favorites`/`payments`/`registry-requests` 목록 페이지네이션 —
+   현재 LIMIT이 없다. 응답 구조가 배열이라 `{total, items}`로 바꾸면 Breaking Change라
+   프론트 동시 수정이 필요하다
+9. **(승인 필요)** 외부 예외/로그 수집(Sentry 등) 도입 — 2026-08-07에 서버 로깅 설정을 신설했지만
+   stdout 스트림뿐이라 운영에서 과거 로그를 되짚을 수 없다. 패키지 설치 필요
+10. **(승인 필요)** selenium 설치 — 크롤러 계열 테스트(`test_db.py` 등)가 이 환경에서
+   `ModuleNotFoundError`로 실행 불가하다. 크롤러 회귀를 전혀 돌리지 못하는 상태
+
+---
 
 ## [완료] Security/Type/Performance Review (Sprint 15, 2026-08-06)
 
@@ -490,7 +598,7 @@ Beta v1 출시 기준
 | Detail | 완료 | `api/v1/item.py` + `src/app/properties/[id]/page.tsx` |
 | Favorite | 완료 | `api/v1/favorites.py` + `src/app/favorites/page.tsx` |
 | Authentication | 완료 | Supabase Auth + `api/auth.py` JWT 검증 |
-| Payment | 진행 중(Flow 준비 완료) | Mock API 완료, `OVERAGE_USAGE`/`SUBSCRIPTION` 금액검증 완료, Provider 인터페이스 분리(Sprint 8) + Interface v2(Sprint 11) + `payments.py`가 실제 PG 흐름과 동일한 순서(`create_order`→`confirm_payment`→`verify_payment`)로 provider를 호출하도록 연결(Sprint 12) 완료. 남은 것은 PG사 확정 + `TossProvider`/`PortOneProvider` 실제 구현뿐 — 흐름 구조 자체는 실연동 준비 완료 |
+| Payment | 진행 중(Flow 준비 완료) | Mock API 완료, `OVERAGE_USAGE`/`SUBSCRIPTION` 금액검증 완료, Provider 인터페이스 분리(Sprint 8) + Interface v2(Sprint 11) + `payments.py`가 실제 PG 흐름과 동일한 순서(`create_order`→`confirm_payment`→`verify_payment`)로 provider를 호출하도록 연결(Sprint 12) 완료. PG사 확정(KG이니시스) + `KGInicisProvider` 클래스 신설(2026-08-07)까지 끝나, 남은 것은 그 6개 메서드의 실제 API 호출 구현뿐 — 흐름 구조 자체는 실연동 준비 완료 |
 | Subscription | 진행 중 | 결제 성공 시 자동 생성 완료, 플랜별 가격 서버 검증 완료(Sprint 8). 플랜별 기간 정책은 여전히 미확정(30일 고정은 가정값) |
 | Premium | 완료 | `has_active_subscription()`으로 판정, Registry 신청 경로에서 실제 게이트로 사용 중 |
 | Registry | **완료 (Release Blocking 해소)** | 신청(프론트 연동) → 무료/초과 판단(백엔드, `BEGIN IMMEDIATE`로 동시성 안전 확보) → 결제 연결(자동) → Admin 상태 관리(MVP) → 실제 문서 다운로드(백엔드+프론트)까지 전체 체인 확인. 5/10/20 스레드 동시 요청 테스트로 무료 한도가 절대 초과되지 않음을 재검증 |
@@ -499,14 +607,14 @@ Beta v1 출시 기준
 ## 전체 진행률(%)
 
 - Beta v1 Success Criteria 7개 항목 기준: **7/7 완료**였으나, 2026-08-06 Sprint 16에서 새 Release Blocking 항목 발견(`auction_case.case_no` 전국 UNIQUE 충돌, 위 Risks/`docs/BUGS.md` #14 참고) — Search/Detail 화면 자체는 지금 당장 안전하지만(잠재적 데이터 오염이 아직 사용자에게 노출되는 필드에 닿지 않음), DB Schema 변경 승인이 있어야 코드로 해결 가능한 상태라 "완전히 알려진 버그 없음"이라고는 더 이상 말할 수 없음(발급기관 자동 연동은 Beta v2 범위로 애초에 제외, 이 항목과는 무관)
-- Payment 도메인을 "PG 실연동까지 포함한 완전한 결제 기능" 기준으로 보면: Mock 체인 **100% 동작**(동시성 안전 포함), 금액 검증(구독+초과분) **100% 완료**, Provider 인터페이스 확장(Interface v2) 완료, **`payments.py`가 실제 PG 흐름 순서(주문→승인→검증)로 provider를 호출하도록 연결 완료(Flow Migration)**. PG 실연동 포함 시 **약 90%**(이전 85%에서 상승 — 남은 건 사실상 "PG사 확정"이라는 의사결정과 `TossProvider`/`PortOneProvider`의 실제 API 호출 코드뿐, 엔드포인트 구조 자체는 더 손댈 곳이 없음)
+- Payment 도메인을 "PG 실연동까지 포함한 완전한 결제 기능" 기준으로 보면: Mock 체인 **100% 동작**(동시성 안전 포함), 금액 검증(구독+초과분) **100% 완료**, Provider 인터페이스 확장(Interface v2) 완료, **`payments.py`가 실제 PG 흐름 순서(주문→승인→검증)로 provider를 호출하도록 연결 완료(Flow Migration)**. PG 실연동 포함 시 **약 92%**(2026-08-07 `KGInicisProvider` 신설로 상승 — 남은 건 그 6개 메서드의 실제 KG이니시스 API 호출 코드 + 환불/Webhook 엔드포인트뿐, 나머지 엔드포인트 구조는 더 손댈 곳이 없음)
 
 ## Beta 남은 작업
 
 1. `ADMIN_API_KEY`를 `.env`에 설정 (Admin MVP 자체는 완료, 이 값만 없으면 500)
 2. ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정**(플랜별 월 단위: 베이직 5회/프로 10회). 남은 것은 **코드 반영**(현재 `FREE_LIMIT=5` 평생 누적)
 3. ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**(플랜명/가격/연 결제/등기부 월 리셋 전부 반영)
-4. ~~PG사 확정~~ → **2026-08-06 KG이니시스 확정**. 남은 것은 `KGInicisProvider` 신설 + Interface v2 6개 메서드 실제 구현(외부 API Key/계약 필요, 승인 대기)
+4. ~~PG사 확정~~ → **2026-08-06 KG이니시스 확정**, ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**. 남은 것은 6개 메서드의 실제 API 호출 구현(외부 API Key/계약 필요, 승인 대기)
 5. 환불 엔드포인트(`cancel_payment` 호출부), Webhook 수신 엔드포인트(`handle_webhook` 호출부) 신규 구현 — 이 둘은 여전히 어디서도 호출되지 않음
 5. ~~구독 플랜 비교/선택 UI~~ (2026-08-06 완료, Sprint 14), Admin 역할(role) 구분(여전히 미착수)
 6. (Beta v2) 등기부등본 실제 발급기관 자동 연동 — 현재는 운영자 수동 배치
@@ -517,11 +625,14 @@ Beta v1 출시 기준
 [PG사 확정] ✅ 2026-08-06 KG이니시스로 확정 완료 (CTO)
      │
      ▼
+[KGInicisProvider 클래스 신설 + PAYMENT_PROVIDER=kginicis 허용값] ✅ 2026-08-07 완료
+(6개 메서드는 NotImplementedError 자리 구현. TossProvider/PortOneProvider는 폐기 예정 표기)
+     │
+     ▼
 [KG이니시스 계약 + API Key 발급]  ← 현재 여기 (승인/외부 절차 필요)
      │
      ▼
-KGInicisProvider 신설 + Interface v2 6개 메서드 실제 API 호출로 구현
-(TossProvider/PortOneProvider는 폐기 예정)
+KGInicisProvider의 Interface v2 6개 메서드를 실제 API 호출로 구현
      │
      ▼
 환불(cancel_payment)·Webhook(handle_webhook) 수신 엔드포인트 신규 구현
@@ -543,6 +654,6 @@ DB 스키마 변경 승인이 있어야 코드로 고칠 수 있는 상태라 �
 (코드 작업이 거의 없는 운영/정책 결정). 이전 회차의 "프론트 결제 UI + registry-requests 연동",
 "Registry-Payment 연결", "Admin MVP", "Registry Download Engine", "Payment Provider 구조 분리"는
 모두 완료되어 Critical Path에서 제외됨 — **Beta 출시 관점에서 남은 코드 작업은 "PG사가 확정된
-이후" `TossProvider`/`PortOneProvider`를 실제로 구현하는 것뿐이다.** 그 전까지 코드 쪽에서
+이후" `KGInicisProvider`의 6개 메서드를 실제 API 호출로 구현하는 것뿐이다.** 그 전까지 코드 쪽에서
 할 수 있는 준비는 이번 Sprint로 전부 끝났다. 등기부 발급기관 자동 연동은 Beta v2로 이관되어
 Beta 출시를 막지 않는다.

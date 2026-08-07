@@ -4,7 +4,7 @@ Status: Active
 
 Owner: Project Management
 
-Last Updated: 2026-08-05
+Last Updated: 2026-08-07
 
 ---
 
@@ -121,7 +121,8 @@ Last Updated: 2026-08-05
 결정
 
 - 무료회원은 상세 API 접근 제한 (설계만 완료, `GET /api/v1/item/{id}` 코드에는 미구현 — `docs/search-engine.md` 알려진 문제점 참고)
-- Premium은 별도 테이블을 만들지 않는다. `subscriptions`에 ACTIVE + 미만료 row가 있으면 Premium (2026-08-05 확정, `api/v1/registry.py`의 `has_active_subscription()` 그대로 사용)
+- Premium은 별도 테이블을 만들지 않는다. `subscriptions`에 이용 가능한 row가 있으면 Premium (2026-08-05 확정, `api/v1/registry.py`의 `has_active_subscription()` 그대로 사용).
+  **2026-08-07 갱신**: 판정 기준이 `ACTIVE` 단독에서 `ACTIVE + GRACE_PERIOD`(만료 후 3일 유예)로 넓어졌다 — Lifecycle 승인(3번)에 맞춘 것이며, 그 전까지는 유예 정책이 정의만 되고 게이트에는 반영되지 않았다
 
 이유
 
@@ -258,11 +259,13 @@ Last Updated: 2026-08-05
 
 - CTO 지시에 따라 **실제 API 연동·계약·API Key 입력·Webhook 연결·실결제 테스트는 론칭
   직전까지 연기**한다. 현재는 `MockProvider`를 유지하며 Provider 구조만 KG이니시스 기준으로 둔다.
-- `api/v1/payment_providers.py`에는 여전히 `TossProvider`/`PortOneProvider` 자리만 있고
-  **`KGInicisProvider` 클래스는 존재하지 않는다**. `get_payment_provider()`의 `_PROVIDERS`
-  맵도 `mock`/`toss`/`portone` 3개만 인식한다(`PAYMENT_PROVIDER` 환경변수 허용값 동일)
-- 즉 "PG사 = KG이니시스"는 현재 **문서상 확정 / 코드 미반영** 상태다. Provider 클래스 신설과
-  Interface v2 6개 메서드의 실제 구현은 별도 Sprint(승인 필요 — 외부 API Key/계약 필요)
+- **2026-08-07 갱신**: `api/v1/payment_providers.py`에 `KGInicisProvider` 클래스를 신설하고
+  `get_payment_provider()`의 `_PROVIDERS` 맵/`PAYMENT_PROVIDER` 허용값에 `kginicis`를 추가했다.
+  `TossProvider`/`PortOneProvider`는 **폐기 예정 후보**로 명시하고 선택 시 경고 로그를 남긴다
+  (삭제는 승인 필요 작업이라 코드는 유지). 알 수 없는 값은 허용값 목록과 함께 `ValueError`
+- 단 `KGInicisProvider`의 6개 메서드는 전부 `NotImplementedError`인 **자리 구현**이다 —
+  즉 "PG사 = KG이니시스"는 이제 **구조상 반영 완료 / 실연동 미착수** 상태다. 6개 메서드의
+  실제 API 호출 구현은 별도 Sprint(승인 필요 — 외부 API Key/계약 필요)
 - `pg_provider` 컬럼은 실연동 전까지 계속 null(MockProvider 동작 그대로)
 
 ---
@@ -361,3 +364,140 @@ Last Updated: 2026-08-05
 - 문서 수집 구조
 - 권리분석 고도화
 - 운영 배포 구조
+
+---
+
+## CTO 승인 6건 (2026-08-07)
+
+### 1. auction 식별 구조 변경 (BUG #18)
+
+결정
+- `auction`의 `UNIQUE(case_no, item_no)`를 **`UNIQUE(court_code, case_no, item_no)`** 로 변경
+- `auction_item`은 **`UNIQUE(case_id, item_no)`** — court_code를 복제하지 않고 case_id 기반으로
+  간다. `case_id`가 가리키는 `auction_case`가 이미 `(court_code, case_no)` 복합키라 법원이
+  특정돼 있으므로 동치이면서 정규화 관점에서도 옳다(기존 `auction_case`와 일관성 유지)
+
+이유
+- 법원마다 사건번호를 독립 채번하는데 식별키에 법원이 없어, 매일 크롤링이 다른 법원의 물건을
+  덮어써 소실시키고 있었다(사본 DB로 재현). `docs/BUGS.md` #18
+
+영향
+- `docs/backend.md`가 `auction`을 "크롤러 원본, 변경 금지"로 표기했으나, 그 취지는 하위호환
+  보호이고 컬럼 구성은 그대로 유지(제약만 강화)하므로 CTO 승인 하에 예외 적용
+- Migration 012/013. id 100% 보존(자식 테이블 11개가 `auction_item.id` 참조)
+
+### 2. Plan API 서버화
+
+결정
+- **Backend가 가격/플랜의 단일 Source of Truth**다. `GET /api/v1/plans`가 플랜명·정상가·할인가·
+  연간가격·등기부 한도·할인기간을 내려주고, Frontend는 응답만 사용한다(하드코딩 금지)
+
+이유
+- 프론트 `PLAN_OPTIONS`가 서버 `PLAN_CATALOG`를 복사해 갖고 있어, 한쪽만 고치면 사용자가 본
+  금액으로 결제를 눌렀을 때 서버가 거절하는 상태가 됐다
+
+### 3. ID 체계 Audit
+
+결정
+- 전 도메인 id의 FK/JOIN/중복/혼용을 전수 조사한다
+
+결과 (2026-08-07 실측)
+- orphan 0 / 논리 불일치 0 / 식별키 중복 0 / 타입 혼용 0
+- **`PRAGMA foreign_keys = 0`** — FK가 선언만 되고 강제되지 않음을 발견(P2 등록)
+
+### 4. Admin 권한 2단계
+
+결정
+- **SUPER_ADMIN / ADMIN** 2단계. Operator 등급은 두지 않는다
+- 등급은 제시된 키로 판정한다(`ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY`)
+- 과금에 직접 영향을 주는 조작(등기부 한도 조정)은 SUPER_ADMIN 전용
+
+영향
+- 기존 `ADMIN_API_KEY`는 그대로 ADMIN 등급으로 동작 — 하위호환 유지
+- 여전히 키 기반이라 **개별 운영자를 특정할 수는 없다**(감사 로그에 등급만 남는다).
+  사용자 단위 식별이 필요해지면 Supabase custom claim 기반으로 교체해야 한다
+
+### 5. 결제 로그 구조 선구축
+
+결정
+- KG이니시스 실연동은 론칭 직전까지 연기하되 `payment_logs` / `payment_webhooks`의
+  Table/Model/Repository/Interface/Mock/테스트/문서는 미리 만든다. **실제 API Key 연결은 안 한다**
+
+영향
+- Webhook은 `event_id` UNIQUE로 멱등 처리(PG는 같은 노티를 재전송한다)
+- 민감정보는 저장 전 마스킹(`mask_sensitive`)
+- 수신 엔드포인트는 여전히 없다 — 구조만 준비된 상태
+
+### 6. registry_credit 구조
+
+결정
+- 관리자가 등기부 무료 횟수를 추가/차감/초기화할 수 있게 한다. Admin UI는 없어도 된다
+- **잔액 컬럼을 두지 않고 조정 원장으로 관리한다**: 유효 한도 = 플랜 월 한도 + 이번 달 조정 합계
+
+이유
+- 잔액 컬럼은 `registry_usage` 기반 사용량 계산과 상태가 이중화되어 반드시 어긋난다.
+  Premium 판정에서 별도 테이블을 거부한 것과 같은 근거(위 "Premium" 항목 참고)
+- 원장은 조정 이력이 그대로 감사 기록이 되고, 월 리셋 정책과 경계가 자동으로 일치한다
+
+### 보류 (진행하지 않음)
+
+Sentry / Rate Limit / Selenium / Monitoring / Analytics / OCR / 지도 API / SNS API /
+Storage 확장 / 외부 서비스 연동 / 패키지 설치
+
+
+---
+
+## CTO 추가 승인 10건 (2026-08-07, Sprint 28)
+
+### 1. SQLite FK 런타임 강제
+- 모든 DB 커넥션에 `PRAGMA foreign_keys = ON`. 마이그레이션만 예외(테이블 재작성 패턴이
+  중간에 자식 행을 고아로 만들기 때문)
+- 이유: `REFERENCES` 15개를 선언해 두고도 SQLite 기본값(OFF) 때문에 전부 무시되고 있었다
+
+### 2. Payment State Machine
+- `CREATED/READY/REQUESTED/PAID/FAILED/EXPIRED/CANCELLED/PARTIAL_REFUND/REFUNDED`
+- **레거시 `SUCCESS`는 제거하지 않는다** — 기존 `payments` 행과 `MockProvider`가 쓰고 있어
+  없애면 데이터 해석이 불가해진다. `PAID`와 동의어로 두고 `is_paid()`가 둘 다 인정한다
+- 허용 전이만 선언하고 나머지는 거부. 기존 흐름(Mock 즉시 SUCCESS)에는 개입하지 않는다
+
+### 3. Subscription Lifecycle
+- `ACTIVE/GRACE_PERIOD/PAUSED/EXPIRED/CANCELLED`, 유예 기간 3일
+- **자동 만료를 배치에 의존하지 않는다** — 상시 스케줄러가 크롤링 배치뿐이라 거기 얹으면
+  "배치가 안 돌아서 만료가 안 됨"이 곧 과금 사고가 된다. 조회 시점 lazy sync로 처리
+- 무료 등기부 초기화는 별도 작업 불요(월 경계 계산이 이미 그 역할을 한다)
+
+### 4. registry_credit_logs
+- `registry_credits`(한도 계산 반영분)와 **별도**로 무료 횟수가 움직인 모든 사건을 추적
+- 사용(USAGE)은 로그에만 남기고 한도 계산에는 넣지 않는다 — `registry_usage`가 이미
+  세고 있어 넣으면 이중 차감
+
+### 5. audit_logs
+- `admin_id/action/target_type/target_id/before/after/created_at`
+- `before`/`after`는 **바뀐 필드만** 담는다. 업무 트랜잭션과 같은 커밋에 넣는다
+
+### 6. Soft Delete
+- **실제 DELETE가 있는 테이블에만** 적용: `favorites`, `search_presets`
+- 이번 범위는 컬럼 추가까지. 전환은 `UNIQUE(user_id,item_id)` 재등록 문제를 먼저 풀어야 한다
+
+### 7. Admin REST 구조
+- `/admin/users|payments|subscriptions|registry|audit-logs` 신설
+- **기존 경로는 유지**한다(`/admin/registry-requests`, `/admin/registry-credits`) —
+  운영 문서·테스트가 참조 중이라 폐기는 Breaking Change
+- `/admin/users`는 users 테이블이 없으므로(인증은 Supabase) 활동 있는 user_id 집계로 제공
+
+### 8. API Response 표준화
+- `{success, data, error, meta, message}` — `error`/`meta` **추가**
+- **`message`는 유지**(프론트가 읽고 있음). Admin의 `HTTPException` 기반 실패는
+  클라이언트가 `status_code`로 분기 중이라 **Skip**(Spec 결정 사항)
+
+### 9. Error Code 표준화
+- 9개 도메인 40개 코드, `docs/ERROR_CODES.md`
+- 클라이언트는 문구가 아니라 코드로 분기한다. 코드 값은 배포 후 바꾸지 않는다
+
+### 10. Enum / Constant 통합
+- `api/constants.py`에 13개 Enum. `str, Enum` 상속이라 문자열처럼 동작한다
+- **문자열 값은 지금 DB에 있는 값 그대로** — 정의 위치만 모았고 값은 바꾸지 않았다
+
+### 보류 (진행하지 않음)
+KG이니시스 실연동 / API Key 입력 / Webhook 실서버 / Sentry / Analytics / OCR / Monitoring /
+Rate Limit / 외부 서비스 / 패키지 설치 / Docker / OS 변경 / GitHub 설정 변경

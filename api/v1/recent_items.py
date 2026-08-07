@@ -23,7 +23,7 @@ def get_recent_items(user_id: str = Depends(get_current_user)):
             FROM recent_items ri
             JOIN auction_item ai ON ri.item_id = ai.id
             WHERE ri.user_id = ?
-            ORDER BY ri.viewed_at DESC
+            ORDER BY ri.viewed_at DESC, ri.id DESC
             LIMIT 20
         """, (user_id,)).fetchall()
         items = []

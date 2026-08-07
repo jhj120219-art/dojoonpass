@@ -11,11 +11,22 @@ def document_stats():
             "SELECT COUNT(*) FROM auction_item"
         ).fetchone()[0]
 
+        # 예전에는 (doc_type, status) 조합마다 COUNT 쿼리를 따로 날려 document_status를
+        # 6번 스캔했다. 한 번의 GROUP BY로 동일한 6개 값을 얻는다(응답 필드/값 동일).
+        counts = {
+            (r["doc_type"], r["status"]): r["cnt"]
+            for r in conn.execute(
+                """
+                SELECT doc_type, status, COUNT(*) AS cnt
+                FROM document_status
+                WHERE doc_type IN ('SPEC','STATUS','APPRAISAL') AND status IN ('READY','FAILED')
+                GROUP BY doc_type, status
+                """
+            ).fetchall()
+        }
+
         def count_status(doc_type, status):
-            return conn.execute(
-                "SELECT COUNT(*) FROM document_status WHERE doc_type=? AND status=?",
-                (doc_type, status)
-            ).fetchone()[0]
+            return counts.get((doc_type, status), 0)
 
         spec_ready    = count_status("SPEC", "READY")
         status_ready  = count_status("STATUS", "READY")

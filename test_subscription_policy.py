@@ -156,6 +156,109 @@ def test_auction_case_composite_key():
         conn.close()
 
 
+def test_auction_identity_keys():
+    """크롤러 파이프라인 전체의 식별키에 법원이 포함돼 있는지 (docs/BUGS.md #18 해결 고정).
+
+    2026-08-06까지 auction/auction_item은 UNIQUE(case_no, item_no)로 **법원 구분이 없었다.**
+    법원마다 사건번호를 독립 채번하므로, 서로 다른 법원이 같은 사건번호+물건번호를 쓰면
+    매일 크롤링이 한쪽 법원의 물건을 통째로 덮어써 소실시켰다(사본 DB로 재현 확인).
+
+    2026-08-07 Migration 012/013으로 해결했다:
+      auction      -> UNIQUE(court_code, case_no, item_no)
+      auction_item -> UNIQUE(case_id, item_no)   (case_id는 이미 법원이 특정된 값)
+
+    이 테스트는 그 상태가 되돌아가지 않도록 고정한다.
+    """
+    print("\n--- 7. auction identity keys (docs/BUGS.md #18) ---")
+    conn = get_connection()
+    try:
+        shared = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT case_no FROM auction"
+            " GROUP BY case_no HAVING COUNT(DISTINCT court_code) > 1)"
+        ).fetchone()[0]
+        # 법원 간 사건번호 공유 자체는 정상이다(각 법원이 독립 채번하므로). 이제는 위험이
+        # 아니라 단순 관측값이라 추이만 남긴다.
+        print("       [INFO] 법원 간 공유 case_no: %d건 (2026-08-07 기준 3건, 이제 안전)" % shared)
+
+        auction_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='auction'").fetchone()[0]
+        item_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='auction_item'").fetchone()[0]
+        check("auction keyed with court_code",
+              "UNIQUE(court_code, case_no, item_no)" in auction_sql, True)
+        check("auction no longer keyed without court",
+              "UNIQUE(case_no, item_no)" in auction_sql, False)
+        check("auction_item keyed by case_id", "UNIQUE(case_id, item_no)" in item_sql, True)
+        check("auction_item no longer keyed by case_no only",
+              "UNIQUE(case_no, item_no)" in item_sql, False)
+
+        # 실제 데이터에도 중복이 없어야 한다.
+        check("no duplicate (court,case_no,item_no) in auction", conn.execute(
+            "SELECT COUNT(*) FROM (SELECT court_code, case_no, item_no FROM auction"
+            " GROUP BY court_code, case_no, item_no HAVING COUNT(*) > 1)").fetchone()[0], 0)
+        check("no duplicate (case_id,item_no) in auction_item", conn.execute(
+            "SELECT COUNT(*) FROM (SELECT case_id, item_no FROM auction_item"
+            " GROUP BY case_id, item_no HAVING COUNT(*) > 1)").fetchone()[0], 0)
+    finally:
+        conn.close()
+
+
+def test_registry_credit_ledger():
+    """등기부 무료횟수 조정 원장 (CTO 승인 6번) — 잔액 컬럼 없이 계산되는지.
+
+    유효 한도 = 플랜 월 한도 + (이번 달 조정 합계). RESET 이후의 조정만 유효하다.
+    DB를 건드리는 검사는 전부 롤백 안에서 수행한다.
+    """
+    print("\n--- 8. registry credit ledger ---")
+    from api.v1.registry_credits import (
+        add_credit, get_credit_adjustment, get_current_month,
+        REASON_GRANT, REASON_DEDUCT, REASON_RESET, MAX_ADJUSTMENT,
+    )
+    from api.v1.registry import get_user_free_limit, get_plan_free_limit
+
+    conn = get_connection()
+    conn.isolation_level = None
+    conn.execute("BEGIN")
+    try:
+        user = "qa-policy-credit-user"
+        check("month format", len(get_current_month()), 7)
+        check("no adjustment initially", get_credit_adjustment(conn, user), 0)
+
+        base = get_plan_free_limit(conn, user)
+        add_credit(conn, user, REASON_GRANT, 4, "test", "SUPER_ADMIN")
+        check("GRANT adds", get_credit_adjustment(conn, user), 4)
+        check("effective limit reflects grant", get_user_free_limit(conn, user), base + 4)
+
+        add_credit(conn, user, REASON_DEDUCT, 2, "test", "SUPER_ADMIN")
+        check("DEDUCT subtracts", get_credit_adjustment(conn, user), 2)
+
+        add_credit(conn, user, REASON_RESET, 0, "test", "SUPER_ADMIN")
+        check("RESET zeroes adjustment", get_credit_adjustment(conn, user), 0)
+
+        add_credit(conn, user, REASON_GRANT, 1, "test", "SUPER_ADMIN")
+        check("only post-RESET entries count", get_credit_adjustment(conn, user), 1)
+
+        # 다른 달의 조정은 이번 달에 영향을 주지 않는다(월 리셋 정책과 동일 경계)
+        check("other month isolated", get_credit_adjustment(conn, user, "1999-01"), 0)
+
+        # 부호는 서버가 정한다 — 호출부가 음수를 넘겨 GRANT가 차감이 되는 일이 없어야 한다
+        for bad in (0, -1, MAX_ADJUSTMENT + 1):
+            try:
+                add_credit(conn, user, REASON_GRANT, bad, None, "SUPER_ADMIN")
+                check("invalid amount %s rejected" % bad, False, True)
+            except ValueError:
+                check("invalid amount %s rejected" % bad, True, True)
+        try:
+            add_credit(conn, user, "UNKNOWN", 1, None, "SUPER_ADMIN")
+            check("unknown reason_type rejected", False, True)
+        except ValueError:
+            check("unknown reason_type rejected", True, True)
+    finally:
+        conn.execute("ROLLBACK")
+        conn.isolation_level = ""
+        conn.close()
+
+
 def run():
     test_plan_prices()
     test_registry_limits()
@@ -163,6 +266,8 @@ def run():
     test_discount_structure()
     test_monthly_reset_and_plan_limit()
     test_auction_case_composite_key()
+    test_auction_identity_keys()
+    test_registry_credit_ledger()
 
     print("\n" + "=" * 55)
     if failures:

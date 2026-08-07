@@ -1,7 +1,12 @@
-﻿from fastapi import APIRouter, HTTPException, Depends
+﻿import logging
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
 from storage.database import get_connection
+from api.auth import SUPABASE_JWT_SECRET
 from api.v1.recent_items import record_view
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -36,16 +41,21 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
         # 로그인 사용자면 최근조회 자동 기록 + 즐겨찾기 여부 확인
         user_id = None
         if credentials:
+            # 토큰이 유효하지 않아도 상세 조회 자체는 비로그인으로 계속 진행한다(선택적 인증).
+            # 예전에는 bare except라 KeyboardInterrupt/SystemExit까지 삼켰고 원인도 남지 않았다.
             try:
-                from api.auth import SUPABASE_JWT_SECRET
-                from jose import jwt
                 payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
                     algorithms=["HS256"], options={"verify_aud": False})
                 user_id = payload.get("sub")
-                if user_id:
+            except JWTError:
+                logger.debug("item 상세: 토큰 검증 실패 — 비로그인으로 처리")
+                user_id = None
+            if user_id:
+                try:
                     record_view(conn, user_id, item_id)
-            except:
-                pass
+                except Exception:
+                    # 최근조회 기록 실패가 상세 조회를 막으면 안 된다 — 기록만 포기한다.
+                    logger.warning("최근조회 기록 실패 (item_id=%s)", item_id, exc_info=True)
 
         is_favorited = False
         if user_id:

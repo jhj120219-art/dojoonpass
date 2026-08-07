@@ -48,7 +48,7 @@ Priority:
 3. docs/roadmap.md
 4. Relevant technical document (frontend.md / backend.md / crawler.md / search-engine.md)
 
-Note: `docs/architecture.md` currently does not exist inside `docs/` — there is an `architecture.md` sitting one level up at `C:\Users\Administrator\Desktop\architecture.md` (Desktop root, outside this repo). Check there until/unless it's moved into `docs/`.
+Note (2026-08-07 정정): `docs/architecture.md`는 **저장소 안에 존재한다** — 이전 버전의 "docs/ 안에 없고 `C:\Users\Administrator\Desktop\architecture.md`를 봐야 한다"는 안내는 stale이었다(그 경로는 이 PC에 존재하지 않는 옛 사용자 프로필 경로다). `docs/architecture.md`를 그대로 참조하면 된다.
 
 Each `docs/*.md` file has its own "절대 변경하면 안 되는 것" (do-not-change) and "알려진 문제점" (known issues) sections — read those before touching the corresponding area (frontend, backend, crawler, search). They are more current and detailed than anything summarized below; treat this file as the index, not a replacement.
 

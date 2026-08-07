@@ -1,8 +1,10 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+﻿import sqlite3
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection
-from api.auth import get_current_user, success, fail
+from api.auth import get_current_user, success, error_response
+from api.constants import ErrorCode
 
 router = APIRouter()
 
@@ -46,8 +48,15 @@ def add_favorite(req: FavoriteRequest, user_id: str = Depends(get_current_user))
                 (user_id, req.item_id, now)
             )
             conn.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(user_id, item_id) 위반 = 이미 등록된 경우. 예전에는 Exception 전체를
+            # 잡아 DB 잠금/디스크 오류까지 "이미 등록됨"으로 잘못 안내했다 — 중복 위반만
+            # 이 메시지로 처리하고, 그 외 오류는 감추지 않고 그대로 올린다.
+            conn.rollback()
+            return error_response(ErrorCode.FAVORITE_ALREADY_EXISTS, "이미 관심물건으로 등록되어 있습니다")
         except Exception:
-            return fail("이미 관심물건으로 등록되어 있습니다")
+            conn.rollback()
+            raise
         return success({"item_id": req.item_id, "created_at": now})
     finally:
         conn.close()
@@ -62,7 +71,7 @@ def remove_favorite(item_id: int, user_id: str = Depends(get_current_user)):
         )
         conn.commit()
         if result.rowcount == 0:
-            return fail("등록된 관심물건이 없습니다")
+            return error_response(ErrorCode.FAVORITE_NOT_FOUND, "등록된 관심물건이 없습니다")
         return success({"item_id": item_id})
     finally:
         conn.close()
@@ -78,7 +87,7 @@ def get_favorites(user_id: str = Depends(get_current_user)):
             FROM favorites f
             JOIN auction_item ai ON f.item_id = ai.id
             WHERE f.user_id = ?
-            ORDER BY f.created_at DESC
+            ORDER BY f.created_at DESC, f.id DESC
         """, (user_id,)).fetchall()
         items = []
         for row in rows:

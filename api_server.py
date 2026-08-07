@@ -1,8 +1,23 @@
-﻿import sys, os
+﻿import sys, os, logging
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# 로깅 설정. 크롤러 계열(mvp_scraper.py / doc_worker.py / migrate_execute.py)은 전부
+# basicConfig를 직접 호출하는데 API 서버만 빠져 있었다 — 그 결과 root logger에 핸들러가
+# 없고 기본 레벨이 WARNING이라, api/v1/*의 logger.info(예: Admin 상태 전이 감사 로그)가
+# 통째로 버려지고 warning조차 timestamp/모듈명 없이 lastResort로만 찍혔다.
+# 같은 포맷("%(asctime)s [%(levelname)s] ...")으로 맞추되, API 쪽은 어느 모듈이 남긴
+# 로그인지가 중요하므로 %(name)s를 함께 넣는다. 레벨은 LOG_LEVEL로 조절 가능(기본 INFO).
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").strip().upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+# 서드파티 라이브러리의 INFO 로그(요청 1건마다 한 줄)가 우리 로그를 덮지 않도록 낮춘다.
+for _noisy in ("httpx", "httpcore", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,9 +38,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# 허용 Origin. 미설정이면 기존과 동일하게 "*"(전체 허용)로 동작한다 — 하위호환 유지.
+# 운영 배포 시 .env에 CORS_ALLOW_ORIGINS=https://<프론트 도메인> 형태로(콤마 구분 다중 가능)
+# 지정하면 그 목록만 허용한다. 인증은 쿠키가 아니라 Authorization 헤더(Bearer)라 CSRF
+# 위험은 없지만, 운영에서 굳이 전 도메인에 API를 열어둘 이유도 없다.
+_cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+CORS_ALLOW_ORIGINS = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()] if _cors_origins_env else ["*"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
     # Content-Disposition은 브라우저 CORS 기본 안전 헤더 목록에 없어 명시적으로 노출해야
