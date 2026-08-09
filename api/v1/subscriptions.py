@@ -108,16 +108,18 @@ def get_active_subscription(conn, user_id: str, at: datetime = None,
     `api/v1/registry.py:get_entitled_subscription()` 쪽이 더 안전하다.
     """
     sync_expired_status(conn, user_id, at, commit=commit)
-    now = (at or datetime.now()).isoformat()
+    # sync_expired_status가 방금 "지금 있어야 할 상태"로 status를 맞춰뒀으므로
+    # status IN (ACTIVE, GRACE_PERIOD)만으로 이미 유효한 구독이다. GRACE_PERIOD는
+    # 정의상 expires_at이 이미 지난 상태라, 여기에 `expires_at > now` 조건을 더하면
+    # 방금 동기화한 GRACE_PERIOD 행이 스스로 걸러져 None이 반환된다(과거 버그).
     return conn.execute(
         """
         SELECT * FROM subscriptions
         WHERE user_id=? AND status IN (?, ?)
-          AND (expires_at IS NULL OR expires_at > ?)
         ORDER BY started_at DESC, id DESC LIMIT 1
         """,
         (user_id, SubscriptionStatus.ACTIVE.value,
-         SubscriptionStatus.GRACE_PERIOD.value, now),
+         SubscriptionStatus.GRACE_PERIOD.value),
     ).fetchone()
 
 

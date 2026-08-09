@@ -233,3 +233,38 @@ FK 강제 / 상태 머신 / 감사 로그 / Error Code / Enum 통합은 전부 *
 
 `api/constants.py`·`api/v1/state_machines.py`·`api/v1/audit.py`·`api/v1/subscriptions.py`는
 외부 서비스를 호출하지 않는다(`grep "os.getenv" `로 재확인 — 신규 0건).
+
+---
+
+## 8. 2026-08-08 — Supabase legacy/publishable 키 명명 확인 (사용자 요청, `.env` 값은 열람하지 않음)
+
+**질문**: `.env`에 `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` / `SUPABASE_SERVICE_ROLE_KEY`가
+입력되어 있는데, 코드가 요구하는 이름과 일치하는가?
+
+**전수 검색 결과** (`grep -rn` 5개 변수명 전체 대상, 값은 열람하지 않음):
+
+| 변수명 | 코드 참조 | 위치 |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 3곳 | `middleware.ts`, `supabaseServer.ts`, `supabaseClient.ts` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 3곳 | 위와 동일 |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | **0건** | — |
+| `SUPABASE_SERVICE_ROLE_KEY` | **0건** | — |
+| `SUPABASE_SECRET_KEY` | **0건** | — |
+| Python(`api/`, `storage/` 등) 전체 | **0건** (5개 변수명 전부) | 백엔드는 Supabase에 직접 접속하지 않음(위 6번 해석 참고) |
+
+**판단**: 코드를 바꿀 필요 없음. `@supabase/ssr`의 `createBrowserClient()`/`createServerClient()`는
+두 번째 인자로 legacy anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SDK가 값의
+형식을 구분하지 않음) — 즉 **변수명은 `NEXT_PUBLIC_SUPABASE_ANON_KEY` 그대로 두고, 그 안에
+신규 publishable 키 값을 넣으면 코드 변경 없이 동작한다.** 이름을 `PUBLISHABLE_KEY`로 바꾸는
+쪽이 아니라, 기존 `ANON_KEY`라는 변수명에 새 값을 담는 쪽이 안전(무변경) 정합화 방향이다.
+
+**추가 확인 필요 지점(코드로는 판단 불가, `.env`/`.env.local` 파일 위치·값 확인 필요)**:
+- `NEXT_PUBLIC_*` 값은 Next.js 빌드 타임에 **`.env.local`만** 클라이언트 번들에 주입한다.
+  `.env`(백엔드 전용 파일)에 넣으면 프론트가 전혀 읽지 못한다 — 어느 파일에 있는지가
+  값 자체보다 중요하다.
+- `SUPABASE_SERVICE_ROLE_KEY`는 여전히 코드 참조 0건이라(1-3항 참고) 어느 파일에 있든 지금은
+  영향이 없다 — 향후 백엔드가 Supabase Admin API를 직접 호출하게 될 때 실제로 필요해진다.
+- `SUPABASE_JWT_SECRET`(1-1항, 인증 필요 API 전체를 막는 값)은 이 세 변수와는 **완전히 다른
+  credential**이다(Supabase "JWT Settings"에서 별도 발급되는 서명 검증용 비밀키) — anon/
+  publishable/service_role/secret 키를 아무리 정확히 넣어도 `SUPABASE_JWT_SECRET`이 없으면
+  이 문제는 별개로 남는다.

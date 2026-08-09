@@ -29,7 +29,11 @@ export type SearchQueryParams = {
   min_land_area?: number
   max_land_area?: number
   special_conditions?: string[]
-  sort_by?: 'auction_date' | 'appraisal_price' | 'minimum_bid_price' | 'bid_rate' | 'fail_count' | 'case_no' | 'full_address'
+  // api/v1/search.py:SORT_COLUMNS 화이트리스트 8개와 정확히 일치해야 한다(2026-08-10
+  // Sprint 43 — crawl_date가 백엔드는 지원하는데 여기 빠져 있던 불일치를 발견해 정정.
+  // 다만 SortBar.tsx UI에 crawl_date 버튼을 추가할지는 별도 제품 판단이 필요해 이번에는
+  // 타입 정확성만 맞추고 UI는 그대로 둔다).
+  sort_by?: 'auction_date' | 'appraisal_price' | 'minimum_bid_price' | 'bid_rate' | 'fail_count' | 'crawl_date' | 'case_no' | 'full_address'
   sort_order?: 'asc' | 'desc'
   page?: number
   size?: number

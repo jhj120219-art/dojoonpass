@@ -8,7 +8,7 @@ from api.constants import (
     ErrorCode, PaymentType, BillingCycle as BillingCycleEnum,
     SubscriptionStatus, is_paid,
 )
-from api.v1.registry import OVERAGE_FEE
+from api.v1.registry import OVERAGE_FEE, get_entitled_subscription
 from api.v1.payment_providers import get_payment_provider
 from api.v1.payment_logs import (
     log_payment_event, get_payment_logs,
@@ -346,6 +346,32 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
             ).fetchone()
             if not target_request:
                 return error_response(ErrorCode.PAY_NO_TARGET_REQUEST, "결제가 필요한 등기부 신청이 없습니다")
+
+        # SUBSCRIPTION은 이미 유효한 구독(ACTIVE/GRACE_PERIOD)이 있으면 새로 만들지 않는다
+        # (2026-08-09, docs/BUGS.md #19 Registry 중복신청 결함과 동일 패턴). 프론트
+        # (properties/[id]/page.tsx)는 애초에 구독이 이미 유효하면 구독 UI 자체를 렌더링하지
+        # 않으므로("이미 구독 중이면 재구독 불가"가 기존에 이미 전제된 불변식이다) 여기 도달하는
+        # 건 중복 클릭·새로고침 재제출·직접 API 호출뿐이다.
+        #
+        # "확인 후 생성"은 그 자체로 SELECT -> 판단 -> INSERT 레이스다 — 기본 isolation_level은
+        # 첫 쓰기 문에야 트랜잭션을 시작하므로, 커밋되지 않은 두 요청이 동시에 이 SELECT를 지나가면
+        # 둘 다 "구독 없음"을 보고 통과할 수 있다(실측 재현: 동시 10회 요청 -> subscriptions/
+        # payments 10개씩 생성, 2026-08-09). registry.py의 등기부 중복신청 방지와 동일하게
+        # BEGIN IMMEDIATE로 쓰기 락을 먼저 선점해 확인+생성을 하나의 원자적 단위로 묶는다 —
+        # 뒤에 오는 결제/구독 생성·최종 commit까지 전부 이 트랜잭션 안에서 이어진다.
+        existing_subscription = None
+        if req.payment_type == "SUBSCRIPTION":
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            existing_subscription = get_entitled_subscription(conn, user_id)
+            if existing_subscription is not None:
+                conn.commit()
+                return success({
+                    "payment": None,
+                    "subscription": row_to_subscription(existing_subscription),
+                    "registry_request": None,
+                    "already_subscribed": True,
+                })
 
         now = datetime.now().isoformat()
         try:

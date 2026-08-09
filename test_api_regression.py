@@ -11,12 +11,18 @@ FastAPI TestClient로 api_server.app을 직접 호출하므로 라우팅/의존�
 주의:
 - 테스트 전용 user_id(qa-reg-<uuid>)로만 데이터를 만들고, 끝나면 그 user_id의 행만 정리한다.
   실제 사용자 데이터는 조회만 하고 절대 건드리지 않는다.
-- ADMIN_API_KEY는 이 프로세스 환경에만 주입한다(.env 파일은 수정하지 않는다).
+- ADMIN_API_KEY / SUPABASE_JWT_SECRET은 이 프로세스 환경에만 주입한다(.env 파일은 수정하지
+  않는다). 두 값 모두 이 테스트가 검증하는 것은 "인가/서명 로직이 올바른가"이지 실제 운영
+  Supabase 프로젝트의 진짜 비밀값이 맞는가가 아니므로, 테스트 프로세스 안에서만 유효한
+  합성 값으로 충분하다(2026-08-08 — 이 환경의 .env에는 SUPABASE_JWT_SECRET이라는 이름
+  자체가 없어서 추가함, JWT_SECRET이라는 다른 이름만 존재. docs/BETA_RELEASE_CHECKLIST.md
+  P0-4 참고. 실제 운영 배포에서는 여전히 .env에 정확한 이름으로 진짜 값을 넣어야 한다).
 - 출력은 ASCII만 사용한다(Windows cp949 콘솔에서 UnicodeEncodeError 방지).
 """
 import sys
 import os
 import uuid
+import secrets
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +33,13 @@ TEST_ADMIN_KEY = "qa-regression-admin-key"
 TEST_SUPER_ADMIN_KEY = "qa-regression-super-admin-key"
 os.environ["ADMIN_API_KEY"] = TEST_ADMIN_KEY
 os.environ["SUPER_ADMIN_API_KEY"] = TEST_SUPER_ADMIN_KEY
+
+# api/auth.py는 모듈 최상단에서 SUPABASE_JWT_SECRET = os.getenv(...)로 한 번만 읽으므로
+# import 전에 설정해야 한다. .env에 이미 값이 있으면(정확한 이름으로) 그 값을 그대로
+# 쓰고, 없을 때만(이 환경처럼) 이 프로세스에서만 유효한 무작위 값으로 대체한다 — 그래야
+# 실제 운영 값이 설정된 뒤에도 이 스크립트가 조용히 그 값을 덮어쓰지 않는다.
+if not os.getenv("SUPABASE_JWT_SECRET"):
+    os.environ["SUPABASE_JWT_SECRET"] = "qa-regression-" + secrets.token_hex(16)
 
 from fastapi.testclient import TestClient
 from jose import jwt
@@ -108,8 +121,20 @@ def test_search():
     check_true("is_favorited false for anonymous",
                all(i["is_favorited"] is False for i in body["items"]))
 
-    # 정렬 화이트리스트: 허용값은 200, 미허용값은 400으로 거부
-    check("sort_by allowed", client.get("/api/v1/search?sort_by=auction_date").status_code, 200)
+    # 정렬 화이트리스트 8개 전수(2026-08-10 Sprint 43 강화) — 기존에는 sort_by=auction_date
+    # 하나만 200인지 확인해, api/v1/search.py:SORT_COLUMNS의 나머지 7개(특히 crawl_date —
+    # 프론트 TypeScript 타입(src/app/search/types.ts)에 빠져 있던 것을 이번에 발견한 바로 그
+    # 필드) 중 하나가 화이트리스트에서 빠지거나 오타가 나도 잡아내지 못했다. 8개 전부 200으로
+    # 허용되고, 실제로 그 필드 기준으로 정렬된 결과를 돌려주는지(status만이 아니라 body 내용)
+    # 까지 확인한다.
+    SORT_WHITELIST = ("auction_date", "appraisal_price", "minimum_bid_price",
+                       "bid_rate", "fail_count", "crawl_date", "case_no", "full_address")
+    for field in SORT_WHITELIST:
+        sr = client.get("/api/v1/search?sort_by=%s&sort_order=asc&size=50" % field)
+        check("sort_by=%s allowed" % field, sr.status_code, 200)
+        values = [i[field] for i in sr.json()["items"] if i.get(field) is not None]
+        check_true("sort_by=%s actually sorted ascending" % field, values == sorted(values),
+                   (field, values[:5]))
     check("sort_by rejected", client.get("/api/v1/search?sort_by=; DROP TABLE--").status_code, 400)
     check("sort_order rejected", client.get("/api/v1/search?sort_order=sideways").status_code, 400)
 
@@ -154,8 +179,63 @@ def test_detail_and_documents():
 
     # 문서: 지원하지 않는 타입은 400, 지원 타입은 200/404(파일 유무에 따라)
     check("document bad type", client.get("/api/v1/item/%d/documents/INVALID" % item_id).status_code, 400)
-    check_true("document known type",
-               client.get("/api/v1/item/%d/documents/SPEC" % item_id).status_code in (200, 404))
+    get_status = client.get("/api/v1/item/%d/documents/SPEC" % item_id).status_code
+    check_true("document known type", get_status in (200, 404))
+
+    # HEAD 프로브 — properties/[id]/page.tsx가 문서 뷰어를 열기 전에 실제로 호출하는
+    # 엔드포인트다(docCheckKey). GET/HEAD를 별도 라우트로 분리한 이유(OpenAPI Duplicate
+    # Operation ID 회피, docs/CHANGELOG.md Sprint 26)가 유지되는지, 응답 상태코드가 GET과
+    # 항상 같은지 여기서 처음으로 자동 검증한다(이전까지 이 라우트는 테스트 0건이었다).
+    head_status = client.head("/api/v1/item/%d/documents/SPEC" % item_id).status_code
+    check("HEAD status matches GET status", head_status, get_status)
+    check("HEAD on bad doc type -> 400",
+          client.head("/api/v1/item/%d/documents/INVALID" % item_id).status_code, 400)
+    check("HEAD on nonexistent item -> 404",
+          client.head("/api/v1/item/99999999/documents/SPEC").status_code, 404)
+
+    # 실제 성공 경로 — 위 "document known type" 검사는 200/404 둘 다 통과로 처리해
+    # 어느 쪽이 맞는지, 200일 때 실제로 올바른 파일이 내려오는지는 확인한 적이 없었다
+    # (docs/CHANGELOG.md Sprint 35에서 registry 다운로드에 대해 지적한 것과 같은 축의 공백).
+    # 크롤러가 이미 수집해 둔 실제 파일이 있으면 그 내용을 검증하고, 없으면 이 테스트가
+    # 임시로 만들어 성공 경로를 강제로 왕복시킨 뒤 정확히 그 파일만 지운다.
+    from api.v1.documents import get_doc_dir, DOC_TYPE_FILES
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT court_name, case_no, item_no FROM auction_item WHERE id=?", (item_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    filename, media_type = DOC_TYPE_FILES["SPEC"]
+    doc_dir = get_doc_dir(row["court_name"], row["case_no"], row["item_no"])
+    doc_path = os.path.join(doc_dir, filename)
+    created_file = created_dirs = False
+    if get_status == 200:
+        # 크롤러가 실제로 수집해 둔 파일 — 존재 여부가 아니라 내용까지 확인한다.
+        check_true("existing SPEC file is non-empty", os.path.getsize(doc_path) > 0)
+    else:
+        if not os.path.isdir(doc_dir):
+            os.makedirs(doc_dir)
+            created_dirs = True
+        with open(doc_path, "wb") as f:
+            f.write(b"%PDF-1.4 qa-regression-doc-content")
+        created_file = True
+        forced = client.get("/api/v1/item/%d/documents/SPEC" % item_id)
+        check("forced real document download status 200", forced.status_code, 200)
+        check("forced real document body matches file", forced.content, b"%PDF-1.4 qa-regression-doc-content")
+        forced_head = client.head("/api/v1/item/%d/documents/SPEC" % item_id)
+        check("forced real document HEAD also 200", forced_head.status_code, 200)
+    if created_file:
+        os.remove(doc_path)
+    if created_dirs:
+        # get_doc_dir()가 만든 court_name/case_no/item_no 3단계 디렉터리를 역순으로 정리한다.
+        d = doc_dir
+        for _ in range(3):
+            try:
+                os.rmdir(d)
+            except OSError:
+                break
+            d = os.path.dirname(d)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +259,35 @@ def test_authentication():
           client.get("/api/v1/favorites", headers={"Authorization": "Bearer " + no_sub}).status_code, 401)
 
     check("valid token -> 200", client.get("/api/v1/favorites", headers=auth_headers()).status_code, 200)
+
+    # 만료 토큰 — python-jose는 exp 클레임이 있으면 기본적으로 검증한다(옵션으로 끄지 않는 한).
+    # SUPABASE_JWT_SECRET을 정확히 알아도 만료된 토큰으로는 접근할 수 없어야 한다.
+    from datetime import timezone as _tz
+    expired = jwt.encode(
+        {"sub": TEST_USER, "exp": datetime.now(_tz.utc) - timedelta(hours=1)},
+        SUPABASE_JWT_SECRET, algorithm="HS256",
+    )
+    check("expired token -> 401",
+          client.get("/api/v1/favorites", headers={"Authorization": "Bearer " + expired}).status_code, 401)
+
+    # 서명은 형식만 맞고(구조적으로 유효한 HS256 JWT) 실제 비밀키가 다른 토큰 — 위조 시도의
+    # 가장 현실적인 형태. "not-a-real-token"(구조 자체가 깨진 문자열)과는 다른 공격면이다.
+    wrong_secret = jwt.encode({"sub": TEST_USER}, "attacker-guessed-wrong-secret", algorithm="HS256")
+    check("wrong-secret token -> 401",
+          client.get("/api/v1/favorites", headers={"Authorization": "Bearer " + wrong_secret}).status_code, 401)
+
+    # alg 혼동 공격: 헤더의 alg를 none으로 바꿔 서명 검증 자체를 우회하려는 고전적 시도.
+    # api/auth.py가 jwt.decode(..., algorithms=["HS256"])로 알고리즘을 명시 고정해두었으므로
+    # 서버가 이를 거부해야 한다(알고리즘 화이트리스트가 실제로 강제되는지의 회귀 방어).
+    try:
+        none_alg_token = jwt.encode({"sub": TEST_USER}, "", algorithm="none")
+        check("alg=none token -> 401",
+              client.get("/api/v1/favorites",
+                        headers={"Authorization": "Bearer " + none_alg_token}).status_code, 401)
+    except Exception:
+        # 라이브러리가 alg=none 인코딩 자체를 막는 버전이면(그 자체로 안전), 서버 왕복 없이도
+        # "그 공격 벡터가 애초에 성립하지 않는다"는 것으로 통과 처리한다.
+        check_true("alg=none encoding rejected by jose itself (equally safe)", True)
 
 
 # ---------------------------------------------------------------------------
@@ -328,31 +437,36 @@ def test_payment_and_subscription():
     check("unknown payment type rejected",
           client.post("/api/v1/payments", json={"payment_type": "GIFT", "amount": 1}, headers=h).json()["success"], False)
 
-    # 정상 구독(BASIC 월) — 확정가 12,900원
+    # 월 결제(BASIC) 기간 검증은 별도 사용자로 한다 — 하위 테스트(9번 Registry 등)가 이
+    # TEST_USER의 PRO 한도(10회)를 전제하므로, TEST_USER는 아래에서 곧바로 PRO 연 구독
+    # 하나만 만든다(중복 구독 방지 수정으로 BASIC->PRO를 같은 사용자에 연이어 만들 수 없다).
+    monthly_user = TEST_USER + "-monthly"
+    hm = auth_headers(monthly_user)
     r = client.post("/api/v1/payments",
                     json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
                           "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
-                          "billing_cycle": BILLING_MONTHLY}, headers=h)
+                          "billing_cycle": BILLING_MONTHLY}, headers=hm)
     body = r.json()
-    check("subscription payment success", body["success"], True)
-    check("payment status SUCCESS", body["data"]["payment"]["status"], "SUCCESS")
-    check("subscription created", body["data"]["subscription"]["plan"], "BASIC")
-    check("subscription price", body["data"]["subscription"]["price"], 12900)
+    check("monthly subscription payment success", body["success"], True)
+    check("monthly payment status SUCCESS", body["data"]["payment"]["status"], "SUCCESS")
+    check("monthly subscription plan", body["data"]["subscription"]["plan"], "BASIC")
+    check("monthly subscription price", body["data"]["subscription"]["price"], 12900)
     check("pg_provider null (mock)", body["data"]["payment"]["pg_provider"], None)
-
-    # 구독 기간이 결제주기(월=30일)를 따르는지
     sub = body["data"]["subscription"]
     days = (datetime.fromisoformat(sub["expires_at"]) - datetime.fromisoformat(sub["started_at"])).days
     check("monthly period ~30d", days, 30)
 
-    # 연 결제(PRO) — 할인가 198,000원이 적용되어야 한다
+    # 연 결제(PRO) — 할인가 198,000원이 적용되어야 한다. TEST_USER는 여기서 처음이자
+    # 유일하게 구독한다(하위 테스트가 PRO 한도 10회를 전제).
     r = client.post("/api/v1/payments",
                     json={"payment_type": "SUBSCRIPTION", "plan": "PRO",
                           "amount": resolve_plan_price("PRO", BILLING_YEARLY),
                           "billing_cycle": BILLING_YEARLY}, headers=h)
     check("yearly PRO success", r.json()["success"], True)
     check("yearly discounted price", r.json()["data"]["subscription"]["price"], 198000)
+    check("fresh subscription has no already_subscribed flag", r.json()["data"].get("already_subscribed"), None)
     sub = r.json()["data"]["subscription"]
+    pro_sub_id = sub["id"]
     days = (datetime.fromisoformat(sub["expires_at"]) - datetime.fromisoformat(sub["started_at"])).days
     check("yearly period ~365d", days, 365)
 
@@ -362,9 +476,97 @@ def test_payment_and_subscription():
                           "amount": 274800, "billing_cycle": BILLING_YEARLY}, headers=h)
     check("list price rejected when discounted", r.json()["success"], False)
 
+    # 중복 구독 방지(멱등성) — 이미 유효한 구독(PRO)이 있는 상태에서 재구독을 시도해도 새
+    # subscriptions/payments 행을 만들지 않고 기존 구독을 그대로 돌려줘야 한다(2026-08-09
+    # 발견: Sprint 37 Registry 중복신청 결함(#19)과 동일 패턴 — POST /api/v1/payments
+    # (SUBSCRIPTION)는 이미 유효한 구독이 있어도 매번 새 subscriptions/payments 행을 만들어
+    # 중복 결제를 허용했다. 프론트(properties/[id]/page.tsx)는 이미 유효한 구독이 있으면
+    # 구독 UI 자체를 렌더링하지 않으므로("이미 구독 중이면 재구독 불가"가 기존에 이미 전제된
+    # 불변식) 승인 없이 수정 가능한 버그로 판단해 즉시 고침. 같은 플랜뿐 아니라 다른 플랜
+    # (BASIC) 재구독 시도도 막혀야 한다 — 이미 entitled한 사용자가 도달할 수 있는 유일한
+    # 경로는 중복 클릭/재시도뿐이고 프론트에 "플랜 변경" UI 자체가 없다. docs/CHANGELOG.md 참고.
+    conn = get_connection()
+    try:
+        before_sub_count = conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (TEST_USER,)).fetchone()[0]
+        before_pay_count = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (TEST_USER,)).fetchone()[0]
+    finally:
+        conn.close()
+    dup = client.post("/api/v1/payments",
+                      json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                            "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                            "billing_cycle": BILLING_MONTHLY}, headers=h)
+    dup_body = dup.json()
+    check("duplicate subscribe still returns success", dup_body["success"], True)
+    check("duplicate subscribe returns existing (PRO) subscription, not the requested plan",
+          dup_body["data"]["subscription"]["plan"], "PRO")
+    check("duplicate subscribe returns same subscription id", dup_body["data"]["subscription"]["id"], pro_sub_id)
+    check_true("duplicate subscribe flagged", dup_body["data"].get("already_subscribed"))
+    check("duplicate subscribe creates no payment", dup_body["data"]["payment"], None)
+    conn = get_connection()
+    try:
+        after_sub_count = conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (TEST_USER,)).fetchone()[0]
+        after_pay_count = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (TEST_USER,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("duplicate subscribe adds no subscriptions row", after_sub_count, before_sub_count)
+    check("duplicate subscribe adds no payments row", after_pay_count, before_pay_count)
+
+    # 구독 결제 실패 시 부수효과 없음 + 실패 후 재시도(2026-08-09 Sprint 38) — MockProvider는
+    # 항상 SUCCESS라 실패를 자연 재현할 수 없으므로 provider를 일시적으로 실패하도록 교체한다.
+    # 실패한 시도는 subscription을 만들지 않아야 하고(entitlement 없음), 이어지는 재시도는
+    # 정상 provider로 새 구독을 만들 수 있어야 한다. 전용 사용자를 쓴다(TEST_USER는 이미
+    # entitled라 이 경로 자체에 도달하지 못하고 already_subscribed로 막힌다).
+    import api.v1.payments as payments_module
+    from api.v1.payment_providers import PaymentProvider, ChargeResult, OrderResult
+
+    class _FailingSubProvider(PaymentProvider):
+        def create_order(self, payment_type, amount, metadata):
+            return OrderResult(order_id="qa-fail-sub-order-" + uuid.uuid4().hex[:8], pg_provider=None)
+
+        def confirm_payment(self, order_id, pg_transaction_id, amount):
+            return ChargeResult(status="FAILED", pg_provider=None, pg_transaction_id="qa-fail-sub-txn")
+
+        def verify_payment(self, pg_transaction_id):
+            return ChargeResult(status="FAILED", pg_provider=None, pg_transaction_id=pg_transaction_id)
+
+    fail_user = TEST_USER + "-subfail"
+    hf = auth_headers(fail_user)
+    _orig_provider = payments_module.get_payment_provider
+    payments_module.get_payment_provider = lambda: _FailingSubProvider()
+    try:
+        fail_r = client.post("/api/v1/payments",
+                             json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                                   "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                                   "billing_cycle": BILLING_MONTHLY}, headers=hf)
+        fail_body = fail_r.json()
+        check("failed subscription payment reports failure", fail_body["success"], False)
+        check("failed subscription payment error code", fail_body.get("error"), "PAY_FAILED")
+    finally:
+        payments_module.get_payment_provider = _orig_provider
+
+    conn = get_connection()
+    try:
+        sub_count = conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (fail_user,)).fetchone()[0]
+        check("no subscription created on failed payment", sub_count, 0)
+    finally:
+        conn.close()
+
+    retry = client.post("/api/v1/payments",
+                        json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                              "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                              "billing_cycle": BILLING_MONTHLY}, headers=hf)
+    retry_body = retry.json()
+    check("retry after failed payment succeeds", retry_body["success"], True)
+    check("retry creates a subscription", retry_body["data"]["subscription"]["plan"], "BASIC")
+
     # 결제 내역 조회 + 소유권 격리
     r = client.get("/api/v1/payments", headers=h)
-    check_true("payment history", len(r.json()["data"]) >= 2)
+    check_true("payment history", len(r.json()["data"]) >= 1)
     pid = r.json()["data"][0]["id"]
     check("own payment detail", client.get("/api/v1/payments/%d" % pid, headers=h).status_code, 200)
     other = client.get("/api/v1/payments/%d" % pid,
@@ -388,6 +590,77 @@ def test_registry():
     check("status PENDING", body["data"]["status"], "PENDING")
     check("PRO remaining 9", body["data"]["free_remaining"], 9)
 
+    # 중복 신청 방지(멱등성) — 같은 물건에 다시 신청해도 새 행을 만들거나 무료횟수를
+    # 추가로 소모하지 않고 기존 신청을 그대로 돌려줘야 한다(2026-08-09 발견: 이 검사가
+    # 없던 시절엔 반복 호출마다 별도 행이 생기고 매번 무료횟수가 소모됐다 — 재현 확인 후
+    # 승인 없이 수정 가능한 버그로 판단해 즉시 고침. `docs/CHANGELOG.md` Sprint 37 참고).
+    dup = client.post("/api/v1/registry-requests", json={"item_id": item_ids[0]}, headers=h)
+    dup_body = dup.json()
+    check("duplicate request returns same id", dup_body["data"]["id"], body["data"]["id"])
+    check_true("duplicate request flagged", dup_body["data"].get("already_requested"))
+    check("duplicate request does not consume another free credit",
+          dup_body["data"]["free_remaining"], 9)
+    conn = get_connection()
+    try:
+        dup_count = conn.execute(
+            "SELECT COUNT(*) FROM registry_requests WHERE user_id=? AND item_id=?",
+            (TEST_USER, item_ids[0]),
+        ).fetchone()[0]
+        check("still exactly one registry_requests row for this item", dup_count, 1)
+        usage_count = conn.execute(
+            "SELECT COUNT(*) FROM registry_usage WHERE user_id=? AND item_id=? AND is_free=1",
+            (TEST_USER, item_ids[0]),
+        ).fetchone()[0]
+        check("still exactly one free usage row for this item", usage_count, 1)
+    finally:
+        conn.close()
+
+    # 종결 상태(COMPLETED/FAILED)는 재신청을 막지 않아야 한다 — 발급 실패 후 재시도,
+    # 재발급 요청 같은 정당한 흐름을 이 중복 방지 로직이 오히려 막으면 안 된다.
+    # 이 서브 검사는 실제로 무료횟수를 하나 더 소모시키므로(재시도도 정당한 신규 신청이라
+    # 당연함), 뒤이은 9번(초과결제 흐름)의 "이미 1건 사용" 전제가 깨지지 않도록 검증
+    # 후 원래 상태(신청 1건, 무료 1건 소모)로 정확히 되돌린다.
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE registry_requests SET status='FAILED', reason='qa-regression-test' WHERE id=?",
+            (body["data"]["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    retry = client.post("/api/v1/registry-requests", json={"item_id": item_ids[0]}, headers=h)
+    retry_body = retry.json()
+    check_true("retry after FAILED is allowed (new request, not blocked)",
+               retry_body["data"]["id"] != body["data"]["id"])
+    check_true("retry after FAILED not flagged as duplicate",
+               not retry_body["data"].get("already_requested"))
+
+    conn = get_connection()
+    try:
+        retry_usage_id = conn.execute(
+            "SELECT usage_id FROM registry_requests WHERE id=?", (retry_body["data"]["id"],)
+        ).fetchone()["usage_id"]
+        # FK가 런타임에 강제되므로 자식(registry_requests, registry_credit_logs) ->
+        # 부모(registry_usage) 순서로 지운다 — log_credit_event()가 USAGE 사유로
+        # registry_credit_logs.related_usage_id도 함께 남기므로 그것도 지워야 한다.
+        conn.execute("DELETE FROM registry_requests WHERE id=?", (retry_body["data"]["id"],))
+        if retry_usage_id is not None:
+            conn.execute("DELETE FROM registry_credit_logs WHERE related_usage_id=?", (retry_usage_id,))
+            conn.execute("DELETE FROM registry_usage WHERE id=?", (retry_usage_id,))
+        conn.execute(
+            "UPDATE registry_requests SET status='PENDING', reason=NULL WHERE id=?",
+            (body["data"]["id"],),
+        )
+        conn.commit()
+        restored_usage = conn.execute(
+            "SELECT COUNT(*) FROM registry_usage WHERE user_id=? AND item_id=? AND is_free=1",
+            (TEST_USER, item_ids[0]),
+        ).fetchone()[0]
+        check("free usage count restored to 1 after retry sub-test", restored_usage, 1)
+    finally:
+        conn.close()
+
     check("nonexistent item -> 404",
           client.post("/api/v1/registry-requests", json={"item_id": 99999999}, headers=h).status_code, 404)
 
@@ -406,6 +679,60 @@ def test_registry():
     # 미완료 상태 다운로드는 거짓 성공 없이 실패 메시지를 반환
     r = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
     check("incomplete download not a file", r.json()["success"], False)
+
+    # 실제 성공 다운로드 — 지금까지 이 파일은 "COMPLETED인데 파일이 없는" 방어 경로만
+    # 검증했고(위 admin 섹션의 doc_url이 항상 존재하지 않는 더미 파일이었다), 베타 사용자
+    # 여정의 마지막 단계인 "실제로 파일이 내려오는" 성공 경로는 테스트 0건이었다.
+    import os as _os
+    from api.v1.registry import REGISTRY_DOCUMENT_ROOT
+    _os.makedirs(REGISTRY_DOCUMENT_ROOT, exist_ok=True)
+    real_filename = "qa-regression-real-file.pdf"
+    real_path = _os.path.join(REGISTRY_DOCUMENT_ROOT, real_filename)
+    file_bytes = b"%PDF-1.4 qa-regression-test-content"
+    with open(real_path, "wb") as f:
+        f.write(file_bytes)
+    try:
+        conn = get_connection()
+        try:
+            conn.execute(
+                "UPDATE registry_requests SET status='COMPLETED', doc_url=?, completed_at=? WHERE id=?",
+                (real_filename, datetime.now().isoformat(), req_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        dl = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
+        check("real download status 200", dl.status_code, 200)
+        check("real download body matches file", dl.content, file_bytes)
+        check_true("content-disposition exposes filename",
+                   real_filename in dl.headers.get("content-disposition", ""))
+
+        # 경로 탐색 방어 — commonpath 검사가 실제로 막는지 지금까지 검증된 적이 없었다.
+        # doc_url은 DB 값이라 클라이언트가 직접 조작할 수 없지만, 방어 로직 자체가
+        # 여전히 정확히 동작하는지는 별도로 확인할 가치가 있다(회귀 시 무음 실패 위험).
+        conn = get_connection()
+        try:
+            conn.execute(
+                "UPDATE registry_requests SET status='COMPLETED', doc_url=? WHERE id=?",
+                ("../../../../etc/passwd", req_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        traversal = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
+        check("path traversal blocked -> 404", traversal.status_code, 404)
+    finally:
+        _os.remove(real_path)
+        conn = get_connection()
+        try:
+            conn.execute(
+                "UPDATE registry_requests SET status='PENDING', doc_url=NULL, completed_at=NULL WHERE id=?",
+                (req_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     # 구독 없는 유저는 신청 자체가 막힌다
     r = client.post("/api/v1/registry-requests", json={"item_id": item_ids[0]}, headers=other_h)
@@ -441,7 +768,45 @@ def test_registry_overage_flow():
     check("over limit not free", over["is_free"], False)
     check("charged amount", over["charged_amount"], OVERAGE_FEE)
 
-    # 초과분 결제 -> 해당 신청이 PENDING으로 자동 전환
+    # 결제 실패 시 부수효과 없음 + 실패 후 재시도(2026-08-09 Sprint 38) — MockProvider는 항상
+    # SUCCESS라 실패를 자연 재현할 수 없으므로 provider를 일시적으로 실패하도록 교체한다.
+    # 실패한 시도는 등기부 신청을 PENDING으로 전환하지 않고(payment_id 그대로 NULL) 그대로
+    # 재시도 가능한 상태로 남아야 한다.
+    import api.v1.payments as payments_module
+    from api.v1.payment_providers import PaymentProvider, ChargeResult, OrderResult
+
+    class _FailingProvider(PaymentProvider):
+        def create_order(self, payment_type, amount, metadata):
+            return OrderResult(order_id="qa-fail-order-" + uuid.uuid4().hex[:8], pg_provider=None)
+
+        def confirm_payment(self, order_id, pg_transaction_id, amount):
+            return ChargeResult(status="FAILED", pg_provider=None, pg_transaction_id="qa-fail-txn")
+
+        def verify_payment(self, pg_transaction_id):
+            return ChargeResult(status="FAILED", pg_provider=None, pg_transaction_id=pg_transaction_id)
+
+    _orig_provider = payments_module.get_payment_provider
+    payments_module.get_payment_provider = lambda: _FailingProvider()
+    try:
+        fail_r = client.post("/api/v1/payments",
+                             json={"payment_type": "OVERAGE_USAGE", "amount": OVERAGE_FEE}, headers=h)
+        fail_body = fail_r.json()
+        check("failed overage payment reports failure", fail_body["success"], False)
+        check("failed overage payment error code", fail_body.get("error"), "PAY_FAILED")
+    finally:
+        payments_module.get_payment_provider = _orig_provider
+
+    conn = get_connection()
+    try:
+        still_unclaimed = conn.execute(
+            "SELECT status, payment_id FROM registry_requests WHERE id=?", (over["id"],)
+        ).fetchone()
+        check("target request still PAYMENT_REQUIRED after failed payment", still_unclaimed["status"], "PAYMENT_REQUIRED")
+        check("target request still unlinked after failed payment", still_unclaimed["payment_id"], None)
+    finally:
+        conn.close()
+
+    # 초과분 결제(실패 후 재시도, 정상 provider) -> 해당 신청이 PENDING으로 자동 전환
     r = client.post("/api/v1/payments",
                     json={"payment_type": "OVERAGE_USAGE", "amount": OVERAGE_FEE}, headers=h)
     check("overage payment success", r.json()["success"], True)
@@ -943,7 +1308,11 @@ def test_payment_logs():
         WEBHOOK_PROCESSED, REDACTED,
     )
 
-    h = auth_headers()
+    # 전용 사용자로 구독한다 — TEST_USER는 8번에서 이미 PRO를 구독해 entitled 상태라,
+    # 공유 TEST_USER로 다시 구독을 시도하면(중복 구독 방지, 2026-08-09) 새 payment가
+    # 생기지 않아 이 테스트가 검증하려는 "새 결제의 로그 3단계"를 만들 수 없다.
+    logs_user = TEST_USER + "-logs"
+    h = auth_headers(logs_user)
     r = client.post("/api/v1/payments",
                     json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
                           "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
@@ -963,6 +1332,18 @@ def test_payment_logs():
     other = client.get("/api/v1/payments/%d/logs" % payment_id,
                        headers=auth_headers("qa-reg-other-" + uuid.uuid4().hex[:6]))
     check("other user cannot read logs", other.status_code, 404)
+
+    # Admin 전용 결제 로그 조회 — GET /admin/payments/{id}/logs는 사용자용 §21과 별개
+    # 라우트(require_admin, 소유권 검사 없이 아무 payment_id나 조회 가능)인데 지금까지
+    # 테스트 0건이었다. 결제 분쟁 대응 시 운영자가 실제로 쓰는 경로이므로 커버한다.
+    ah = {"X-Admin-Key": TEST_ADMIN_KEY}
+    admin_view = client.get("/api/v1/admin/payments/%d/logs" % payment_id, headers=ah)
+    check("admin can view any payment's logs", admin_view.status_code, 200)
+    check("admin view has same log count", len(admin_view.json()["data"]), 3)
+    check("admin payment logs requires admin key",
+          client.get("/api/v1/admin/payments/%d/logs" % payment_id).status_code, 403)
+    check("admin payment logs 404 for unknown payment",
+          client.get("/api/v1/admin/payments/999999999/logs", headers=ah).status_code, 404)
 
     # 민감정보 마스킹 — 로그는 폭넓게 열람되므로 카드번호 등이 남으면 안 된다
     masked = mask_sensitive({"card_no": "4111111111111111", "amount": 1000,

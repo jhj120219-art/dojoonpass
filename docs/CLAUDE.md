@@ -88,7 +88,7 @@ python -m storage.migrations.run_migrations     # applies numbered SQL files (fa
 `storage/database.py`'s `init_db()` only creates the legacy `auction` + `document_queue` + `document_version_log` tables (idempotent, runs automatically on every `mvp_scraper.py`/`doc_worker.py` invocation) — it does **not** create the v4.1 tables above.
 
 ### Tests
-No test runner is configured (no pytest config). Root-level `test_*.py` files are standalone manual scripts, run directly: `python test_db.py`. The many `step*.py`, `check_*.py`, `patch_*.py` files are one-off investigation scripts from past debugging sessions, not a suite — and are gitignored (see below), so don't assume one is current, load-bearing code just because it's on disk.
+No test runner is configured (no pytest config). Root-level `test_*.py` files are standalone manual scripts (`python test_api_regression.py` etc. — see `docs/TEST_PLAN.md` for the full current list and coverage). `test_db.py`/`test_docs.py`/`test_docs2.py` are the exception: they drive Selenium against the live `courtauction.go.kr` and are not meant to be run as part of routine regression (real network calls). The many `step*.py`, `check_*.py`, `patch_*.py` files are one-off investigation scripts from past debugging sessions, not a suite — and are gitignored (see below), so don't assume one is current, load-bearing code just because it's on disk.
 
 ## Architecture
 

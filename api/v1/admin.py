@@ -206,22 +206,36 @@ def update_registry_request_status(
 
         now = datetime.now().isoformat()
         try:
+            # WHERE에 status=current를 다시 걸어(2026-08-09 Sprint 39 TOCTOU 감사) SELECT와
+            # UPDATE 사이에 다른 요청이 먼저 상태를 바꿨다면 rowcount=0으로 감지한다 — 이 조건이
+            # 없으면 같은 request_id에 동시에 도착한 두 관리자 요청(예: 같은 PROCESSING 건을
+            # 하나는 COMPLETED로, 하나는 FAILED로)이 둘 다 "현재 상태는 PROCESSING"을 보고
+            # 통과해 나중에 커밋되는 쪽이 앞선 결과(doc_url/reason 포함)를 조용히 덮어쓸 수
+            # 있었다. payments.py의 OVERAGE_USAGE 연결과 동일한 조건부 UPDATE 패턴이다.
             if req.status == "COMPLETED":
-                conn.execute(
-                    "UPDATE registry_requests SET status=?, completed_at=?, doc_url=? WHERE id=?",
-                    (req.status, now, req.doc_url, request_id),
+                cursor = conn.execute(
+                    "UPDATE registry_requests SET status=?, completed_at=?, doc_url=? WHERE id=? AND status=?",
+                    (req.status, now, req.doc_url, request_id, current["status"]),
                 )
             elif req.status == "FAILED":
-                conn.execute(
-                    "UPDATE registry_requests SET status=?, reason=? WHERE id=?",
-                    (req.status, req.reason, request_id),
+                cursor = conn.execute(
+                    "UPDATE registry_requests SET status=?, reason=? WHERE id=? AND status=?",
+                    (req.status, req.reason, request_id, current["status"]),
                 )
             else:
-                conn.execute(
-                    "UPDATE registry_requests SET status=? WHERE id=?",
-                    (req.status, request_id),
+                cursor = conn.execute(
+                    "UPDATE registry_requests SET status=? WHERE id=? AND status=?",
+                    (req.status, request_id, current["status"]),
+                )
+            if cursor.rowcount == 0:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"다른 요청이 먼저 상태를 바꿨습니다 (기대한 현재 상태: {current['status']})",
                 )
             conn.commit()
+        except HTTPException:
+            raise
         except Exception:
             conn.rollback()
             raise

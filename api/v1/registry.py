@@ -148,10 +148,43 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
 
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # 멱등성/중복 신청 방지 — 같은 사용자가 같은 물건에 이미 진행 중인 신청이
+            # 있으면 그 신청을 그대로 돌려준다(새로 만들지 않는다). 이 검사가 없으면
+            # 같은 item_id로 반복 호출할 때마다 무료횟수를 매번 새로 소진하거나
+            # PAYMENT_REQUIRED 행이 계속 쌓여, 중복 클릭/새로고침 재제출/직접 API 호출로
+            # 한 물건에 대해 무료 한도를 여러 번 소모하거나 중복 결제 대상을 만들 수 있었다
+            # (2026-08-09 재현 확인: 승인 없이 수정 가능한 버그로 판단 — 새 UX/Spec을
+            # 도입하는 게 아니라 "사용자당 물건당 진행 중인 신청은 1건"이라는, 기존
+            # 응답 스키마를 그대로 쓰는 멱등 처리다. COMPLETED/FAILED는 종결 상태이므로
+            # 재신청(재발급 시도)을 막지 않는다).
+            existing = conn.execute("""
+                SELECT * FROM registry_requests
+                WHERE user_id=? AND item_id=? AND status IN (?,?,?)
+                ORDER BY requested_at DESC, id DESC LIMIT 1
+            """, (user_id, req.item_id, RegistryRequestStatus.PENDING.value,
+                  RegistryRequestStatus.PAYMENT_REQUIRED.value,
+                  RegistryRequestStatus.PROCESSING.value)).fetchone()
+
             # 무료 횟수 확인 (이 지점부터는 쓰기 락을 쥐고 있어 다른 요청과 절대 겹치지 않는다)
             # 한도는 플랜별로 다르고(베이직 5 / 프로 10), 사용량은 이번 달 것만 센다.
+            # 기존 신청을 그대로 돌려줄 때도 "지금 남은 무료 횟수"는 최신값으로 안내해야
+            # 하므로 이 계산은 existing 분기 이전에 항상 수행한다(추가 소모는 하지 않음).
             free_limit = get_user_free_limit(conn, user_id)
             free_used = get_free_count(conn, user_id)
+
+            if existing:
+                conn.commit()
+                return success({
+                    "id": existing["id"],
+                    "item_id": existing["item_id"],
+                    "status": existing["status"],
+                    "is_free": existing["status"] != RegistryRequestStatus.PAYMENT_REQUIRED.value,
+                    "free_remaining": max(0, free_limit - free_used),
+                    "charged_amount": OVERAGE_FEE if existing["status"] == RegistryRequestStatus.PAYMENT_REQUIRED.value else 0,
+                    "requested_at": existing["requested_at"],
+                    "already_requested": True,
+                })
+
             is_free = free_used < free_limit
             # 청구액은 여기서 한 번만 정한다 — 아래 두 분기의 응답/기록이 같은 값을 쓴다.
             charged_amount = 0 if is_free else OVERAGE_FEE

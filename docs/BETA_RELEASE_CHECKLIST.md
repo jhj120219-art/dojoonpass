@@ -33,12 +33,30 @@ Owner: Project Management
 | Subscription | ✅ | 플랜/할인/기간/한도 서버 검증, 플랜 tie-break 버그 수정(2026-08-07) |
 | 관리자 | ⚠️ | API 완성 + **SUPER_ADMIN/ADMIN 2단계 권한**·등기부 한도 조정 추가. **키 미설정으로 현재 전체 500**, UI 없음 (P0/P1) |
 | 문서 | ✅ | 2026-08-07 전수 감사 — 코드와 어긋난 서술 정정 완료 + `API_KEY_CHECKLIST.md` 신설 |
-| Runtime | ✅ | Type Check / Lint 0 통과, 회귀 **340 + 48** 전부 통과. `npm run build`는 `.next` 잔여 아티팩트(EPERM)로 이번 실행만 실패 — 코드 문제 아님(아래 P2) |
+| Runtime | ✅ | Type Check / Lint / Build 전부 통과. **2026-08-08(Sprint 32) 최초로 HTTP 레벨 실제 실행**: `test_api_regression.py` **380검사**(377 + 신규 JWT 적대적 케이스 3건) 전부 PASS, `test_subscription_policy.py` **48항목** 전부 PASS(연속 2회 재실행으로 재현성 확인, 잔여 QA 데이터 0건) |
 | 로깅/추적 | ⚠️ | 2026-08-07 API 서버 로깅 설정 신설(그 전엔 `logger.info` 전량 유실). 외부 수집(Sentry 등)은 없음 (P2) |
 
 ---
 
 ## P0 — 출시 차단
+
+### ~~P0-0. 로컬 `auction.db`/`storage/migrations/`가 문서 기록과 불일치~~ → **2026-08-08 복구 완료**
+
+- 발견(2026-08-08 오전): 이 작업 디렉터리의 `auction.db`/`storage/migrations/`(둘 다 git
+  비추적)가 Migration 010~015 이전 상태로 되돌아가 있었다 — `docs/BUGS.md` #18(법원 무시
+  UNIQUE 키로 인한 데이터 소실)이 이 DB 파일 기준 미해결이었고, `audit_logs`/`payment_logs`/
+  `payment_webhooks`/`registry_credits`/`registry_credit_logs` 5개 테이블도 없었다. 실측
+  중 `migrate_execute.py`(정상 코드)가 이 스키마에 대고 실행되면 `INSERT INTO auction_case`에서
+  `court_code` 컬럼 부재로 **매일 크롤링 파이프라인이 크래시**하는 것도 함께 확인됨(Runtime Bug)
+- 해결(같은 날, CTO 승인): `storage/migrations/010~016.sql` 재작성(코드의 실제 INSERT/SELECT
+  문에서 컬럼 추출) → 백업 → 사본 리허설(FK ON/OFF 양쪽) → 실제 `auction.db` 적용 → 30개
+  무결성 검증 항목 전부 통과 → `storage/database.py`(`upsert_batch()` court_code 안전화,
+  `PRAGMA foreign_keys=ON`, `CREATE_TABLE_SQL` 정정) / `storage/migrate_v4_1.py`(fresh clone도
+  같은 제약) 함께 수정 → fresh-clone 전체 부트스트랩(`init_db`→`migrate_v4_1`→`run_migrations`)
+  재현 검증까지 완료. 상세는 `docs/CHANGELOG.md` 2026-08-08(Sprint 30) 항목,
+  회귀는 `test_auction_identity.py`(신규, 26검사 전부 PASS) 참고
+- **`.env`의 `SUPABASE_JWT_SECRET` 부재는 별개 사안으로 여전히 남아 있다** — `.env` 수정은
+  승인 목록에 없어 이번에도 Skip. 아래 P0-3 참고
 
 ### P0-1. KG이니시스 실연동 미완료 (결제 불가)
 
@@ -49,13 +67,16 @@ Owner: Project Management
   두 메서드는 인터페이스에만 있고 호출부가 없다
 - **승인/외부 절차 필요 → 코드로 해결 불가**
 
-### P0-2. `ADMIN_API_KEY` 미설정 (등기부 운영 불가)
+### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — 변수명은 존재, 값 유효성 미확인
 
-- `.env`에 값이 없어 `/api/v1/admin/*` 전체가 `500 "관리자 키 미설정"`.
-- 등기부 신청이 들어와도 **운영자가 상태를 PROCESSING/COMPLETED로 옮길 방법이 없어**
-  결제까지 마친 사용자가 문서를 영영 받지 못한다. 즉 P0-1과 별개로 등기부 유료 흐름이 막힌다.
-- 값 생성: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
-- **`.env` 수정은 승인 필요 → Skip 상태**
+- **2026-08-08 재확인**: `.env`에 `ADMIN_API_KEY=`/`SUPER_ADMIN_API_KEY=` **변수명 자체는
+  존재한다**(이전 문서가 "미설정"으로 기록했던 것과 달리 이름은 있음). 다만 이 세션은
+  Secret 값을 열람/출력하지 않는 원칙이라 **실제로 유효한 값이 채워져 있는지는 확인하지
+  않았다** — 값이 비어 있거나 형식이 잘못됐다면 여전히 `/api/v1/admin/*` 전체가
+  `500 "관리자 키 미설정"`이 된다. 사용자가 직접 `.env`를 열어 값이 채워져 있는지
+  확인 필요
+- 값이 비어 있다면 생성: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+- **`.env` 수정은 승인 필요 → 이 세션에서는 확인만 가능, 수정 불가**
 
 ### P0-3. Supabase Site URL / Redirect URLs 미확인 (회원가입 완료 불가 위험)
 
@@ -64,6 +85,43 @@ Owner: Project Management
 - 이 값이 `localhost:3000`인 채로 배포되면 **운영 사용자가 회원가입을 끝낼 수 없다.**
   코드로는 확인할 수 없는 외부 대시보드 설정이라 배포 전 반드시 눈으로 확인해야 한다.
 - 2026-08-07 신규 등록 (`docs/API_KEY_CHECKLIST.md` 5절)
+
+### P0-4. **[2026-08-08 신규]** `.env`에 `SUPABASE_JWT_SECRET` 변수명 자체가 없음 (인증 전체 불가)
+
+- `api/auth.py:9`가 `os.getenv("SUPABASE_JWT_SECRET")`을 읽는데, 현재 `.env`에는 이 이름이
+  없다(`JWT_SECRET`이라는 **다른 이름**만 존재 — `docs/ENVIRONMENT_VARIABLES.md`가 이미
+  경고해온 바로 그 이름 실수). 값이 아니라 **변수명 자체가 코드와 불일치**하므로, 어떤 값을
+  넣어도 `JWT_SECRET`이라는 이름으로는 작동하지 않는다
+- 영향: `get_current_user()`가 `500 "JWT Secret 미설정"`을 반환 — 인증이 필요한 API
+  (favorites/recent-items/search-presets/registry-requests/payments) **전체가 막힌다**.
+- **2026-08-08 갱신**: `python-jose`는 승인 하에 설치 완료(P1-x 아래 갱신 참고). 회귀 스크립트
+  (`test_api_regression.py`)는 `.env`에 이 이름이 없을 때만 **이 프로세스 안에서만 유효한
+  합성 값**을 주입하도록 수정해(`ADMIN_API_KEY`와 동일한 기존 패턴) 380검사(377+신규 3건) 전부
+  실제 HTTP 레벨로 통과했다 — **이것은 인가·서명 검증 로직 자체가 옳다는 증거**이지, 실제
+  운영 `.env`가 고쳐졌다는 뜻이 아니다. 운영 배포에는 여전히 `.env`에 정확한 이름으로 진짜
+  Supabase JWT Secret을 넣어야 한다 — 이 항목은 **여전히 P0**
+- **2026-08-09 분류 확정**(사용자 요청, `JWT_SECRET`/`SUPABASE_JWT_SECRET`/`NEXTAUTH_SECRET`
+  3개 변수명 코드 전체 재검색, 값은 열람하지 않음):
+  - `SUPABASE_JWT_SECRET` — **실제로 별도 필요함**(분류 1). `api/auth.py`(모듈 최상단 로드 +
+    `get_current_user()`), `api/v1/item.py`/`api/v1/search.py`(선택적 인증 경로),
+    `test_api_regression.py`(테스트 토큰 서명)까지 전부 이 이름 하나로 통일되어 있다.
+    다른 이름으로 대체하도록 설계된 적이 없다(분류 2 해당 없음)
+  - `JWT_SECRET`(현재 `.env`에 있는 이름) — 코드 참조 **0건**. **분류 3(잘못된 변수명으로
+    남은 값)**. Supabase의 실제 JWT Signing Secret일 가능성이 높지만 이름이 코드와 달라
+    인식되지 않는다
+  - `NEXTAUTH_SECRET`/`NEXTAUTH_URL` — 코드 참조 0건, `next-auth` 패키지 자체도 참조 0건.
+    **분류 3(완전히 무관한 잔재)** — 이 프로젝트는 NextAuth.js를 쓰지 않는다(Auth는
+    Supabase Auth로 확정, `docs/decision-log.md` "Authentication"). 옮겨 담을 대상이
+    아니라 그냥 미사용 항목
+- 조치: `.env`에서 `JWT_SECRET`의 **값**을 `SUPABASE_JWT_SECRET`이라는 **이름**으로 옮기거나
+  (기존 `JWT_SECRET` 항목은 그대로 둬도 무해 — 코드가 안 읽으므로), 같은 값을
+  `SUPABASE_JWT_SECRET`이라는 이름으로 추가 입력하면 해결된다 — Supabase 대시보드
+  → Project Settings → API → JWT Settings에서 같은 값을 다시 확인 가능. `NEXTAUTH_SECRET`은
+  건드릴 필요 없음(무관)
+- **`.env` 수정은 승인 필요 → 이 세션에서는 확인만 가능, 수정 불가**. 사용자가 `.env`에서
+  `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY`를 이미 입력해 둔 것으로
+  보아(2026-08-08, `docs/API_KEY_CHECKLIST.md` 8절) Supabase 키 자체는 준비돼 있을 가능성이
+  높다 — `SUPABASE_JWT_SECRET`이라는 정확한 이름으로 옮겨 담는 작업만 남았을 수 있다
 
 ---
 

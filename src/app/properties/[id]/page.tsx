@@ -150,6 +150,10 @@ export default function PropertyDetailPage() {
   const [registryLoading, setRegistryLoading] = useState(true)
   const [registryBusy, setRegistryBusy] = useState(false)
   const [registryMessage, setRegistryMessage] = useState<string | null>(null)
+  // 등기부 신청 실패 응답의 도메인 Error Code(docs/ERROR_CODES.md). 구독 필요 UI 분기는
+  // 이 코드로만 판단한다 — registryMessage(한국어 문구)로 비교하면 백엔드가 문구를 다듬는
+  // 순간 이 화면(구독 전환 퍼널)이 조용히 깨진다(FavoriteButton.tsx에서 이미 겪은 문제와 동일 축).
+  const [registryErrorCode, setRegistryErrorCode] = useState<string | null>(null)
   const [viewingDoc, setViewingDoc] = useState<string | null>(null)
   // 문서 존재 확인(HEAD) 결과를 "물건id:문서종류" 키로 보관하고, 아직 결과가 없으면 렌더
   // 중에 'checking'으로 파생시킨다. effect 안에서 곧바로 setDocAvailable('checking')을
@@ -207,6 +211,7 @@ export default function PropertyDetailPage() {
       setProperty(null)
       setRegistryRequest(null)
       setRegistryMessage(null)
+      setRegistryErrorCode(null)
       setRegistryLoading(true)
       setViewingDoc(null)
       setFavError(null)
@@ -269,18 +274,37 @@ export default function PropertyDetailPage() {
 
   // "등기부등본 신청하기" — 무료/초과 판단은 전부 백엔드(has_active_subscription/get_free_count)가
   // 내리고, 프론트는 그 응답(status/is_free/free_remaining/charged_amount)을 그대로 반영만 한다.
-  async function handleRegistryRequest() {
+  // 등기부 신청 실제 호출 — busy 관리 없이 로직만 담당한다. handleSubscribe가 구독 성공 직후
+  // 이미 registryBusy를 쥔 채로 이어서 호출해야 하므로(자기 자신의 가드에 막히면 안 됨),
+  // 가드/busy 관리는 각 공개 핸들러(아래 handleRegistryRequest, handleSubscribe)가 맡는다.
+  async function performRegistryRequest() {
     const token = await requireToken()
     if (!token) return
+    const result = await postJSON<RegistryRequestSummary>('/api/v1/registry-requests', { item_id: Number(id) }, token)
+    if (!result.success || !result.data) {
+      const code = result.error ?? null
+      setRegistryErrorCode(code)
+      // 구독 필요 상태는 아래 플랜 선택 UI 자체가 이유를 설명하므로 중복 문구를 띄우지 않는다.
+      // (그 외 실패는 그대로 표시 — registryErrorCode와 무관하게 항상 렌더링된다)
+      if (code !== ERROR_CODES.REGISTRY_SUBSCRIPTION_REQUIRED) {
+        setRegistryMessage(result.message ?? '등기부 신청에 실패했습니다')
+      }
+      return
+    }
+    setRegistryRequest(result.data)
+  }
+
+  async function handleRegistryRequest() {
+    // FavoriteButton.tsx/handleToggleFavorite와 동일한 이유로 busy 플래그를 await 이전에
+    // 동기적으로 세운다 — requireToken() await 중에 재클릭이 들어오면 이 시점의 registryBusy는
+    // 아직 false라 가드를 그냥 통과해버린다(백엔드는 #19로 이미 안전하지만, 불필요한 중복
+    // 요청 자체를 프론트에서부터 막는 게 맞다. 2026-08-09 Sprint 39).
+    if (registryBusy) return
     setRegistryBusy(true)
     setRegistryMessage(null)
+    setRegistryErrorCode(null)
     try {
-      const result = await postJSON<RegistryRequestSummary>('/api/v1/registry-requests', { item_id: Number(id) }, token)
-      if (!result.success || !result.data) {
-        setRegistryMessage(result.message ?? '등기부 신청에 실패했습니다')
-        return
-      }
-      setRegistryRequest(result.data)
+      await performRegistryRequest()
     } catch {
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
@@ -292,16 +316,21 @@ export default function PropertyDetailPage() {
   // has_active_subscription()이 true가 되므로, 곧바로 등기부 신청을 재시도한다.
   // amount는 서버가 내려준 카탈로그 값을 그대로 되돌려 보내고, 서버가 PLAN_CATALOG로 다시 검증한다.
   async function handleSubscribe(plan: SubscriptionPlan, cycle: BillingCycle) {
-    const token = await requireToken()
-    if (!token) return
-    const planOption = planOptions.find((p) => p.plan === plan)
-    if (!planOption || !planOption.prices[cycle]) {
-      setRegistryMessage('요금제 정보를 불러오지 못했습니다. 잠시 후 다시 시도해주세요')
-      return
-    }
+    // handleRegistryRequest와 동일한 이유로 busy를 await 이전에 동기적으로 세운다(2026-08-09
+    // Sprint 39). 성공 후 이어서 등기부 신청을 재시도할 때는 이미 registryBusy를 쥐고 있으므로
+    // (아래) 가드가 있는 handleRegistryRequest가 아니라 performRegistryRequest를 직접 부른다 —
+    // 그렇지 않으면 handleRegistryRequest 자신의 가드에 막혀 재시도가 조용히 무시된다.
+    if (registryBusy) return
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
+      const token = await requireToken()
+      if (!token) return
+      const planOption = planOptions.find((p) => p.plan === plan)
+      if (!planOption || !planOption.prices[cycle]) {
+        setRegistryMessage('요금제 정보를 불러오지 못했습니다. 잠시 후 다시 시도해주세요')
+        return
+      }
       const result = await postJSON<unknown>(
         '/api/v1/payments',
         {
@@ -316,7 +345,7 @@ export default function PropertyDetailPage() {
         setRegistryMessage(result.message ?? '구독 처리에 실패했습니다')
         return
       }
-      await handleRegistryRequest()
+      await performRegistryRequest()
     } catch {
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
@@ -328,11 +357,14 @@ export default function PropertyDetailPage() {
   // PAYMENT_REQUIRED 신청을 찾아 payment_id를 연결하고 status를 PENDING으로 바꾼 뒤 그 결과를
   // 응답에 함께 실어준다. 프론트는 그 값을 그대로 반영만 한다(직접 상태를 추정하지 않음).
   async function handlePayOverage() {
-    const token = await requireToken()
-    if (!token || !registryRequest) return
+    // 2026-08-09 Sprint 39 — 나머지 등기부/구독 핸들러와 동일하게 busy를 await 이전에
+    // 동기적으로 세운다.
+    if (registryBusy) return
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
+      const token = await requireToken()
+      if (!token || !registryRequest) return
       const result = await postJSON<{ registry_request: RegistryRequestSummary | null }>(
         '/api/v1/payments',
         { payment_type: 'OVERAGE_USAGE', amount: registryRequest.charged_amount ?? overageFee },
@@ -356,11 +388,14 @@ export default function PropertyDetailPage() {
   // {success:false} JSON을(200으로) 돌려주고, COMPLETED면 실제 파일을 응답 바디로 돌려준다.
   // 두 경우를 Content-Type으로 구분해서 처리한다(거짓 성공 표시 금지).
   async function handleDownloadRegistry() {
-    const token = await requireToken()
-    if (!token || !registryRequest) return
+    // 2026-08-09 Sprint 39 — 나머지 등기부/구독 핸들러와 동일하게 busy를 await 이전에
+    // 동기적으로 세운다.
+    if (registryBusy) return
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
+      const token = await requireToken()
+      if (!token || !registryRequest) return
       const res = await fetchAuthedRaw(`/api/v1/registry-requests/${registryRequest.id}/download`, token)
       const contentType = res.headers.get('content-type') ?? ''
       if (!res.ok || contentType.includes('application/json')) {
@@ -806,7 +841,7 @@ export default function PropertyDetailPage() {
           <h3 className="text-sm font-bold text-gray-900 mb-3">📋 등기부등본</h3>
           {registryLoading ? (
             <p className="text-sm text-gray-400 text-center py-4">확인 중...</p>
-          ) : registryMessage === '구독이 필요합니다' ? (
+          ) : registryErrorCode === ERROR_CODES.REGISTRY_SUBSCRIPTION_REQUIRED ? (
             <div className="py-4">
               <p className="text-sm text-gray-400 mb-3 text-center">등기부등본 신청은 구독 후 이용할 수 있습니다</p>
               {/* 월/연 결제주기 토글. 결제주기 목록도 서버(GET /api/v1/plans)가 정한다. */}
@@ -922,7 +957,7 @@ export default function PropertyDetailPage() {
               </button>
             </div>
           )}
-          {registryMessage && registryMessage !== '구독이 필요합니다' && (
+          {registryMessage && (
             <p className="text-xs text-red-400 mt-2">{registryMessage}</p>
           )}
         </div>

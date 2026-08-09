@@ -1,7 +1,7 @@
 # Error Code 표준 (도메인별)
 
 Status: Active
-Last Updated: 2026-08-07 (Sprint 28)
+Last Updated: 2026-08-09 (Sprint 40 — `api/constants.py:ErrorCode` 40개 전량과 1:1 대조 재확인, 불일치 0건)
 Owner: CTO
 
 정의 위치: `api/constants.py:ErrorCode` — **이 문서가 아니라 코드가 기준**이다.

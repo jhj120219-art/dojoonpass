@@ -17,6 +17,7 @@ run_daily.bat
 .env
 api/
 auth.py
+constants.py          (2026-08-07 Sprint 28 신설 — 도메인 상태값/Error Code 단일 정의)
 v1/
 search.py
 item.py
@@ -24,9 +25,15 @@ favorites.py
 recent_items.py
 search_presets.py
 registry.py
+registry_credits.py   (2026-08-07 Sprint 27 신설 — 등기부 무료횟수 조정 원장)
 documents.py
 payments.py
 payment_providers.py
+payment_logs.py        (2026-08-07 Sprint 27 신설 — 결제 로그/Webhook 구조)
+subscriptions.py       (2026-08-07 Sprint 28 신설 — Subscription Lifecycle, get_active_subscription/
+                          sync_expired_status/change_status/renew. Admin REST가 사용, 자체 라우터 없음)
+state_machines.py      (2026-08-07 Sprint 28 신설 — Payment/Subscription 상태 전이 규칙)
+audit.py               (2026-08-07 Sprint 28 신설 — Admin 작업 감사 로그)
 admin.py
 doc_stats.py
 storage/
@@ -44,6 +51,13 @@ migrations/
 008_create_search_indexes.sql
 009_add_default_sort_index.sql
 010_add_registry_request_reason.sql
+011_auction_case_court_code_unique.sql   (2026-08-08 Migration 정합성 복구로 재작성)
+012_auction_court_code_unique.sql        (〃)
+013_auction_item_case_id_unique.sql      (〃)
+014_create_payment_logs.sql              (〃)
+015_create_registry_credits.sql          (〃)
+016_create_audit_logs.sql                (〃)
+017_add_soft_delete_columns.sql          (2026-08-09 신설 — favorites/search_presets deleted_at/deleted_by)
 run_migrations.py
 crawler/
 court_crawler.py
@@ -425,12 +439,26 @@ Task Scheduler (매일 06:00)
 - ~~등기부 무료 한도 평생 누적~~ → 2026-08-06 해결(월 리셋 + 플랜별 차등)
 - ~~플랜명/가격 불일치~~ → 2026-08-06 해결(`BASIC` 12,900 / `PRO` 22,900, 연 결제 포함)
 - 기존 `BETA_EARLYBIRD`/`STANDARD` 플랜으로 생성된 `subscriptions` row가 있다면 새 플랜 체계로 해석되지 않는다 — `get_user_free_limit()`이 `DEFAULT_FREE_LIMIT`(5)로 폴백하므로 동작은 안전하나, 이관 방침은 미정
-- `ADMIN_API_KEY`가 `.env`에 아직 설정되어 있지 않음 — 설정 전까지 모든 `/api/v1/admin/*` 요청은 `500`
-- Admin 인증에 역할(role) 구분이 없음 — 키를 아는 사람은 누구나 전체 관리자 권한(MVP 한계, 사용자 확인 하에 채택)
+- ~~`ADMIN_API_KEY`가 `.env`에 아직 설정되어 있지 않음~~ → 2026-08-08/09 재확인 결과 stale.
+  `.env`에 `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY` **변수명 자체는 이제 존재**한다(값 유효성은
+  이 세션에서 확인 안 함 — Secret 값 열람 금지 원칙). `docs/BETA_RELEASE_CHECKLIST.md` P0-2 참고
+- Admin 인증에 SUPER_ADMIN/ADMIN 2단계는 있으나 등급 안에서는 여전히 공유키 — 키를 아는 사람은
+  그 등급의 전체 권한(MVP 한계, 사용자 확인 하에 채택). 아래 "2026-08-07 추가" 절 참고
 - ~~[Release Blocking] 등기부 무료횟수 레이스 컨디션~~ → **2026-08-05 수정 완료**. `registry.py:create_registry_request()`에서 `conn.isolation_level = None` + `BEGIN IMMEDIATE`로 무료횟수 확인(`get_free_count()`)과 INSERT를 하나의 원자적 트랜잭션으로 묶었다 — SQLite가 이 커넥션에 즉시 쓰기 락을 선점시켜, 동시 요청 중 하나가 커밋을 마칠 때까지 다른 요청은 자신의 COUNT를 다시 셀 수 없다. `payments.py`의 `OVERAGE_USAGE`(조건부 UPDATE+rowcount)와 목적은 같지만, 이쪽은 COUNT 집계값을 다루므로 row 단위 조건부 UPDATE로는 막을 수 없어 트랜잭션 자체를 직접 제어하는 방식을 썼다. 5/10/20 스레드 동시 요청 테스트 전부에서 정확히 5건만 무료 처리되고 나머지는 `PAYMENT_REQUIRED`로 정상 처리됨을 실증 확인(이전엔 5스레드만으로도 8건까지 초과됐었음)
-- SQLite FK(`REFERENCES`)가 `storage/database.py`에 `PRAGMA foreign_keys=ON`이 없어 DB 레벨에서 전혀 강제되지 않음(확인됨, 스키마 선언은 문서용). 현재는 어떤 테이블에도 DELETE 경로가 없어 실제 orphan row는 발생하지 않지만, 구조적으로는 무방비 상태(Non-blocking, 향후 삭제 기능 추가 시 재검토 필요)
+- ~~SQLite FK(`REFERENCES`)가 `PRAGMA foreign_keys=ON`이 없어 DB 레벨에서 전혀 강제되지 않음~~ →
+  **2026-08-08 해결**(Migration 정합성 복구, CTO 승인). `storage/database.py:get_connection()`이
+  기본으로 `PRAGMA foreign_keys=ON`을 켠다(`enforce_foreign_keys=False`로 명시 호출하면
+  끌 수 있고, 테이블 재작성 패턴을 쓰는 마이그레이션만 이 값을 쓴다). 고아 INSERT가 실제로
+  `sqlite3.IntegrityError`로 차단됨을 `test_schema_hygiene.py`/`test_api_regression.py`
+  23번(FK 런타임 강제)에서 실측 확인
 - ~~`registry.py:create_registry_request()`는 다중 INSERT 앞뒤로 명시적 `try/except/rollback`이 없음~~ → 2026-08-06 코드 재확인 결과 stale한 서술이었음. Sprint 10(`BEGIN IMMEDIATE` 도입) 시점에 `except Exception: conn.rollback(); raise`가 이미 함께 추가되어 있어 `payments.py`/`admin.py`와 동일한 패턴을 따르고 있음(코드 확인 완료, 수정 불필요)
-- `payments.status`의 스키마 선언값(PENDING/SUCCESS/FAILED/REFUNDED) 중 `PENDING`은 컬럼 DEFAULT로만 존재(모든 INSERT가 status를 명시적으로 지정해 실제로는 절대 쓰이지 않음), `REFUNDED`는 이 값을 쓰는 코드가 전체 저장소에 0건(환불 기능 자체가 없음) — 둘 다 죽은 상태(Non-blocking, PG/환불 기능 설계 시 정리 필요)
+- `payments.status`의 컬럼 DEFAULT인 `PENDING`은 모든 INSERT가 status를 명시적으로 지정해
+  실제로는 절대 자연 발생하지 않는다(Non-blocking). ~~`REFUNDED`는 죽은 상태~~는 2026-08-07
+  Sprint 28(Payment State Machine, `api/constants.py:PaymentStatus`)로 stale — `REFUNDED`/
+  `PARTIAL_REFUND`는 이제 정식 상태값이고 `PAID`/`SUCCESS` → 그 상태로의 전이 규칙까지
+  `api/v1/state_machines.py`에 정의·테스트(`test_api_regression.py` 24번)되어 있다. 다만
+  실제로 이 상태에 도달시키는 **엔드포인트**(`cancel_payment` 호출부)는 여전히 없다 — "상태는
+  모델링됨, 도달 경로만 없음"이 정확한 표현이다
 
 ---
 

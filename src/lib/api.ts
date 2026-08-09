@@ -30,6 +30,7 @@ export interface ApiEnvelope<T> {
 export const ERROR_CODES = {
   FAVORITE_ALREADY_EXISTS: 'FAVORITE_ALREADY_EXISTS',
   FAVORITE_NOT_FOUND: 'FAVORITE_NOT_FOUND',
+  REGISTRY_SUBSCRIPTION_REQUIRED: 'REGISTRY_SUBSCRIPTION_REQUIRED',
 } as const
 
 export async function fetchJSON<T>(path: string, token?: string): Promise<T> {

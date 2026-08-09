@@ -85,7 +85,9 @@ Beta v1 Development
 
 - ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정 + 코드 반영 완료**(플랜별 월 단위: 베이직 5회 / 프로 10회, 월 자동 리셋)
 - ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**: `BASIC` 12,900원/월·154,800원/년, `PRO` 22,900원/월·연 정상가 274,800원→판매가 198,000원. 할인은 `list_price`/`sale_price` 분리 구조
-- `ADMIN_API_KEY`를 `.env`에 설정 (Admin MVP는 완료됐으나 현재 키 미설정으로 전체 500)
+- `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`를 `.env`에 설정 — **2026-08-08/09 재확인**: 변수명
+  자체는 이제 `.env`에 존재한다(값 유효성은 Secret 열람 금지 원칙상 이 세션에서 미확인).
+  `docs/BETA_RELEASE_CHECKLIST.md` P0-2 참고
 - ~~`SUBSCRIPTION` 결제 금액 서버 검증~~ (2026-08-05 완료, 2026-08-06 `PLAN_CATALOG` 기준으로 교체 완료)
 
 ## Crawler

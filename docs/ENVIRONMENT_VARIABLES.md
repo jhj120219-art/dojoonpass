@@ -103,6 +103,22 @@ Owner: CTO
 | 비고 | 공개 키지만 RLS가 없으면 데이터가 열린다 — Supabase 쪽 RLS 설정과 함께 관리할 것 |
 | 예시 | `NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.<...>` |
 
+### 2026-08-08 확인 — Supabase의 legacy anon/service_role → publishable/secret key 전환과의 관계
+
+Supabase는 2026년 기준 대시보드에서 legacy `anon`/`service_role` 키와 신규
+`publishable`(`sb_publishable_...`)/`secret`(`sb_secret_...`) 키를 함께 제공한다(같은 프로젝트,
+같은 권한 등급, 형식만 다른 값). **코드가 실제로 요구하는 것은 변수명 `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+뿐이다** — `createBrowserClient()`/`createServerClient()`(`@supabase/ssr`)의 두 번째 인자는 legacy
+anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SDK는 값의 형식을 구분하지 않음).
+즉 **`.env.local`의 `NEXT_PUBLIC_SUPABASE_ANON_KEY`에 신규 publishable 키 값을 넣어도 코드 변경
+없이 동작한다** — 변수명만 기존 그대로 유지하면 된다.
+
+**주의**: `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`라는 이름으로 값을 넣으면 코드가 그 이름을
+읽지 않으므로 **아무 효과가 없다**(조용히 무시됨). 반드시 `NEXT_PUBLIC_SUPABASE_ANON_KEY`라는
+기존 변수명을 그대로 써야 한다. 또한 `NEXT_PUBLIC_`로 시작하는 프론트엔드 값은 `.env.local`에
+있어야 하며, `.env`(백엔드 전용, `api_server.py`가 `load_dotenv()`로 읽는 파일)에 넣으면 프론트가
+전혀 읽지 못한다 — Next.js가 빌드 타임에 `.env.local`만 읽어 클라이언트 번들에 주입하기 때문이다.
+
 ## SUPABASE_SERVICE_ROLE_KEY
 
 | 항목 | 내용 |
@@ -127,6 +143,14 @@ Owner: CTO
 > 이 문서의 요청 항목명은 `JWT_SECRET`이지만, `api/auth.py`는
 > `os.getenv("SUPABASE_JWT_SECRET")`을 읽는다. 이름을 바꾸려면 코드 수정이 필요하므로
 > **현재는 `SUPABASE_JWT_SECRET`으로 설정해야 동작한다.**
+>
+> **2026-08-09 분류 확정**(`docs/BETA_RELEASE_CHECKLIST.md` P0-4 상세 근거): `JWT_SECRET`/
+> `SUPABASE_JWT_SECRET`/`NEXTAUTH_SECRET` 3개 변수명을 코드 전체에서 재검색한 결과 —
+> `SUPABASE_JWT_SECRET`만 실제로 별도 필요(코드 참조 다수), `JWT_SECRET`은 코드 참조
+> **0건**(이 환경의 `.env`에 그 이름으로 값이 들어있지만 어떤 코드도 읽지 않음),
+> `NEXTAUTH_SECRET`은 이 프로젝트가 NextAuth.js를 쓰지 않아 **완전히 무관**(코드 참조 0건).
+> 셋 중 대체 가능하거나 재활용할 이름은 없다 — `SUPABASE_JWT_SECRET`이라는 정확한 이름으로
+> 값을 넣는 것 외에는 방법이 없다.
 
 | 항목 | 내용 |
 |---|---|
@@ -135,9 +159,9 @@ Owner: CTO
 | 설명 | FastAPI가 Supabase 발급 JWT의 서명을 검증하는 비밀키(HS256) |
 | 필수 여부 | **필수** |
 | 언제 필요한지 | 인증이 필요한 모든 API(favorites/recent-items/search-presets/registry-requests/payments) |
-| 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
+| 현재 필요한가 | **예 — 2026-08-09 기준 이 환경의 `.env`에는 이 이름이 없어 미동작**(`JWT_SECRET`이라는 다른 이름만 존재, 값은 열람하지 않음). `docs/BETA_RELEASE_CHECKLIST.md` P0-4 참고 |
 | 발급 위치 | Supabase 대시보드 → Project Settings → API → JWT Settings → JWT Secret |
-| 코드 참조 여부 | `api/auth.py:9`, `api/v1/item.py`, `api/v1/search.py`(선택적 검증) |
+| 코드 참조 여부 | `api/auth.py:9`, `api/v1/item.py`, `api/v1/search.py`(선택적 검증), `test_api_regression.py`(테스트 토큰 서명) |
 | 비고 | 미설정 시 인증 필요 API가 전부 `500 "JWT Secret 미설정"`으로 막힌다. `NEXT_PUBLIC_` 금지 |
 | 예시 | `SUPABASE_JWT_SECRET=super-long-random-secret-from-supabase` |
 

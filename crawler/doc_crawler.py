@@ -304,8 +304,17 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
     try:
         outer_html = driver.execute_script("return arguments[0].outerHTML;", overlay)
 
-        with open(html_path, "w", encoding="utf-8") as f:
+        # 임시 파일에 먼저 쓰고 os.replace()로 원자적 교체한다(2026-08-09 Sprint 40 File/DB
+        # Consistency Audit). 목적지 경로에 직접 쓰면 쓰기 도중 프로세스가 강제 종료됐을 때
+        # (전원 차단, OOM kill 등 — except로 못 잡는 죽음) 잘려나간 파일이 목적지에 남을 수
+        # 있다. doc_exists()는 status.json의 존재+0바이트초과만으로 "완료"를 판정하므로,
+        # 손상됐지만 크기는 0이 아닌 파일이 하나라도 생기면 그 물건은 영구히 재수집 대상에서
+        # 빠진다 — os.replace()는 같은 파일시스템 안에서 원자적이라 이 중간 상태 자체가
+        # 존재할 수 없다(목적지는 항상 이전 내용 그대로이거나 새 내용 그대로만 남는다).
+        html_tmp = html_path + ".tmp"
+        with open(html_tmp, "w", encoding="utf-8") as f:
             f.write(outer_html)
+        os.replace(html_tmp, html_path)
 
         # 구조화 데이터: 오버레이 내부에서 실제 값을 담고 있는 요소(span.w2span.txt,
         # div.w2textbox 등)를 id-텍스트 쌍으로 그대로 추출한다.
@@ -328,8 +337,10 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
             "fields": fields,
         }
 
-        with open(json_path, "w", encoding="utf-8") as f:
+        json_tmp = json_path + ".tmp"
+        with open(json_tmp, "w", encoding="utf-8") as f:
             json.dump(json_payload, f, ensure_ascii=False, indent=2)
+        os.replace(json_tmp, json_path)
 
         new_hash = calc_file_hash(json_path)
 
