@@ -16,7 +16,10 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from crawler.court_crawler import resume_start_idx
+# crawler/resume.py(순수 로직). 예전에는 crawler.court_crawler에서 가져왔는데 그 모듈이
+# base_crawler를 통해 selenium을 import하는 탓에 selenium 없는 환경에서 실행 자체가
+# 불가능했다(2026-08-10 Sprint 47). 검증 대상 함수는 동일한 그 함수다.
+from crawler.resume import resume_start_idx
 
 failures = []
 

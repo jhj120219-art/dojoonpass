@@ -5,7 +5,8 @@ import { useRouter } from 'next/navigation'
 import { fetchAuthedJSON, ApiError } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { formatPrice } from '@/lib/format'
-import PrimaryNav from '@/components/PrimaryNav'
+import SiteHeader from '@/components/SiteHeader'
+import { CONTAINER } from '@/lib/layout'
 
 interface RecentItem {
   id: number
@@ -66,23 +67,18 @@ export default function RecentItemsPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
-        <button onClick={() => router.back()} className="text-gray-500 text-lg">←</button>
-        <h1 className="text-base font-bold text-gray-900">최근 본 물건</h1>
-        <div className="ml-auto">
-          <PrimaryNav current="recent" />
-        </div>
-      </div>
-      <div className="px-4 py-4 space-y-3">
+      <SiteHeader current="recent" title="최근 본 물건" />
+      <div className={`${CONTAINER} py-4`}>
         {error && <p className="text-sm text-red-500 text-center py-20">{error}</p>}
         {!error && items && items.length === 0 && (
           <div className="text-center py-20">
             <p className="text-gray-400">최근 본 물건이 없습니다</p>
           </div>
         )}
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 items-start">
         {!error && items && items.map((item) => (
           <Link key={item.id} href={`/properties/${item.id}`} className="block">
-            <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 mb-3">
+            <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
               <div className="flex items-start justify-between mb-1">
                 <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">
                   {item.property_type || '-'}
@@ -112,6 +108,7 @@ export default function RecentItemsPage() {
             </div>
           </Link>
         ))}
+        </div>
       </div>
     </div>
   )

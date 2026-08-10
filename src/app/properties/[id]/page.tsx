@@ -5,6 +5,11 @@ import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiEr
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { formatDday } from '@/app/search/ResultList'
+import { CONTAINER } from '@/lib/layout'
+// '억' 고정 표기(0 -> "0.0억"). 공용 formatPrice()와 표기 기준이 다르며,
+// 어느 쪽으로 통일할지는 미결정이라 중복만 제거했다 — src/lib/format.ts 주석 참고.
+import { formatPriceEok as formatPrice } from '@/lib/format'
+import SiteHeader from '@/components/SiteHeader'
 
 interface DocumentStatusItem {
   doc_type: string
@@ -143,6 +148,15 @@ export default function PropertyDetailPage() {
   function goToNav(targetId: number, targetIndex: number) {
     router.push(`/properties/${targetId}?ids=${navIds.join(',')}&i=${targetIndex}`)
   }
+  // 로그인으로 보낼 때 현재 상세 URL을 **쿼리스트링까지** 보존한다
+  // (docs/FRONTEND_MASTER_SPEC.md §3.4). pathname만 넘기면 로그인 후 돌아왔을 때
+  // 목록 내 이전/다음 물건 컨텍스트(?ids=...&i=...)가 사라진다 — middleware.ts에서 고친 것과
+  // 같은 결함이 세션 만료 후 액션(즐겨찾기/등기부 신청) 경로에도 있었다.
+  function loginRedirectUrl() {
+    const qs = searchParams.toString()
+    const target = qs ? `/properties/${id}?${qs}` : `/properties/${id}`
+    return `/login?${new URLSearchParams({ redirect: target }).toString()}`
+  }
   const [property, setProperty] = useState<AuctionItemDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
@@ -266,7 +280,7 @@ export default function PropertyDetailPage() {
       setAccessToken(token)
     }
     if (!token) {
-      router.push(`/login?redirect=/properties/${id}`)
+      router.push(loginRedirectUrl())
       return null
     }
     return token
@@ -433,7 +447,7 @@ export default function PropertyDetailPage() {
       if (idRef.current === requestId) setAccessToken(token)
     }
     if (!token) {
-      router.push(`/login?redirect=/properties/${id}`)
+      router.push(loginRedirectUrl())
       return
     }
     setFavBusy(true)
@@ -465,7 +479,7 @@ export default function PropertyDetailPage() {
       if (idRef.current !== requestId) return
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         setFavError('로그인이 만료되었습니다. 다시 로그인해주세요')
-        router.push(`/login?redirect=/properties/${id}`)
+        router.push(loginRedirectUrl())
       } else {
         setFavError('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
       }
@@ -473,7 +487,7 @@ export default function PropertyDetailPage() {
       if (idRef.current === requestId) setFavBusy(false)
     }
   }
-  function formatPrice(price: number) { return (price / 100000000).toFixed(1) + '억' }
+
   function formatWon(amount: number) { return amount.toLocaleString() + '원' }
   const specView = property ? mapSpecView(property.tenants) : undefined
   const statusTenants = property ? property.tenants.filter((t) => t.source === 'STATUS') : []
@@ -485,11 +499,31 @@ export default function PropertyDetailPage() {
       )
     : undefined
   const dday = property ? formatDday(property.auction_date) : null
-  if (loading) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">불러오는 중...</p></div>
-  if (loadError || !property) return <div className="min-h-screen bg-white flex items-center justify-center"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
+  // 로딩/실패 상태에서도 공통 Header를 유지한다 — 상세 진입에 실패했을 때 화면에 아무
+  // 이동 수단이 없어 뒤로가기 외에는 빠져나갈 길이 없던 문제를 함께 없앤다.
+  if (loading) return (
+    <div className="min-h-screen bg-gray-50">
+      <SiteHeader />
+      <div className="flex items-center justify-center py-20"><p className="text-gray-400">불러오는 중...</p></div>
+    </div>
+  )
+  if (loadError || !property) return (
+    <div className="min-h-screen bg-gray-50">
+      <SiteHeader />
+      <div className="flex items-center justify-center py-20"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
+    </div>
+  )
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="bg-white px-5 py-4 flex items-center gap-3 border-b border-gray-100">
+      {/* 공통 Header(docs/FRONTEND_MASTER_SPEC.md §5.3) — 상세 화면에서 검색/관심물건/
+          최근 본 물건으로 이동할 방법이 뒤로가기밖에 없고 로그아웃 경로도 없던 문제를 없앤다.
+          아래 상세 전용 바(뒤로가기·즐겨찾기·무료잔여)는 그대로 둔다 — 기능이 다르므로
+          대체가 아니라 위에 얹는다. */}
+      <SiteHeader />
+      {/* 상단 바/본문 모두 다른 화면과 같은 중앙 컨테이너 기준으로 정렬한다
+          (docs/FRONTEND_MASTER_SPEC.md §5.2). 배경은 화면 폭 전체, 내용만 컨테이너 안. */}
+      <div className="bg-white border-b border-gray-100">
+      <div className={`${CONTAINER} py-4 flex items-center gap-3`}>
         <button onClick={() => router.back()} className="text-gray-500 text-lg">←</button>
         <h1 className="text-base font-bold text-gray-900">매물 상세</h1>
         <button
@@ -506,8 +540,10 @@ export default function PropertyDetailPage() {
           <span className="ml-auto text-xs text-gray-400">등기열람 무료 잔여 {registryRequest.free_remaining}회</span>
         )}
       </div>
+      </div>
       {navIndex >= 0 && (
-        <div className="bg-white px-4 py-2 flex items-center justify-between border-b border-gray-100">
+        <div className="bg-white border-b border-gray-100">
+        <div className={`${CONTAINER} py-2 flex items-center justify-between`}>
           <button
             type="button"
             onClick={() => prevNavId != null && goToNav(prevNavId, navIndex - 1)}
@@ -526,13 +562,16 @@ export default function PropertyDetailPage() {
             다음 물건 →
           </button>
         </div>
+        </div>
       )}
       {favError && (
-        <div className="px-4 pt-3">
+        <div className={`${CONTAINER} pt-3`}>
           <p className="text-xs text-red-500">{favError}</p>
         </div>
       )}
-      <div className="px-4 py-4 space-y-3">
+      {/* 데스크톱에서 카드가 1320px를 가로지르지 않도록 xl에서 2열로 나눈다.
+          카드 순서(DOM 순서)는 그대로 유지된다 — 정보 구성은 변경 대상이 아니다(§9.3). */}
+      <div className={`${CONTAINER} py-4 space-y-3 xl:space-y-0 xl:grid xl:grid-cols-2 xl:gap-3 xl:items-start`}>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex items-start justify-between gap-2">
             <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>

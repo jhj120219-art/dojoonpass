@@ -2175,3 +2175,286 @@ Admin PATCH는 파일 존재 여부에 관여하지 않음) — 통합 부족이
 
 **[문서]** `docs/TEST_PLAN.md` 신규 테스트 파일 등록. 실제 결함이 아니라 검증 공백 해소라
 `docs/BUGS.md`는 갱신하지 않음.
+
+---
+
+2026-08-10 (Frontend Sprint 44 — 첫 화면 재정의 / 공통 Layout / 로그인 Redirect)
+
+기준 문서: `docs/FRONTEND_MASTER_SPEC.md`(신규 최상위 기준) + `search/00_SEARCH_MVP.md` v0.2
+
+**[P0 첫 진입 화면]** `src/app/page.tsx`의 무조건 redirect(로그인→`/properties`,
+비로그인→`/login`)를 제거하고 `/` 자체를 경매 검색 화면으로 만들었다. 화면 구성은
+`src/app/search/SearchScreen.tsx`(신규)로 추출해 `/`와 `/search`가 **복제 없이 공유**한다.
+첫 화면 로그인 강제가 사라졌고, 비로그인 상태에서 검색/결과/정렬/페이지 이동이 모두 가능하다.
+
+**[P0 검색 URL]** `SearchForm.handleSearch()` / `SearchPresets.applyPreset()`·`redirectToLogin()`에
+하드코딩돼 있던 `/search`를 `usePathname()` 기준으로 바꿨다 — `/`에서 검색하면 `/`에 머문다.
+`/search`는 그대로 동작(호환 유지).
+
+**[P0 로그인 Redirect 결함 수정]** `middleware.ts`가 `redirect`에 `pathname`만 실어
+쿼리스트링을 버리고 있었다 → 검색 결과에서 물건을 클릭해 로그인하면 목록 내 이전/다음 물건
+컨텍스트(`?ids=...&i=...`)가 사라졌다. `pathname + search` 전체를 보존하도록 수정.
+같은 결함이 `properties/[id]/page.tsx`의 세션 만료 후 액션 경로 3곳에도 있어
+`loginRedirectUrl()`로 통일. Open Redirect 방어(`sanitizeRedirectPath`)는 그대로 유지.
+`login/actions.ts`의 기본 복귀 경로를 레거시 `/properties` → `/`로 정정.
+
+**[P0 공통 Layout / Header]** `src/lib/layout.ts`(신규)에 `CONTAINER`(=`max-w-[1320px] mx-auto`)를
+단일 정의하고 `/`·`/search`·`/favorites`·`/properties/recent`·`/properties/[id]`에 적용.
+`src/components/SiteHeader.tsx`(신규)는 기존 `PrimaryNav`+`LogoutButton`을 재사용하며
+배경은 풀블리드, 내용은 본문과 동일 컨테이너 정렬. 비로그인엔 로그인 링크, 로그인엔
+이메일+로그아웃을 노출해 `/properties`에만 있던 로그아웃 경로 문제를 해소했다.
+`PrimaryNav`의 검색 링크를 `/search` → `/`로 통일. 로그아웃 후 이동도 `/login` → `/`.
+
+**[P1 반응형]** 검색 Form(주소 블록 + 아코디언 묶음)과 결과 목록, `/favorites`,
+`/properties/recent`를 모바일 1열 / 태블릿(md 768px) 2열 / 데스크톱(xl 1280px) 3열로 적용.
+상세는 xl 2열. 레이아웃 클래스만 변경했고 필드 구성·state·`buildSearchQuery()` 결과는 무변경.
+`/login` 폼은 화면 전체 폭으로 늘어나던 것을 `max-w-md` 가독 폭으로 제한.
+
+**[부수 결함 수정]** `SearchPresets`의 목록 조회가 401/403을 "불러오기 실패"(빨간 에러)로
+표시하고 있었다 — 만료 토큰으로 `getSession()`이 세션을 돌려주는 경우 비로그인 사용자에게
+고칠 수 없는 실패가 보인다. 저장/삭제 경로와 동일하게 비로그인 상태로 되돌리도록 통일.
+
+**[검증]** `npx tsc --noEmit` / `npm run lint`(0건) / `npm run build` 전부 통과.
+실제 브라우저(localhost:3000)에서 첫 화면 렌더·검색 실행 시 `/` 유지·정렬·상세 진입·
+비로그인 307 게이트(쿼리스트링 보존)·로그인 페이지 hidden input 값까지 확인.
+
+**[미해결/SKIP]** 로그인 사용자의 Supabase JWT를 FastAPI가 401로 거부하는 환경 문제
+(`SUPABASE_JWT_SECRET` 불일치 추정) — 즐겨찾기/최근조회/검색조건 저장이 로그인 상태에서도
+동작하지 않는다. Secret 변경은 승인 필요라 SKIP, 보고서에만 기록.
+
+---
+
+2026-08-10 (Frontend Sprint 45 — 계약 테스트 도입 / Backlog 조사·정리)
+
+**[Frontend 자동 테스트 신규]** `tests/frontend-contract.test.mjs` + `npm run test:frontend`.
+프로젝트에 프론트엔드 자동 테스트가 **0건**이던 공백을 메웠다(Sprint 44 최대 리스크 항목).
+
+- 러너는 **Node 내장 `node:test`** — 새 라이브러리 설치 없음(`docs/CLAUDE.md` 승인 규칙 준수).
+  기존 Python 스크립트 방식과 중복되는 러너를 만들지 않으려 npm script 하나만 추가.
+- **HTTP 블랙박스** 20검사: `/` 무redirect / 첫 화면이 로그인 폼 아님 / 비로그인 목록 노출 /
+  검색 실행의 pathname 유지 / `/search` 호환 / 결과→상세 링크 형태 / 비로그인 상세 307 게이트 /
+  **redirect query string 보존** / 로그인 폼 복귀 구조 / 공개 라우트 무차단 / 정렬·페이지
+  파라미터 비로그인 처리 / `/favorites` 서버 응답에 개인 데이터 미노출 / 1320px 컨테이너 / 반응형
+- **DB 건수에 의존하지 않게** 설계 — `test_search.py`가 기대 건수 노후화로 3건 실패하는 것과
+  같은 함정을 반복하지 않도록 구조만 단언한다
+- **회귀 검출력 검증**: `middleware.ts`를 결함 상태(pathname만 전달)로 되돌리는 mutation
+  테스트를 실행해 해당 검사가 정확한 메시지로 실패하는 것을 확인한 뒤 원복
+
+**[상세 화면 네비게이션 막다른 길 해소]** `/properties/[id]`에는 공통 Header가 없어
+검색/관심물건/최근 본 물건으로 이동할 방법이 뒤로가기뿐이었고 로그아웃 경로도 없었다.
+기존 상세 전용 바(뒤로가기·즐겨찾기·무료잔여)는 그대로 두고 `SiteHeader`를 위에 얹는
+가산 방식으로 해결. 로딩/실패 상태에서도 Header를 유지해 "빠져나갈 길이 없는 화면"을 없앴다.
+
+**[Backlog 조사 — 코드 근거로 결론]**
+- `middleware`의 공개 요청 `getUser()`: 실측 **2~3ms**(비로그인 `/` 20회, 전체 median 84ms).
+  세션 쿠키가 없으면 Supabase 왕복 없이 즉시 반환된다 — **Sprint 44의 성능 우려는 과장이었음**을
+  측정으로 정정
+- 디자인 토큰: 색상 고유 35종이나 gray+blue 단일 primary+의미색의 **일관된 단일 팔레트**라
+  현 시점 도입 불필요(경쟁 팔레트 없음). 브랜드 변경/다크모드 결정 시 재검토
+- `/properties` 레거시: 코드상 **inbound 링크 0건**(Sprint 44에서 `/` redirect와 PrimaryNav
+  링크가 사라져 완전 고아 상태). 삭제는 정책 결정이라 SKIP, 상태만 확정 기록
+- `src/login/`: 참조 **0건** 재확인. 삭제는 프로젝트 규칙상 SKIP
+- `formatPrice`: 정의 3곳(`lib/format.ts` 공용 + `properties/page.tsx` + `properties/[id]`).
+  통일은 "억 고정 vs 만/억 단계" 표기 기준 UX 결정이 선행돼야 해 SKIP 유지
+
+**[JWT 401 원인 확정 — Sprint 44 추정 → 확정]** `docs/BUGS.md` #27 신규.
+`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`이 **200 + `kty=EC`/`alg=ES256`** 을 반환한다 —
+Supabase 프로젝트가 비대칭 서명으로 전환됐는데 백엔드 검증 3곳(`api/auth.py:20-23`,
+`api/v1/item.py:47-48`, `api/v1/search.py:145-146`)은 `algorithms=["HS256"]` + 공유 시크릿
+고정이다. ES256 토큰은 원리상 검증 불가 → 인증 필수 라우트 401, 선택적 인증 라우트는 예외를
+삼켜 `is_favorited`가 항상 false(검색 결과 하트가 전부 빈 하트로 보이던 증상의 정체).
+**Secret 교체로 해결되지 않으며 검증 코드를 고쳐야 한다**(`python-jose`가 ES256/JWK 지원,
+신규 라이브러리 불필요). 함정: `NEXT_PUBLIC_SUPABASE_ANON_KEY`는 여전히 `alg=HS256`이라
+anon 키만 보면 오진하기 쉽다. 백엔드 수정은 이번 Sprint 범위 밖이라 원인 확정까지만 수행.
+
+**[검증]** `npx tsc --noEmit` / `npm run lint`(0건) / `npm run build` / `npm run test:frontend`
+(20/20) 전부 통과. 브라우저에서 상세 화면 공통 Header 노출 확인.
+
+**[문서]** `docs/TEST_PLAN.md`에 Frontend 계약 테스트 절 신설(1-A/1-B 분리),
+`docs/FRONTEND_MASTER_SPEC.md` §16 갱신, `docs/BUGS.md` #27.
+
+2026-08-10 (Sprint 45 후속 — Empty State / 인증 경계 통일)
+
+**[Empty State 개선]** 검색 결과 0건일 때 회색 한 줄("검색 결과가 없습니다")만 덩그러니
+떠 있어, 조건을 잘못 넣은 사용자가 무엇을 해야 하는지도 어떻게 되돌리는지도 알 수 없었다.
+원인 안내("검색조건을 줄이거나 지역·가격 범위를 넓혀보세요")와 복구 동선
+("조건 없이 전체 물건 보기")을 추가했다. 복구 링크는 **현재 화면의 경로**를 가리킨다 —
+`/`에서는 `/`로, `/search`에서는 `/search`로(§8.2의 pathname 유지 규칙과 동일). 이를 위해
+`SearchScreen`/`ResultList`에 `basePath` prop을 추가했고, `/`와 `/search`가 각자 자기 경로를 넘긴다.
+
+**[0건일 때 페이지네이션 숨김]** 결과가 0건인데도 페이지 크기(20/30/50/100)와 이전/다음
+컨트롤이 남아 Empty State 안내를 가리고 있었다. `data.total > 0`일 때만 렌더한다.
+
+**[인증 경계 통일]** `/properties/recent`는 middleware가 서버에서 307로 막는데
+`/favorites`는 middleware 대상이 아니라 200을 준 뒤 클라이언트에서 튕겼다 — 같은 개인화
+화면인데 게이트 방식이 갈려 있었고, 빈 화면이 잠깐 그려졌다가 이동하는 깜빡임도 있었다.
+`middleware.ts`의 보호 경로를 `PROTECTED_PREFIXES = ['/properties', '/favorites']`로 통일해
+둘 다 서버 게이트로 맞췄다(각 페이지의 클라이언트 체크는 토큰 만료 대응용 이중 방어로 유지).
+
+**[테스트]** 계약 테스트 20 → **24검사**(Empty State 4건 추가, 개인화 라우트 검사를
+서버 게이트 기준으로 강화). `npx tsc --noEmit`/`npm run lint`(0건)/`npm run build`/
+`npm run test:frontend`(24/24) 전부 통과. 브라우저에서 Empty State와 `/favorites` 307 확인.
+
+---
+
+2026-08-10 (Sprint 46 — JWT 인증 체인 복구 / Release Blocker 해소)
+
+**[Release Blocker 해소] ES256(JWKS) 검증 도입** — `docs/BUGS.md` #27.
+Supabase가 비대칭 서명(ES256)으로 전환됐는데 백엔드 3곳이 `algorithms=["HS256"]` +
+공유 시크릿 고정이라, 로그인 사용자의 즐겨찾기/최근조회/검색조건 저장/등기부/결제가 전부
+401이었고 검색 결과의 `is_favorited`도 항상 false였다.
+
+- `api/auth.py`에 `decode_supabase_jwt()` 신설: 헤더 `alg`에 따라 ES256(JWKS 공개키) /
+  HS256(레거시) 경로 선택, **알고리즘 화이트리스트 고정**(`alg:"none"` 위조 차단),
+  **kid 기반 키 선택 + JWKS 캐시**(TTL 600초, 미상 kid 시 재조회로 키 회전 대응,
+  최소 재조회 간격 30초), JWKS 실패 시 기존 캐시 보존
+- `api/v1/item.py`/`api/v1/search.py`의 중복 `jwt.decode` 3중 구현을 공용 함수로 통합
+- **예외 정규화**: jose가 `JWTError`의 형제 예외(`JWSError` 등)를 던지는 경로가 있어,
+  선택적 인증 라우트(검색/상세)가 이상한 토큰 하나로 500이 될 수 있었다 — 테스트 작성 중
+  발견해 `JWTError`로 정규화
+- 실패 사유 로깅 추가(토큰/시크릿은 로그에 남기지 않음)
+- **Secret은 발급/변경/조회하지 않았고 `.env`도 수정하지 않았다.** JWKS URL은 `.env.local`의
+  `NEXT_PUBLIC_SUPABASE_URL`을 읽기만 한다
+
+**[테스트 신규] `test_auth_jwt.py` (23검사)** — Supabase 개인키 없이 실제 코드 경로를 검증하기
+위해, 테스트가 자체 EC P-256 키쌍을 만들어 공개키를 JWKS 캐시에 주입하고 개인키로 서명한다
+(네트워크 무의존). ES256 성공/만료/위조서명/미상 kid/kid 누락, `alg:"none"`·알고리즘 혼동
+(공개키를 HMAC 키로 사용)·미상 alg 거부, HS256 레거시 성공/실패, 엔드포인트 레벨 인증 필수
+200/401 및 선택적 인증 200 유지까지 포함.
+
+**[결정적 검증]** 실제 Supabase ES256 토큰으로 구/신 코드 서버를 동시 비교:
+구 코드 401/401/401 → 신 코드 **200/200/200**(search-presets/recent-items/favorites).
+
+**[정정]** 진행 중 `SiteHeader`를 `getSession()` → `getUser()`로 바꿨다가 되돌렸다.
+"헤더는 로그인인데 미들웨어는 로그아웃"이라고 판단했으나, 로그 재확인 결과 미들웨어는 200으로
+통과했고 리다이렉트는 API 401을 받은 클라이언트가 한 것이었다 — 그 결함은 존재하지 않았다.
+middleware가 매 요청 `getUser()`로 쿠키를 갱신한 뒤 렌더되므로 `getSession()`으로 충분하며,
+헤더에서 다시 `getUser()`를 부르면 로그인 사용자의 매 페이지 로드에 왕복만 늘어난다.
+
+**[검증]** `test_auth_jwt.py` 23/23, `test_api_regression.py` 434검사 ALL PASSED,
+`test_state_machines.py`/`test_race_conditions.py`/`test_subscription_policy.py`/
+`test_registry_credits.py`/`test_schema_hygiene.py` 전부 PASS,
+`npm run test:frontend` 24/24, `npx tsc --noEmit`/`npm run lint`(0건)/`npm run build` 통과.
+
+**[운영 주의]** `--reload`가 걸린 기존 프로세스가 변경을 확실히 반영하지 못할 수 있다.
+**API 서버를 완전히 재기동해야** 적용된다(이번에도 낡은 프로세스 때문에 브라우저에서
+401이 계속 보였다).
+
+---
+
+2026-08-10 (Sprint 47 — 운영 검증 / 테스트 복구 / 잔여 부채)
+
+**[운영 검증] API 서버 재기동 후 인증 체인 실동작 확인**
+Sprint 46에서 고친 코드가 낡은 프로세스 때문에 브라우저에 반영되지 않던 상태를 해소했다.
+netstat이 가리키던 PID는 이미 사라진 reloader 부모였고 실제 소켓은 워커가 쥐고 있었다.
+워커를 종료하고 최신 코드로 재기동한 뒤, 실제 Supabase ES256 토큰으로
+`search-presets`/`recent-items`/`favorites` 전부 **200**을 확인했다.
+브라우저에서도 상세 진입 → `record_view()` 기록 → 최근 본 물건 목록 표시까지
+**전 스택 인증 체인이 실동작**함을 확인했다(브라우저 → Next.js → FastAPI → JWT 검증 → DB).
+
+**[테스트 복구] selenium 의존성 분리로 회귀 테스트 2건 되살림**
+`crawler/doc_crawler.py`와 `crawler/court_crawler.py`는 최상단에서 selenium을 import하는데,
+순수 계산 함수만 쓰는 테스트까지 selenium 설치를 강요받아 실행조차 못 하고 있었다.
+- `crawler/doc_paths.py` 신규 — 문서 저장 경로 규칙(`get_doc_dir`/`doc_exists`/`DOCUMENT_ROOT`)
+- `crawler/resume.py` 신규 — 체크포인트 재개 위치 계산(`resume_start_idx`)
+- 원본 모듈은 두 이름을 **재노출**하므로 `doc_worker.py` 등 기존 호출부는 무변경
+- **우회가 아니라 불필요한 의존성을 실제로 끊은 것** — 검증 대상은 동일한 그 함수다
+- `test_doc_storage_atomicity.py`(15검사), `test_crawl_resume.py`(10검사) 실행 복구
+
+**[테스트 재설계] `test_search.py` — 고정 row count 제거**
+`address_detail="서울" -> total == 284` 같은 절대 건수는 크롤링으로 매일 드리프트해,
+두 번 연속 "실패 3건"이 났지만 **전부 기대값 노후화였고 실제 회귀는 하나도 없었다**.
+건수 대신 아래를 검증하도록 재설계(13건 -> **25검사**):
+- 행 단위 검증: 반환된 모든 행이 그 의도에 맞는 컬럼 값을 갖는가
+- **컬럼 매핑 고정**: `address_detail="오금동"` 결과 == `dong="오금동"` 결과 (0건이어도 성립)
+- 표기 동치("서울"=="서울시"=="서울특별시"), 분해 동치, 포함 관계, 응답 계약/필수 필드
+- **mutation 테스트로 검출력 확인**: DONG 의도를 `sigungu` 컬럼에 걸도록 바꾸자 정확히
+  "컬럼 매핑 고정" 검사가 실패했다. (1차 재설계안은 0건일 때 조용히 통과해 mutation을
+  놓쳤고, 그래서 컬럼 매핑 동치 검사를 추가했다)
+- 부수 수정: 출력 문자열의 em-dash가 cp949 콘솔에서 UnicodeEncodeError를 일으켜
+  테스트가 중간에 죽던 문제(과거 `test_normalizer.py`와 동일한 함정)를 ASCII로 교체
+
+**[결함 수정] `storage/checkpoint.py` 원자적 쓰기 복구 — `docs/BUGS.md` #28**
+`save()`/`clear()`가 목적지에 직접 쓰고 있었다. `docs/BUGS.md` #23(Sprint 42)이 고쳤다고
+기록한 수정이 **코드에서 사라진 상태**였고, `storage/`가 통째로 gitignore라 이력 추적도
+불가능했다. `_write_atomic()`(tmp -> fsync -> `os.replace`)으로 복구.
+체크포인트 저장 중 크래시 시 크롤러가 전체 진행 상황을 잃는 실질적 결함이었다.
+
+**[검증]** Python 회귀 **15/15 전부 PASS**(이번 세션 최초):
+auth_jwt(23) / api_regression(434) / search(25) / doc_storage_atomicity(15) /
+state_machines / race_conditions / subscription_policy / registry_credits /
+auction_identity / schema_hygiene / intent_analyzer / normalizer /
+checkpoint_atomicity(15) / validation_log_integrity / crawl_resume(10).
+`npm run test:frontend` 24/24, `npx tsc --noEmit`/`npm run lint`(0건)/`npm run build` 통과.
+
+**[조사 결과 — 버그 아님]** `crawler`의 `get_doc_dir(court_code, ...)`와
+`api/v1/documents.py`의 `get_doc_dir(court_name, ...)`가 서로 다른 인자명을 쓰지만,
+DB 실측 결과 `document_queue.court_code`/`auction_case.court_code`/`auction_item.court_name`이
+**전부 한글 법원명**을 담고 있어 경로가 일치한다. 인자 이름만 오해를 부르는 상태이며
+문서 서빙에는 문제가 없다.
+
+**[접근성 감사 — Sprint 47 추가]** 실제 DOM 검사로 4건 발견·수정.
+- **`<h1>` 부재** — Sprint 44에서 공통 Header를 만들며 각 페이지의 `<h1>`을 헤더로 옮기다가
+  `<span>`으로 바꿔버려 문서에 h1이 하나도 없었다(내가 만든 회귀). 시각적 크기는 그대로 두고
+  시맨틱만 복구
+- **`<main>` / `<nav>` 랜드마크 0개** — `SearchScreen` 본문을 `<main>`으로,
+  `PrimaryNav`를 `<nav aria-label="주요 메뉴">`로 변경
+- **라벨 없는 select 2개** — 시/도·시/군/구(+법원)에 `aria-label` 추가. 첫 option의
+  placeholder 텍스트는 접근 가능한 이름이 아니라 스크린리더가 아무것도 읽지 못했다
+- 계약 테스트에 접근성 4검사 추가(24 -> **28검사**)해 같은 회귀를 고정
+
+**[최종 게이트]** Python 회귀 **15/15 PASS**, 프론트 계약 **28/28 PASS**,
+`npx tsc --noEmit` / `npm run lint`(0건) / `npm run build` 전부 통과.
+(빌드가 한 번 `EPERM: unlink .next/static/...`으로 실패했으나 재실행 시 정상 —
+dev 서버/OneDrive의 일시적 파일 잠금이며 코드 문제가 아니다.)
+
+---
+
+2026-08-10 (Sprint 48 — 잔여 Backlog 조사 / 안전한 정리)
+
+**[조사 확정 — 코드 변경 없음]**
+- **`/properties` 레거시**: 도달 가능한 inbound 링크 **0건** 확정(주석 2건, 죽은 코드
+  `src/login/action.ts` 1건, middleware의 보호 prefix 1건이 전부 — 전부 진입 경로가 아님).
+  직접 URL 입력 외에는 도달 불가. 삭제/redirect는 정책 결정이라 SKIP
+- **`src/login/`**: import/route/link/dynamic reference **0건** 재확인(파일 2개).
+  삭제는 프로젝트 규칙상 SKIP
+- **table view**: 관련 구현/TODO **0건**. 미착수 확정
+- **마이페이지/Admin/권리분석**: `src/app/`에 해당 라우트 없음. `rightsAnalysis.ts`는
+  `REGISTRY: available:false` 하드코딩 스텁 상태 그대로(등기부 파싱 테이블 자체가 없음)
+
+**[문서 정정] CORS 기록이 stale이었다** — `docs/search-engine.md`가
+"전체 허용(`allow_origins=["*"]`)"으로만 적고 있었으나, 실제 `api_server.py`는
+**`CORS_ALLOW_ORIGINS` 환경변수를 콤마 구분으로 읽어 그 목록만 허용**하고 미설정일 때만
+하위호환으로 `["*"]`가 된다. 즉 "코드가 전체 허용으로 고정"이 아니라 "운영 값 미설정"이다.
+`.env` 설정은 승인 사항이라 값 자체는 건드리지 않고 기록만 정정했다.
+
+**[중복 제거 — 동작 무변경] `formatPrice`**
+`properties/page.tsx`(레거시)와 `properties/[id]/page.tsx`(상세)에 **글자 단위로 동일한**
+`(price/1e8).toFixed(1) + '억'` 구현이 각각 복사돼 있었다. `src/lib/format.ts`에
+`formatPriceEok()`로 추출하고 두 화면이 이를 쓰도록 통합했다 — **표시되는 숫자는 하나도
+바뀌지 않는다**. 공용 `formatPrice()`(0 -> '-', 만/억 단계)와 표기 기준이 다른 것은 그대로
+남으며, 어느 쪽으로 통일할지는 화면 숫자가 바뀌는 UX 결정이라 SKIP(함수 주석에 명시).
+
+**[조사 확정 — rename SKIP] `court_code` / `court_name`**
+DB 실측 결과 `ALL_COURTS[].code == ALL_COURTS[].name`이고
+`document_queue.court_code`/`auction_case.court_code`/`auction_item.court_name`이 **전부 한글
+법원명**을 담는다. 따라서 크롤러(`documents/<법원명>/`)와 API(`documents/<법원명>/`) 경로는
+일치하며 문서 서빙에 불일치가 없다(버그 아님). 인자명 rename은 **하지 않았다** — DB 컬럼명이
+`court_code`인 이상 내부 인자만 바꾸면 호출부(`item["court_code"]`)와 어긋나 혼란이 옮겨갈
+뿐이고, 컬럼명 변경은 스키마 변경이라 승인이 필요하다. 대신 양쪽 함수에 근거를 주석으로 남겼다.
+
+**[결함 수정] 로그인 redirect 주석 stale**
+`login/actions.ts`가 "기본값(`/properties`)으로 되돌린다"고 적고 있었으나 실제
+`DEFAULT_REDIRECT`는 Sprint 44에 `/`로 바뀌었다(내가 만든 불일치). 주석 정정.
+
+**[테스트 추가] Open Redirect 방어 회귀**
+자격증명 없이 검증 가능한 지점을 찾아 계약 테스트에 추가했다 — `//evil.example.com`,
+`/\evil.example.com`, `https://evil.example.com`을 `redirect`로 넘겨도 로그인 페이지가
+200이며 **외부 origin으로 튕기지 않는지** 확인한다(28 -> **29검사**).
+제출 시점의 `sanitizeRedirectPath()` 동작 자체는 비밀번호 입력이 필요해 여전히 범위 밖.
+
+**[기록] `storage/` git 미추적 소스 전수 특정**
+`git ls-files storage/` 결과 **0건**. 실제로는 load-bearing 소스 **22개**가 있다
+(`database.py`/`checkpoint.py`/`migrate_v4_1.py`/`migrate_doc_collect.py`/`__init__.py` +
+migrations `.sql` 16개 + `run_migrations.py`). Sprint 47의 checkpoint 원자성 유실(BUGS #28)이
+바로 이 구조 때문에 이력 없이 발생했다. 추적 정책 변경은 승인 사항이라 SKIP하고 범위만 확정 기록.

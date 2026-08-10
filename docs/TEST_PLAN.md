@@ -11,7 +11,33 @@ Last Updated: 2026-08-09
 
 ## 1. 자동 회귀 테스트 (상시 실행 가능)
 
-별도 러너(pytest 등) 설정은 없다. 두 스크립트를 직접 실행한다.
+### 1-A. Frontend 계약 테스트 (2026-08-10 Sprint 45 신규)
+
+```bash
+npm run dev                  # 먼저 서버를 띄운다 (npm run start도 가능)
+npm run test:frontend        # tests/frontend-contract.test.mjs — 29 검사
+```
+
+`docs/FRONTEND_MASTER_SPEC.md`가 "절대 변경 금지"로 못박은 계약을 고정한다: `/` 무redirect,
+첫 화면이 로그인 폼이 아님, 비로그인 목록 노출, 검색 실행의 pathname 유지, `/search` 호환,
+결과→상세 링크 형태, 비로그인 상세 307 게이트, **redirect의 query string 보존**,
+로그인 폼의 redirect 복귀 구조, 공개 라우트 무차단, 정렬/페이지 파라미터 비로그인 처리,
+개인화 라우트(`/properties/recent`·`/favorites`) 서버 게이트, **Empty State 안내·복구 동선**,
+1320px 컨테이너, 반응형 열 구성, **접근성 기본**(h1 단일/main·nav 랜드마크/select 접근 이름/lang), **Open Redirect 방어**(GET 단계 외부 origin 이탈 없음).
+
+- **러너는 Node 내장 `node:test`** — 새 라이브러리를 설치하지 않았다(`docs/CLAUDE.md` 규칙).
+  기존 Python 스크립트 방식과 중복되는 러너를 만들지 않기 위해 `npm run test:frontend` 하나만 추가.
+- **HTTP 블랙박스**로만 검증해 번들러/트랜스파일 설정이 필요 없다.
+- **DB 건수에 의존하지 않는다** — `test_search.py`가 기대 건수 노후화로 실패하는 함정을
+  반복하지 않도록 구조(상태코드/링크 형태/파라미터 보존)만 단언한다.
+- **자격증명을 다루지 않는다** — 비밀번호 제출과 실제 세션 파기는 범위 밖. 그래서
+  `sanitizeRedirectPath()`의 Open Redirect 방어는 이 계층에서 검증되지 않는다(의도적 공백).
+- 회귀 검출력 확인: `middleware.ts`를 `pathname`만 넘기도록 되돌리는 mutation 테스트로
+  "redirect 파라미터가 query string 전체를 보존한다" 검사가 실제로 실패하는 것을 확인했다.
+
+### 1-B. Backend / Crawler 회귀 테스트
+
+별도 러너(pytest 등) 설정은 없다. 아래 스크립트를 직접 실행한다.
 
 ```bash
 python test_api_regression.py       # 전 도메인 실제 HTTP 회귀 (434 검사, 2026-08-09 HEAD 프로브 + Admin 결제로그 조회 + 등기부/문서 실다운로드·경로탐색 + 등기부 중복신청 방지 + 구독 중복결제 방지 + 결제 실패 후 재시도 + 2026-08-10 Sprint 43 sort_by 화이트리스트 8개 전수(정렬 결과 body까지) 검증 추가, `docs/BUGS.md` #24)
@@ -23,12 +49,22 @@ python test_schema_hygiene.py       # get_connection(enforce_foreign_keys=) + so
 python test_race_conditions.py      # 등기부 무료한도 + 초과결제 + 구독 + Admin 상태전이 동시 요청 방어 (2026-08-09 신규, 실스레드 22 검사, 구독 시나리오는 Sprint 38, Admin 상태전이 시나리오는 Sprint 39에서 각각 결함 수정 후 추가)
 python test_intent_analyzer.py      # intent.analyzer 순수 함수 (기존, DB/API 무의존, 16 검사)
 python test_normalizer.py           # normalizer.normalize_address 순수 함수 (기존, DB/API 무의존, 29 검사, 2026-08-09 cp949 크래시 수정)
-python test_search.py               # /api/v1/search 주소 Intent 회귀 (기존, 17 검사, 2026-08-09 D7 필터 드리프트 재동기화)
-python test_doc_storage_atomicity.py # crawler/doc_crawler.py 문서 저장 + storage/database.py 큐 완료 처리 순수 로직(Selenium 무의존) — get_doc_dir/doc_exists/원자적 쓰기(os.replace)/mark_queue_done() 부분실패 rollback (2026-08-09 Sprint 40 신규 12검사, 2026-08-10 Sprint 41 mark_queue_done rollback 검증 3검사 추가 → 15 검사, `docs/BUGS.md` #22)
+python test_auth_jwt.py             # JWT 인증 체인 — ES256(JWKS, kid 선택/캐시/키회전) + HS256 레거시 + 알고리즘 화이트리스트(alg:none·알고리즘 혼동 거부) + 엔드포인트 레벨 인증필수/선택적인증 (2026-08-10 Sprint 46 신규, 23 검사, `docs/BUGS.md` #27). 자체 EC 키쌍을 JWKS 캐시에 주입해 네트워크 무의존
+python test_search.py               # /api/v1/search 주소 Intent 회귀 (2026-08-10 Sprint 47 재설계, 25 검사) — 고정 row count 단언을 전부 제거하고 행 단위 검증 + 컬럼 매핑 동치 + 표기/분해 동치 + 포함 관계로 대체. 데이터가 늘어도 유효하며 mutation 테스트로 검출력 확인
+python test_doc_storage_atomicity.py # crawler/doc_paths.py(Sprint 47 분리) 문서 저장 + storage/database.py 큐 완료 처리 순수 로직(Selenium 무의존) — get_doc_dir/doc_exists/원자적 쓰기(os.replace)/mark_queue_done() 부분실패 rollback (2026-08-09 Sprint 40 신규 12검사, 2026-08-10 Sprint 41 mark_queue_done rollback 검증 3검사 추가 → 15 검사, `docs/BUGS.md` #22)
 python test_checkpoint_atomicity.py # storage/checkpoint.py(크롤러 재시작 이어받기) 순수 로직(Selenium 무의존) — 여러 법원 공유 파일 격리, 원자적 쓰기(os.replace), 손상 파일에도 크래시하지 않는 폴백 (2026-08-10 Sprint 42 신규, 15 검사, `docs/BUGS.md` #23)
 python test_validation_log_integrity.py # validator/validation_engine.py의 logs/validation.jsonl append 순수 로직(Selenium 무의존) — 로그-결과 일치, 마지막 줄 손상이 이전 줄에 영향 없음 (2026-08-10 Sprint 42 신규, 9 검사)
-python test_crawl_resume.py         # crawler/court_crawler.py:resume_start_idx() 체크포인트 재개 순수 로직(Selenium 무의존) — 정상 매칭/묶인 사건번호/체크포인트가 오늘 목록에 없을 때의 안전한 0-폴백 (2026-08-10 Sprint 43 신규, 10 검사, crawl_court() 인라인 로직을 순수 함수로 추출)
+python test_crawl_resume.py         # crawler/resume.py:resume_start_idx()(Sprint 47 분리) 체크포인트 재개 순수 로직(Selenium 무의존) — 정상 매칭/묶인 사건번호/체크포인트가 오늘 목록에 없을 때의 안전한 0-폴백 (2026-08-10 Sprint 43 신규, 10 검사, crawl_court() 인라인 로직을 순수 함수로 추출)
 ```
+
+**2026-08-10(Sprint 45) 주의 — `test_search.py`의 3건 실패는 회귀가 아니다**:
+`address_detail='서울'`/`'서울시'`/`'서울특별시'` 3개 검사가 `total=269`인데 기대값이 `284`로
+하드코딩돼 있어 실패한다. 크롤러가 매일 데이터를 갱신하므로 **기대 건수가 노후화된 것**이며
+(2026-08-09에도 같은 이유로 한 번 재동기화한 이력이 있다), 검색 로직 변경 때문이 아니다.
+같은 파일의 응답 스키마 불변 검사와 `sido` 정규화 회귀 검사는 PASS 상태다.
+근본 해결은 "절대 건수" 대신 관계(예: 시도 합계 = 하위 시군구 합계)로 단언하도록 바꾸는 것이며,
+테스트 검증력을 낮추지 않는 재설계가 필요해 별도 작업으로 남긴다. Sprint 45에서 신설한
+Frontend 계약 테스트(§1-A)는 이 함정을 피하려 처음부터 건수를 단언하지 않는다.
 
 **2026-08-09 갱신**: 저장소 루트의 `test_*.py` 전체를 재탐색해 이번 세션 이전에는 실행되지
 않았던 3개(`test_intent_analyzer.py`/`test_normalizer.py`/`test_search.py`)를 발견·실행했다.
@@ -158,3 +194,21 @@ npm run build       # Next.js 빌드 — 통과해야 함
   `available:false`로 하드코딩한 스텁이다. 등기부 파싱 테이블/파이프라인 자체가 없다
   (`docs/roadmap.md` "In Progress > Frontend" 참고)
 - **Admin 화면**: Admin은 API만 있고 UI가 없다
+
+---
+
+## 6. 알려진 테스트 환경 이슈 (2026-08-10 Sprint 46)
+
+- ~~`test_doc_storage_atomicity.py`는 selenium 없이 실행되지 않는다~~ →
+  **2026-08-10 Sprint 47 해결**. 같은 문제가 `test_crawl_resume.py`에도 있었다
+  (`court_crawler` -> `base_crawler` -> selenium).
+  순수 함수를 selenium을 import하지 않는 모듈로 분리해 해결했다(위 (a) 방향):
+  `crawler/doc_paths.py`(경로 규칙), `crawler/resume.py`(재개 위치 계산).
+  원본 모듈이 이름을 재노출하므로 `doc_worker.py` 등 기존 호출부는 무변경이고,
+  테스트가 검증하는 함수는 **동일한 그 함수**라 검증력이 약해지지 않았다.
+  selenium 설치는 여전히 하지 않았다(승인 사항).
+
+- **`storage/`가 통째로 gitignore라 그 안의 수정은 조용히 사라질 수 있다.**
+  2026-08-10 Sprint 47에 `storage/checkpoint.py`의 원자적 쓰기(BUGS #23 수정분)가
+  코드에서 사라진 것을 `test_checkpoint_atomicity.py`가 잡아냈다(BUGS #28).
+  git 이력이 없으므로 **이 디렉터리의 회귀 테스트가 유일한 안전장치**다.

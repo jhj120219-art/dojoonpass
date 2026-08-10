@@ -59,7 +59,7 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
 
   return (
     <Link href={`/properties/${item.id}?${navQuery}`} className="block">
-    <div className="bg-white rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow border border-gray-100 mb-4">
+    <div className="bg-white rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow border border-gray-100">
       {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적.
           대표 이미지는 넣지 않는다 — auction_item에 이미지 컬럼이 없어 항상 빈 placeholder만
           차지하므로, 그 공간을 텍스트 정보가 쓰도록 비워둔다. */}
@@ -115,11 +115,25 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
   )
 }
 
-export default function ResultList({ data }: { data: SearchResponse }) {
+// basePath: 이 검색 화면이 렌더된 경로(`/` 또는 `/search`). Empty State의 "조건 없이 다시 보기"가
+// 사용자를 다른 화면으로 옮기지 않고 **지금 있는 화면의 조건만** 비우도록 하기 위해 받는다
+// (docs/FRONTEND_MASTER_SPEC.md §8.2 "검색 실행이 현재 pathname을 유지한다"와 같은 규칙).
+export default function ResultList({ data, basePath }: { data: SearchResponse; basePath: string }) {
   if (data.items.length === 0) {
+    // Empty State: 예전에는 회색 한 줄만 덩그러니 떠 있어서, 조건을 잘못 넣은 사용자가
+    // 무엇을 해야 하는지도 어떻게 되돌리는지도 알 수 없었다. 원인 안내 + 복구 동선을 준다.
     return (
       <div className="text-center py-20">
-        <p className="text-gray-400">검색 결과가 없습니다</p>
+        <p className="text-gray-500 font-medium">검색 결과가 없습니다</p>
+        <p className="mt-1 text-sm text-gray-400">
+          검색조건을 줄이거나 지역·가격 범위를 넓혀보세요
+        </p>
+        <Link
+          href={basePath}
+          className="mt-4 inline-block rounded-xl bg-gray-100 px-4 py-2 text-sm font-medium text-gray-600"
+        >
+          조건 없이 전체 물건 보기
+        </Link>
       </div>
     )
   }
@@ -135,9 +149,15 @@ export default function ResultList({ data }: { data: SearchResponse }) {
         <span className="text-sm font-bold text-blue-600">총 {data.total.toLocaleString()}건</span>
         <span className="text-xs font-medium text-gray-600"> ({data.page}/{data.total_pages}페이지)</span>
       </p>
-      {data.items.map((item, index) => (
-        <ResultItemRow key={item.id} item={item} navQuery={`ids=${ids}&i=${index}`} />
-      ))}
+      {/* 목록 밀도(FRONTEND_MASTER_SPEC.md §6): 모바일 1열 / 태블릿 2열 / 데스크톱 3열.
+          카드 자체의 정보 구성은 그대로 두고 배치만 바꾼다(§12.4 1단계). 카드 간격은
+          카드의 mb-4 대신 grid gap으로 준다 — 열이 여러 개일 때 세로 간격만 남던 문제 방지.
+          items-start: 같은 행에서 짧은 카드가 억지로 늘어나지 않게 한다. */}
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3 items-start">
+        {data.items.map((item, index) => (
+          <ResultItemRow key={item.id} item={item} navQuery={`ids=${ids}&i=${index}`} />
+        ))}
+      </div>
     </div>
   )
 }

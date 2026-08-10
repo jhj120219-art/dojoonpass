@@ -4,6 +4,8 @@ import Link from 'next/link'
 import SearchFilters from './SearchFilters'
 import LogoutButton from './LogoutButton'
 import PrimaryNav from '@/components/PrimaryNav'
+// 상세 화면과 글자 단위로 동일했던 지역 formatPrice를 공용 구현으로 통합(동작 무변경).
+import { formatPriceEok as formatPrice } from '@/lib/format'
 
 type PropertiesPageProps = {
   searchParams: Promise<{
@@ -42,10 +44,6 @@ export default async function PropertiesPage({ searchParams }: PropertiesPagePro
   }
 
   const { data: properties } = await query.order('bid_date', { ascending: true })
-
-  function formatPrice(price: number) {
-    return (price / 100000000).toFixed(1) + '억'
-  }
 
   function formatDate(dateStr: string) {
     const date = new Date(dateStr)

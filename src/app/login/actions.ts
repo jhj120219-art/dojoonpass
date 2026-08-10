@@ -3,12 +3,16 @@
 import { redirect } from 'next/navigation'
 import { createServerSupabaseClient } from '@/lib/supabaseServer'
 
-const DEFAULT_REDIRECT = '/properties'
+// 기본 복귀 경로는 첫 화면(=검색 화면)이다(docs/FRONTEND_MASTER_SPEC.md §3.4).
+// 예전 값이던 '/properties'는 Supabase 직접 조회 레거시 목록 화면이라, 로그인 성공의
+// 기본 착지점으로는 더 이상 맞지 않는다.
+const DEFAULT_REDIRECT = '/'
 
-// middleware.ts가 만드는 `/login?redirect=<pathname>`의 값을 검증한다.
+// middleware.ts가 만드는 `/login?redirect=<pathname + search>`의 값을 검증한다.
 // 외부 URL로 리다이렉트되는 Open Redirect를 막기 위해 '/'로 시작하는 내부 상대경로만
 // 허용하고, '//evil.com'이나 '/\evil.com'처럼 프로토콜-상대 URL로 해석될 수 있는
-// 패턴은 전부 거부해 기본값(/properties)으로 되돌린다.
+// 패턴은 전부 거부해 기본값(DEFAULT_REDIRECT = '/')으로 되돌린다.
+// (쿼리스트링이 붙은 값도 '/'로 시작하므로 그대로 허용된다 — 상세 복귀에 필요하다.)
 function sanitizeRedirectPath(value: FormDataEntryValue | null): string {
   if (typeof value !== 'string' || value.length === 0) return DEFAULT_REDIRECT
   if (!value.startsWith('/') || /^\/[\/\\]/.test(value)) return DEFAULT_REDIRECT

@@ -194,7 +194,12 @@ Priority 3
 - **`(user_id, status)` 복합 인덱스 부재** — 구독/초과결제 조회가 `status` 인덱스를 타고
   TEMP B-TREE 정렬을 만든다(2026-08-07 실행계획 실측)
 - **외부 예외/로그 수집 없음**(Sentry 등) — 운영에서 과거 로그 추적 불가
-- **selenium 미설치** — 크롤러 계열 테스트를 현재 환경에서 실행할 수 없다
+- **selenium 미설치** — 크롤러 **실동작** 테스트(`test_docs.py` 등)는 여전히 실행 불가.
+  다만 순수 로직 테스트 2건(`test_doc_storage_atomicity.py`/`test_crawl_resume.py`)은
+  2026-08-10 Sprint 47에 의존성 분리(`crawler/doc_paths.py`/`crawler/resume.py`)로 복구됨
+- **`storage/`가 통째로 gitignore** — 그 안의 수정이 이력 없이 사라질 수 있다.
+  실제로 Sprint 47에 `checkpoint.py`의 원자적 쓰기(BUGS #23)가 유실된 것을 발견해
+  복구했다(BUGS #28). 회귀 테스트가 유일한 안전장치다
 
 ---
 
@@ -376,6 +381,40 @@ migrate_execute.py 실패 후에도 뒤따르는 echo 명령 때문에 배치 �
 - 현재 `/properties/*`를 게이트하는 middleware 인증 로직 재검토 필요 (docs/CLAUDE.md 참고)
 
 이번 Sprint 범위: 등록만 함. 구현하지 않음.
+
+2026-08-10 업데이트: **이 항목은 스펙이 전부 확정됐다** — `docs/FRONTEND_MASTER_SPEC.md`(신규,
+Frontend 최상위 기준) + `search/00_SEARCH_MVP.md` v0.2(검색 화면 상세).
+
+- 첫 화면: `/`의 무조건 redirect(`src/app/page.tsx`)를 제거하고 `/` 자체를 검색 화면으로 만든다
+- 공개 범위: 검색 / 결과 / 목록 탐색 / 정렬 / 페이지 이동까지 비로그인 허용
+- **상세(`/properties/[id]`)는 로그인 필수로 확정** — "무엇을 보여줄지"는 더 이상 미결정이 아니다.
+  비로그인은 목록까지 보고, 물건 클릭 시 로그인으로 이동한 뒤 원래 상세 URL로 복귀한다.
+  `middleware.ts`의 `/properties/*` 게이트는 이 정책과 일치하므로 유지하고, redirect가
+  쿼리스트링을 버리는 결함만 수정한다
+- 검색 API 변경 없음
+
+**2026-08-10 Sprint 44에서 P0·P1 구현 완료** — 첫 화면 redirect 제거(`/`=검색 화면),
+`/`·`/search` 화면 공유(`SearchScreen`), 검색 실행의 pathname 유지, 공통 Header(`SiteHeader`),
+1320px 컨테이너 단일화(`src/lib/layout.ts`), 반응형 1/2/3열, 로그인 redirect의 쿼리스트링 보존
+(middleware + 상세 액션 3곳), 로그인 기본 복귀 경로 `/`. 자세한 내용은 `docs/CHANGELOG.md`.
+
+**2026-08-10 Sprint 45**: 프론트엔드 자동 테스트 신규(`npm run test:frontend`, 20검사,
+Node 내장 러너 — 새 의존성 없음), 상세 화면 공통 Header 적용(네비게이션 막다른 길 해소),
+Backlog 6건 코드 근거로 조사 완료(`docs/CHANGELOG.md`).
+
+남은 것: `/properties` 레거시 화면 처리(미결정 — 코드상 inbound 링크 0건인 고아 상태로 확정)와
+아래 환경 이슈.
+
+**[해결됨 · 2026-08-10 Sprint 46]** 로그인 사용자의 Supabase JWT를 FastAPI가
+401로 거부한다(`docs/BUGS.md` #27). Supabase 프로젝트가 **ES256 비대칭 서명으로 전환**됐음을
+JWKS 엔드포인트(200, `kty=EC`/`alg=ES256`)로 확인했는데, 백엔드 검증 3곳
+(`api/auth.py:20-23`, `api/v1/item.py:47-48`, `api/v1/search.py:145-146`)이 여전히
+`algorithms=["HS256"]` + 공유 시크릿 고정이다. ES256 토큰은 이 방식으로 원리상 검증되지 않는다.
+
+**Secret 교체로는 해결되지 않는다 — 검증 코드를 JWKS 기반 ES256으로 바꿔야 한다**
+(`python-jose`가 이미 지원하므로 신규 라이브러리 불필요, `kid` 기반 키 선택 + 캐시 필요,
+전환기에는 HS256 병행 허용 권장). Sprint 46에서 JWKS 기반 ES256 검증을 도입해 **해결**했다(HS256 병행 유지, `docs/BUGS.md` #27).
+실제 Supabase 토큰으로 401 → 200 전환을 확인했다. **API 서버 완전 재기동 필요.**
 
 2026-08-06(Sprint 15) 재확인: `/search`는 이미 비로그인 접근 가능(기존 구현, `middleware.ts`가
 `/properties/*`만 게이트). 남은 범위는 "상세(`/properties/[id]`) 진입 시 무엇을 보여줄지"인데

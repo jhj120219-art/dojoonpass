@@ -1,5 +1,5 @@
 """
-문서 저장 파일시스템 계층(crawler/doc_crawler.py) 순수 로직 회귀 테스트.
+문서 저장 파일시스템 계층(crawler/doc_paths.py, 구 crawler/doc_crawler.py) 순수 로직 회귀 테스트.
 
 Selenium/실제 브라우저는 전혀 쓰지 않는다 — get_doc_dir()/doc_exists()/원자적 쓰기(os.replace())
 패턴만 파일시스템 레벨에서 직접 검증한다. test_docs.py/test_docs2.py(실제 courtauction.go.kr
@@ -21,7 +21,11 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from crawler.doc_crawler import get_doc_dir, doc_exists, DOCUMENT_ROOT
+# 경로 규칙은 crawler/doc_paths.py(순수 로직)에 있다. 예전에는 crawler/doc_crawler에서
+# 가져왔는데, 그 모듈이 최상단에서 selenium을 import하는 탓에 selenium이 없는 환경에서는
+# 이 테스트가 ModuleNotFoundError로 아예 실행되지 못했다(2026-08-10 Sprint 47).
+# 검증 대상 함수는 **동일한 그 함수**다 — 우회가 아니라 불필요한 의존성을 끊은 것이다.
+from crawler.doc_paths import get_doc_dir, doc_exists, DOCUMENT_ROOT
 from storage.database import get_connection, mark_queue_done
 
 failures = []

@@ -17,9 +17,17 @@ from selenium.webdriver.support import expected_conditions as EC
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOWNLOAD_DIR = os.path.join(PROJECT_ROOT, "downloads")
-DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
+# 경로 규칙은 selenium 없이도 쓸 수 있어야 해서 crawler/doc_paths.py로 분리했다
+# (이 모듈은 최상단에서 selenium을 import하므로, 경로 계산만 필요한 쪽까지 selenium
+# 설치를 강요하게 된다 — Sprint 47). 아래 재노출로 기존 호출부는 그대로 동작한다.
+from crawler.doc_paths import (  # noqa: F401  (하위 호환 재노출)
+    PROJECT_ROOT,
+    DOWNLOAD_DIR,
+    DOCUMENT_ROOT,
+    get_doc_dir,
+    doc_exists,
+    _PRIMARY_EXT,
+)
 
 KAPANET_BASE = "https://ca.kapanet.or.kr"
 OVERLAY_TIMEOUT = 15
@@ -73,26 +81,6 @@ def restart_download_driver(driver):
     new_driver = build_download_driver()
     logger.info("드라이버 재시작 완료")
     return new_driver
-
-
-def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
-    safe_case_no = case_no.replace("/", "_").strip()
-    safe_item_no = (item_no or "1").replace("/", "_").strip()
-    path = os.path.join(DOCUMENT_ROOT, court_code, safe_case_no, safe_item_no)
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-# 문서 종류별 "완성 여부 판단 기준 파일" 확장자.
-# status는 json+html 세트가 완성되어야 성공이므로 json을 기준 파일로 삼는다
-# (html만 있고 json이 없는 "partial" 상태는 기존 결과 재사용 대상에서 제외하기 위함).
-_PRIMARY_EXT = {"spec": "pdf", "status": "json", "appraisal": "pdf"}
-
-
-def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bool:
-    ext = _PRIMARY_EXT.get(doc_type, "pdf")
-    path = os.path.join(get_doc_dir(court_code, case_no, item_no), doc_type + "." + ext)
-    return os.path.exists(path) and os.path.getsize(path) > 0
 
 
 def calc_file_hash(path: str) -> str:

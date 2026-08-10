@@ -16,6 +16,10 @@ DOC_TYPE_FILES = {
 }
 
 
+# crawler/doc_paths.py:get_doc_dir()는 같은 경로를 만들면서 인자명을 court_code로 쓴다.
+# 이름만 다를 뿐 **값은 동일한 한글 법원명**이라 두 경로는 일치한다(2026-08-10 Sprint 48
+# DB 실측 확인 — ALL_COURTS의 code == name, 관련 컬럼 전부 한글 법원명).
+# 크롤러가 쓴 문서를 API가 못 찾는 문제는 없다.
 def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
     safe_case_no = case_no.replace("/", "_").strip()
     safe_item_no = (item_no or "1").replace("/", "_").strip()

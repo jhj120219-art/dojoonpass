@@ -1,9 +1,9 @@
 ﻿import logging
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+from jose import JWTError
 from storage.database import get_connection
-from api.auth import SUPABASE_JWT_SECRET
+from api.auth import decode_supabase_jwt
 from api.v1.recent_items import record_view
 
 logger = logging.getLogger(__name__)
@@ -44,8 +44,10 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             # 토큰이 유효하지 않아도 상세 조회 자체는 비로그인으로 계속 진행한다(선택적 인증).
             # 예전에는 bare except라 KeyboardInterrupt/SystemExit까지 삼켰고 원인도 남지 않았다.
             try:
-                payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
-                    algorithms=["HS256"], options={"verify_aud": False})
+                # ES256(JWKS) / HS256(레거시)을 함께 다루는 공용 검증기 — api/auth.py 참고.
+                # 예전에는 여기서 HS256만 검증해, Supabase가 ES256으로 전환된 뒤 로그인
+                # 사용자도 항상 비로그인으로 처리됐다(docs/BUGS.md #27).
+                payload = decode_supabase_jwt(credentials.credentials)
                 user_id = payload.get("sub")
             except JWTError:
                 logger.debug("item 상세: 토큰 검증 실패 — 비로그인으로 처리")

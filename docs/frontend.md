@@ -24,15 +24,61 @@
 
 ## 페이지 구조
 
-| 경로 | 접근 조건 | 구현 여부 |
+아래 표는 **현재(as-is) 코드 기준**이다. 2026-08-10 확정된 목표(to-be) 정책은
+`search/00_SEARCH_MVP.md` §1~§2가 Single Source of Truth이며, 아래 "첫 진입 화면 정책(2026-08-10 확정)"
+절에 차이를 정리했다.
+
+| 경로 | 접근 조건 (as-is) | 구현 여부 |
 |---|---|---|
-| `/` | 없음 (redirect 전용) | 구현됨 |
+| `/` | 없음 — **검색 화면**(2026-08-10 Sprint 44에서 redirect 제거 완료) | 구현됨 |
 | `/login` | 없음 | 구현됨 |
 | `/properties` | 로그인 필요 (middleware + 페이지 내부 이중 체크) | 구현됨 |
-| `/properties/[id]` | 로그인 필요 (페이지 내부 체크) | 구현됨 |
-| `/properties/recent` | 로그인 필요 | 구현됨 |
+| `/properties/[id]` | 로그인 필요 (middleware `/properties/*` 게이트 + 페이지 내부 체크) | 구현됨 |
+| `/properties/recent` | 로그인 필요 (middleware + 페이지 내부 체크) | 구현됨 |
 | `/search` | 로그인 불필요(비로그인도 조회 가능) | 구현됨 |
-| `/favorites` | 로그인 필요 | 구현됨 |
+| `/favorites` | 로그인 필요 (**Sprint 45부터 middleware + 페이지 내부 이중 체크**) | 구현됨 |
+
+## 첫 진입 화면 정책 (2026-08-10 확정 → **같은 날 Sprint 44에서 구현 완료**)
+
+> 아래 "현재 코드와의 불일치" 표는 **Sprint 44 이전 상태**의 기록이다. 5개 항목 전부
+> 해소됐다(`docs/CHANGELOG.md` 2026-08-10 항목 참고). 신규 파일:
+> `src/app/search/SearchScreen.tsx`(`/`·`/search` 공유 화면), `src/components/SiteHeader.tsx`(공통 헤더),
+> `src/lib/layout.ts`(`CONTAINER` = `max-w-[1320px] mx-auto`, 컨테이너 단일 정의).
+>
+> **Sprint 45 추가**: `SiteHeader`가 `/properties/[id]`(상세)에도 적용돼 전 주요 화면이
+> 공통 Header를 공유한다(상세 전용 바는 유지, 위에 얹는 방식).
+> 프론트엔드 계약 테스트가 생겼다 — `tests/frontend-contract.test.mjs`,
+> `npm run test:frontend`(20검사, Node 내장 러너, 새 의존성 없음). `docs/TEST_PLAN.md` §1-A 참고.
+
+
+확정 정책은 `search/00_SEARCH_MVP.md` v0.2 §1~§3에 있다. 요약:
+
+- `/`는 **검색 화면 자체**이며 어떤 경로로도 redirect하지 않는다(로그인 여부 무관)
+- 비로그인도 첫 화면에서 검색조건 입력 → 검색 → 결과 탐색까지 가능
+- 검색 결과는 별도 화면이 아니라 **같은 페이지 하단**에 이어짐
+- 로그인은 즐겨찾기 / 최근조회 / 검색조건 저장 / 구독·결제 / 등기부 **액션 시점**에만 요구
+- 모든 화면(헤더 포함)은 `max-w-[1320px] mx-auto` 중앙 컨테이너 기준으로 정렬
+
+현재 코드와의 불일치(= 구현 대상):
+
+| 항목 | 현재 코드 | 확정 정책 |
+|---|---|---|
+| `/` 동작 | `src/app/page.tsx`가 무조건 redirect (`user` → `/properties`, 비로그인 → `/login`) | 검색 화면 렌더 |
+| 검색 실행 경로 | `SearchForm.handleSearch()` / `SearchPresets.applyPreset()`이 `/search`로 하드코딩 push | 현재 pathname으로 push |
+| 컨테이너 | `/search`만 `max-w-[1320px]`, `/properties`·`/login`·`/favorites`·`/properties/recent`는 풀블리드(`px-4`/`px-5`/`px-6`) | 전 화면 동일 컨테이너 |
+| 데스크톱 밀도 | 모바일 1열 레이아웃이 1320px 폭으로 그대로 늘어남(입력 필드가 화면을 가로지름) | `md` 2열 / `xl` 3열 |
+| 공용 헤더 | 없음(각 page.tsx가 상단 바를 개별 작성, `PrimaryNav`만 공유) | 공용 헤더에서 컨테이너 정렬 + 로그인/로그아웃 노출 |
+
+`/properties/[id]`(상세) 게이트는 **2026-08-10 확정됐다: 로그인 필수** — 더 이상 PM 결정 대기
+항목이 아니다. 비로그인은 목록까지만 보고, 물건을 클릭하는 순간 로그인으로 이동한다.
+`middleware.ts`의 `/properties/*` 게이트가 이미 이 정책과 일치하므로 게이트 로직은 그대로 두되,
+로그인 redirect가 **쿼리스트링을 버리는 결함**은 수정 대상이다(`middleware.ts:42`가 `pathname`만
+넘겨 상세의 `?ids=&i=` 이전/다음 물건 컨텍스트가 소실됨. `login/actions.ts`의 기본 복귀 경로도
+레거시 `/properties`라 `/`로 바뀌어야 함).
+
+**Frontend 전체의 최상위 기준은 `docs/FRONTEND_MASTER_SPEC.md`다**(2026-08-10 신규).
+라우팅/인증 경계/공통 Layout/Navigation 정책은 그 문서를 따르고, 검색 화면 세부는
+`search/00_SEARCH_MVP.md`, 현재 코드 현황은 이 문서를 본다.
 
 ## Component 구조
 

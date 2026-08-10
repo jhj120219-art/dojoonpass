@@ -1,6 +1,6 @@
 'use client'
 
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useRouter, usePathname, useSearchParams } from 'next/navigation'
 import { useEffect, useState, useTransition } from 'react'
 import type { SearchQueryParams } from './types'
 import { fetchJSON } from '@/lib/api'
@@ -236,6 +236,10 @@ export default function SearchForm() {
 
 function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
   const router = useRouter()
+  // 검색 결과는 "별도 화면"이 아니라 현재 화면 하단에 이어진다(FRONTEND_MASTER_SPEC.md §8.2).
+  // 예전에는 '/search'가 하드코딩돼 있어서 첫 화면(`/`)에서 검색하면 다른 경로로 튕겨나갔다.
+  // 지금 화면의 경로를 그대로 유지하고 쿼리스트링만 갱신한다 — `/`와 `/search` 양쪽에서 동일하게 동작.
+  const pathname = usePathname()
   const [isSearchPending, startSearchTransition] = useTransition()
   const [form, setForm] = useState<SearchFormState>(() => parseFormState(searchParams))
 
@@ -373,7 +377,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
     })
 
     const qs = params.toString()
-    router.push(qs ? `/search?${qs}` : '/search')
+    router.push(qs ? `${pathname}?${qs}` : pathname)
   }
 
   const inputClass =
@@ -390,6 +394,11 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         })
       }}
     >
+      {/* 검색조건 밀도(FRONTEND_MASTER_SPEC.md §6): 모바일 1열 / 태블릿 2열 / 데스크톱 3열.
+          레이아웃(컨테이너 클래스)만 바꾼다 — 각 섹션의 필드 구성·state·buildSearchQuery()
+          결과는 그대로다. 데스크톱에서 입력 필드 하나가 1320px를 가로지르던 문제의 해결책.
+          items-start: 섹션마다 높이가 달라도 grid가 세로로 늘려 빈 칸을 만들지 않게 한다. */}
+      <div className="md:grid md:grid-cols-2 md:items-start md:gap-x-6 xl:grid-cols-3">
       {/* 주소/법원 토글 — Tank Auction의 toggleBtn(주소/법원 탭) 참고 */}
       <div className="pt-4 pb-3 border-b border-gray-100">
         <div className="flex rounded-full overflow-hidden border border-gray-200 mb-2">
@@ -419,6 +428,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
               <select
                 value={form.sido}
                 onChange={(e) => handleSidoChange(e.target.value)}
+                aria-label="시/도"
                 className={inputClass}
               >
                 <option value="">시/도 전체</option>
@@ -430,6 +440,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
                 value={form.sigungu}
                 onChange={(e) => handleSigunguChange(e.target.value)}
                 disabled={!form.sido || sigunguLoading}
+                aria-label="시/군/구"
                 className={inputClass}
               >
                 <option value="">
@@ -473,6 +484,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           <select
             value={form.courtName}
             onChange={(e) => update('courtName', e.target.value)}
+            aria-label="법원"
             className={inputClass}
           >
             <option value="">법원 전체</option>
@@ -487,6 +499,9 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         )}
       </div>
 
+      {/* 나머지 검색조건 아코디언 묶음. 접힌 상태에서는 높이가 서로 같아 자체 grid로 촘촘히
+          채워지므로, 키가 큰 주소 블록과 같은 행에 섞여 빈 공간이 생기지 않는다. */}
+      <div className="xl:col-span-2 xl:grid xl:grid-cols-2 xl:items-start xl:gap-x-6">
       <SearchAccordionSection title="물건정보" defaultOpen={false}>
         <div>
           <span className={labelClass}>사건번호</span>
@@ -637,6 +652,8 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
       <SearchAccordionSection title="특수조건" defaultOpen={false} muted>
         <p className="text-xs text-gray-400 py-1">준비 중입니다</p>
       </SearchAccordionSection>
+      </div>
+      </div>
 
       <div className="py-4 flex gap-2">
         <button

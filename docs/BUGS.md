@@ -642,3 +642,176 @@ api/v1/search.py의 기존 쿼리 파라미터명과 동일하게 맞춘다"를 
 타입을 강제하지 않고 `success`/`message`만 읽어 안전함을 재확인.
 
 **[문서]** `docs/CHANGELOG.md` Sprint 43 항목.
+
+---
+
+#25
+
+로그인 Redirect가 쿼리스트링을 버려 원래 URL로 정확히 복귀하지 못함
+
+해결 (2026-08-10, Sprint 44)
+
+**[증상]** 비로그인 사용자가 검색 결과에서 물건을 클릭하면 로그인으로 이동하는데, 로그인 후
+돌아온 상세 화면에 **"이전 물건 / 다음 물건" 이동 버튼이 사라져 있었다.** 목록에서 들어온
+것이 분명한데도 직접 링크로 들어온 것처럼 취급됐다.
+
+**[원인]** `src/middleware.ts`가 로그인 URL을 만들 때
+`loginUrl.searchParams.set('redirect', request.nextUrl.pathname)`으로 **pathname만** 실었다.
+검색 결과의 링크는 `/properties/{id}?ids=84,85,86&i=0` 형태로 목록 내 이동 컨텍스트를
+쿼리스트링에 담아 전달하는데(`ResultList.tsx`의 `navQuery`), 그 부분이 통째로 잘려나갔다.
+로그인 후 `sanitizeRedirectPath()`가 돌려주는 값은 `/properties/{id}`뿐이라
+`properties/[id]/page.tsx`의 `navIds`/`navIndex`가 빈 값이 되고, 이전/다음 버튼이
+"컨텍스트 없음"으로 판정돼 렌더되지 않는다.
+
+같은 결함이 **세션 만료 후 액션 경로에도** 있었다 — `properties/[id]/page.tsx`의
+`router.push(\`/login?redirect=/properties/${id}\`)` 3곳(즐겨찾기 토글, 등기부 신청,
+401 응답 처리)도 동일하게 쿼리스트링을 버렸다. 반면 `search/FavoriteButton.tsx`와
+`SearchPresets.tsx`는 처음부터 `pathname + search`를 넘기고 있어, **같은 프로젝트 안에서
+두 방식이 공존**하고 있었던 것이 문제를 오래 눈에 띄지 않게 만들었다.
+
+**[수정]**
+- `src/middleware.ts`: `pathname` → `pathname + search`
+- `src/app/properties/[id]/page.tsx`: `loginRedirectUrl()` 헬퍼를 만들어
+  `searchParams.toString()`을 붙이도록 3곳 통일
+- Open Redirect 방어(`sanitizeRedirectPath`)는 **변경 없음** — 값이 길어졌을 뿐
+  `/`로 시작하는 내부 상대경로라는 조건은 그대로다
+
+**[검증]** 비로그인 상태로 `/properties/84?ids=84,85&i=0` 요청 시
+`307 -> /login?redirect=%2Fproperties%2F84%3Fids%3D84%252C85%26i%3D0` 확인,
+로그인 화면 HTML의 hidden input이 `value="/properties/84?ids=84,85&i=0"`로 전체 URL을
+담고 있음을 확인.
+
+**[관련]** `docs/FRONTEND_MASTER_SPEC.md` §3.4가 이 계약("pathname + query string 전체 보존")을
+확정 정책으로 명시한다.
+
+---
+
+#26
+
+검색조건 저장 목록이 인증 실패를 "불러오기 실패"로 표시
+
+해결 (2026-08-10, Sprint 44)
+
+**[증상]** 검색 화면의 "검색조건 저장" 카드에 빨간 글씨로
+"저장된 검색조건을 불러오지 못했습니다"가 떴다. 사용자가 할 수 있는 조치가 없는 실패 메시지다.
+
+**[원인]** `SearchPresets.tsx`의 초기 목록 조회가 모든 예외를 하나로 묶어 에러 문구를 띄웠다.
+그런데 실제로 발생한 예외는 `ApiError(401)` — **세션이 유효하지 않다**는 뜻이었다.
+브라우저에 남은 만료 토큰으로 `getSession()`이 세션 객체를 돌려주는 경우가 실제로 있어
+(이번에 `SUPABASE_JWT_SECRET` 불일치 환경에서 재현됨) 컴포넌트는 자신을 로그인 상태로 믿고
+조회를 시도한다. 같은 파일의 저장/삭제 경로는 이미 401/403을 로그인 유도로 처리하고 있어
+**같은 파일 안에서 규칙이 갈렸다.**
+
+**[수정]** `src/app/search/SearchPresets.tsx` — 목록 조회의 `catch`에서 401/403이면
+`setAccessToken(null)`로 비로그인 상태로 되돌린다(안내 문구
+"로그인하면 검색조건을 저장하고 불러올 수 있습니다"가 대신 표시됨). 그 외 예외만 에러로 표시.
+
+**[검증]** 만료 토큰 상태의 실제 브라우저에서 빨간 에러 → 회색 안내 문구로 바뀌는 것 확인.
+
+---
+
+#27
+
+로그인 상태인데 인증 API가 전부 401 — Supabase가 ES256으로 전환됐는데 백엔드는 HS256만 검증
+
+해결 (2026-08-10 Sprint 46) — Sprint 45에서 원인 확정, Sprint 46에서 수정
+
+**[증상]** 로그인된 사용자인데도
+- `/favorites`, `/properties/recent` 진입 시 로그인 화면으로 튕김
+- 검색 화면의 "검색조건 저장" 목록 조회 실패
+- 검색 결과의 즐겨찾기 하트가 **전부 빈 하트(🤍)** 로 표시 (실제 즐겨찾기 여부와 무관)
+
+Supabase 세션 자체는 유효하다 — `middleware.ts`의 `supabase.auth.getUser()`는 통과하고
+`/properties/[id]` 상세 진입도 정상이다. **오직 FastAPI만 같은 토큰을 거부한다.**
+
+**[원인 — 확정]** Supabase 프로젝트가 **비대칭 JWT 서명(ES256)** 으로 전환됐다.
+`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`이 HTTP 200으로 `kty=EC, alg=ES256` 키를
+1개 게시하고 있음을 확인했다(2026-08-10). 즉 사용자 access token은 이제 ES256으로 서명된다.
+
+반면 백엔드는 세 곳 모두 **공유 시크릿 + HS256 고정**으로만 검증한다:
+- `api/auth.py:20-23` — `get_current_user()`. favorites / recent-items / search-presets /
+  registry-requests / payments 등 **인증 필수 라우트 전부**가 여기를 지난다
+- `api/v1/item.py:47-48` — 선택적 인증
+- `api/v1/search.py:145-146` — 선택적 인증
+
+ES256으로 서명된 토큰은 `algorithms=["HS256"]` + 대칭 시크릿으로는 **원리상 절대 검증되지
+않는다**(서명 알고리즘 자체가 다름). 그래서 인증 필수 라우트는 401, 선택적 인증 라우트는
+`JWTError`를 삼키고 비로그인으로 처리 → 검색은 되지만 `is_favorited`가 항상 false가 된다.
+
+참고로 `NEXT_PUBLIC_SUPABASE_ANON_KEY`의 JWT 헤더는 여전히 `alg=HS256`이다 — anon/service
+키는 레거시 형식을 유지하므로, **anon 키만 보고 "이 프로젝트는 HS256"이라고 판단하면 안 된다.**
+이번 오진의 함정이 정확히 이 지점이었다.
+
+**[해결 방향]** Secret 교체가 아니라 **검증 코드 변경**이다(시크릿을 아무리 바꿔도 해결되지 않음).
+JWKS에서 공개키를 받아 ES256으로 검증하도록 위 3곳을 고쳐야 한다. `python-jose`는 ES256과
+JWK dict를 이미 지원하므로 **새 라이브러리 설치는 불필요**하다. 키는 `kid`로 선택하고
+캐시해야 한다(요청마다 JWKS를 받으면 안 됨). 레거시 HS256 토큰이 남아 있을 수 있으므로
+전환기에는 두 알고리즘을 모두 허용하는 편이 안전하다.
+
+**[범위]** Sprint 44는 Frontend 전용(백엔드 코드 수정 금지)이라 원인 확정과 기록까지만 수행.
+프론트엔드 코드 결함은 아니다 — 프론트는 토큰을 정확히 실어 보내고 있다.
+
+**[영향]** 이 결함이 해소되기 전에는 즐겨찾기 / 최근조회 / 검색조건 저장 / 등기부 신청 /
+구독·결제가 **로그인 상태에서도 동작하지 않는다.** 비로그인 검색 경로는 영향 없음.
+
+### #27 해결 내역 (2026-08-10 Sprint 46)
+
+**[수정] `api/auth.py`** — `decode_supabase_jwt()` 신설. 토큰 헤더의 `alg`를 보고
+ES256(JWKS 공개키) / HS256(레거시 공유 시크릿) 중 맞는 경로로 검증한다.
+
+- **알고리즘 화이트리스트 고정**: 토큰이 알려준 `alg`를 그대로 `algorithms=[alg]`에 넘기면
+  `alg:"none"` 위조가 통과한다. 대칭(HS256)/비대칭(ES·RS 계열) 두 집합에 없는 alg는 전부 거부
+- **kid 기반 키 선택 + JWKS 캐시**(TTL 600초). 캐시에 없는 kid가 오면 재조회해 **키 회전**에
+  대응하되, 최소 재조회 간격 30초로 외부 호출 폭주를 막는다. JWKS 조회 실패 시 기존 캐시를
+  비우지 않는다(일시적 오류로 전원 로그아웃되는 것을 막기 위함)
+- **예외 정규화**: jose는 `JWTError`가 아닌 형제 예외(`JWSError` 등)를 던지는 경로가 있는데,
+  호출부는 `except JWTError`만 잡는다. 그대로 새어 나가면 **선택적 인증** 라우트(검색/상세)가
+  토큰이 이상하다는 이유로 500이 된다. 검증 실패는 종류 불문 `JWTError`로 정규화했다
+  (테스트 작성 중 실제로 발견한 결함)
+- **실패 사유 로깅**(토큰/시크릿 제외). 원인 없이 401만 떨어져 이 사고를 오래 못 찾았다
+- **HS256을 계속 허용하는 이유**: 전환기의 기존 토큰과, 합성 시크릿으로 HS256 토큰을 만들어
+  인증 로직을 검증하는 기존 회귀 스위트(`test_api_regression.py`)가 그대로 동작해야 한다
+
+**[수정] `api/v1/item.py` / `api/v1/search.py`** — 각자 복사돼 있던 `jwt.decode(..., HS256)`을
+공용 `decode_supabase_jwt()` 호출로 대체(검증 로직 3중 중복 제거).
+
+**[검증]** `test_auth_jwt.py` 신규 23검사 전부 통과. 결정적 증거는 **실제 Supabase ES256 토큰**으로
+같은 요청을 두 서버에 보낸 비교다 — 구 코드 서버는 `search-presets`/`recent-items`/`favorites`
+전부 401, 새 코드 서버는 전부 **200**. `test_api_regression.py` 434검사도 무변동 통과
+(HS256 경로가 보존됐다는 증거).
+
+**[주의]** 이미 떠 있는 API 서버 프로세스는 `--reload`가 걸려 있어도 이번 변경을 확실히
+반영하지 못할 수 있다. 배포/로컬 모두 **API 서버를 완전히 재기동**해야 적용된다.
+
+---
+
+#28
+
+체크포인트 원자적 쓰기가 코드에서 사라져 있었음 (#23 수정분 유실)
+
+해결 (2026-08-10, Sprint 47)
+
+**[증상]** `test_checkpoint_atomicity.py`의 "orphaned tmp from the simulated crash is gone"
+검사가 실패했다. 다른 검사는 전부 통과해서 오래 눈에 띄지 않았다.
+
+**[원인]** `storage/checkpoint.py`의 `save()`/`clear()`가 **목적지 파일에 직접 쓰고 있었다** —
+임시 파일도 `os.replace()`도 없었다. 이는 `docs/BUGS.md` #23(2026-08-10 Sprint 42)이
+"원자적 쓰기로 고쳤다"고 기록한 바로 그 결함이다. 즉 **한 번 고친 수정이 코드에서 사라진 상태**였다.
+
+**`storage/` 전체가 `.gitignore` 대상**이라 이 파일은 git이 추적하지 않는다. 따라서 언제·어떻게
+되돌아갔는지 이력으로 확인할 방법이 없다(`docs/CLAUDE.md`의 "storage/ 가 통째로 gitignore되어
+load-bearing 소스가 버전관리 밖에 있다"는 경고가 현실화된 사례다).
+
+**[영향]** 체크포인트 저장 도중 프로세스가 죽으면 `logs/checkpoint.json`이 반쯤 잘린 JSON으로
+남고, 다음 실행의 `_load_all()`이 이를 파싱하지 못해 `{}`로 폴백한다 → **크롤러가 전체 법원의
+진행 상황을 잃고 처음부터 다시 긁는다**(데이터 손상은 아니지만 재수집 비용이 크다).
+
+**[수정] `storage/checkpoint.py`** — `_write_atomic()` 헬퍼를 추가하고 `save()`/`clear()` 둘 다
+이를 쓰도록 했다. 임시 파일에 쓰고 `flush()` + `os.fsync()` 후 `os.replace()`로 교체한다
+(같은 볼륨에서 원자적이라 목적지는 "이전 내용" 아니면 "새 내용" 둘 중 하나만 된다).
+`clear()`도 같은 이유로 원자화했다 — 삭제 도중 죽으면 남은 법원들의 진행 상황까지 날아간다.
+
+**[검증]** `test_checkpoint_atomicity.py` 15검사 전부 통과.
+
+**[교훈]** gitignore된 디렉터리의 소스는 수정이 조용히 사라져도 아무도 모른다. 이번에 이걸
+잡아낸 것은 **테스트뿐이었다** — `storage/`의 회귀 테스트는 특히 중요하다.

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useRouter, usePathname, useSearchParams } from 'next/navigation'
 import { fetchAuthedJSON, postJSON, deleteJSON, ApiError } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { FILTER_PARAM_KEYS } from './SearchForm'
@@ -26,6 +26,9 @@ function currentConditions(searchParams: URLSearchParams | ReturnType<typeof use
 
 export default function SearchPresets() {
   const router = useRouter()
+  // SearchForm과 동일한 이유로 '/search' 하드코딩을 걷어낸다 — 저장된 조건을 적용하거나
+  // 로그인으로 유도할 때 지금 보고 있는 화면(`/` 또는 `/search`)을 벗어나지 않아야 한다.
+  const pathname = usePathname()
   const searchParams = useSearchParams()
 
   const [accessToken, setAccessToken] = useState<string | null>(null)
@@ -50,8 +53,17 @@ export default function SearchPresets() {
       try {
         const result = await fetchAuthedJSON<SearchPreset[]>('/api/v1/search-presets', token)
         setPresets(result.data ?? [])
-      } catch {
-        setListError('저장된 검색조건을 불러오지 못했습니다')
+      } catch (err) {
+        // 401/403은 "불러오기 실패"가 아니라 **세션이 더 이상 유효하지 않다**는 뜻이다.
+        // (브라우저에 남은 만료 토큰으로 getSession()이 세션을 돌려주는 경우가 실제로 있다.)
+        // 그때 빨간 에러를 띄우면, 비로그인 사용자에게 고칠 수도 없는 실패를 보여주는 꼴이 된다.
+        // 저장/삭제 경로가 이미 401/403을 로그인 유도로 처리하는 것과 같은 규칙을 목록 조회에도 적용해
+        // 비로그인 상태(=아래 "로그인하면 검색조건을 저장할 수 있습니다" 안내)로 되돌린다.
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          setAccessToken(null)
+        } else {
+          setListError('저장된 검색조건을 불러오지 못했습니다')
+        }
       } finally {
         setListLoading(false)
       }
@@ -61,7 +73,7 @@ export default function SearchPresets() {
 
   function redirectToLogin() {
     const qs = searchParams.toString()
-    const target = qs ? `/search?${qs}` : '/search'
+    const target = qs ? `${pathname}?${qs}` : pathname
     const loginParams = new URLSearchParams()
     loginParams.set('redirect', target)
     router.push(`/login?${loginParams.toString()}`)
@@ -120,7 +132,7 @@ export default function SearchPresets() {
     if (sortOrder) params.set('sort_order', sortOrder)
     if (size) params.set('size', size)
     const qs = params.toString()
-    router.push(qs ? `/search?${qs}` : '/search')
+    router.push(qs ? `${pathname}?${qs}` : pathname)
   }
 
   async function handleDelete(id: number) {

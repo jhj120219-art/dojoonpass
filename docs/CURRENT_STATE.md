@@ -420,3 +420,49 @@ KG이니시스) 대기로 수렴
 □ (Beta v2) 등기부등본 실제 발급기관(대법원 인터넷등기소 등) 자동 연동
 
 자세한 근거와 우선순위는 `docs/roadmap.md`("진행률 재계산" 섹션), `docs/backend.md` 참고.
+
+---
+
+## 2026-08-10 (Sprint 44~46) Frontend 재정의 + 인증 체인 복구
+
+**Frontend UX 재정의(Sprint 44~45)**
+- `/`가 첫 화면이자 **검색 화면**이다. redirect 없음, 비로그인으로 검색/정렬/페이지 이동 가능
+- `/search`는 호환 유지(같은 `SearchScreen` 공유, 복제 없음)
+- 상세 `/properties/[id]`, `/favorites`, `/properties/recent`는 **로그인 필수**(middleware 서버 게이트)
+- 로그인 redirect가 **query string까지 보존**한다(`docs/BUGS.md` #25)
+- 공통 `SiteHeader` + 1320px 중앙 컨테이너, 반응형 1/2/3열
+- 프론트 계약 테스트 신설: `npm run test:frontend` (24검사, Node 내장 러너, 새 의존성 없음)
+
+**인증 체인 복구(Sprint 46) — Release Blocker 해소**
+- Supabase가 ES256(비대칭)으로 전환된 것을 백엔드가 따라가지 못해 로그인 사용자의 모든 인증
+  API가 401이었다(`docs/BUGS.md` #27). `api/auth.py`에 JWKS 기반 ES256 검증을 도입하고
+  HS256(레거시)을 함께 지원하도록 고쳤다. `item.py`/`search.py`의 중복 검증도 공용 함수로 통합
+- 실제 Supabase 토큰으로 구/신 코드를 비교해 401 → **200** 전환을 확인했다
+- **API 서버를 완전히 재기동해야 적용된다**(`--reload`만으로는 반영되지 않는 경우가 있었다)
+
+**현재 릴리스 상태**: 비로그인 검색 경로와 로그인 인증 경로 모두 코드 레벨 검증 완료.
+남은 미결정은 `/properties` 레거시 화면 처리와 표기/디자인 관련 UX 결정들이다.
+
+### 2026-08-10 (Sprint 47) 운영 검증 + 테스트 복구
+
+- API 서버를 최신 코드로 재기동하고 **실제 Supabase ES256 토큰으로 인증 API 전부 200** 확인.
+  브라우저에서 상세 진입 → 최근조회 기록 → 목록 표시까지 전 스택 실동작 확인
+- selenium 의존성 분리(`crawler/doc_paths.py`, `crawler/resume.py`)로 실행 불가였던
+  회귀 테스트 2건 복구
+- `test_search.py`를 고정 건수 비의존으로 재설계(25검사, mutation 검증)
+- `storage/checkpoint.py` 원자적 쓰기 복구(BUGS #28 — #23 수정분이 유실돼 있었음)
+- **Python 회귀 15/15 전부 PASS**, 프론트 계약 24/24, Type/Lint/Build 통과
+
+운영 주의: API 서버는 `--reload`만으로 변경이 반영되지 않는 경우가 있으므로 **완전 재기동**한다.
+
+### 2026-08-10 (Sprint 48) 잔여 Backlog 조사 + 안전한 정리
+
+- `/properties`(레거시)·`src/login/`: 도달 경로 **0건** 확정. 삭제/redirect는 정책 결정이라 SKIP
+- table view·마이페이지·Admin·권리분석 화면: 구현 0건(미착수) 확정
+- CORS: `CORS_ALLOW_ORIGINS` 환경변수로 **이미 제한 가능**. 문서의 "전체 허용 고정" 기록 정정
+- `formatPrice`: 동일했던 두 지역 구현을 `formatPriceEok()`로 통합(표시 숫자 무변경).
+  표기 기준 통일 자체는 여전히 UX 결정 대기
+- `court_code`/`court_name`: 값이 전부 한글 법원명으로 동일 — 경로 불일치 없음(버그 아님).
+  DB 컬럼명이 `court_code`라 내부 rename은 하지 않고 주석으로 근거 기록
+- Open Redirect 방어 회귀 테스트 추가(계약 테스트 29검사)
+- `storage/` git 미추적 소스 **22개** 전수 특정(BUGS #28의 구조적 원인)

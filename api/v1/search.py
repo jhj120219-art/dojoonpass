@@ -1,11 +1,11 @@
 import logging
 from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+from jose import JWTError
 from typing import Optional
 from datetime import date
 from storage.database import get_connection
-from api.auth import SUPABASE_JWT_SECRET
+from api.auth import decode_supabase_jwt
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
     analyze_intent,
@@ -142,8 +142,10 @@ def search(
     if credentials:
         # 예전에는 bare except라 KeyboardInterrupt/SystemExit까지 삼켰고 원인도 남지 않았다.
         try:
-            payload = jwt.decode(credentials.credentials, SUPABASE_JWT_SECRET,
-                algorithms=["HS256"], options={"verify_aud": False})
+            # ES256(JWKS) / HS256(레거시)을 함께 다루는 공용 검증기 — api/auth.py 참고.
+            # 예전에는 HS256만 검증해서, 로그인 사용자의 검색 결과에도 is_favorited가
+            # 항상 false로 내려갔다(하트가 전부 빈 하트로 보이던 증상, docs/BUGS.md #27).
+            payload = decode_supabase_jwt(credentials.credentials)
             user_id = payload.get("sub")
         except JWTError:
             logger.debug("search: 토큰 검증 실패 — 비로그인으로 처리")

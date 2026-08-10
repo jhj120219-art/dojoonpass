@@ -26,6 +26,10 @@ function LoginPageInner() {
 
   return (
     <div className="min-h-screen bg-white flex flex-col justify-center px-6">
+      {/* 로그인 폼이 데스크톱에서 화면 전체 폭으로 늘어나 입력칸이 1920px를 가로지르던 문제를
+          막는다. 이건 페이지 컨테이너(1320px)가 아니라 **폼 한 줄의 가독 폭**이라 별도 값을 쓴다
+          — Master Spec §5.2가 금지하는 "새 페이지 max-width"에 해당하지 않는다. */}
+      <div className="w-full max-w-md mx-auto">
       <div className="mb-10 text-center">
         <div className="w-14 h-14 bg-blue-500 rounded-2xl flex items-center justify-center mx-auto mb-4">
           <span className="text-white text-2xl font-bold">콕</span>
@@ -61,11 +65,13 @@ function LoginPageInner() {
         </button>
       </div>
       <div className="mt-3 text-center">
-        <Link href="/search" className="text-xs text-gray-400 hover:text-blue-500 transition-colors duration-200">
+        {/* 첫 화면(`/`)이 곧 검색 화면이므로 둘러보기 대상도 `/`로 통일한다 */}
+        <Link href="/" className="text-xs text-gray-400 hover:text-blue-500 transition-colors duration-200">
           로그인 없이 둘러보기
         </Link>
       </div>
       <p className="mt-10 text-xs text-gray-300 text-center">로그인 시 서비스 이용약관 및 개인정보처리방침에 동의하게 됩니다</p>
+      </div>
     </div>
   )
 }
