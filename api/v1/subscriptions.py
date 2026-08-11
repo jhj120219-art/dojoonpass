@@ -123,36 +123,100 @@ def get_active_subscription(conn, user_id: str, at: datetime = None,
     ).fetchone()
 
 
+class ConcurrentStatusChange(Exception):
+    """다른 요청이 SELECT와 UPDATE 사이에 먼저 상태를 바꿨다(TOCTOU 충돌).
+
+    2026-08-12 발견: Admin PATCH /admin/subscriptions/{id}(유일한 호출부)에 서로 다른 목표
+    상태로 동시 요청 2건을 보내면, 가드가 없어 **둘 다 200으로 성공 응답**하고 최종 DB
+    상태는 나중에 커밋된 쪽으로 조용히 결정됐다(재현 5/5) — `docs/BUGS.md` #21(Admin 등기부
+    상태 전이 레이스)과 같은 부류의 결함이 이 경로에는 아직 없었다. registry.py/payments.py가
+    이미 쓰는 "BEGIN IMMEDIATE + 조건부 UPDATE(WHERE id=? AND status=?) + rowcount 확인"
+    패턴을 그대로 적용해 해소한다.
+    """
+
+
+class ReactivationRequiresNewExpiry(Exception):
+    """이미 지난 `expires_at`을 가진 구독을 ACTIVE로 되돌리려는데 새 만료 시각이 없다.
+
+    2026-08-12 발견: `change_status()`의 ACTIVE 분기는 기존에 `expires_at`을 전혀 건드리지
+    않았다 — 이 함수의 docstring 자체가 "만료된 구독을 되살리는 경우라면 호출부가 새
+    expires_at을 함께 넘긴다"고 명시하는데, 실제로는 그 값을 받을 매개변수조차 없었다.
+    재현: EXPIRED 구독을 Admin PATCH로 ACTIVE로 바꾸면 200이 오지만, 같은 응답 안의
+    `effective_status`가 이미 `EXPIRED`이고(과거 만료 시각을 그대로 지닌 채라 lazy sync가
+    즉시 되돌린다), 바로 다음 조회에서 DB 상태도 원래대로 `EXPIRED`로 돌아와 있었다 —
+    "성공했다고 응답했지만 아무 일도 일어나지 않은" 조용한 실패. 며칠/몇 개월을 얼마나
+    연장할지는 이 함수가 정할 수 없는 값이라(요금 정산 정책, `subscriptions` 테이블에
+    `billing_cycle`도 저장되지 않는다) 조용히 실패하는 대신 **호출부에 새 expires_at을
+    요구**한다 — 이미 미래 시각을 갖고 있는 PAUSED→ACTIVE(재개)는 영향 없다.
+    """
+
+
 def change_status(conn, subscription_id: int, target: str,
-                  actor: str = "SYSTEM", at: datetime = None) -> dict:
+                  actor: str = "SYSTEM", at: datetime = None,
+                  new_expires_at: datetime = None) -> dict:
     """구독 상태를 바꾼다. 전이 규칙에 어긋나면 InvalidTransition을 던진다.
 
     부수 효과(만료 시각 조정)는 상태별로 다르다:
       PAUSED  : 남은 기간을 보존해야 하므로 만료 시각을 건드리지 않는다.
                 (재개 시 남은 일수를 다시 얹는 정책은 요금 정산 규칙이 필요해 여기서 정하지 않는다)
-      ACTIVE  : 만료된 구독을 되살리는 경우라면 호출부가 새 expires_at을 함께 넘긴다
+      ACTIVE  : 현재 `expires_at`이 이미 지났다면(만료된 구독 재활성화) `new_expires_at`이
+                반드시 있어야 한다 — 없으면 `ReactivationRequiresNewExpiry`. 아직 지나지
+                않았다면(PAUSED에서 재개) 기존 값을 그대로 둔다. `new_expires_at`이 주어지면
+                현재 상태와 무관하게 그 값으로 갱신한다(호출부가 명시적으로 원한 경우).
       CANCELLED/EXPIRED : 즉시 종료 — 만료 시각을 지금으로 당긴다
+
+    동시 요청 방어: 함수 진입 직후 쓰기 락을 선점하고(`BEGIN IMMEDIATE`), UPDATE의 WHERE에
+    읽었던 현재 상태를 다시 걸어 rowcount로 검증한다 — 그 사이 다른 요청이 먼저 상태를
+    바꿨다면 `ConcurrentStatusChange`를 던진다(registry.py §19/payments.py 환불과 동일 패턴).
     """
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+
     now = at or datetime.now()
     row = conn.execute("SELECT * FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
     if not row:
         raise LookupError("구독을 찾을 수 없습니다")
 
-    assert_subscription_transition(row["status"], target)
+    current_status = row["status"]
+    assert_subscription_transition(current_status, target)
 
     if target in (SubscriptionStatus.CANCELLED, SubscriptionStatus.EXPIRED):
-        conn.execute(
-            "UPDATE subscriptions SET status=?, expires_at=?, updated_at=? WHERE id=?",
-            (str(target), now.isoformat(), now.isoformat(), subscription_id),
+        cursor = conn.execute(
+            "UPDATE subscriptions SET status=?, expires_at=?, updated_at=? WHERE id=? AND status=?",
+            (str(target), now.isoformat(), now.isoformat(), subscription_id, current_status),
         )
+    elif target == SubscriptionStatus.ACTIVE:
+        currently_expired = bool(row["expires_at"]) and row["expires_at"] <= now.isoformat()
+        if new_expires_at is None and currently_expired:
+            conn.rollback()
+            raise ReactivationRequiresNewExpiry(
+                f"만료 시각({row['expires_at']})이 이미 지난 구독을 ACTIVE로 되돌리려면"
+                " 새 expires_at이 필요합니다"
+            )
+        if new_expires_at is not None:
+            cursor = conn.execute(
+                "UPDATE subscriptions SET status=?, expires_at=?, updated_at=? WHERE id=? AND status=?",
+                (str(target), new_expires_at.isoformat(), now.isoformat(), subscription_id, current_status),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE subscriptions SET status=?, updated_at=? WHERE id=? AND status=?",
+                (str(target), now.isoformat(), subscription_id, current_status),
+            )
     else:
-        conn.execute(
-            "UPDATE subscriptions SET status=?, updated_at=? WHERE id=?",
-            (str(target), now.isoformat(), subscription_id),
+        cursor = conn.execute(
+            "UPDATE subscriptions SET status=?, updated_at=? WHERE id=? AND status=?",
+            (str(target), now.isoformat(), subscription_id, current_status),
+        )
+
+    if cursor.rowcount == 0:
+        conn.rollback()
+        raise ConcurrentStatusChange(
+            f"다른 요청이 먼저 구독 상태를 바꿨습니다 (기대한 현재 상태: {current_status})"
         )
 
     logger.info("구독 상태 변경: id=%s %s -> %s (by=%s)",
-                subscription_id, row["status"], target, actor)
+                subscription_id, current_status, target, actor)
     updated = conn.execute("SELECT * FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
     return {"before": row_to_subscription(row), "after": row_to_subscription(updated)}
 

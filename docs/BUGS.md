@@ -2092,3 +2092,212 @@ id=542 [기타 동력선] / id=1806 [선박 동력선, 동어호] / id=6311 [선
 
 고칠 수 없더라도 **늘어나는 것은 막는다.** `test_pipeline_integrity.py` §6이 양방향으로 세고
 상한(2건 / 5건)을 둔다. 이 수치가 커지면 크롤러가 계속 잘못 분류하고 있다는 신호다.
+
+---
+
+#57
+
+`auction.db`가 Sprint 51/52/55 완료분을 잃고 이전 시점 상태로 되돌아가 있었다 —
+migration_history 3건 미기록 + audit_logs 잔여 698행 + document_status 574행 재역행
+
+해결 (2026-08-11, Sprint 57)
+
+**[발견 경위]** `/goal` 지시에 따라 문서를 그대로 믿지 않고 실제 코드/DB 상태부터
+재확인하던 중, 세션 시작 시점 `git status`가 보여준 미추적 파일 3개
+(`storage/migrations/016_create_audit_logs.sql`, `017_add_soft_delete_columns.sql`,
+`storage/migrate_doc_collect.py`)를 조사하다 발견했다. 이 셋은 `docs/CHANGELOG.md`
+Sprint 53 항목이 "제거 완료"로 기록한 것들인데 디스크에 그대로 남아 있었다 — 이 저장소가
+반복해서 겪어 온 "`auction.db`/`storage/`가 git 비추적이라 조용히 이전 시점으로
+되돌아간다"는 패턴(#18, #23, #28과 동일 부류)이 다시 발생한 것으로 의심해 실측했다.
+
+**[실측 1 — migration_history 드리프트]** `test_schema_hygiene.py`의
+"디스크의 모든 .sql이 migration_history에 기록돼 있는가" 검사가 **FAIL**로 나왔다.
+실제 `auction.db`의 `migration_history`에는 Sprint 51 이전에 쓰던 옛 파일명
+(`016_create_audit_logs.sql`, `017_add_soft_delete_columns.sql`)만 기록돼 있고, Sprint 51이
+그 자리를 대체한 현재 추적 파일(`016_create_audit_and_credit_logs.sql`,
+`017_create_document_collect_failures.sql`, `018_document_queue_item_no_unique.sql`)은
+셋 다 **한 번도 적용된 적이 없었다.** 그 상태로 `run_migrations.py`를 그냥 돌리면
+`016_create_audit_and_credit_logs.sql`의 `ALTER TABLE ... ADD COLUMN`이 이미 존재하는
+컬럼과 충돌해 `duplicate column name` 에러로 **전체 마이그레이션이 즉시 중단**됨을
+사본으로 재현 확인했다(부트스트랩이 아니라 **이미 운영 중인 이 `auction.db` 자체**가
+이 상태였다는 점이 #18/#23/#28과 다르다 — 그때는 fresh clone 재현 문제였다).
+
+**[실측 2 — Migration 018이 실제로 반영되지 않고 있었다]** `018_document_queue_item_no_unique.sql`은
+`document_queue`의 `UNIQUE(court_code, case_no, doc_type)`에 `item_no`를 넣어 한 사건에
+물건이 여럿일 때 두 번째 물건부터 `INSERT OR IGNORE`에 조용히 버려지던 결함(#48)을 고치는
+마이그레이션이다. `docs/CURRENT_STATE.md` Sprint 56은 이것을 "완료"로 기록했지만, 실측
+결과 **실제 `document_queue` 스키마는 여전히 옛 제약(`UNIQUE(court_code, case_no, doc_type)`)
+그대로**였고, 자기 `item_no`로 큐에 없는 물건이 **751/2,012건(37.3%)** — Sprint 55가 처음
+발견했을 때의 규모(716/1,870, 38%)와 사실상 동일한 수치로 **재발**해 있었다.
+
+**[실측 3 — audit_logs 잔여 698행]** Sprint 52(#39)가 "정리 완료, 이제 0행"이라 기록한
+`audit_logs`의 대상 삭제된(dangling) 행이 **698개** 다시 쌓여 있었다(전부 2026-08-08~
+2026-08-10 사이 생성 — 이번 세션 이전의 옛 데이터, 즉 Sprint 52의 정리 작업 자체가 이후
+어느 시점엔가 통째로 되돌려진 것이지 새로 쌓인 게 아니다).
+
+**[실측 4 — document_status 574행 재역행]** Sprint 55(#50)가 디스크 실물 기준으로
+`document_status`의 COLLECTING→READY 574행을 보정했다고 기록했지만, `repair_document_status.py`
+(그 Sprint가 만든 1회성 스크립트, 아직 저장소에 남아 있어 재실행 가능했다)를 다시 돌려보니
+**정확히 같은 574건**이 다시 "고쳐야 함" 상태로 잡혔다 — 파일은 디스크에 실제로 존재하는데
+DB만 COLLECTING으로 되어 있는, Sprint 55 수정 이전과 동일한 상태였다.
+
+**[판단]** 네 가지 증상 모두 같은 하나의 원인(`auction.db`가 대략 Sprint 50~52 언저리
+시점으로 되돌아감)이 서로 다른 각도에서 드러난 것이다. 새 정책 결정이 필요한 사안이
+아니라 **이미 완료·승인된 작업이 유실된 것을 재적용**하는 문제라 승인 없이 즉시 복구했다.
+
+**[수정]**
+- 실행 전 `auction.db.backup_before_migration_reconcile_20260811_233247` 백업 생성
+- `016_create_audit_and_credit_logs.sql`/`017_create_document_collect_failures.sql`을
+  문장 단위로 재실행 — 이미 존재하는 테이블/컬럼(`duplicate column name`)은 건너뛰고
+  아직 없던 인덱스 9개(`idx_registry_credit_logs_*` 3개, `idx_audit_logs_created_at`/
+  `admin`/`action`, `idx_favorites_deleted_at`, `idx_search_presets_deleted_at`)는
+  실제로 생성한 뒤 `migration_history`에 두 파일명을 기록
+- `run_migrations.py`를 정상 실행해 `018_document_queue_item_no_unique.sql`을 **실제로 적용**
+  (행 3,804건 id 보존 재확인, `document_queue` 스키마가
+  `UNIQUE(court_code, case_no, item_no, doc_type)`로 전환됨을 확인)
+- `db.enqueue_documents()`를 현재 `auction_item` 전량으로 재호출해 새로 열린 제약으로
+  큐에 들어갈 수 있게 된 항목을 적재(81건 추가, 나머지는 `auction_date`가 이미 지나
+  설계대로 제외됨). 재확인 결과 **매각기일이 남은 물건 중 자기 item_no로 큐에 없는 건
+  0건**(만료된 과거 물건 724건은 정책상 큐에 넣지 않는 것이 맞다)
+- 대상이 사라진 `audit_logs` 698행 삭제(전부 QA 테스트가 만든 `payments`/`registry_requests`/
+  `subscriptions`/`registry_credits` 대상이 이미 지워진 잔재, 실사용자 데이터 아님 확인)
+- `repair_document_status.py --apply` 재실행으로 574행을 다시 COLLECTING→READY로 보정
+  (판정 근거는 디스크 실물 — Sprint 55와 동일한 스크립트, 동일한 기준)
+- 드리프트를 유발한 미추적 중복 파일 3개 삭제: `storage/migrations/016_create_audit_logs.sql`,
+  `017_add_soft_delete_columns.sql`(둘 다 Sprint 51에서 이미 대체됐어야 함),
+  `storage/migrate_doc_collect.py`(Sprint 53에서 "제거 완료"로 기록됐던 파일 — 코드 참조 0건
+  재확인 후 삭제)
+
+**[검증]** `test_schema_hygiene.py`(migration_history 드리프트 검사 포함) 전부 PASS,
+`test_api_regression.py`(dangling audit 포함) 전부 PASS, `test_pipeline_integrity.py`
+(done↔READY 정합 포함) 전부 PASS, 나머지 Python 회귀 13개 파일 전부 PASS(`test_db.py`는
+설계상 SKIP). `npx tsc --noEmit`/`npm run lint`(0건)/`npm run build`(경고 0) 전부 통과.
+API 서버 + `npm run dev`를 함께 띄운 상태에서 `npm run test:frontend` 93/93 PASS
+(`cancelled: 0`으로 서버가 실제로 응답했음을 확인 — `docs/CURRENT_STATE.md` Sprint 56이
+경고한 "cancelled인데 fail 0으로 보이는 함정"을 그대로 점검).
+
+**[재발 방지에 대한 솔직한 평가]** 이 복구는 **증상만 다시 고친 것**이고 `auction.db`가
+왜 되돌아갔는지(OneDrive 동기화 충돌 해소, 이전 백업에서의 수동 복원, 다른 세션과의 작업
+디렉터리 공유 등)는 이번 조사로 특정하지 못했다. `storage/`가 git 비추적인 것과 별개로
+`auction.db` 자체도 처음부터 git 비추적이므로, 같은 일이 다시 벌어져도 git으로는 막을 수
+없다 — 유일한 방어선은 `test_schema_hygiene.py`/`test_pipeline_integrity.py`/
+`test_api_regression.py`의 dangling 검사처럼 "DB가 스스로의 무결성을 실측 검증하는" 회귀뿐이다.
+이번에 그 회귀들이 실제로 문제를 잡아냈다는 점 자체가 그 방어선이 유효함을 보여준다.
+
+---
+
+#58
+
+Admin 구독 상태 변경(`PATCH /admin/subscriptions/{id}`)에 동시성 방어가 전혀 없어, 서로 다른
+목표 상태로 동시 요청 시 둘 다 200 성공을 응답하고 진 쪽 요청은 자신이 실제로 반영됐다고
+잘못 믿게 됨
+
+해결 (2026-08-12, Sprint 59 — 승인 없이 가능한 버그로 판단해 즉시 수정)
+
+**[발견 경위]** Backend API Contract Audit으로 Admin 41개 엔드포인트를 훑던 중, 등기부 신청
+상태 전이(#21)/결제 환불/Webhook 재처리가 전부 `BEGIN IMMEDIATE` + 조건부 UPDATE(`WHERE id=?
+AND status=?`) + rowcount 확인 패턴으로 방어돼 있는데, 같은 부류인 구독 상태 변경
+(`api/v1/subscriptions.py:change_status()`, `PATCH /admin/subscriptions/{id}`의 유일한
+호출부)만 예외임을 코드 대조로 발견했다.
+
+**[재현]** ACTIVE 구독 1건에 PAUSED/CANCELLED로 동시 PATCH 2건을 보내는 실측 재현(5회 반복)
+결과 **매번 둘 다 200 성공**을 응답했고, 최종 DB 상태는 나중에 커밋되는 쪽으로 결정됐다 —
+어느 쪽이 이길지 예측할 수 없을 뿐 아니라(#16의 정렬 비결정성과 같은 근본 원인은 아니고
+순수 TOCTOU), **진 쪽 요청도 200과 함께 자신이 요청한 상태를 응답 body에 그대로 담아
+돌려받아** 실제로는 반영되지 않았는데도 성공했다고 믿게 된다. `docs/CLAUDE.md`가 이
+엔드포인트를 "과금에 직접 영향을 주므로 SUPER_ADMIN 전용"이라 표기한 것과 정확히 반대로,
+가장 방어가 필요한 지점에 방어가 없었다.
+
+**[판단]** 새 정책이 아니라 이 저장소가 이미 세 번(#19 등기부, #20 구독 결제, #21 Admin
+등기부 상태전이) 확립한 "확인 후 쓰기" 불변식을 이 경로만 못 지키고 있던 구현 공백이라
+승인 없이 수정 가능한 버그로 판단했다.
+
+**[수정] `api/v1/subscriptions.py:change_status()`**
+- 함수 진입 직후 `conn.isolation_level = None` + `conn.execute("BEGIN IMMEDIATE")`로 쓰기
+  락을 선점(등기부/환불/Webhook 재처리와 동일 패턴)
+- 두 UPDATE 분기(CANCELLED/EXPIRED 경로, 그 외 경로) 모두 `WHERE id=? AND status=?`로
+  현재 상태를 다시 확인
+- `rowcount == 0`이면 롤백 후 신규 `ConcurrentStatusChange` 예외를 던진다
+- `api/v1/admin.py:admin_change_subscription_status()`가 이 예외를 잡아 `HTTPException(409)`로
+  변환(등기부 #21과 동일한 응답 관례)
+
+**[검증]** 수정 전/후 대조 재현: 수정 후 5/5 전부 **정확히 1건만 200**, 최종 DB 상태가
+성공 응답과 항상 일치함을 확인. 기존 `test_api_regression.py`의 순차 테스트(§27, SUPER_ADMIN
+권한/전이 규칙/404)는 무변동 PASS(재확인). `test_race_conditions.py`에 신규 시나리오 2개
+추가(§9 실스레드 재현, §10 결정적 구조 검사) — `BEGIN IMMEDIATE` 제거/`WHERE status=?` 제거
+두 변이 모두 §10(구조 검사)이 결정적으로 검출함을 확인(§9 스레드 재현은 이번에도 두 변이를
+놓쳤다 — refund/webhook 재처리 감사에서 이미 확인한 것과 같은 "좁은 창" 한계, 그래서 두
+검사를 함께 둔다). 검증 후 소스는 정확히 복구해 최종 diff만 남김.
+
+**[영향 범위]** `change_status()`의 유일한 호출부가 이 엔드포인트뿐이라 다른 경로에는 영향
+없음(`sync_expired_status()`/`renew()`는 이 함수를 호출하지 않는 별도 경로 — 각각 "시간
+경과에 따른 결정적 자동 전이"와 "결제 성공 시 시스템 갱신"이라 사람이 서로 다른 목표로
+경합할 위험이 구조적으로 없어 이번 수정 범위에서 제외했다).
+
+**[회귀]** `test_race_conditions.py` 41 → **49검사**, `test_api_regression.py` 627검사
+무변동 PASS. `python -m compileall`/`npx tsc --noEmit`/`npm run lint`(0건)/`npm run build`
+전부 통과.
+
+---
+
+#59
+
+만료된 구독을 Admin이 ACTIVE로 되돌려도 만료 시각을 갱신하지 않아, 200 응답 직후 다시
+EXPIRED로 조용히 되돌아감(재활성화가 실제로는 항상 실패)
+
+해결 (2026-08-12, Sprint 59 — #58과 같은 감사에서 이어서 발견, 승인 없이 가능한 버그로
+판단해 즉시 수정)
+
+**[발견 경위]** #58(구독 상태 변경 동시성 결함) 수정 중 `api/v1/subscriptions.py:change_status()`를
+정독하다, 함수 자신의 docstring이 "ACTIVE: 만료된 구독을 되살리는 경우라면 호출부가 새
+expires_at을 함께 넘긴다"고 명시하는데 **정작 함수 시그니처에 그 값을 받을 매개변수 자체가
+없었다**는 것을 발견했다. 추가로 `renew()`(만료 시각을 올바르게 연장하는 함수)를 저장소
+전체에서 호출하는 곳이 **0곳**임도 확인했다 — 준비만 되고 배선이 안 된, 이 저장소에
+반복적으로 나타나는 패턴(KG이니시스 스텁, 파이프라인 후반 스크립트와 같은 부류).
+
+**[재현]** EXPIRED 구독(만료 시각이 5일 전)에 Admin PATCH로 `{"status": "ACTIVE"}`만 보내면:
+- 응답은 200이고 `status: "ACTIVE"`
+- **그러나 같은 응답 안의 `effective_status`가 이미 `"EXPIRED"`, `is_entitled: false`** —
+  응답 자체가 자기모순
+- 로그에 "구독 자동 만료: id=N ACTIVE -> EXPIRED"가 **같은 요청 처리 중**(응답 body를
+  만드는 `row_to_subscription`/lazy sync 계산 과정에서) 즉시 찍힌다
+- 뒤이은 `GET /subscriptions/me` 조회에서 DB `status`도 다시 `EXPIRED`로 확인됨
+
+원인은 `change_status()`의 ACTIVE 분기가 `status`/`updated_at`만 갱신하고 `expires_at`은
+전혀 건드리지 않아서다 — 상태만 ACTIVE로 바뀌고 만료 시각은 과거 그대로 남으므로, 그 즉시
+(혹은 다음 조회에서) `resolve_expected_status()`가 다시 EXPIRED로 판정한다. **CS가 고객
+지원 차원에서 구독을 되살려 주려 해도 이 엔드포인트로는 항상 실패한다** — 실패한다는
+신호조차 없이(200 응답) 실패한다는 점이 더 나쁘다.
+
+**[판단]** 새 정책을 만드는 대신, 함수 자신의 docstring이 이미 명시한 설계("호출부가 새
+expires_at을 넘긴다")를 실제로 배선하는 문제로 좁혔다. 다만 **몇 일을 연장할지는 이 함수가
+결정할 수 없다**(요금 정산 정책, `subscriptions` 테이블에 `billing_cycle`도 저장되지
+않아 원래 결제 주기를 역산할 방법도 없다) — 그래서 기본값을 추측해 채우는 대신, 그 값이
+없을 때는 **명확히 거부**하도록 했다(조용히 성공한 뒤 되돌아가는 것보다 명시적 400이 낫다).
+
+**[수정]**
+- `api/v1/subscriptions.py:change_status()` — `new_expires_at: datetime = None` 매개변수
+  추가. ACTIVE로 전이할 때 현재 `expires_at`이 이미 지났는데 `new_expires_at`이 없으면
+  신규 예외 `ReactivationRequiresNewExpiry`를 던진다(막 잡은 `BEGIN IMMEDIATE` 락은 롤백
+  후 해제). `new_expires_at`이 있으면 상태와 만료 시각을 함께 갱신. 아직 만료되지 않은
+  경우(PAUSED에서 재개)는 기존과 동일하게 `expires_at`을 건드리지 않는다
+- `api/v1/admin.py` — `SubscriptionStatusRequest`에 `expires_at: Optional[str]` 필드 추가
+  (ISO 8601 문자열, ACTIVE로 되돌릴 때만 의미가 있다). 파싱 실패는 400,
+  `ReactivationRequiresNewExpiry`도 400으로 변환
+- `renew()`는 이번에도 배선하지 않았다 — 이 함수는 "기간을 연장"(연장 일수 필요)이고
+  Admin 재활성화는 "특정 시각까지"(만료 시각 직접 지정)라 요구사항이 달라, 억지로 재사용하면
+  오히려 함수 하나가 두 가지 의미를 갖게 된다
+
+**[검증]** 수정 전/후 대조: 수정 후 (1) `expires_at` 없이 만료 구독 재활성화 시도 → 400,
+DB 상태 `EXPIRED` 그대로(수정 전에는 200 + 즉시 자기모순 응답 + 재조회 시 원상복구), (2)
+`expires_at` 형식 오류 → 400, (3) `expires_at`을 함께 주면 200 + `effective_status`도
+`ACTIVE`로 일치 + DB에 실제로 반영, (4) PAUSED → ACTIVE(재개, 아직 안 지난 만료 시각)는
+`expires_at` 없이도 기존과 동일하게 정상 동작(회귀 없음). `test_api_regression.py` §27에
+19개 검사 신규(627 → 646검사 — 재활성화 관련 11개 + Sprint 마무리 검증 중 커버리지 공백으로
+확인한 ACTIVE→CANCELLED/ACTIVE→EXPIRED 실제 엔드포인트 왕복 8개), `test_race_conditions.py`
+§10 구조 검사를 4개 UPDATE 분기 전수로 갱신(49검사 무변동, 검사 내용만 정합화). `BEGIN
+IMMEDIATE` 제거·조건부 UPDATE 제거 두 변이 모두 §10이 결정적으로 검출함을 마무리 검증
+단계에서 재확인(수정 후 원복, git diff 0).
+
+**[검증 — Type/Lint/Build]** `python -m compileall`/`npx tsc --noEmit`/`npm run lint`(0건)/
+`npm run build` 전부 통과.

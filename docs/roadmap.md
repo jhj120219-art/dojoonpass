@@ -1066,3 +1066,77 @@ Sprint 53에서 해소: ~~Webhook 운영 도구 부재~~ / ~~Webhook 저장소 �
   `property_type` 모순 5건의 원본 대조
 - **승인 없이 가능**: 일회성 스크립트 91개 정리 기준 수립, `logs/*.py` 스테일 사본 처리,
   Frontend ↔ API 소비 계약 확대(현재 검색 파라미터만 고정됨)
+
+---
+
+## Sprint 57~58 반영 (2026-08-11~12)
+
+### 완료
+
+- `auction.db` 되돌아감 복구(Sprint 57, `docs/BUGS.md` #57) — migration_history 3건,
+  audit_logs 698행, document_status 574행
+- `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`가 실제로는 이미 설정되어 정상 동작 확인(Sprint 58) —
+  과거 여러 Sprint가 반복 기록하던 "미설정 → 500" 블로커가 더 이상 유효하지 않다.
+  **운영 설정 목록에서 제거**
+- 환불/Webhook 재처리 동시성 회귀 신설(Sprint 58) — 새 버그는 없었고 기존 방어가 이미
+  올바름을 확인, 검증 공백만 해소
+
+### Backlog 갱신
+
+기존 "운영 설정" 목록(6~8번, ADMIN_API_KEY 등)에서 ADMIN_API_KEY/SUPER_ADMIN_API_KEY 항목을
+제거한다. 남은 운영 설정은 `PAYMENT_WEBHOOK_SECRET`(Webhook 실수신 시 필요)과 Supabase
+Site URL/Redirect URL(운영 도메인 확정 시)뿐이다.
+
+### Release Blocking (변동 없음)
+
+1. KG이니시스 실연동 — 계속 SKIP
+2. 크롤 파이프라인 운영 조치(selenium 설치, 예약 작업 등록) — 저장소 측 원인은 이미 제거됨,
+   Sprint 57의 document_queue 복구로 크롤러 재가동 시 이전보다 더 정확하게 큐가 채워진다
+
+### 다음 Sprint 후보 (Sprint 59)
+
+- Admin 41개 엔드포인트 API Contract Audit 계속(이번 Sprint는 refund/webhook reprocess만
+  집중 점검) — 나머지 엔드포인트의 동시성/응답 계약 재확인
+- Frontend ↔ API 소비 계약 확대(현재 검색 파라미터만 소스 계약으로 고정돼 있음)
+- 크롤 파이프라인 운영 조치가 끝나면: 종료 코드 실증, 큐 누락 재확인
+- `doc_raw` 적재 소유권 결정(16-B), 미파싱 문서 처리(16-A 선행 필요) — 운영 스케줄 결정 대기
+
+---
+
+## Sprint 59 반영 (2026-08-12)
+
+### 완료
+
+- Admin 구독 상태 변경(`PATCH /admin/subscriptions/{id}`) 동시성 결함 발견·수정
+  (`docs/BUGS.md` #58) — 등기부 #21과 동일한 패턴으로 해소, 회귀 2종 신규
+
+### 다음 Sprint 후보 (Sprint 60)
+
+- Admin 41개 엔드포인트 API Contract Audit 계속 — 이번까지 정밀 점검한 것은 refund/webhook
+  reprocess/subscription status 3개뿐, 나머지(users/audit-logs/registry-credits 등) 미점검
+- Favorites/Search Presets/Recent Items의 소유권·중복 처리 재점검(§8 IDOR 관점)
+- Frontend ↔ API 소비 계약 확대(현재 검색 파라미터만 소스 계약으로 고정됨)
+- 크롤 파이프라인 운영 조치가 끝나면: 종료 코드 실증, 큐 누락 재확인
+
+---
+
+## Sprint 60 반영 (2026-08-12)
+
+### 완료
+
+- 만료 구독 재활성화가 항상 조용히 실패하던 결함 발견·수정(`docs/BUGS.md` #59) —
+  `change_status()`가 자신의 docstring이 이미 명시한 설계를 실제로는 구현하지 않고 있었다.
+  `renew()`(만료 시각 연장 함수)가 저장소 전체에서 호출 0건인 것도 함께 확인(배선 안 된
+  준비 코드 — KG이니시스 스텁과 같은 부류, 이번에는 별도 매개변수 추가로 해소해 `renew()`
+  자체는 여전히 미배선 상태로 남음)
+
+### 다음 Sprint 후보 (Sprint 61)
+
+- Admin 41개 엔드포인트 API Contract Audit 계속 — 정밀 점검 완료는 refund/webhook
+  reprocess/subscription status 4개(상태전이 2건 + 재활성화 1건 + 동시성 1건), 나머지
+  (users/audit-logs/registry-credits/payments 등) 미점검
+- `renew()`가 여전히 0곳에서 호출됨 — 실제로 필요한 기능인지(자동 갱신 배치? 사용자 셀프
+  갱신?), 죽은 코드로 정리할지는 제품 결정 필요, 기록만 하고 SKIP
+- Favorites/Search Presets/Recent Items의 소유권·중복 처리 재점검(§8 IDOR 관점)
+- Frontend ↔ API 소비 계약 확대(현재 검색 파라미터만 소스 계약으로 고정됨)
+- 크롤 파이프라인 운영 조치가 끝나면: 종료 코드 실증, 큐 누락 재확인

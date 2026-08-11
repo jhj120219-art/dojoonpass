@@ -804,3 +804,185 @@ Python  test_api_regression.py       627검사
 프런트엔드 테스트는 dev 서버가 없으면 `frontend-contract.test.mjs` 전체가 **cancelled**가 되고,
 출력이 `pass 45 / fail 0`으로 보인다(종료 코드는 정상적으로 1). `fail 0`만 읽으면 초록으로
 오인한다 — **`cancelled`와 종료 코드를 함께 봐야 한다.**
+
+---
+
+## 2026-08-11 Sprint 57 기준 실측 — `auction.db` 되돌아감 재발견·복구
+
+`/goal` 자동 루프 지시에 따라 과거 Sprint 보고서를 신뢰하지 않고 코드/DB 실측부터
+다시 시작했다. 그 결과 Sprint 51/52/55가 "완료"로 기록한 작업 3건이 이 저장소의
+`auction.db`에서 **사라져 있었음**을 발견하고 복구했다(`docs/BUGS.md` #57).
+
+**발견 → 복구**
+
+1. `migration_history`가 Sprint 51 이전 옛 파일명(`016_create_audit_logs.sql`,
+   `017_add_soft_delete_columns.sql`)만 기록하고 있었고, 현재 추적 파일(`016_create_audit_and_credit_logs.sql`,
+   `017_create_document_collect_failures.sql`, `018_document_queue_item_no_unique.sql`)은
+   한 번도 적용되지 않았다 — `run_migrations.py`를 그대로 돌리면 `duplicate column name`으로
+   **전체 마이그레이션이 중단**됨을 사본으로 재현 확인. 이미 존재하는 부분은 건너뛰고 누락된
+   인덱스 9개만 실제로 생성한 뒤 `migration_history`를 정합화
+2. Migration 018(`document_queue` UNIQUE에 `item_no` 포함, BUGS #48)이 **실제로는 반영되지
+   않고 있었다** — 자기 item_no로 큐에 없는 물건이 751/2,012건(37.3%)으로, Sprint 55가
+   처음 발견했을 때 규모(38%)와 사실상 동일하게 재발. 실제로 적용 후 `enqueue_documents()`를
+   현재 데이터 전량으로 재호출 — 매각기일이 남은 물건은 **전부** 자기 item_no로 큐에 등록됨
+3. `audit_logs` dangling 698행 재발(Sprint 52 #39가 "0행"으로 기록) — 삭제
+4. `document_status` COLLECTING↔READY 574행이 Sprint 55(#50) 수정 이전 상태로 재역행 —
+   `repair_document_status.py --apply` 재실행으로 재보정(디스크 실물 기준, 동일 스크립트)
+5. 드리프트를 유발한 미추적 중복 파일 3개 삭제(`storage/migrations/016_create_audit_logs.sql`,
+   `017_add_soft_delete_columns.sql`, `storage/migrate_doc_collect.py` — 셋 다 이전 Sprint가
+   "제거/대체 완료"로 기록했던 것들이 디스크에 남아 있었다)
+
+작업 전 `auction.db.backup_before_migration_reconcile_20260811_233247` 백업 생성.
+네 증상 모두 새 정책 결정이 아니라 **이미 승인·완료된 작업의 재적용**이라 승인 없이 즉시 처리했다.
+
+**품질 게이트** — Python 회귀 15개 파일 전부 PASS(`test_db.py`는 설계상 SKIP),
+`test_schema_hygiene.py`/`test_pipeline_integrity.py`(이번에 새로 드러난 실패 포함)
+전부 PASS로 전환, 프런트 계약 93/93 PASS(API+dev 서버 동시 기동, `cancelled: 0` 확인),
+Type Check / Lint(0) / Build(경고 0) 전부 통과.
+
+**남은 것**: `auction.db`가 왜 되돌아갔는지(OneDrive 동기화, 수동 백업 복원 등)는 특정하지
+못했다. `auction.db`는 애초에 git 비추적이라 같은 일이 다시 벌어져도 git으로는 막을 수
+없다 — `test_schema_hygiene.py`/`test_pipeline_integrity.py`/`test_api_regression.py`의
+실측 기반 무결성 검사가 유일한 방어선이며, 이번에 그 검사들이 실제로 문제를 잡아냈다.
+**모든 Sprint 실행 시작 시 이 세 파일부터 돌려 DB 상태를 재확인하는 것을 권장한다** —
+문서의 "완료" 기록을 그대로 믿지 않는다는 이 프로젝트의 원칙이 정확히 이 사고에 적용됐다.
+
+### Release Blocking (변동 없음)
+
+1. KG이니시스 실연동 — 계속 SKIP(외부 계약 필요)
+2. 크롤 파이프라인 운영 조치(selenium 설치, 예약 작업 등록) — 여전히 미착수, 저장소 측
+   원인은 Sprint 54/55에서 이미 제거됨. 이번 Sprint의 document_queue 복구로, 크롤러가
+   다시 돌기 시작하면 이전보다 더 많은 물건이 정확하게 큐에 오른다(item_no 결손 해소)
+
+---
+
+## 2026-08-12 Sprint 58 — Admin 키 상태 재확인 + 환불/Webhook 재처리 동시성 커버리지
+
+`/goal` 지시에 따라 Backend API Contract Audit을 계속하던 중 두 가지를 확인·보완했다.
+
+**1. `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`가 실제로는 이미 설정되어 정상 동작 중임을 확인**
+
+문서 여러 곳(`docs/ENVIRONMENT_VARIABLES.md`, `docs/roadmap.md` 등)이 "미설정 → Admin API
+전체 500"으로 기록하고 있었으나, 실제 요청으로 재확인한 결과 두 키 모두 설정되어 있고
+정상 동작한다(`ADMIN_API_KEY`로 일반 Admin 라우트 200, 잘못된/누락 키 403, `SUPER_ADMIN_API_KEY`
+전용 라우트에 일반 `ADMIN_API_KEY`를 쓰면 403 — 등급 분리도 정상). 두 값을 운영자가 이미
+설정한 것으로 보이며, `docs/ENVIRONMENT_VARIABLES.md`를 실측 기준으로 정정했다. `SUPABASE_JWT_SECRET`은
+여전히 이름 자체가 없지만, 2026-08-10 Sprint 46부터 JWKS/ES256이 주 경로라 실사용자 인증에는
+영향이 없음을 코드(`api/auth.py`)로 재확인해 문서의 "예 — 필요" 서술도 정정했다.
+
+**2. 환불/Webhook 재처리 동시성 회귀 신설**
+
+Admin 41개 엔드포인트를 API Contract Audit으로 훑다가, 환불(Sprint 52 신설)과 Webhook 재처리
+(Sprint 53 신설) 둘 다 소스에는 `BEGIN IMMEDIATE` + 조건부 UPDATE 가드가 있는데 `test_race_conditions.py`에는
+두 경로 모두 동시 요청 회귀가 없었음을 발견했다(순차 재현만 `test_api_regression.py`에 있었다).
+Sprint 38의 교훈("순차 재현만으로는 동시성 결함을 검출 못한다")이 아직 이 두 경로에는
+적용되지 않은 상태였다 — **버그는 아니지만 검증 공백**이었다.
+
+신규 3개 시나리오 추가(22 → 41검사):
+- 환불 3스레드 동시 요청(결제액의 절반보다 큰 부분환불을 동시에 3번 — 총 환불액이 결제액을
+  넘지 않는지)
+- 환불 가드 결정적 구조 검사(`BEGIN IMMEDIATE`/조건부 UPDATE/rowcount/rollback/409)
+- Webhook 재처리 가드 결정적 구조 검사(`reprocess_webhook`과 `_apply_webhook_event`가 실시간
+  수신 경로와 같은 가드를 공유하는지)
+
+**변이 검증**: `BEGIN IMMEDIATE` 제거와 UPDATE의 `WHERE status=?` 제거 두 변이를 각각 넣어
+확인한 결과, **3스레드 재현은 둘 다 놓쳤다**(Sprint 56이 Admin TOCTOU에서 겪은 것과 동일한
+"좁은 창" 한계 — `BEGIN IMMEDIATE`가 전체 구간을 이미 직렬화해 안쪽 가드까지 창을 벌리지
+못한다). 구조 검사는 두 변이 모두 결정적으로 검출했다. 수정 후 원복해 정상 통과를 재확인했다
+(git diff 0 — 실제 소스 변경 없음, 테스트만 추가).
+
+**품질 게이트**: `test_race_conditions.py` 41/41, `test_api_regression.py` 627검사,
+`test_schema_hygiene.py`/`test_pipeline_integrity.py` 전부 PASS(Sprint 57 상태 유지 확인),
+`python -m compileall` 클린, TypeCheck/Lint 통과.
+
+**문서**: `docs/ENVIRONMENT_VARIABLES.md`(Admin 키 상태 정정), `docs/TEST_PLAN.md`(Sprint 57
+누락분 + Sprint 58 신규 시나리오).
+
+---
+
+## 2026-08-12 Sprint 59 — Admin 구독 상태 변경 동시성 결함 발견·수정
+
+Backend API Contract Audit을 계속하던 중 **실제 기능 결함**을 발견해 즉시 수정했다
+(`docs/BUGS.md` #58).
+
+`PATCH /admin/subscriptions/{id}`(구독 상태 변경, 과금에 직접 영향을 주는 SUPER_ADMIN 전용
+엔드포인트)의 유일한 구현부 `api/v1/subscriptions.py:change_status()`에 동시성 방어가
+전혀 없었다. 등기부 신청 상태전이(#21)/결제 환불/Webhook 재처리는 전부 `BEGIN IMMEDIATE`
++ 조건부 UPDATE + rowcount 확인으로 방어돼 있는데 이 경로만 예외였다.
+
+실측 재현(5회) 결과 서로 다른 목표 상태로 동시 PATCH를 보내면 **매번 둘 다 200 성공**을
+응답했다 — 진 쪽 요청도 자신이 요청한 상태가 반영됐다고 믿게 되는, 조용한 데이터 손실보다
+나쁜 "거짓 성공" 패턴이었다.
+
+등기부(#21)와 동일한 패턴(`BEGIN IMMEDIATE` + `WHERE id=? AND status=?` + rowcount → 409)으로
+수정. 수정 후 5/5 재현 전부 정확히 1건만 200, 최종 DB 상태가 성공 응답과 항상 일치함을 확인.
+
+`test_race_conditions.py`에 실스레드 재현 + 결정적 구조 검사 2개 시나리오 추가(41 → 49검사).
+두 변이(락 제거/조건부 WHERE 제거) 모두 구조 검사가 결정적으로 검출, 스레드 재현은 이번에도
+좁은 창 때문에 놓쳤다(refund/webhook 재처리 감사에서 이미 확인한 것과 같은 한계 — 그래서
+두 검사를 함께 둔다).
+
+**품질 게이트**: `test_race_conditions.py` 49/49, `test_api_regression.py` 627검사 무변동,
+`test_schema_hygiene.py`/`test_pipeline_integrity.py`/`test_state_machines.py` 전부 PASS,
+`compileall`/TypeCheck/Lint(0)/Build(경고 0) 전부 통과.
+
+**문서**: `docs/BUGS.md` #58, `docs/TEST_PLAN.md`/`docs/CHANGELOG.md` 갱신.
+
+---
+
+## 2026-08-12 Sprint 60 — 만료 구독 재활성화가 항상 조용히 실패하던 결함 발견·수정
+
+Sprint 59(#58)를 고치며 `change_status()`를 정독하다 이어서 발견했다(`docs/BUGS.md` #59).
+
+함수 자신의 docstring이 "ACTIVE: 만료된 구독을 되살리는 경우라면 호출부가 새 expires_at을
+함께 넘긴다"고 명시하는데, 정작 함수 시그니처에 그 값을 받을 매개변수가 없었다. 만료 시각을
+올바르게 연장하는 `renew()` 함수도 저장소 전체에서 호출하는 곳이 0곳 — 준비만 되고 배선이
+안 된, 이 저장소에 반복되는 패턴(KG이니시스 스텁과 같은 부류)이었다.
+
+**재현**: 만료된 구독(5일 전 만료)에 Admin이 `{"status": "ACTIVE"}`만 보내면 **200이
+오지만 같은 응답 안의 `effective_status`가 이미 "EXPIRED"** — 응답 자체가 자기모순이고,
+다음 조회에서 DB도 다시 EXPIRED로 돌아와 있었다. CS가 고객 지원 차원에서 구독을 되살려
+주려 해도 이 엔드포인트는 **항상, 아무 신호 없이** 실패했다.
+
+**수정**: `change_status()`에 `new_expires_at` 매개변수를 추가하고, 만료된 구독을 ACTIVE로
+되돌리는데 이 값이 없으면 신규 예외(`ReactivationRequiresNewExpiry`)로 명확히 거부(400)하도록
+했다. 며칠을 연장할지는 요금 정산 정책이라(`subscriptions`에 `billing_cycle`도 없어 원래
+결제 주기 역산도 불가능) 서버가 추측하지 않고 Admin이 `expires_at`을 명시하게 했다 —
+`refund` 금액을 Admin이 직접 지정하는 것과 같은 원칙. PAUSED→ACTIVE(재개, 만료 전)는
+기존과 동일하게 `expires_at` 없이도 정상 동작(회귀 없음, 실측 확인).
+
+**품질 게이트**: `test_api_regression.py` 627 → **638검사**(§27에 11개 신규 — 거부/성공/
+재개 3갈래 전부), `test_race_conditions.py` 49/49(§10 구조 검사를 4개 UPDATE 분기 전수로
+갱신), `test_schema_hygiene.py`/`test_pipeline_integrity.py`/`test_state_machines.py`/
+`test_subscription_policy.py` 전부 PASS. `compileall`/TypeCheck/Lint(0)/Build(경고 0)
+전부 통과.
+
+**문서**: `docs/BUGS.md` #59.
+
+---
+
+## 2026-08-12 Sprint 60 마무리 — Release 준비 최종 검증
+
+Sprint 59~60(#58/#59)을 커밋 전 최종 점검했다. 사용자가 지정한 11개 회귀 체크리스트를
+하나씩 대조하다 **ACTIVE → CANCELLED / ACTIVE → EXPIRED가 실제 Admin 엔드포인트를 통해
+검증된 적이 없음**을 발견했다(내부 상태머신 순수 로직 테스트는 있었지만, `change_status()`의
+CANCELLED/EXPIRED 종결 분기를 실제 HTTP 경로로 왕복 확인한 테스트는 없었다) — `test_api_regression.py`
+§27에 각각 4개씩(성공 200/응답 status/DB 반영/만료 시각이 과거로 당겨짐) 8개 신규
+(638 → **646검사**).
+
+**마무리 검증 결과**:
+- 회귀 체크리스트 11개 전항목 실제 통과 확인(ACTIVE→CANCELLED/EXPIRED/PAUSED→ACTIVE/
+  EXPIRED→ACTIVE 거부·성공/형식 오류/404/무효 전이/동시 요청/구조 검사 2종)
+- `BEGIN IMMEDIATE` 제거, `WHERE id=? AND status=?` 제거 두 변이 각각 최종 재검증 —
+  §10 구조 검사가 결정적으로 검출, 수정 후 정확히 원복(git diff 0)
+- 저장소 전체에 mutation-test 임시 코드/디버그 print/scratch 파일 잔여 0건 확인
+- `api/v1/subscriptions.py`/`api/v1/admin.py` diff 전문 재검토 — 중복 UPDATE·중복 import·
+  구식 코드 잔존 없음
+- Python 전체 회귀(15개 실행 가능 파일) + `compileall` + TypeScript + Lint(0) + Build(경고 0) +
+  프런트 계약 93/93(API+dev 서버 동시 기동, `cancelled: 0` 확인) 전부 최종 재통과
+
+**품질 게이트(최종)**: `test_api_regression.py` **646검사**, `test_race_conditions.py`
+**49검사**, 나머지 Python 회귀 전부 PASS, 프런트 계약 93/93, TypeCheck/Lint(0)/Build(경고 0)
+전부 통과. 이번 세션의 코드 변경 범위는 `api/v1/admin.py`/`api/v1/subscriptions.py`
+(BUGS #58/#59) + 회귀 테스트(`test_api_regression.py`/`test_race_conditions.py`) +
+문서뿐이며, 이와 무관한 파일은 손대지 않았다.

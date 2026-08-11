@@ -2961,3 +2961,104 @@ document_queue 적재 누락 (BUGS #48) — Migration 018
 
 테스트: Python 627검사 + 파일 22개(19 PASS / 3 설계상 건너뜀), 프런트 93검사,
 변이 22종 전부 검출(9 + 5 + 4 + 4). TypeCheck/Lint/Build 통과.
+
+---
+
+2026-08-11 (Sprint 57)
+
+`auction.db`가 되돌아가 있던 것을 재발견·복구 (BUGS #57)
+
+- migration_history가 Sprint 51 이전 옛 파일명만 기록, 현재 추적 파일(016/017/018)
+  3개가 실제로는 한 번도 적용되지 않은 상태였음을 `test_schema_hygiene.py`로 발견
+- Migration 018(document_queue UNIQUE에 item_no 포함, BUGS #48) 미반영으로
+  자기 item_no로 큐에 없는 물건이 37.3%(751/2,012)까지 재발해 있었음 — 실제 적용 후
+  enqueue_documents() 재호출로 매각기일 남은 물건 전량 큐 등록 확인
+- audit_logs dangling 698행(Sprint 52 #39 재발), document_status 574행(Sprint 55 #50
+  재역행) 둘 다 재보정
+- 드리프트를 유발한 미추적 중복 파일 3개 삭제(storage/migrations/016_create_audit_logs.sql,
+  017_add_soft_delete_columns.sql, storage/migrate_doc_collect.py)
+- docs/backend.md의 stale 마이그레이션 목록(016_create_audit_logs.sql/
+  017_add_soft_delete_columns.sql로 남아 있던 것)을 실제 추적 파일 기준으로 정정
+
+새 정책 결정이 아니라 이미 승인·완료된 작업의 재적용이라 승인 없이 즉시 처리.
+작업 전 `auction.db.backup_before_migration_reconcile_20260811_233247` 백업.
+
+테스트: Python 15개 파일 전부 PASS(test_db.py 설계상 SKIP, test_schema_hygiene.py/
+test_pipeline_integrity.py 신규 FAIL 발견분 포함 전부 PASS로 전환), 프런트 93/93 PASS
+(API+dev 서버 동시 기동, cancelled 0 확인). TypeCheck/Lint(0)/Build(경고 0) 통과.
+
+---
+
+2026-08-12 (Sprint 58)
+
+Admin 키 상태 재확인 + 환불/Webhook 재처리 동시성 커버리지 신설
+
+- ADMIN_API_KEY/SUPER_ADMIN_API_KEY가 실제로 이미 설정되어 정상 동작 중임을 실제 요청으로
+  재확인(이전 문서의 "미설정 500" 기록은 stale). SUPABASE_JWT_SECRET은 여전히 이름이 없지만
+  JWKS/ES256이 주 경로라 실사용자 인증에 영향 없음을 재확인. docs/ENVIRONMENT_VARIABLES.md 정정
+- 환불(Sprint 52)/Webhook 재처리(Sprint 53) 둘 다 소스에는 BEGIN IMMEDIATE + 조건부 UPDATE
+  가드가 있는데 동시 요청 회귀가 없던 공백을 발견 — test_race_conditions.py에 3개 시나리오
+  신규(22 -> 41검사): 환불 3스레드 동시요청, 환불 가드 구조검사, Webhook 재처리 가드 구조검사
+- 변이 검증: BEGIN IMMEDIATE 제거/조건부 UPDATE 제거 두 변이 모두 3스레드 재현으로는 미검출
+  (Sprint 56 Admin TOCTOU와 동일한 "좁은 창" 한계), 구조 검사는 둘 다 결정적으로 검출.
+  검증 후 소스는 정확히 원복(git diff 0, 테스트 파일만 순증)
+
+새 버그는 발견하지 않음 — 기존 코드의 동시성 방어는 이미 올바르게 구현돼 있었고, 이번
+Sprint는 그 사실을 검증 가능한 회귀로 고정한 것.
+
+테스트: test_race_conditions.py 22 -> 41검사, 나머지 전부 무변동 PASS. TypeCheck/Lint/
+compileall 통과.
+
+---
+
+2026-08-12 (Sprint 59)
+
+Admin 구독 상태 변경 동시성 결함 발견·수정 (BUGS #58)
+
+- api/v1/subscriptions.py:change_status()(PATCH /admin/subscriptions/{id}의 유일한 구현부)에
+  동시성 방어가 전혀 없어, 서로 다른 목표 상태로 동시 PATCH 시 둘 다 200 성공 응답(진 쪽도
+  거짓 성공)했음을 실측 재현(5/5)으로 발견. 등기부 #21과 동일한 BEGIN IMMEDIATE + 조건부
+  UPDATE(WHERE id=? AND status=?) + rowcount 확인 패턴으로 수정, 신규 ConcurrentStatusChange
+  예외 -> admin.py에서 409로 변환
+- 수정 후 5/5 재현 전부 정확히 1건만 200으로 확인
+- test_race_conditions.py 신규 2개 시나리오(실스레드 재현 + 결정적 구조 검사, 41 -> 49검사).
+  변이 검증: 두 가지(BEGIN IMMEDIATE 제거/WHERE status=? 제거) 모두 구조 검사만 결정적으로
+  검출(스레드 재현은 refund/webhook 재처리와 동일한 좁은 창 한계로 놓침)
+
+테스트: test_race_conditions.py 49/49, test_api_regression.py 627검사 무변동, 나머지 회귀
+전부 PASS. TypeCheck/Lint(0)/Build(경고 0)/compileall 전부 통과.
+
+---
+
+2026-08-12 (Sprint 60)
+
+만료 구독 재활성화가 항상 조용히 실패하던 결함 발견·수정 (BUGS #59)
+
+- change_status()의 docstring이 이미 명시한 설계("ACTIVE 재활성화 시 호출부가 새 expires_at을
+  넘긴다")가 실제로는 배선되지 않았음을 발견. 만료 구독을 Admin이 ACTIVE로 되돌려도
+  expires_at을 갱신하지 않아 200 응답 직후(같은 응답 안에서도 effective_status가 이미
+  EXPIRED) 조용히 원상복구됐다
+- change_status()에 new_expires_at 매개변수 추가, 없으면 ReactivationRequiresNewExpiry(400)
+  로 명확히 거부. 값은 Admin이 명시(요금 정산 정책은 서버가 추측하지 않음, refund 금액과
+  동일 원칙). PAUSED->ACTIVE 재개는 영향 없음(실측 확인)
+- test_api_regression.py §27에 11개 검사 신규(627 -> 638), test_race_conditions.py §10
+  구조 검사를 4개 UPDATE 분기 전수로 갱신(49검사 무변동)
+
+테스트: 전체 회귀 PASS. TypeCheck/Lint(0)/Build(경고 0)/compileall 전부 통과.
+
+---
+
+2026-08-12 (Sprint 60 마무리 — Release 준비)
+
+- 사용자 지정 11개 회귀 체크리스트 대조 중 ACTIVE→CANCELLED/ACTIVE→EXPIRED가 실제 Admin
+  엔드포인트로는 검증된 적이 없었음을 발견 — test_api_regression.py §27에 8개 신규
+  (638 -> 646), 실제 PATCH 왕복으로 200/status/DB 반영/만료 시각 확인
+- BEGIN IMMEDIATE 제거·조건부 UPDATE 제거 두 변이 최종 재검증(§10이 결정적으로 검출),
+  수정 후 정확히 원복(git diff 0)
+- mutation-test 임시 코드/디버그 print/scratch 파일 저장소 잔여 0건 확인
+- api/v1/subscriptions.py·api/v1/admin.py diff 전문 재검토 — 중복 UPDATE/import/구식
+  코드 없음
+
+테스트(최종): test_api_regression.py 646검사, test_race_conditions.py 49검사, Python
+회귀 15개 파일 전부 PASS, 프런트 계약 93/93(cancelled 0). TypeCheck/Lint(0)/Build(경고 0)
+전부 통과.

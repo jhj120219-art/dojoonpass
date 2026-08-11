@@ -55,8 +55,11 @@ migrations/
 013_auction_item_case_id_unique.sql      (〃)
 014_create_payment_logs.sql              (〃)
 015_create_registry_credits.sql          (〃)
-016_create_audit_logs.sql                (〃)
-017_add_soft_delete_columns.sql          (2026-08-09 신설 — favorites/search_presets deleted_at/deleted_by)
+016_create_audit_and_credit_logs.sql     (2026-08-11 Sprint 51 — audit_logs/registry_credit_logs/soft delete 통합.
+                                           옛 016_create_audit_logs.sql·017_add_soft_delete_columns.sql은
+                                           이 파일로 대체되어 Sprint 57에서 삭제됨)
+017_create_document_collect_failures.sql (2026-08-11 Sprint 51 — 부트스트랩 누락 복구)
+018_document_queue_item_no_unique.sql    (2026-08-11 Sprint 55 — document_queue UNIQUE에 item_no 포함, BUGS #48)
 run_migrations.py
 crawler/
 court_crawler.py
@@ -85,7 +88,8 @@ backend.md
   `uvicorn.run(..., host="127.0.0.1", ...)` 하드코딩 확인(`git log -p`로 커밋 `bfefbf7`(인증
   도입 시점)에서 `0.0.0.0` → `127.0.0.1`로 이미 변경된 이력 확인). 이전 버전 문서의 "0.0.0.0"은 stale
 - Swagger: `http://localhost:8000/docs`
-- CORS: 전체 허용 (개발 환경)
+- CORS: `CORS_ALLOW_ORIGINS` 환경변수로 제한 가능(콤마 구분 다중 오리진). 미설정 시 전체 허용(`*`)으로
+  폴백 — 2026-08-10 Sprint 48 재확인, "전체 허용 고정"이던 이전 서술은 stale이었다
 - 라우터 prefix: `/api/v1`
 - 서비스 레이어: 없음 (라우터에 직접 구현)
 - 레포지토리 레이어: 없음 (라우터에서 직접 SQLite 쿼리)

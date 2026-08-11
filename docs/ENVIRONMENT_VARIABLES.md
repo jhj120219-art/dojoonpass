@@ -31,8 +31,8 @@ Owner: CTO
 
 | 상태 | 항목 |
 |---|---|
-| ✅ 설정 완료·동작 중 | `SUPABASE_JWT_SECRET`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
-| ⚠️ 코드는 완성, 값 미설정 | `ADMIN_API_KEY` (미설정 시 `/api/v1/admin/*` 전체 500), `SUPER_ADMIN_API_KEY` (미설정 시 등기부 한도 조정 403) |
+| ✅ 설정 완료·동작 중 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `ADMIN_API_KEY`, `SUPER_ADMIN_API_KEY`(2026-08-11 Sprint 57 재확인 — 둘 다 실제 요청으로 정상 동작 확인, 이전 "미설정" 기록은 stale) |
+| ⚪ 값 없이도 정상 동작 | `SUPABASE_JWT_SECRET`(2026-08-10 Sprint 46부터 JWKS/ES256이 주 경로라 없어도 실사용자 인증이 막히지 않는다. HS256 레거시 검증에만 쓰이므로 없으면 그 경로만 비활성) |
 | 🕓 론칭 직전 필요 | KG이니시스 4종, Mail, SMS, GA4, Sentry, Slack |
 | 💤 지금 Skip 가능 | 코드에 참조 지점이 아직 없는 항목 전부(아래 "코드 참조 여부" 열 확인) |
 
@@ -42,11 +42,11 @@ Owner: CTO
 
 | 변수 | 상태 | 없을 때 증상 |
 |---|---|---|
-| `SUPABASE_JWT_SECRET` | ✅ 설정됨 | 인증 필요 API 전부 `500 "JWT Secret 미설정"` |
+| `SUPABASE_JWT_SECRET` | ❌ 미설정(2026-08-11 재확인) | HS256 레거시 검증 경로만 비활성 — 실사용자 토큰은 ES256/JWKS로 검증되어 영향 없음(`docs/BUGS.md` #27) |
 | `NEXT_PUBLIC_SUPABASE_URL` | ✅ 설정됨 | 로그인/회원가입 불가 |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 설정됨 | 로그인/회원가입 불가 |
-| `ADMIN_API_KEY` | ❌ **미설정** | `/api/v1/admin/*` 전체 `500 "관리자 키 미설정"` — 등기부 신청 상태 관리 불가. 2026-08-07부터 **ADMIN 등급** |
-| `SUPER_ADMIN_API_KEY` | ❌ **미설정** | 등기부 무료횟수 조정(`POST /admin/registry-credits`) 403 — CS 대응 불가. 나머지 Admin 기능은 정상 |
+| `ADMIN_API_KEY` | ✅ 설정됨(2026-08-11 Sprint 57 실제 요청으로 재확인 — 이전 "미설정" 기록은 stale) | — |
+| `SUPER_ADMIN_API_KEY` | ✅ 설정됨(2026-08-11 Sprint 57 재확인, `ADMIN_API_KEY`와 다른 값이라 등급 분리 정상 동작) | — |
 
 ### B. 론칭 직전 필요 — 결제/모니터링 개시 시점
 
@@ -159,7 +159,7 @@ anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SD
 | 설명 | FastAPI가 Supabase 발급 JWT의 서명을 검증하는 비밀키(HS256) |
 | 필수 여부 | **필수** |
 | 언제 필요한지 | 인증이 필요한 모든 API(favorites/recent-items/search-presets/registry-requests/payments) |
-| 현재 필요한가 | **예 — 2026-08-09 기준 이 환경의 `.env`에는 이 이름이 없어 미동작**(`JWT_SECRET`이라는 다른 이름만 존재, 값은 열람하지 않음). `docs/BETA_RELEASE_CHECKLIST.md` P0-4 참고 |
+| 현재 필요한가 | **아니오(2026-08-11 재확인)** — 이름이 여전히 `.env`에 없지만, 2026-08-10 Sprint 46부터 실사용자 토큰은 JWKS 기반 ES256으로 검증되어 이 값과 무관하게 동작한다. 없으면 HS256 레거시 검증 경로(테스트 토큰 등)만 비활성 |
 | 발급 위치 | Supabase 대시보드 → Project Settings → API → JWT Settings → JWT Secret |
 | 코드 참조 여부 | `api/auth.py:9`, `api/v1/item.py`, `api/v1/search.py`(선택적 검증), `test_api_regression.py`(테스트 토큰 서명) |
 | 비고 | 미설정 시 인증 필요 API가 전부 `500 "JWT Secret 미설정"`으로 막힌다. `NEXT_PUBLIC_` 금지 |
@@ -177,7 +177,7 @@ anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SD
 | 설명 | `/api/v1/admin/*` 접근용 공유 키. `X-Admin-Key` 헤더 값과 상수시간 비교(`hmac.compare_digest`) |
 | 필수 여부 | **필수 (운영 전)** |
 | 언제 필요한지 | 등기부 신청 상태 관리(목록 조회, PENDING→PROCESSING→COMPLETED 전이, `doc_url` 등록) |
-| 현재 필요한가 | **예 — 지금 미설정 상태라 Admin API 전체가 `500 "관리자 키 미설정"`으로 막혀 있다** |
+| 현재 필요한가 | **아니오 — 2026-08-11 Sprint 57 재확인, 설정되어 정상 동작 중**(실제 요청으로 200/403 응답 확인) |
 | 발급 위치 | 외부 발급 없음. **직접 생성**(예: `python -c "import secrets; print(secrets.token_urlsafe(32))"`) |
 | 코드 참조 여부 | `api/v1/admin.py:resolve_admin_role()` / `require_admin()` |
 | 비고 | 2026-08-07부터 이 키는 **ADMIN 등급**이다(SUPER_ADMIN은 아래 별도 키). 같은 등급 안에서는 사용자 구분이 없어 키를 아는 사람이 동일 권한을 갖는다. 유출 시 즉시 교체 |

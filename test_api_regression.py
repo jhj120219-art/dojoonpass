@@ -2001,6 +2001,107 @@ def test_admin_rest_structure():
           client.patch("/api/v1/admin/subscriptions/99999999",
                        json={"status": "PAUSED"}, headers=sh).status_code, 404)
 
+    # ACTIVE -> CANCELLED / ACTIVE -> EXPIRED — 둘 다 CANCELLED/EXPIRED 종결 분기를 타며
+    # 즉시 만료 시각을 지금으로 당긴다. 각각 별도 구독으로 실제 엔드포인트를 통해 확인한다
+    # (2026-08-12, BUGS #58 동시성 수정 이후 이 분기가 실제로 여전히 정상 동작하는지 고정).
+    for target_status in ("CANCELLED", "EXPIRED"):
+        conn = get_connection()
+        try:
+            ts = datetime.now().isoformat()
+            fresh_sub_id = conn.execute(
+                "INSERT INTO subscriptions (user_id,plan,price,status,started_at,expires_at,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (TEST_USER, "BASIC", 12900, "ACTIVE", ts,
+                 (datetime.now() + timedelta(days=30)).isoformat(), ts, ts),
+            ).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        r_end = client.patch("/api/v1/admin/subscriptions/%d" % fresh_sub_id,
+                             json={"status": target_status, "reason": "test"}, headers=sh)
+        check("ACTIVE -> %s 성공" % target_status, r_end.status_code, 200)
+        check("응답 status가 %s" % target_status, r_end.json()["data"]["status"], target_status)
+        conn = get_connection()
+        try:
+            row_end = conn.execute("SELECT status, expires_at FROM subscriptions WHERE id=?",
+                                   (fresh_sub_id,)).fetchone()
+            check("%s DB 상태 반영" % target_status, row_end["status"], target_status)
+            check_true("%s 만료 시각이 과거로 당겨짐" % target_status,
+                       row_end["expires_at"] <= datetime.now().isoformat())
+        finally:
+            conn.close()
+
+    # --- 만료된 구독 재활성화 (2026-08-12, docs/BUGS.md #59) ---
+    # expires_at 없이 ACTIVE로 되돌리면 응답은 200(status=ACTIVE)이었지만 만료 시각을
+    # 갱신하지 않아 같은 응답의 effective_status가 이미 EXPIRED였고, 다음 조회에서 DB
+    # 상태도 조용히 EXPIRED로 되돌아갔다 — "성공했다고 응답했지만 아무 일도 없었던" 결함.
+    conn = get_connection()
+    try:
+        ts = datetime.now().isoformat()
+        expired_sub_id = conn.execute(
+            "INSERT INTO subscriptions (user_id,plan,price,status,started_at,expires_at,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (TEST_USER, "BASIC", 12900, "EXPIRED", ts,
+             (datetime.now() - timedelta(days=5)).isoformat(), ts, ts),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.patch("/api/v1/admin/subscriptions/%d" % expired_sub_id,
+                     json={"status": "ACTIVE"}, headers=sh)
+    check("expires_at 없이 만료 구독 재활성화는 400(조용한 실패 대신 명시적 거부)",
+          r.status_code, 400)
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT status FROM subscriptions WHERE id=?",
+                           (expired_sub_id,)).fetchone()
+        check("거부 후 DB 상태는 EXPIRED 그대로", row["status"], "EXPIRED")
+    finally:
+        conn.close()
+
+    check("expires_at 형식이 잘못되면 400",
+          client.patch("/api/v1/admin/subscriptions/%d" % expired_sub_id,
+                       json={"status": "ACTIVE", "expires_at": "not-a-date"},
+                       headers=sh).status_code, 400)
+
+    new_expiry = (datetime.now() + timedelta(days=30)).isoformat()
+    r2 = client.patch("/api/v1/admin/subscriptions/%d" % expired_sub_id,
+                      json={"status": "ACTIVE", "expires_at": new_expiry, "reason": "cs"},
+                      headers=sh)
+    check("expires_at을 함께 주면 재활성화 성공", r2.status_code, 200)
+    check("응답 status가 ACTIVE", r2.json()["data"]["status"], "ACTIVE")
+    check("응답 effective_status도 ACTIVE(모순 없음)",
+          r2.json()["data"]["effective_status"], "ACTIVE")
+    check_true("응답 is_entitled True", r2.json()["data"]["is_entitled"])
+    conn = get_connection()
+    try:
+        row2 = conn.execute("SELECT status, expires_at FROM subscriptions WHERE id=?",
+                            (expired_sub_id,)).fetchone()
+        check("DB 상태가 실제로 ACTIVE로 반영됨", row2["status"], "ACTIVE")
+        check("DB expires_at이 새 값으로 반영됨", row2["expires_at"], new_expiry)
+    finally:
+        conn.close()
+
+    # PAUSED -> ACTIVE(재개)는 expires_at이 아직 남아있으므로 없이도 정상 동작해야 한다
+    # (이번 수정이 재개 경로까지 깨뜨리지 않았는지 확인).
+    conn = get_connection()
+    try:
+        ts = datetime.now().isoformat()
+        paused_sub_id = conn.execute(
+            "INSERT INTO subscriptions (user_id,plan,price,status,started_at,expires_at,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (TEST_USER, "BASIC", 12900, "PAUSED", ts,
+             (datetime.now() + timedelta(days=20)).isoformat(), ts, ts),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    r3 = client.patch("/api/v1/admin/subscriptions/%d" % paused_sub_id,
+                      json={"status": "ACTIVE"}, headers=sh)
+    check("PAUSED -> ACTIVE 재개는 expires_at 없이도 200", r3.status_code, 200)
+    check("재개 응답도 effective_status ACTIVE", r3.json()["data"]["effective_status"], "ACTIVE")
+
 
 # ---------------------------------------------------------------------------
 # 28. Soft Delete 컬럼 (CTO 승인 6번)

@@ -31,6 +31,7 @@ from jose import jwt
 
 import api_server
 from api.auth import SUPABASE_JWT_SECRET
+from api.v1.payments import resolve_plan_price, BILLING_MONTHLY
 from storage.database import get_connection
 
 client = TestClient(api_server.app)
@@ -42,6 +43,8 @@ TEST_USER_LIMIT = "qa-race-limit-" + uuid.uuid4().hex[:10]
 TEST_USER_PAYMENT = "qa-race-payment-" + uuid.uuid4().hex[:10]
 TEST_USER_SUBSCRIPTION = "qa-race-sub-" + uuid.uuid4().hex[:10]
 TEST_USER_ADMIN_TARGET = "qa-race-admintarget-" + uuid.uuid4().hex[:10]
+TEST_USER_REFUND = "qa-race-refund-" + uuid.uuid4().hex[:10]
+TEST_USER_SUB_STATUS = "qa-race-substatus-" + uuid.uuid4().hex[:10]
 failures = []
 
 
@@ -353,6 +356,78 @@ def test_admin_registry_status_race():
         conn.close()
 
 
+def test_admin_refund_race():
+    """같은 결제 1건에 부분 환불 요청 3개를 정확히 동시에 보낸다.
+
+    `api/v1/payments.py:refund_payment()`는 `BEGIN IMMEDIATE`로 쓰기 락을 먼저 잡고
+    (등기부 §1/구독 §3과 동일 패턴), 그 안에서 "이미 환불된 금액 조회 -> 환불 가능액
+    계산 -> 조건부 UPDATE"를 수행한다. 락을 잡는 시점이 함수 진입 즉시라 다른 레이스
+    시나리오(좁은 SELECT->UPDATE 창)보다 스레드로 안정 재현하기 쉽다 — 동시에 도착한
+    요청들이 락 위에서 완전히 직렬화되므로 "먼저 커밋된 요청이 반영한 already_refunded를
+    다음 요청이 반드시 보게" 된다.
+
+    금액을 결제액의 절반보다 살짝 크게 잡아, 두 번째 요청까지는 성공하면 총 환불액이
+    결제액을 넘는 상황을 만든다 — 방어가 없다면(각 스레드가 서로의 커밋을 보지 못하고
+    "환불 가능액 100%"로 오판하면) 총 환불액이 결제액을 초과하는 **초과 환불**이 발생한다.
+    """
+    print("\n--- 5. admin refund race (3 threads, partial refunds > payment amount) ---")
+    r = client.post(
+        "/api/v1/payments",
+        json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+              "amount": resolve_plan_price("BASIC", BILLING_MONTHLY), "billing_cycle": BILLING_MONTHLY},
+        headers=auth_headers(TEST_USER_REFUND),
+    )
+    body = r.json()
+    check_true("설정: 결제 생성 성공", body.get("success"))
+    payment_id = body["data"]["payment"]["id"]
+    amount = body["data"]["payment"]["amount"]
+    partial = amount // 2 + 1000  # 2개만 성공해도 결제액을 넘는 크기
+
+    n = 3
+    super_admin_headers = {"X-Admin-Key": os.environ["SUPER_ADMIN_API_KEY"]}
+    results = [None] * n
+    start_barrier = threading.Barrier(n)
+
+    def worker(idx):
+        start_barrier.wait()
+        r = client.post(
+            f"/api/v1/admin/payments/{payment_id}/refund",
+            json={"amount": partial, "reason": "qa-race-refund"},
+            headers=super_admin_headers,
+        )
+        results[idx] = (r.status_code, r.json())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = [code for code, _ in results]
+    succeeded = [body for code, body in results if code == 200]
+    check("최소 1건은 성공", len(succeeded) >= 1, True)
+    check("모든 요청이 유효한 코드로만 응답(200 또는 400)",
+          all(c in (200, 400) for c in statuses), True)
+    # already_refunded=True로 200이 온 경우는 "초과 환불로 이미 막힌 뒤 재시도"가 아니라
+    # "전액이 이미 환불된 결제에 대한 멱등 응답"이다 — partial < amount라 이번 시나리오에서는
+    # 발생하지 않아야 한다(발생하면 로직이 예상과 다르게 동작했다는 신호).
+    check("성공 응답 중 already_refunded는 없다(부분액이라 전액 도달 불가)",
+          any(b.get("data", {}).get("already_refunded") for b in succeeded), False)
+
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT amount FROM payments WHERE id=?", (payment_id,)).fetchone()
+        total_refunded = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payment_logs"
+            " WHERE payment_id=? AND event_type='CANCEL' AND status='SUCCESS'",
+            (payment_id,),
+        ).fetchone()[0]
+        check("총 환불액이 결제액을 초과하지 않는다", total_refunded <= row["amount"], True)
+        check("총 환불액이 성공한 요청 수 * partial과 정확히 일치한다(중복/유실 없음)",
+              total_refunded, len(succeeded) * partial)
+    finally:
+        conn.close()
+
 
 def test_toctou_guard_is_structural():
     """조건부 UPDATE(TOCTOU 가드)가 **모든 전이 분기에** 남아 있는가 — 결정적 검사.
@@ -365,7 +440,7 @@ def test_toctou_guard_is_structural():
     전부 `WHERE id=? AND status=?` 형태이고, rowcount==0이면 409로 거부하는가.
     """
     import re
-    print("\n--- 5. TOCTOU 가드 구조 검사 (결정적) ---")
+    print("\n--- 6. TOCTOU 가드 구조 검사 (결정적) ---")
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "v1", "admin.py"),
                encoding="utf-8-sig").read()
     i = src.index("def update_registry_request_status")
@@ -380,6 +455,150 @@ def test_toctou_guard_is_structural():
     check_true("거부 응답이 409다", "status_code=409" in body)
     check_true("거부 시 롤백한다", "conn.rollback()" in body)
 
+
+def test_refund_guard_is_structural():
+    """환불의 동시성 방어가 소스 레벨에 남아 있는가 — 결정적 검사.
+
+    2026-08-11 실측: `test_admin_refund_race()`(시나리오 5)에서 `BEGIN IMMEDIATE`를 없애거나
+    UPDATE의 `WHERE status=?` 조건을 없애는 변이를 각각 넣어 봤는데, 3스레드 재현으로는
+    **둘 다 잡히지 않았다**(TestClient 스레드가 이 경로에서는 창을 벌리지 못한다 —
+    `test_admin_registry_status_race()`가 이미 겪은 것과 같은 종류의 한계). 확률에 기대는
+    검사만 두면 가드가 사라져도 통과하는 날이 생기므로, `test_toctou_guard_is_structural()`과
+    같은 방법으로 소스 레벨에서 함께 못 박는다.
+    """
+    print("\n--- 7. refund 가드 구조 검사 (결정적) ---")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "v1", "payments.py"),
+               encoding="utf-8-sig").read()
+    i = src.index("def refund_payment")
+    j = src.index("\ndef ", i + 1)
+    body = src[i:j]
+
+    check_true("함수 진입 직후 쓰기 락을 선점한다(BEGIN IMMEDIATE)",
+               'conn.execute("BEGIN IMMEDIATE")' in body)
+    check_true("UPDATE가 현재 상태를 다시 확인한다(WHERE id=? AND status=?)",
+               "WHERE id=? AND status=?" in body)
+    check_true("rowcount==0이면 거부한다", "cursor.rowcount == 0" in body)
+    check_true("거부 시 롤백한다", "conn.rollback()" in body)
+    check_true("거부 응답이 409다(다른 요청이 먼저 반영됨)",
+               "409," in body or "409)" in body)
+
+
+def test_webhook_reprocess_guard_is_structural():
+    """Webhook 재처리(`reprocess_webhook()`)와 그 안이 호출하는 상태 반영(`_apply_webhook_event()`)
+    도 환불과 같은 `BEGIN IMMEDIATE` + 조건부 UPDATE 패턴을 쓰는가 — 결정적 검사.
+
+    운영자가 같은 Webhook을 두 번 빠르게 재처리 클릭하는 시나리오를 막는다. 실시간 수신
+    경로(`receive_payment_webhook`)와 재처리가 **같은** `_apply_webhook_event()`를 공유하므로
+    가드 하나로 두 경로를 함께 지킨다.
+    """
+    print("\n--- 8. webhook 재처리 가드 구조 검사 (결정적) ---")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "v1", "payments.py"),
+               encoding="utf-8-sig").read()
+
+    i = src.index("def reprocess_webhook")
+    j = src.index("\ndef ", i + 1)
+    reprocess_body = src[i:j]
+    check_true("reprocess_webhook 진입 직후 쓰기 락을 선점한다(BEGIN IMMEDIATE)",
+               'conn.execute("BEGIN IMMEDIATE")' in reprocess_body)
+
+    i2 = src.index("def _apply_webhook_event")
+    j2 = src.index("\ndef ", i2 + 1)
+    apply_body = src[i2:j2]
+    check_true("_apply_webhook_event의 UPDATE가 현재 상태를 다시 확인한다(WHERE id=? AND status=?)",
+               "WHERE id=? AND status=?" in apply_body)
+    check_true("rowcount==0이면 적용하지 않고 건너뛴다(멱등)",
+               "cursor.rowcount == 0" in apply_body)
+
+
+def test_admin_subscription_status_race():
+    """ACTIVE 구독 1건에 같은 목표 상태(CANCELLED)로 두 SUPER_ADMIN 요청을 정확히 동시에 보낸다.
+
+    2026-08-12 발견: `api/v1/subscriptions.py:change_status()`(Admin PATCH
+    /admin/subscriptions/{id}의 유일한 호출부)에는 이 감사에서 다룬 다른 모든 상태 전이
+    경로(registry-requests #21, refund, webhook reprocess)와 달리 **동시성 가드가 전혀
+    없었다.** 재현(5/5): 같은 구독에 PAUSED/CANCELLED로 동시 PATCH를 보내면 **둘 다 200
+    성공**을 응답하고, 최종 DB 상태는 나중에 커밋되는 쪽으로 조용히 결정됐다 — 이긴 쪽만
+    성공 응답을 받아야 하는데 진 쪽도 자신의 요청이 반영됐다고 믿게 된다(과금에 직접
+    영향을 주는 SUPER_ADMIN 전용 엔드포인트라 영향이 작지 않다). `change_status()`에
+    `BEGIN IMMEDIATE` + 조건부 UPDATE(WHERE id=? AND status=?) + rowcount 확인을 추가해
+    해소했다.
+
+    같은 목표(CANCELLED)를 두 번 겨냥한다 — CANCELLED는 종결 상태(전이 규칙상 나가는
+    전이가 없다)라, 직렬화가 정상 동작하면 먼저 반영된 쪽만 200이고 나중 쪽은 "이미
+    CANCELLED"라 전이 자체가 막혀 400을 받는다(수정 전에는 방어가 아예 없어 **둘 다
+    200**을 받았다 — 이 테스트가 검출하려는 것이 바로 그 차이다).
+    """
+    print("\n--- 9. admin subscription status race (2 threads, same target CANCELLED) ---")
+    conn = get_connection()
+    try:
+        ts = datetime.now().isoformat()
+        sub_id = conn.execute(
+            "INSERT INTO subscriptions (user_id,plan,price,status,started_at,expires_at,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (TEST_USER_SUB_STATUS, "BASIC", 12900, "ACTIVE", ts,
+             (datetime.now() + timedelta(days=30)).isoformat(), ts, ts),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    super_admin_headers = {"X-Admin-Key": os.environ["SUPER_ADMIN_API_KEY"]}
+    n = 2
+    results = [None] * n
+    start_barrier = threading.Barrier(n)
+
+    def worker(idx):
+        start_barrier.wait()
+        r = client.patch(
+            f"/api/v1/admin/subscriptions/{sub_id}",
+            json={"status": "CANCELLED", "reason": "qa-race-sub-status"},
+            headers=super_admin_headers,
+        )
+        results[idx] = (r.status_code, r.json())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = [code for code, _ in results]
+    check("exactly one request succeeded (200)", statuses.count(200), 1)
+    check("the other request did not also succeed(둘 다 200이면 수정 전 결함이 재발한 것)",
+          statuses.count(200) == 1 and any(c != 200 for c in statuses), True)
+    check("the rejected request used a valid conflict/rule code (400 or 409)",
+          all(c in (200, 400, 409) for c in statuses), True)
+
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT status FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+        check("최종 DB 상태가 CANCELLED다(둘 다 같은 목표라 혼선 여지 없음)", row["status"], "CANCELLED")
+    finally:
+        conn.close()
+
+
+def test_subscription_status_guard_is_structural():
+    """구독 상태 변경의 동시성 방어가 소스 레벨에 남아 있는가 — 결정적 검사.
+
+    이유는 refund/webhook 재처리와 동일 — 3스레드/2스레드 재현이 이 종류의 좁은 창을
+    안정적으로 잡지 못할 수 있다(이번 감사에서 반복 확인된 한계).
+    """
+    print("\n--- 10. 구독 상태 변경 가드 구조 검사 (결정적) ---")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "v1", "subscriptions.py"),
+               encoding="utf-8-sig").read()
+    i = src.index("def change_status")
+    j = src.index("\ndef ", i + 1)
+    body = src[i:j]
+
+    check_true("함수 진입 직후 쓰기 락을 선점한다(BEGIN IMMEDIATE)",
+               'conn.execute("BEGIN IMMEDIATE")' in body)
+    # 2026-08-12 BUGS #58 이어 발견한 재활성화 결함(만료 시각 미갱신) 수정으로 ACTIVE 분기가
+    # new_expires_at 유무에 따라 둘로 나뉘어 총 4개 UPDATE 분기가 됐다(CANCELLED/EXPIRED,
+    # ACTIVE+new_expires_at, ACTIVE 그대로, 그 외/PAUSED 등) — 전부 조건부여야 한다.
+    check_true("모든 UPDATE 분기가 현재 상태를 다시 확인한다(WHERE id=? AND status=?, 4곳)",
+               body.count("WHERE id=? AND status=?") == 4)
+    check_true("rowcount==0이면 거부한다", "cursor.rowcount == 0" in body)
+    check_true("거부 시 롤백한다", "conn.rollback()" in body)
 
 
 def cleanup():
@@ -402,12 +621,41 @@ def cleanup():
             )
             total += cur.rowcount
 
+        # 환불 레이스 시나리오가 만든 결제도 같은 이유(target_id로 연결)로 먼저 id를 구해 지운다.
+        refund_payment_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM payments WHERE user_id=?", (TEST_USER_REFUND,)
+            ).fetchall()
+        ]
+        if refund_payment_ids:
+            placeholders = ",".join("?" * len(refund_payment_ids))
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type='PAYMENT' AND target_id IN (%s)" % placeholders,
+                refund_payment_ids,
+            )
+            total += cur.rowcount
+
         # FK가 런타임에 강제되므로 자식 -> 부모 순서로 지운다(test_api_regression.py의
         # cleanup()과 동일한 순서 원칙 — registry_credit_logs/payment_logs가 각각
         # registry_usage/payments를 참조하므로 먼저 지워야 한다).
+        # 구독 상태 레이스 시나리오가 만든 audit_logs도 target_id(subscriptions.id)로 연결된다.
+        sub_status_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM subscriptions WHERE user_id=?", (TEST_USER_SUB_STATUS,)
+            ).fetchall()
+        ]
+        if sub_status_ids:
+            placeholders = ",".join("?" * len(sub_status_ids))
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type='SUBSCRIPTION' AND target_id IN (%s)" % placeholders,
+                [str(i) for i in sub_status_ids],
+            )
+            total += cur.rowcount
+
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
                       "payment_logs", "payments", "subscriptions"):
-            for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION, TEST_USER_ADMIN_TARGET):
+            for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION,
+                         TEST_USER_ADMIN_TARGET, TEST_USER_REFUND, TEST_USER_SUB_STATUS):
                 cur = conn.execute("DELETE FROM %s WHERE user_id=?" % table, (user,))
                 total += cur.rowcount
         conn.commit()
@@ -418,6 +666,12 @@ def cleanup():
             ).fetchone()[0]
             for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION, TEST_USER_ADMIN_TARGET)
         )
+        left += conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (TEST_USER_REFUND,)
+        ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (TEST_USER_SUB_STATUS,)
+        ).fetchone()[0]
         check("no test rows left", left, 0)
     finally:
         conn.close()
@@ -429,7 +683,12 @@ def run():
         test_overage_payment_race()
         test_subscription_race()
         test_admin_registry_status_race()
+        test_admin_refund_race()
         test_toctou_guard_is_structural()
+        test_refund_guard_is_structural()
+        test_webhook_reprocess_guard_is_structural()
+        test_admin_subscription_status_race()
+        test_subscription_status_guard_is_structural()
     finally:
         cleanup()
 

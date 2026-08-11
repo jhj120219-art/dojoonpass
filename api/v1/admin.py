@@ -799,6 +799,10 @@ def admin_list_subscriptions(
 class SubscriptionStatusRequest(BaseModel):
     status: str
     reason: Optional[str] = None
+    # ACTIVE로 되돌릴 때만 쓰인다. 이미 만료 시각이 지난 구독을 재활성화하려면 필수 —
+    # 몇 일을 연장할지는 요금 정산 정책이라 서버가 자동으로 정하지 않고 운영자가 명시한다
+    # (docs/BUGS.md 참고, api/v1/subscriptions.py:ReactivationRequiresNewExpiry).
+    expires_at: Optional[str] = None
 
 
 @router.patch("/admin/subscriptions/{subscription_id}")
@@ -810,19 +814,34 @@ def admin_change_subscription_status(
     """구독 상태 변경. 과금에 직접 영향을 주므로 SUPER_ADMIN 전용이다.
 
     전이 규칙(api/v1/state_machines.py)을 통과하지 못하면 400 — 임의 상태로 건너뛸 수 없다.
+    ACTIVE로 되돌리는데 기존 만료 시각이 이미 지났다면 `expires_at`(ISO 문자열)을 함께
+    보내야 한다 — 없으면 400(`docs/BUGS.md` 참고, 조용히 성공한 뒤 되돌아가는 것을 막는다).
     """
     from api.v1.state_machines import InvalidTransition
-    from api.v1.subscriptions import change_status
+    from api.v1.subscriptions import change_status, ConcurrentStatusChange, ReactivationRequiresNewExpiry
+
+    new_expires_at = None
+    if req.expires_at:
+        try:
+            new_expires_at = datetime.fromisoformat(req.expires_at)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="expires_at 형식이 올바르지 않습니다(ISO 8601)")
 
     conn = get_connection()
     try:
         try:
-            result = change_status(conn, subscription_id, req.status, actor=admin_role)
+            result = change_status(conn, subscription_id, req.status, actor=admin_role,
+                                   new_expires_at=new_expires_at)
         except LookupError:
             raise HTTPException(status_code=404, detail="구독을 찾을 수 없습니다")
         except InvalidTransition as e:
             conn.rollback()
             raise HTTPException(status_code=400, detail=str(e))
+        except ReactivationRequiresNewExpiry as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except ConcurrentStatusChange as e:
+            # change_status()가 이미 rollback까지 마쳤다(registry.py/refund와 동일 관례).
+            raise HTTPException(status_code=409, detail=str(e))
 
         record_audit(
             conn, admin_id=admin_role,

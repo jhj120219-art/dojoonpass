@@ -471,3 +471,106 @@ python test_api_regression.py            627검사
 그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀
 npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
 ```
+
+---
+
+## Sprint 57 (2026-08-11) — `auction.db` 되돌아감 복구, 신규 테스트는 없음
+
+`docs/BUGS.md` #57. `test_schema_hygiene.py`/`test_pipeline_integrity.py`가 이미 갖고 있던
+검사(migration_history 완전성, done↔READY 정합)가 실제로 드리프트를 잡아냈다 — 신규 테스트
+작성 없이 기존 회귀가 문제를 검출한 사례. `audit_logs` dangling 698행/`document_status`
+574행은 데이터 보정이며 테스트 로직 변경은 없었다.
+
+## Sprint 58 (2026-08-12) — 환불/Webhook 재처리 동시성 커버리지 공백 해소
+
+`docs/roadmap.md` Sprint 57 이후 배경: Admin 키가 실제로 설정된 것을 확인(§ENVIRONMENT_VARIABLES.md
+갱신)한 뒤 Admin 엔드포인트 41개를 API Contract Audit으로 재점검하다, 환불(`POST
+/admin/payments/{id}/refund`, Sprint 52 신설)과 Webhook 재처리(`POST
+/admin/payments/webhooks/{id}/reprocess`, Sprint 53 신설) 둘 다 소스에 `BEGIN IMMEDIATE` +
+조건부 UPDATE 가드가 있는데도 **동시 요청 회귀가 없었다** — 순차 재현(`test_api_regression.py`
+§29/§32)만 있고 `test_race_conditions.py`에는 두 경로 모두 없었다. Sprint 38의 교훈
+("순차 재현만으로는 동시성 결함을 검출 못한다")이 두 신규 경로에는 아직 적용 안 된 상태였다.
+
+| 파일 | 검사 | 대상 |
+|---|---|---|
+| `test_race_conditions.py` §5 (신규) | 6 | 결제 환불 동시 요청 — 3스레드, 결제액의 절반보다 큰 부분환불을 동시에 3번 보내 총 환불액이 결제액을 넘지 않는지 |
+| `test_race_conditions.py` §7 (신규) | 5 | 환불 가드 결정적 구조 검사(`BEGIN IMMEDIATE`/`WHERE id=? AND status=?`/rowcount/rollback/409) |
+| `test_race_conditions.py` §8 (신규) | 3 | Webhook 재처리 가드 결정적 구조 검사(`reprocess_webhook`/`_apply_webhook_event` 공유 가드) |
+
+### 스레드 재현은 이번에도 신뢰할 수 없었다 — 구조 검사가 실제로 잡아낸 것은 구조 검사뿐
+
+환불 레이스(§5)에 대해 두 가지 변이를 직접 넣어 검증했다.
+
+```
+                                        §5(스레드) 검출   §7(구조) 검출
+BEGIN IMMEDIATE 제거                    실패(미검출)      성공
+UPDATE의 "AND status=?" 제거            실패(미검출)      성공
+```
+
+3스레드 재현은 두 변이 모두 놓쳤다(BEGIN IMMEDIATE 제거는 실행할 때마다 결과가 달라지는
+진짜 flaky였고, WHERE 조건 제거는 매번 조용히 통과했다 — `BEGIN IMMEDIATE`가 전체
+읽기-판단-쓰기 구간을 이미 완전히 직렬화해 그 안쪽 가드까지 창을 벌리지 못했기 때문으로
+추정). Sprint 56이 Admin TOCTOU에서 이미 겪은 것과 같은 결론 — **좁은 창은 스레드 수를
+늘려도 안정 재현되지 않는다** — 이 세 번째 사례로 재확인됐다. §7 구조 검사가 두 변이를
+전부 결정적으로 잡아냈다(수정 후 원복해 정상 통과 확인).
+
+### 현재 게이트
+
+```
+python test_api_regression.py            627검사 (무변동)
+test_race_conditions.py                  41검사 (22 -> 41, 신규 3시나리오)
+그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀(test_db.py/test_docs.py/test_docs2.py, ALLOW_LIVE_CRAWL 가드)
+npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
+```
+
+---
+
+## Sprint 59 (2026-08-12) — Admin 구독 상태 변경 동시성 결함(BUGS #58) + 회귀 신설
+
+`test_race_conditions.py`에 2개 시나리오 추가.
+
+| 파일 | 검사 | 대상 |
+|---|---|---|
+| `test_race_conditions.py` §9 (신규) | 4 | Admin 구독 상태 변경 동시 요청 — 2스레드, 같은 목표(CANCELLED)로 동시 PATCH 시 정확히 1건만 성공 |
+| `test_race_conditions.py` §10 (신규) | 4 | 구독 상태 변경 가드 결정적 구조 검사(`BEGIN IMMEDIATE`/`WHERE id=? AND status=?`/rowcount/rollback) |
+
+Sprint 58의 refund/webhook 재처리 감사와 같은 방식(변이 주입 → 스레드/구조 검사 각각의
+검출력 비교)으로 검증했다. 결과도 동일했다 — 스레드 재현(§9)은 두 변이(락 제거/조건부
+WHERE 제거) 모두 놓쳤고, 구조 검사(§10)만 결정적으로 잡아냈다.
+
+### 현재 게이트
+
+```
+python test_api_regression.py            627검사 (무변동)
+test_race_conditions.py                  49검사 (41 -> 49, 신규 2시나리오)
+그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀
+npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
+```
+
+---
+
+## Sprint 60 (2026-08-12) — 만료 구독 재활성화 결함(BUGS #59) + 회귀 신설
+
+`test_api_regression.py` §27(admin rest structure)에 11개 검사 추가: expires_at 없이
+재활성화 거부(400 + DB 불변) / 형식 오류 거부(400) / expires_at과 함께면 성공(200 +
+effective_status/is_entitled 일치 + DB 반영) / PAUSED→ACTIVE 재개는 영향 없음(회귀 방지).
+
+`test_race_conditions.py` §10(구독 상태 변경 구조 검사)을 change_status()의 UPDATE 분기가
+2개에서 4개로 늘어난 것에 맞춰 갱신(개수 검사만 정합화, 새 시나리오 아님).
+
+### Sprint 60 마무리 — Release 준비 최종 검증
+
+Commit 전 사용자 지정 11개 회귀 체크리스트를 하나씩 대조하다 ACTIVE→CANCELLED/
+ACTIVE→EXPIRED가 실제 Admin 엔드포인트로는 한 번도 검증되지 않았음을 발견(내부 상태머신
+순수 로직 테스트만 있었다) — `test_api_regression.py` §27에 8개 신규(638 → 646검사).
+`BEGIN IMMEDIATE`/조건부 UPDATE 제거 변이를 최종 재검증(§10이 결정적으로 검출), 저장소
+전체에 mutation-test 임시 코드·scratch 파일 잔여 0건 확인.
+
+### 현재 게이트 (최종, Sprint 60 Release 시점)
+
+```
+python test_api_regression.py            646검사 (627 -> 638 -> 646)
+test_race_conditions.py                  49검사 (무변동, 구조 검사 갱신만)
+그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀
+npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
+```
