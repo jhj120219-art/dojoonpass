@@ -231,6 +231,88 @@ def test_grace_period_end():
     check("grace_period_end(malformed) -> None", grace_period_end("garbage"), None)
 
 
+
+
+# ---------------------------------------------------------------------------
+# 8. 만료 시각이 깨졌을 때 — 안전하게 실패하되 **조용하지 않게** (2026-08-11 Sprint 56)
+#
+#    `_parse()`가 None을 돌려 만료 판정을 보류하는 것 자체는 옳다. 파싱 실패를 '만료'로
+#    해석하면 정상 구독자가 끊긴다. 문제는 그 폴백이 **로그 한 줄 없이** 일어났다는 것이다.
+#    깨진 expires_at을 가진 구독은 `effective_status()`가 영원히 만료로 넘기지 않으므로
+#    **무기한 유효한 구독**이 되는데, 그 사실을 알 방법이 없었다.
+#    안전한 방향으로 실패하는 것과 실패를 숨기는 것은 다르다.
+# ---------------------------------------------------------------------------
+def test_corrupt_expiry_is_safe_and_logged():
+    import logging
+    from datetime import datetime, timedelta
+
+    print("\n--- 8. 깨진 만료 시각 처리 ---")
+    now = datetime.now()
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    sm_logger = logging.getLogger("api.v1.state_machines")
+    cap = Capture()
+    sm_logger.addHandler(cap)
+    prev_level = sm_logger.level
+    sm_logger.setLevel(logging.WARNING)
+    try:
+        # 진짜로 해석 불가능한 값만 고른다.
+        # `''`는 "만료 시각 없음"(부재)이지 부패가 아니고, `'20260811'`은 Python 3.11+의
+        # fromisoformat이 정상 파싱한다(기본 ISO 형식). 둘을 부패로 취급하면 테스트가
+        # 실제 동작이 아니라 내 짐작을 검사하게 된다 — 실제로 그렇게 틀렸었다.
+        for bad in ("not-a-date", "2026-13-45", "2026-08-11T99:99", "1754899200"):
+            cap.records.clear()
+            got = resolve_expected_status(SubscriptionStatus.ACTIVE, bad, now)
+            # 안전한 방향: 만료로 넘기지 않는다
+            check("expires_at=%r 이면 만료시키지 않는다" % bad, got, SubscriptionStatus.ACTIVE)
+            # 그리고 반드시 드러난다
+            check_true("expires_at=%r 파싱 실패가 로그에 남는다" % bad,
+                       any(r.levelno >= logging.WARNING for r in cap.records))
+
+        # 만료 시각 자체가 없는 것은 부패가 아니다 — 경고 없이 상태를 유지해야 한다.
+        # (과잉 경고는 진짜 경고를 묻는다)
+        for absent in (None, ""):
+            cap.records.clear()
+            check("expires_at=%r 는 상태 유지" % absent,
+                  resolve_expected_status(SubscriptionStatus.ACTIVE, absent, now),
+                  SubscriptionStatus.ACTIVE)
+            check("expires_at=%r 에는 경고를 남기지 않는다" % absent,
+                  [r for r in cap.records if r.levelno >= logging.WARNING], [])
+
+        # 날짜만 있는 값은 자정으로 해석된다 — 부패가 아니므로 경고 없이 정상 처리한다.
+        cap.records.clear()
+        check("날짜만 있는 값은 자정 기준으로 정상 처리",
+              resolve_expected_status(SubscriptionStatus.ACTIVE,
+                                      (now + timedelta(days=2)).strftime("%Y-%m-%d"), now),
+              SubscriptionStatus.ACTIVE)
+        check("날짜만 있는 값에 경고 없음",
+              [r for r in cap.records if r.levelno >= logging.WARNING], [])
+
+        # grace_period_end도 같은 경로를 쓴다
+        cap.records.clear()
+        check("깨진 값이면 유예 종료 시각도 없음", grace_period_end("not-a-date"), None)
+        check_true("유예 종료 계산에서도 로그가 남는다",
+                   any(r.levelno >= logging.WARNING for r in cap.records))
+
+        # 정상 값에서는 경고가 나오면 안 된다 (과잉 경고는 진짜 경고를 묻는다)
+        cap.records.clear()
+        ok = (now + timedelta(days=10)).isoformat()
+        check("정상 만료값은 ACTIVE 유지",
+              resolve_expected_status(SubscriptionStatus.ACTIVE, ok, now), SubscriptionStatus.ACTIVE)
+        check("정상 값에는 경고를 남기지 않는다",
+              [r for r in cap.records if r.levelno >= logging.WARNING], [])
+    finally:
+        sm_logger.removeHandler(cap)
+        sm_logger.setLevel(prev_level)
+
+
 def run():
     test_payment_transitions_allowed()
     test_payment_transitions_forbidden()
@@ -240,6 +322,7 @@ def run():
     test_resolve_expected_status()
     test_is_entitled()
     test_grace_period_end()
+    test_corrupt_expiry_is_safe_and_logged()
 
     print("\n" + "=" * 55)
     if failures:

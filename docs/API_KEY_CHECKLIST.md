@@ -60,7 +60,7 @@ grep -rn "process.env" src/                                 # 프론트가 읽�
 
 | 항목 | 내용 |
 |---|---|
-| 참조 지점 | `src/lib/supabaseClient.ts:10-11`, `src/lib/supabaseServer.ts:13-14`, `src/middleware.ts:14-15` |
+| 참조 지점 | `src/lib/supabaseClient.ts:10-11`, `src/lib/supabaseServer.ts:13-14`, `src/proxy.ts` (Sprint 50에서 `src/middleware.ts`에서 이름만 변경) |
 | 용도 | 로그인/회원가입/세션 갱신 |
 | 없으면 | 인증 전체 불가 (`!` non-null 단언이라 런타임에서 터짐) |
 | 현재 | ✅ 설정됨 |
@@ -179,13 +179,41 @@ grep -rn "process.env" src/                                 # 프론트가 읽�
 ## 4. env 파일 ↔ 코드 드리프트 (2026-08-07 실측)
 
 ```
-.env / .env.local에 선언됨 :  SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_JWT_SECRET,
+.env / .env.local에 선언됨 :  SUPABASE_URL(빈 값), SUPABASE_ANON_KEY(빈 값), SUPABASE_JWT_SECRET,
                               NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
                               NEXT_PUBLIC_API_BASE_URL
 코드가 읽지만 미선언       :  ADMIN_API_KEY, SUPER_ADMIN_API_KEY, PAYMENT_PROVIDER,
                               CORS_ALLOW_ORIGINS, LOG_LEVEL
-선언됐지만 코드가 안 읽음  :  SUPABASE_URL, SUPABASE_ANON_KEY
+선언됐지만 코드가 안 읽음  :  SUPABASE_ANON_KEY
 ```
+
+**2026-08-11 (Sprint 50) 실측 정정 2건**
+
+1. **`SUPABASE_URL`은 이제 코드가 읽는다.** Sprint 46의 ES256/JWKS 도입으로
+   `api/auth.py:24`가 `os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")`을
+   읽어 JWKS 엔드포인트(`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`)를 만든다.
+   아래 "어떤 Python 코드도 읽지 않는다"는 서술은 Sprint 46 이전 기준이라 stale이었다.
+2. **`.env`의 `SUPABASE_URL` / `SUPABASE_ANON_KEY`는 값이 비어 있다**(이름만 선언).
+   그래서 실제 JWKS URL은 `.env.local`의 `NEXT_PUBLIC_SUPABASE_URL` 폴백으로 채워지며
+   (런타임 실측: `https://<project>.supabase.co`), **현재 인증은 정상 동작한다.**
+
+**~~주의 — `.env`에 UTF-8 BOM이 있다~~ → ✅ 2026-08-11 Sprint 53 해결**
+
+BOM 3바이트를 제거했다(145 → 142바이트, **본문 SHA256 동일** — 값은 하나도 바뀌지 않았다).
+이제 `os.getenv("SUPABASE_URL")`이 정상적으로 읽힌다. 아래는 당시 기록이다.
+
+
+`.env`의 첫 3바이트가 `EF BB BF`(BOM)라서 `python-dotenv`가 **첫 줄의 키를
+`﻿SUPABASE_URL`로 파싱**한다. 즉 `os.getenv("SUPABASE_URL")`은 영원히 `None`이다.
+지금은 그 값이 어차피 비어 있고 `NEXT_PUBLIC_SUPABASE_URL` 폴백이 있어 **아무 문제가 없다.**
+
+문제가 되는 시점은 **누군가 `.env`의 첫 줄에 실제 값을 채워 넣을 때**다 — 값을 넣어도
+코드가 읽지 못해 "설정했는데 안 먹는다"가 된다. `.env` 첫 줄이 항상 첫 키라는 점 때문에
+어떤 변수든 이 함정에 걸린다.
+
+- 확인: `python -c "print(open('.env','rb').read()[:3])"` → `b'ï»¿'`이면 BOM
+- 해결: `.env`를 **BOM 없는 UTF-8**로 다시 저장(값 변경 아님). 또는 첫 줄에 주석 한 줄을 둔다
+- **`.env` 수정은 `docs/CLAUDE.md`상 승인 필요 → Sprint 50에서는 수정하지 않고 기록만 함**
 
 ### 해석
 
@@ -193,7 +221,9 @@ grep -rn "process.env" src/                                 # 프론트가 읽�
 - `SUPER_ADMIN_API_KEY` 미선언은 P1이다 — 등기부 무료횟수 조정(CS 대응)이 불가능하다.
 - `PAYMENT_PROVIDER` / `CORS_ALLOW_ORIGINS` / `LOG_LEVEL` 미선언은 **정상**이다. 셋 다 안전한
   기본값(`mock` / `*` / `INFO`)으로 폴백하도록 설계했다.
-- **`SUPABASE_URL` / `SUPABASE_ANON_KEY`(`.env`)는 어떤 Python 코드도 읽지 않는다.**
+- ~~**`SUPABASE_URL` / `SUPABASE_ANON_KEY`(`.env`)는 어떤 Python 코드도 읽지 않는다.**~~
+  → **2026-08-11 Sprint 50 정정**: `SUPABASE_URL`은 `api/auth.py`가 읽는다(위 참고).
+  아래 서술은 `SUPABASE_ANON_KEY`에만 유효하다.
   백엔드는 Supabase에 직접 접속하지 않고 JWT 서명만 검증하기 때문이다(`docs/decision-log.md`
   "Authentication" — 인증과 경매 데이터 분리). 프론트는 `NEXT_PUBLIC_` 버전을 따로 쓴다.
   → 지금은 **무해한 잔재**다. 삭제는 `.env` 수정이라 승인 필요 → Skip. 향후 백엔드가
@@ -245,7 +275,7 @@ FK 강제 / 상태 머신 / 감사 로그 / Error Code / Enum 통합은 전부 *
 
 | 변수명 | 코드 참조 | 위치 |
 |---|---|---|
-| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 3곳 | `middleware.ts`, `supabaseServer.ts`, `supabaseClient.ts` |
+| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 3곳 | `proxy.ts`(구 `middleware.ts`), `supabaseServer.ts`, `supabaseClient.ts` |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 3곳 | 위와 동일 |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | **0건** | — |
 | `SUPABASE_SERVICE_ROLE_KEY` | **0건** | — |

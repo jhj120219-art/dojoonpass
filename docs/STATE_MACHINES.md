@@ -48,11 +48,21 @@ CREATED ──> READY ──> REQUESTED ──> PAID ──> PARTIAL_REFUND ─�
 
 `PARTIAL_REFUND`도 `is_paid()`가 참으로 본다 — 일부 금액은 아직 유효하기 때문이다.
 
-### 현재 흐름과의 관계
+### 현재 흐름과의 관계 (2026-08-11 Sprint 52 갱신)
 
-지금 결제는 `MockProvider`가 곧바로 `SUCCESS`를 만들고 그 뒤로 상태가 바뀌는 경로가 없다.
-이 상태 머신은 *앞으로* 상태를 바꾸려는 코드(환불/Webhook/Admin 조작)가 반드시 통과해야 할
-관문이며, **지금 흐름에는 개입하지 않는다**(기존 동작 무변경).
+~~이 상태 머신은 앞으로 상태를 바꾸려는 코드가 통과할 관문이며 지금 흐름에는 개입하지 않는다~~
+→ **이제 실제로 개입한다.** Sprint 52에서 상태를 바꾸는 두 경로를 연결했다.
+
+| 경로 | 전이 | 관문 |
+|---|---|---|
+| `POST /api/v1/admin/payments/{id}/refund` (SUPER_ADMIN) | PAID/SUCCESS → PARTIAL_REFUND / REFUNDED | `assert_payment_transition()` |
+| `POST /api/v1/payments/webhook/{provider}` (서명 검증 필수) | PG 노티가 지시하는 상태로 | `assert_payment_transition()` |
+
+두 경로 모두 상태머신이 막는 전이는 **적용하지 않는다**(환불은 400, Webhook은 무시 후 200).
+결제 생성 흐름(`MockProvider` → SUCCESS)은 그대로다 — 기존 동작 무변경.
+
+부분 환불의 누적 금액은 `payments`에 컬럼을 추가하지 않고 **`payment_logs`의 CANCEL 이벤트
+합계**로 계산한다(원장이 이미 append-only라 두 번째 진실을 만들지 않기 위해서다).
 
 ---
 

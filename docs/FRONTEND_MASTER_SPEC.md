@@ -1,8 +1,8 @@
 # DOJOONPASS Frontend Master Spec
 
-Version: 1.2
-Status: 확정 — **P0/P1 구현 완료(Sprint 44~45) + 인증 체인 복구(Sprint 46)**
-Last Updated: 2026-08-10
+Version: 1.3
+Status: 확정 — **P0/P1 구현 완료(Sprint 44~45) + 인증 체인 복구(Sprint 46) + 전 동선 브라우저 실측 검증(Sprint 49)**
+Last Updated: 2026-08-11
 Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
 
 ---
@@ -29,7 +29,7 @@ Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
 ### 조사 기준
 
 본 문서는 2026-08-10 아래를 **실제 코드로 전수 대조**해 작성했다.
-`src/app/**`, `src/components/**`, `src/lib/api.ts`, `src/middleware.ts`, `api_server.py`, `api/v1/*.py`,
+`src/app/**`, `src/components/**`, `src/lib/api.ts`, `src/proxy.ts`(2026-08-11 Sprint 50 이전 파일명 `src/middleware.ts`), `api_server.py`, `api/v1/*.py`,
 `search/00_SEARCH_MVP.md`, `docs/frontend.md`, `docs/search-engine.md`, `docs/roadmap.md`, `docs/CLAUDE.md`
 
 ---
@@ -56,17 +56,27 @@ Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
 | `/search` | `src/app/search/page.tsx` | `/`와 동일한 검색 화면. 기존 링크/북마크 호환 유지 | **공개** |
 | `/login` | `src/app/login/page.tsx` + `actions.ts` | 로그인 / 회원가입 통합 폼 | **공개** |
 | `/properties/[id]` | `src/app/properties/[id]/page.tsx` | 물건 상세 | **로그인 필수** |
-| `/favorites` | `src/app/favorites/page.tsx` | 관심물건 목록 | **로그인 필수** (Sprint 45부터 middleware 서버 게이트) |
+| `/favorites` | `src/app/favorites/page.tsx` | 관심물건 목록 | **로그인 필수** (Sprint 45부터 서버 게이트 — 현재 `src/proxy.ts`) |
 | `/properties/recent` | `src/app/properties/recent/page.tsx` | 최근 본 물건 목록 | **로그인 필수** |
-| `/properties` | `src/app/properties/page.tsx` | **레거시 목록 화면**(Supabase `properties` 직접 조회) | 로그인 필수 (현행 유지) |
+| `/properties` | `src/app/properties/page.tsx` | **`/`로 영구 이동**(2026-08-11 Sprint 51). 레거시 목록 화면은 제거됨 | 로그인 게이트는 유지(비로그인 → `/login`) |
 
 ### 2.2 라우트가 아닌 코드
 
-- `src/login/`(`page.tsx`, `action.ts`) — `src/app/` 밖이라 **Next.js가 라우팅하지 않는 도달 불가 코드**.
-  구 브랜드명 "도준 경매 패스"를 사용하고 있어 `docs/decision-log.md`의 서비스명 규칙에 어긋난다.
-  **프로젝트 규칙상 "사용 여부가 확실하지 않은 코드는 임의 삭제하지 않는다" → 이번 범위에서 삭제하지 않는다.**
+- ~~`src/login/`(`page.tsx`, `action.ts`)~~ — **2026-08-11 Sprint 51에 제거했다.**
+  `src/app/` 밖이라 Next.js가 라우팅할 수 없고 import 참조도 0건이라 **도달 불가가 증명**됐다.
+  게다가 구 브랜드명("도준 경매 패스")을 쓰고, 로그인 성공 시 `redirect('/properties')`로 보내며
+  `redirect` 파라미터·`sanitizeRedirectPath` 방어가 전혀 없어 **§3.4 확정 계약과 정면으로 어긋나는**
+  구현이었다(복사해 쓰면 Open Redirect가 되는 코드). 계약 테스트가 재생성을 막는다.
 
-### 2.3 `/properties`(레거시)에 대한 기록
+### 2.3 `/properties`(레거시) — 2026-08-11 Sprint 51에 `/`로 이동 완료
+
+**아래 기록은 처리 전 상태다.** Sprint 51에서 다음 근거로 `/`로 영구 이동시켰다
+(`docs/BUGS.md` #34): ① 404가 아니라 **항상 엉뚱한 물건이 열리는** 조용한 오답이었고,
+② `docs/CLAUDE.md`의 "경매 데이터는 항상 Python API 경유" 규칙을 어기는 저장소 내 유일한
+화면이었으며, ③ Supabase `properties` 5행이 프로토타입 시드 데이터였다.
+`/properties/[id]`·`/properties/recent`는 하위 경로라 영향이 없고 로그인 게이트도 그대로다.
+
+#### 처리 전 기록
 
 `/properties`는 다음 문제를 이미 가지고 있다(`docs/frontend.md` 기록, 2026-08-10 코드 재확인).
 
@@ -124,7 +134,8 @@ Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
 - 비로그인 사용자에게 **`/properties/[id]` 상세 조회는 허용하지 않는다.**
 - 이 정책은 **확정 사항이다.** PM 결정 대기 항목으로 기록하지 않는다.
   (이전 문서들이 "PM 결정 대기"로 기록하고 있던 상태는 2026-08-10 본 결정으로 종료됐다.)
-- 게이트 위치: `src/middleware.ts`의 `/properties/*` 서버사이드 게이트를 **그대로 사용**한다.
+- 게이트 위치: `src/proxy.ts`의 `/properties/*` 서버사이드 게이트를 **그대로 사용**한다.
+  (2026-08-11 Sprint 50에 Next.js 16 `proxy` 규약으로 파일명·export명만 이전. 게이트 로직 무변경)
   이미 구현되어 있으므로 새 게이트 로직을 추가하지 않는다.
 
 ### 3.4 로그인 Redirect 계약 (확정)
@@ -140,7 +151,7 @@ Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
    허용하고 `//evil.com` · `/\evil.com`는 거부한다.
 5. `redirect`가 없거나 거부된 경우의 기본 복귀 경로는 **`/`(검색 화면)**다.
 
-**구현 상태(2026-08-10 Sprint 44 완료)**: `src/middleware.ts`는 `pathname + search` 전체를
+**구현 상태(2026-08-10 Sprint 44 완료)**: `src/proxy.ts`(당시 `src/middleware.ts`)는 `pathname + search` 전체를
 넘기고, `login/actions.ts`의 기본 복귀 경로는 `/`다. 상세 화면의 세션 만료 후 액션 3곳도
 `loginRedirectUrl()`로 통일했다(`docs/BUGS.md` #25). 이 계약은 `tests/frontend-contract.test.mjs`가
 회귀 테스트로 고정하고 있다(mutation 테스트로 검출력 확인 완료).
@@ -176,17 +187,32 @@ Header
 
 ## 5. 공통 Layout
 
-### 5.1 현재 코드에 존재하는 것 (조사 결과)
+### 5.1 AS-IS (2026-08-10 **Sprint 44 이전** 조사 결과)
+
+> **이 표는 과거 기록이다.** 아래 TO-BE(§5.2·§5.3)가 Sprint 44~45에서 전부 구현됐으므로
+> 현재 코드 상태는 표 아래 "2026-08-11 현재" 항목을 봐야 한다. §13의 AS-IS 표와 같은 성격으로
+> "무엇을 왜 바꿨는가"의 근거로만 보존한다.
+> (2026-08-11 Sprint 50 정정: 이 절이 갱신되지 않은 채 남아 "공통 Header가 존재하지 않는다"고
+>  읽혔다 — §11.2의 "중복 컴포넌트를 만들지 않는다"와 정면으로 충돌하는 위험한 stale 기록이었다.)
+
+| 요소 | 당시 현황 |
+|---|---|
+| `src/app/layout.tsx` | RootLayout. metadata(`콕찰 — 법원경매 검색`) + `lang="ko"` + `body` flex column만 정의. **공통 Header 없음** |
+| 공통 Header 컴포넌트 | **존재하지 않았다.** 각 page.tsx가 상단 바를 개별 작성 |
+| `src/components/PrimaryNav.tsx` | 검색 / 최근 본 물건 / 관심물건 3개 링크. `/search`·`/properties`·`/favorites`·`/properties/recent` 상단 바가 공유 |
+| `src/app/properties/LogoutButton.tsx` | 로그아웃 버튼. **`/properties` 헤더에만 연결되어 있었다** |
+| `src/app/globals.css` | `create-next-app` 기본값(배경/전경 변수, 폰트)만. 디자인 토큰 파일 없음 |
+
+**당시 결과**: 로그아웃은 레거시 `/properties`에서만 가능하고, 컨테이너 규칙은 화면마다 제각각이었다.
+
+**2026-08-11 현재 (Sprint 44~45 구현 완료, Sprint 50 재확인)**
 
 | 요소 | 현황 |
 |---|---|
-| `src/app/layout.tsx` | RootLayout. metadata(`콕찰 — 법원경매 검색`) + `lang="ko"` + `body` flex column만 정의. **공통 Header 없음** |
-| 공통 Header 컴포넌트 | **존재하지 않는다.** 각 page.tsx가 상단 바를 개별 작성 |
-| `src/components/PrimaryNav.tsx` | 검색 / 최근 본 물건 / 관심물건 3개 링크. `/search`·`/properties`·`/favorites`·`/properties/recent` 상단 바가 공유 |
-| `src/app/properties/LogoutButton.tsx` | 로그아웃 버튼. **`/properties` 헤더에만 연결되어 있다** |
-| `src/app/globals.css` | `create-next-app` 기본값(배경/전경 변수, 폰트)만. 디자인 토큰 파일 없음 |
-
-**결과**: 로그아웃은 레거시 `/properties`에서만 가능하고, 컨테이너 규칙은 화면마다 제각각이다.
+| `src/components/SiteHeader.tsx` | **공통 Header 존재.** `PrimaryNav` + `LogoutButton`(또는 비로그인 시 로그인 링크)을 조합. `/`·`/search`·`/favorites`·`/properties/recent`·`/properties/[id]`(로딩·실패 상태 포함)가 공유 |
+| `src/lib/layout.ts` | `CONTAINER = 'max-w-[1320px] mx-auto px-4 md:px-8'` — 화면별 하드코딩 없이 이 상수 하나를 공유 |
+| `LogoutButton` | `SiteHeader`를 통해 **모든 주요 화면**에서 사용 가능. 레거시 `/properties`도 계속 직접 사용 |
+| `globals.css` | 변동 없음(디자인 토큰 파일은 여전히 없음 — §16에서 "현 시점 불필요"로 판단) |
 
 ### 5.2 확정 원칙
 
@@ -298,7 +324,7 @@ Tailwind 기본 breakpoint를 그대로 사용한다(`md` 768px / `lg` 1024px / 
 
 - 비로그인 사용자가 검색 결과에서 물건을 클릭하면 **로그인으로 이동**한다.
 - 로그인 후 **해당 상세 URL로 복귀**한다(§3.4 — 쿼리스트링 포함).
-- 게이트는 `src/middleware.ts`의 기존 `/properties/*` 서버사이드 검사를 사용한다.
+- 게이트는 `src/proxy.ts`의 기존 `/properties/*` 서버사이드 검사를 사용한다.
 
 ### 9.2 현재 상세페이지의 실제 정보 구성 (코드 조사 결과)
 
@@ -311,7 +337,7 @@ Tailwind 기본 breakpoint를 그대로 사용한다(`md` 768px / `lg` 1024px / 
 | 기본 정보 | 물건종류, D-day 배지, 소재지, 사건번호(+물건번호), 지번, 최근 수집일 |
 | 가격·일정 | 감정가, 최저입찰가, 입찰기일, 담당법원, 사건번호, 진행상태, 입찰가율, 유찰횟수, 검증상태 |
 | 권리분석 | 점유관계, 공실여부, 임대차 인원수, 명도난이도, 위험도, 인수금액, 특이사항 (`rights_summary` 있을 때만) |
-| 권리분석 신뢰도 | confidence, 정보원(REGISTRY 제외), 충돌, 경고 (`rightsAnalysis.ts`) |
+| 권리분석 신뢰도 | confidence, 정보원(REGISTRY 제외), 충돌, 경고 (`rightsAnalysis.ts`) — 등급 규칙은 아래 참조 |
 | 사건 정보 | 사건종류, 접수일, 배당요구종기일 |
 | 임차인 상세 | SPEC(매각물건명세서) 기준 임차인 목록 |
 | 현황조사서 임차인 | STATUS 기준 임차인 목록 |
@@ -355,6 +381,7 @@ Tailwind 기본 breakpoint를 그대로 사용한다(`md` 768px / `lg` 1024px / 
 | `POST /api/v1/registry-requests` | 필수 | 상세(등기부 신청) | envelope |
 | `GET /api/v1/registry-requests` | 필수 | 상세(기존 신청 조회) | envelope |
 | `GET /api/v1/registry-requests/{id}/download` | 필수 | 상세(다운로드) | **파일 또는 JSON** — `fetchAuthedRaw`로 Content-Type 분기 |
+| `GET /api/v1/subscriptions/me` | 필수 | **아직 프론트 미사용**(2026-08-11 Sprint 52 신설) | envelope + 리스트. 사용자가 자기 구독(플랜/만료/유예/이용가능 여부)을 볼 수 있는 유일한 경로 — 마이페이지 스펙과 무관하게 필요해 API만 먼저 만들었다 |
 
 Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `payments` 조회 계열 일부.
 (Admin 화면은 미구현 — §16)
@@ -381,9 +408,9 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 
 ## 11. 공통 컴포넌트
 
-### 11.1 현재 실제 존재하는 컴포넌트 (2026-08-10 전수 확인)
+### 11.1 현재 실제 존재하는 컴포넌트 (2026-08-11 Sprint 50 전수 재확인)
 
-**`src/components/`** — 5개, 전부 사용 중
+**`src/components/`** — 6개, 전부 사용 중
 
 | 컴포넌트 | 사용처 |
 |---|---|
@@ -392,28 +419,33 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 | `RangeSelect` | `SearchForm`(최저가율, 유찰횟수) |
 | `PropertyTypeTree` (+ `PROPERTY_CATEGORY_GROUPS`) | `SearchForm` |
 | `SearchAccordionSection` | `SearchForm` |
+| `SiteHeader` (Sprint 44 신설) | `/`·`/search`(`SearchScreen`), `/favorites`, `/properties/recent`, `/properties/[id]` |
 
 **라우트 지역 컴포넌트**
 
 | 컴포넌트 | 위치 |
 |---|---|
-| `SearchForm` / `SearchPresets` / `SortBar` / `ResultList` / `Pagination` / `FavoriteButton` | `src/app/search/` |
-| `SearchFilters` / `LogoutButton` | `src/app/properties/` |
-| `rightsAnalysis.ts`(`mapSpecView` / `assembleRightsAnalysis`) | `src/app/properties/[id]/` |
+| `SearchScreen`(`/`와 `/search`가 공유하는 검색 화면 본체) / `SearchForm` / `SearchPresets` / `SortBar` / `ResultList` / `Pagination` / `FavoriteButton` | `src/app/search/` |
+| `LogoutButton` | `src/app/properties/` | (`SearchFilters`는 Sprint 51에 `/properties` 정리와 함께 제거)
+| `rightsAnalysis.ts`(`mapSpecView` / `assembleRightsAnalysis`) / `navContext.ts`(`resolveNavContext`, Sprint 49 분리) | `src/app/properties/[id]/` |
 
-**공용 유틸** — `src/lib/format.ts`(`formatPrice`), `src/lib/api.ts`,
-`src/lib/supabaseClient.ts`(클라이언트 세션), `src/lib/supabaseServer.ts`(서버 세션)
+**공용 유틸** — `src/lib/format.ts`(`formatPrice` / `formatPriceEok`), `src/lib/api.ts`,
+`src/lib/layout.ts`(`CONTAINER`), `src/lib/supabaseClient.ts`(클라이언트 세션),
+`src/lib/supabaseServer.ts`(서버 세션)
+
+**서버 게이트** — `src/proxy.ts`(Sprint 50에 `src/middleware.ts`에서 규약 이전, 로직 무변경)
 
 ### 11.2 확정 원칙
 
 - **동일 기능의 중복 컴포넌트를 새로 만들지 않는다.** 기존 컴포넌트 재사용을 우선한다.
-- 공통 Header는 새로 만들되(현재 존재하지 않음), **내부는 기존 `PrimaryNav` + `LogoutButton`을
-  조합**한다. 네비게이션/로그아웃을 다시 구현하지 않는다.
+- 공통 Header는 **이미 `src/components/SiteHeader.tsx`로 존재한다**(Sprint 44 신설).
+  내부는 기존 `PrimaryNav` + `LogoutButton` 조합이다. **새 Header를 또 만들지 않는다** —
+  네비게이션/로그아웃도 다시 구현하지 않는다.
 - 검색 화면을 `/`와 `/search`가 공유할 때 **화면 컴포넌트를 복제하지 않는다** — 하나를 두고 둘이 함께 쓴다.
-- `formatPrice` 중복: `properties/page.tsx`와 `properties/[id]/page.tsx`에 공용 구현과 다르게 동작하는
-  지역 함수가 남아 있다. **표기 기준 통일은 UX 결정이 선행되어야 하므로 이번 범위에서 통일하지 않는다**(§16).
-- `SearchFilters.tsx`(레거시 `/properties` 전용)는 `SearchForm`과 통합하지 않는다 —
-  `/properties`의 처리 방향이 미결정이기 때문이다(§2.3).
+- `formatPrice` 중복: 두 화면의 지역 구현은 **Sprint 48에서 `formatPriceEok()`로 통합 완료**(표시 숫자 무변경).
+  남은 것은 공용 `formatPrice()`와 표기 기준을 통일할지의 UX 결정뿐이다(§16).
+- ~~`SearchFilters.tsx`(레거시 `/properties` 전용)~~ — **2026-08-11 Sprint 51에 제거**.
+  `/properties`가 `/`로 이동하면서 유일한 사용처가 사라졌다. `SearchForm`과의 통합 논의도 함께 종료.
 
 ---
 
@@ -450,6 +482,9 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 
 - **1단계(현행 범위)**: 기존 `ResultList` 카드를 재사용하고 데스크톱에서 열 수만 늘려 밀도를 확보한다.
   카드 내부 정보 구성은 변경하지 않는다.
+  - 예외(2026-08-11 Sprint 52): **"조회수 -" 표시는 제거했다.** `auction_item`에 조회수 컬럼이
+    없어 **구조적으로 어떤 물건에서도 값이 채워질 수 없는** 자리였다 — 정보 구성 변경이 아니라
+    죽은 UI 제거다. 조회수 기능이 실제로 생기면(스키마 + 집계) 그때 다시 넣는다.
 - **2단계(범위 밖)**: 탱크옥션식 표(table) 뷰. 카드/표 이중 구현이 되므로 별도 결정 후 진행한다.
   이번 범위에서 만들지 않는다.
 
@@ -498,12 +533,14 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 - 반응형(1/2/3열)
 - Navigation
 
-### P2 — 개인화
+### P2 — 개인화 ✅ 실동작 확인 완료 (2026-08-11 Sprint 49)
 
-- 최근조회
-- 관심물건
-- 검색조건 저장
-- 기타 개인화 기능
+- 최근조회 — 상세 진입 시 백엔드가 자동 기록(`record_view()`), `/properties/recent` 최상단에 노출.
+  재조회해도 중복 행이 생기지 않음(`ON CONFLICT DO UPDATE`, `test_api_regression.py`가 회귀 고정)
+- 관심물건 — 상세/검색 결과 어느 쪽에서 토글해도 서버 상태가 바뀌고, `/favorites`와
+  **검색 결과 카드의 하트(`is_favorited`)** 양쪽에 반영됨
+- 검색조건 저장 — 저장 → 목록 노출 → 불러오기(현재 pathname 유지한 채 조건 복원) → 삭제 전부 확인
+- 위 3개는 §16의 JWT 401 이슈(Sprint 46 해결) 이후 실제 브라우저에서 처음으로 전부 실동작 확인됐다
 
 > 실제 코드/문서와 충돌하는 경우 **근거를 기록하고 임의 결정하지 않는다.**
 > 본 문서 작성 중 발견된 충돌은 §13과 §16에 근거와 함께 기록했다.
@@ -554,6 +591,29 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 □ 모든 주요 화면에서 로그인/로그아웃이 가능하다
 □ 기존 검색 / 상세 / 즐겨찾기 / 최근조회 / 등기부 기능의 계약이 그대로 동작한다
 
+### 2026-08-11 (Sprint 49) 실측 결과
+
+위 체크리스트를 **실제 브라우저 + 실제 데이터**로 확인했다(코드 정적 확인이 아니다).
+
+| 항목 | 결과 |
+|---|---|
+| `/` 무redirect · 첫 화면이 검색 화면 | ✅ |
+| 비로그인 검색조건 입력 → 검색 실행 | ✅ 6건, 결과 카드 주소가 전부 조건과 일치 |
+| 결과가 같은 페이지 하단에 이어짐 / 조건 없는 첫 로드도 목록 있음 | ✅ 총 41건 |
+| 정렬 | ⚠️ **결함 2건 발견·수정**(`docs/BUGS.md` #29 #30) 후 ✅ |
+| 페이지 이동 / 페이지 크기 | ✅ (범위 초과 처리 결함 #31 발견·수정) |
+| 물건 클릭 → 상세(로그인 상태) | ✅ `?ids=&i=` 컨텍스트 유지, 이전/다음 이동 동작 |
+| 비로그인 물건 클릭 → 로그인 이동 + **원래 URL 전체 보존** | ✅ 쿠키 없는 실제 브라우저 요청으로 확인 |
+| 로그인 폼이 `redirect` 값을 그대로 실음 | ✅ |
+| 즐겨찾기 / 최근조회 / 검색조건 저장 | ✅ (§14 P2 참고) |
+| 이전/다음 물건 바가 컨텍스트 없을 때 숨겨짐 | ⚠️ **결함 발견·수정**(#32) 후 ✅ |
+| 로그아웃 후 개인화 라우트 차단 | ✅ 세션 없는 요청은 307 → `/login?redirect=<원래 경로>` |
+| 물건종류 검색 | ❌ **미해결** — 69개 중 60개가 항상 0건(#33, §16 결정 대기) |
+
+**자격증명을 다루지 않는 범위**: 실제 비밀번호 제출(로그인 성공 순간)은 검증하지 않았다.
+그 직후의 복귀 경로는 `loginAction`이 `redirect(sanitizeRedirectPath(formData.get('redirect')))`
+임을 계약 테스트가 고정하고, 로그인 폼이 원래 URL을 그대로 싣는 것까지는 HTTP로 확인했다.
+
 ---
 
 ## 16. 이번 범위에서 결정하지 않은 것 (SKIP)
@@ -566,9 +626,11 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 | `src/login/`(도달 불가 중복 코드) 삭제 | SKIP | "사용 여부가 확실하지 않은 코드는 임의 삭제하지 않는다"(`docs/CLAUDE.md`) |
 | `formatPrice` 표기 기준 통일 | SKIP(표기 결정) | 2026-08-10 Sprint 48: 두 화면에 **글자 단위로 동일**하던 구현은 `formatPriceEok()`로 **중복 제거 완료**(표시 숫자 무변경). 남은 것은 공용 `formatPrice()`와 표기 기준을 통일할지의 UX 결정뿐 |
 | 결과 목록 table 뷰 도입 | SKIP | 카드/표 이중 구현. 별도 결정 필요(§12.4) |
-| 마이페이지 / Admin 화면 / 권리분석 전용 화면 | 미착수 | 신규 화면 스펙 미정 |
-| `SortBar`에 `crawl_date` 정렬 노출 | SKIP | 백엔드는 지원하나 UI 노출은 제품 판단 필요(`types.ts` 주석 기록) |
+| Admin 화면 / 권리분석 전용 화면 | 미착수 | Admin은 운영자별 신원 체계 선행 필요(공유 `X-Admin-Key` 하나뿐) |
+| 마이페이지 | **완료** (2026-08-11 Sprint 54) | 기존 API 3종 조합, 읽기 전용 |
+| ~~`SortBar`에 `crawl_date` 정렬 노출~~ | **✅ 2026-08-11 Sprint 52 완료** | 백엔드 화이트리스트·프론트 타입에 이미 있는 값을 UI만 노출하지 않아 **URL을 직접 편집해야 쓸 수 있는 도달 불가 정렬**이었다. 정렬 칩 하나 추가로 해소(API 계약·정렬 규칙 무변경). 계약 테스트가 "타입에 있는 정렬은 UI에도 있어야 한다"를 고정한다 |
 | 검색 Form 면적조건 / 특수조건 활성화 | 불가 | 백엔드 미지원(`auction_item`에 대응 컬럼 없음). "준비 중" 표기 유지 |
+| ~~물건종류 검색 어휘 통일~~ | **✅ 2026-08-11 Sprint 51 해결** | `api/v1/search.py`에 어휘 별칭 7개(다세대주택→다세대, 근린생활시설→근린시설, 오피스텔(주거)/(상업)→오피스텔, 근린상가→상가, 자동차관련→자동차, 기타중기→중기)를 **순수 가산** 방식으로 추가. 원본 패턴을 항상 먼저 넣고 별칭을 OR로 덧붙여 기존 결과가 줄지 않는다 — 응답 구조·파라미터명 무변경이라 API 계약 유지. **UI 어휘(Tank Auction 전수 복사)는 그대로 두었다**(§12.2 무위반). 이름으로 도달 불가한 행 **745 → 0**, 결과가 나오는 항목 9 → 16. 개별 차종은 DB에 구분이 없어 의도적으로 매핑 제외(제품 의미 훼손 방지). 회귀 `test_api_regression.py` §2-B, 변이 4종 검출 확인. 상세는 `docs/BUGS.md` #33 |
 | 상세 페이지 정보 구성 변경 | 범위 밖 | 본 문서 범위는 접근 정책 + 레이아웃 |
 | 디자인 토큰 파일 도입 | SKIP | 현재 Tailwind 유틸리티 하드코딩. 도입은 별도 결정 |
 | ~~로그인 사용자의 JWT를 FastAPI가 401로 거부~~ | **✅ 2026-08-10 Sprint 46 해결** | 2026-08-10 발견·확정(`docs/BUGS.md` #27). Supabase 프로젝트가 **ES256(비대칭 서명)** 으로 전환됐는데(JWKS 200, `kty=EC`) 백엔드는 `algorithms=["HS256"]` + 공유 시크릿으로만 검증한다(`api/auth.py:20-23`, `item.py:47-48`, `search.py:145-146`). **Secret 교체로는 해결되지 않고 검증 코드를 고쳐야 한다.** Sprint 46에서 `api/auth.py`에 JWKS 기반 ES256 검증을 도입해 해결(HS256 병행 유지). 실제 Supabase 토큰으로 401 → 200 확인. **API 서버 완전 재기동 필요** |
@@ -579,3 +641,53 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 ---
 
 END
+
+---
+
+## §9.5 권리분석 신뢰도 등급 (2026-08-11 Sprint 54 확정)
+
+신뢰도는 "데이터가 좋은가"가 아니라 **"얼마나 교차 검증됐는가"**를 나타낸다.
+
+| 등급 | 조건 | 의미 |
+|---|---|---|
+| `LOW` | 정보원끼리 정면으로 어긋남 (`DIRECT_CONFLICT`) | 한쪽이 틀렸다 |
+| `MEDIUM` | 집계 차이(`AGGREGATION_DIFFERENCE`) **또는 대조 불가** | 확정할 수 없다 |
+| `HIGH` | 둘 이상의 정보원이 실제로 대조돼 일치 | 교차 검증됨 |
+
+**대조 불가**는 정보원이 하나뿐이거나, 둘 다 있어도 비교값(임차인 수)이 NULL인 경우다.
+`canCrossCheck()` 한 함수가 이 판정을 담당하고, `detectConflicts()`의 가드와
+`computeConfidence()`의 입력이 **같은 함수를 본다**.
+
+지켜야 하는 계약: **신뢰도 `HIGH`와 정보원 누락 경고(`MISSING_SPEC`/`MISSING_STATUS`)는
+동시에 나올 수 없다.** 예전에는 이 둘이 나란히 표시됐다(BUGS #44 — 대상 물건의 45%).
+`tests/rights-analysis.test.mjs`가 이 계약을 고정한다.
+
+반박된 것(`LOW`)과 확인되지 않은 것(`MEDIUM`)은 다르다. 단일 정보원을 `LOW`로 낮추면
+"명세서와 정면으로 어긋난 물건"과 "명세서가 아직 없는 물건"이 다시 같은 등급이 된다.
+
+> 미해결(BUGS #45): 화면의 "정보원" 행은 **원본 PDF 확보 여부**를 보여주는데,
+> 임차인 표는 **파싱된 데이터**로 그린다. 문서 수집이 멈춘 지금 두 사실이 갈려서
+> "SPEC 미확보" 아래에 명세서 임차인 4명이 표시되는 물건이 있다. 어느 쪽을 "정보원"으로
+> 부를지는 화면 설계 결정이라 미결로 둔다. 신뢰도 계산은 파싱 데이터 기준으로 일관된다.
+
+### §9.5-A 명세서 경고: "문서 없음"과 "파싱 안 됨"의 구분 (2026-08-11 Sprint 55)
+
+| 코드 | 조건 | 문구 | 해야 할 일 |
+|---|---|---|---|
+| `MISSING_SPEC` | 파싱 결과 없음 **+ 문서도 없음** | 확인 가능한 임차인 상세정보가 없습니다 | 문서 수집 |
+| `SPEC_NOT_PARSED` | 파싱 결과 없음 **+ 문서는 확보** | 확보했으나 아직 분석되지 않았습니다 | 파서 점검 |
+
+BUGS #50으로 문서 수집 상태가 화면에 제대로 반영되기 시작하자 드러난 모호함이다.
+물건 54에서 이렇게 보였다.
+
+```
+정보원  SPEC ✓ 확보
+경고    [MISSING_SPEC] 매각물건명세서에서 확인 가능한 임차인 상세정보가 없습니다.
+```
+
+둘 다 사실이지만(문서는 있고 파싱 결과는 없다) 같은 단어를 써서 모순으로 읽혔다.
+두 상황은 손봐야 할 곳이 다르므로 코드와 문구를 나눴다.
+
+**신뢰도에는 영향이 없다.** 문서 파일이 존재한다는 사실만으로 정보원 대조가 되는 것은
+아니기 때문이다 — 이 선을 흐리면 BUGS #44가 다른 경로로 재발한다.
+`tests/rights-analysis.test.mjs`가 "문서 확보 여부가 신뢰도를 바꾸지 않는다"를 고정한다.

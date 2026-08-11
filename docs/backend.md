@@ -39,7 +39,6 @@ doc_stats.py
 storage/
 database.py
 migrate_v4_1.py
-migrate_doc_collect.py
 migrations/
 001_create_favorites.sql
 002_create_recent_items.sql
@@ -116,12 +115,18 @@ backend.md
 | GET | /api/v1/registry-requests/{id}/download |
 | POST/GET | /api/v1/payments |
 | GET | /api/v1/payments/{id} |
+| GET | /api/v1/subscriptions/me | 2026-08-11 Sprint 52 신설. 내 구독 목록(최신순). 파생 필드 `effective_status`/`is_entitled`/`grace_period_end` 포함, 조회 시 lazy sync |
+| POST | /api/v1/payments/webhook/{provider} | 2026-08-11 Sprint 52 신설. **사용자 인증 없음**(PG가 호출) — 서명 검증이 유일한 방어선. 검증 실패 401, `event_id` 멱등 |
 
 ### Admin 전용 (Supabase JWT 아님 — `X-Admin-Key` 헤더, 2026-08-05 추가)
 | 메서드 | 경로 | 비고 |
 |--------|------|------|
 | GET | /api/v1/admin/registry-requests | 목록 조회. `status`/`user_id`/`item_id`/`case_no`/`page`/`size` 필터 |
 | PATCH | /api/v1/admin/registry-requests/{id} | 상태 전이. 허용: PENDING→(PROCESSING,FAILED), PROCESSING→(COMPLETED,FAILED) |
+| GET | /api/v1/admin/payments/webhooks | 2026-08-11 Sprint 53 신설. Webhook 수신 목록. `processing_status`/`provider`/`payment_id`/`signature_verified`/`reprocessable_only` 필터. 각 행에 `reprocessable`·차단 사유 포함 |
+| GET | /api/v1/admin/payments/webhooks/{id} | 2026-08-11 Sprint 53 신설. 원문 payload + 실패 사유 |
+| POST | /api/v1/admin/payments/webhooks/{id}/reprocess | 2026-08-11 Sprint 53 신설. **SUPER_ADMIN 전용**(결제 상태 변경 가능). 수신 경로와 같은 `_apply_webhook_event()`를 타므로 상태머신 우회 없음. 서명 미검증/이미 처리됨/FAILED는 거부 |
+| POST | /api/v1/admin/payments/{id}/refund | 2026-08-11 Sprint 52 신설. **SUPER_ADMIN 전용**(과금 직접 영향). 전액/부분/반복 환불, 상태머신 관문 통과 필수, 멱등, 감사 로그 기록. 실제 PG 호출 없음(MockProvider) |
 
 - 인증 방식이 다른 모든 API와 다르다: Supabase JWT를 쓰지 않고 `X-Admin-Key` 헤더를 서버 환경변수 `ADMIN_API_KEY`와 비교한다(`api/v1/admin.py:require_admin`). 2026-08-06(Sprint 15)부터 `hmac.compare_digest()`로 상수 시간 비교(타이밍 공격 방어) — 이전에는 단순 `!=` 비교였음. 역할(role) 개념이 프로젝트 어디에도 없어 MVP로 도입한 임시 인증이며, 사용자별 권한 구분은 없다(키를 아는 사람은 전체 관리자 권한, 이 부분은 이번 수정 범위 밖).
 - `ADMIN_API_KEY`가 `.env`에 설정되어 있지 않으면 요청 자체가 `500 "관리자 키 미설정"`으로 막힌다 — 아직 `.env`에 값이 없다(운영 전 사용자가 직접 설정 필요, DB/env 변경 승인 정책상 임의로 넣지 않음).

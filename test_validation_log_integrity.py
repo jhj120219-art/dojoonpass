@@ -23,6 +23,8 @@ list comprehension으로 항목마다 한 번씩 append), test_db.py(실 크롤�
 import sys
 import os
 import json
+import shutil
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +46,13 @@ def check_true(name, cond, detail=""):
         failures.append(name)
 
 
-QA_LOG_PATH = "logs/qa-validation-" + uuid.uuid4().hex[:8] + ".jsonl"
+# 2026-08-11 Sprint 52 — `logs/`(OneDrive 동기화 폴더) 대신 시스템 임시 디렉터리를 쓴다.
+# `test_checkpoint_atomicity.py`에서 같은 위치가 간헐적 flaky의 원인이었다(동기화 중인
+# 파일에 쓰고 곧바로 읽으면 이전 내용이 보이는 경우가 있었다). 이 테스트도 append 직후
+# 바이트 단위로 되읽는 구조라 동일한 노출이 있어 선제적으로 옮긴다.
+# 검증 대상은 ValidationEngine의 append 로직이지 저장소의 logs/ 디렉터리가 아니다.
+QA_DIR = tempfile.mkdtemp(prefix="dojoonpass-qa-validation-")
+QA_LOG_PATH = os.path.join(QA_DIR, "qa-validation-" + uuid.uuid4().hex[:8] + ".jsonl")
 
 
 def make_item(case_no, appraisal="100000000", minimum="80000000"):
@@ -122,6 +130,8 @@ def cleanup():
     if os.path.exists(QA_LOG_PATH):
         os.remove(QA_LOG_PATH)
     check_true("qa validation log removed", not os.path.exists(QA_LOG_PATH))
+    shutil.rmtree(QA_DIR, ignore_errors=True)
+    check_true("qa temp dir removed", not os.path.exists(QA_DIR), QA_DIR)
 
 
 def run():

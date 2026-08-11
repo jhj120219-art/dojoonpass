@@ -23,6 +23,8 @@ mvp_scraper.py의 단일 프로세스, 법원 순차 루프(`for court in courts
 import sys
 import os
 import json
+import shutil
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +48,18 @@ def check_true(name, cond, detail=""):
         failures.append(name)
 
 
-QA_PATH = "logs/qa-checkpoint-" + uuid.uuid4().hex[:8] + ".json"
+# 2026-08-11 Sprint 52 — 저장소 안(`logs/`)이 아니라 **시스템 임시 디렉터리**에 쓴다.
+#
+# 왜 옮겼나: 이 저장소는 OneDrive 동기화 폴더 안에 있고, `logs/`에 쓰면 OneDrive가 그 파일을
+# 실시간으로 스캔·동기화한다. 그 상태에서 `os.replace()` 직후 읽으면 **간헐적으로 교체 이전
+# 내용이 보였다** — 15종 순차 실행에서 재현(`before_crash`가 `{}`로 읽혀 다음 단언이
+# TypeError). 단독 실행 5회는 전부 통과해 원인 파악이 늦어질 수 있는 형태의 flaky였다.
+#
+# 이 테스트가 검증하는 것은 `CheckpointManager`의 **순수 로직**(임시파일 + os.replace)이지
+# 저장소의 `logs/` 디렉터리가 아니다. 동기화 폴더를 벗어나면 그 무관한 실패 요인이 사라진다.
+# (제품 코드는 그대로 `logs/checkpoint.json`을 쓴다 — 테스트 경로만 바꾼 것이다.)
+QA_DIR = tempfile.mkdtemp(prefix="dojoonpass-qa-checkpoint-")
+QA_PATH = os.path.join(QA_DIR, "qa-checkpoint-" + uuid.uuid4().hex[:8] + ".json")
 
 
 def test_save_get_clear_roundtrip():
@@ -135,6 +148,9 @@ def cleanup():
         if os.path.exists(p):
             os.remove(p)
     check_true("qa checkpoint file removed", not os.path.exists(QA_PATH))
+    # 임시 디렉터리째 정리한다(시스템 temp라 저장소에는 아무것도 남기지 않는다).
+    shutil.rmtree(QA_DIR, ignore_errors=True)
+    check_true("qa temp dir removed", not os.path.exists(QA_DIR), QA_DIR)
 
 
 def run():

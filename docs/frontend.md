@@ -5,19 +5,23 @@
 - 콕찰(Kokchal, 구 도준패스): 법원경매 매물 조회 / 로그인 서비스
 - 이 문서는 2026-07-22 실제 코드(`src/`) 재확인을 기준으로 재작성됨. 이전 버전은 현재 저장소에 존재하지 않는 구현(NextAuth, `components/`, `lib/mock`, `lib/api` 등)을 전제로 작성되어 있었음 — "주의사항" 참고
 
-## 현재 화면 구성 (실제 구현됨, 2026-08-05 재확인)
+## 현재 화면 구성 (실제 구현됨, 2026-08-11 Sprint 50 재확인)
 
-- `/`: 서버 컴포넌트. 로그인 세션 확인 후 `/properties`(로그인 시) 또는 `/login`(비로그인 시)으로 즉시 redirect. 자체 UI 없음
+- `/`: 서버 컴포넌트. **검색 화면 자체**다 — `SearchScreen`(`src/app/search/SearchScreen.tsx`)을 렌더하며 **어떤 경로로도 redirect하지 않는다**.
+  (2026-08-11 Sprint 50 정정: 이 줄은 오랫동안 "로그인 시 `/properties`, 비로그인 시 `/login`으로 즉시 redirect. 자체 UI 없음"으로 남아 있었다 —
+  Sprint 44에서 redirect를 제거했는데 이 절만 갱신되지 않아, 같은 문서의 아래 "페이지 구조" 표와 서로 모순되던 stale 기록이다.)
 - `/login`: 로그인/회원가입 통합 폼(클라이언트 컴포넌트, `useActionState`로 모드 전환)
 - `/properties`: 매물 목록(서버 컴포넌트). Supabase `properties` 테이블 직접 조회 — FastAPI 백엔드 미사용
 - `/properties/[id]`: 매물 상세(클라이언트 컴포넌트). FastAPI `GET /api/v1/item/{id}`로 물건 데이터 조회 + `POST/GET /api/v1/registry-requests`, `POST /api/v1/payments`로 등기부등본 신청/구독/초과결제 처리 (2026-08-05 연동, 아래 "API 호출 방식" 참고). Supabase `view_counts` 기반 구현은 제거됨(`properties/[id]/actions.ts` 삭제)
 - `/properties/recent`: 최근조회 목록. FastAPI `GET /api/v1/recent-items` 사용 (Release 완료)
-- `/search`: 검색 화면. FastAPI `GET /api/v1/search` 사용 (Release 완료)
+- `/search`: `/`와 **동일한 `SearchScreen`을 공유**하는 검색 화면(복제 없음). 기존 링크/북마크 호환용으로 유지. FastAPI `GET /api/v1/search` 사용 (Release 완료)
 - `/favorites`: 관심물건 목록. FastAPI `/api/v1/favorites` 사용 (Release 완료)
 
 **중요**: `/properties`(+ `[id]`의 물건 목록 데이터 자체)는 Supabase 직접 조회, `/search`·`/favorites`·`/properties/recent`·`[id]`의 상세 데이터는 FastAPI 경유 — 두 데이터 경로가 화면별로 공존한다. 이전 버전 문서는 후자(Search/Favorite/최근조회)가 전부 미구현이라고 기술했으나 현재는 Release 완료 상태다.
 
-미구현 (2026-08-07 재확인): **마이페이지**, **관리자(Admin) 화면**, 권리분석 화면(상세 페이지 내 `rightsAnalysis.ts`는 REGISTRY 소스를 `available:false`로 하드코딩한 스텁 — 등기부 신청 카드와는 별개)
+~~마이페이지~~ → **2026-08-11 Sprint 54 구현 완료** (`/mypage`). 기존 API 3종(`/subscriptions/me`, `/payments`, `/registry-requests`)을 조합한 읽기 전용 화면으로,신규 엔드포인트를 만들지 않았다. 구독 해지 같은 정책 미결정 액션은 넣지 않았다.
+
+미구현 (2026-08-11 재확인): **관리자(Admin) 화면** — 인증이 공유 `X-Admin-Key` 하나뿐이고 `audit_logs.admin_id`에 사람이 아니라 역할 문자열이 기록된다. 환불이 누구 소행인지 남지 않으므로 **운영자별 신원 체계가 선행**돼야 한다. 권리분석 전용 화면 — 상세 페이지 안의 권리분석/신뢰도 섹션은 동작하지만(`rightsAnalysis.ts`, 신뢰도 규칙은 FRONTEND_MASTER_SPEC §9.5), REGISTRY 소스는 여전히 `available:false` 고정이고 표시할 데이터 자체가 거의 없다(`rights_summary` 162/1,870건, 분석 컬럼 19개 중 14개가 100% NULL — BUGS #46).
 
 ~~플랜 선택 UI~~ → 2026-08-06 구현됨(`properties/[id]/page.tsx` 등기부 카드 안의 월/연 토글 + BASIC/PRO 비교 카드. 별도 페이지가 아님).
 ~~검색조건 저장 UI~~ → 구현됨(`src/app/search/SearchPresets.tsx`, `/search` 화면에 노출).
@@ -32,11 +36,11 @@
 |---|---|---|
 | `/` | 없음 — **검색 화면**(2026-08-10 Sprint 44에서 redirect 제거 완료) | 구현됨 |
 | `/login` | 없음 | 구현됨 |
-| `/properties` | 로그인 필요 (middleware + 페이지 내부 이중 체크) | 구현됨 |
-| `/properties/[id]` | 로그인 필요 (middleware `/properties/*` 게이트 + 페이지 내부 체크) | 구현됨 |
-| `/properties/recent` | 로그인 필요 (middleware + 페이지 내부 체크) | 구현됨 |
-| `/search` | 로그인 불필요(비로그인도 조회 가능) | 구현됨 |
-| `/favorites` | 로그인 필요 (**Sprint 45부터 middleware + 페이지 내부 이중 체크**) | 구현됨 |
+| `/properties` | 로그인 필요 (`proxy.ts` + 페이지 내부 이중 체크) | 구현됨(레거시·고아 라우트) |
+| `/properties/[id]` | 로그인 필요 (`proxy.ts`의 `/properties/*` 게이트 + 페이지 내부 체크) | 구현됨 |
+| `/properties/recent` | 로그인 필요 (`proxy.ts` + 페이지 내부 체크) | 구현됨 |
+| `/search` | 로그인 불필요(비로그인도 조회 가능) | 구현됨(`/`와 `SearchScreen` 공유) |
+| `/favorites` | 로그인 필요 (**Sprint 45부터 `proxy.ts` 서버 게이트 + 페이지 내부 이중 체크**) | 구현됨 |
 
 ## 첫 진입 화면 정책 (2026-08-10 확정 → **같은 날 Sprint 44에서 구현 완료**)
 
@@ -48,7 +52,8 @@
 > **Sprint 45 추가**: `SiteHeader`가 `/properties/[id]`(상세)에도 적용돼 전 주요 화면이
 > 공통 Header를 공유한다(상세 전용 바는 유지, 위에 얹는 방식).
 > 프론트엔드 계약 테스트가 생겼다 — `tests/frontend-contract.test.mjs`,
-> `npm run test:frontend`(20검사, Node 내장 러너, 새 의존성 없음). `docs/TEST_PLAN.md` §1-A 참고.
+> `npm run test:frontend`. 이후 확장되어 **2026-08-11 Sprint 50 기준 53검사**
+> (계약 45 + `tests/nav-context.test.mjs` 8, Node 내장 러너, 새 의존성 없음). `docs/TEST_PLAN.md` §1-A 참고.
 
 
 확정 정책은 `search/00_SEARCH_MVP.md` v0.2 §1~§3에 있다. 요약:
@@ -71,8 +76,8 @@
 
 `/properties/[id]`(상세) 게이트는 **2026-08-10 확정됐다: 로그인 필수** — 더 이상 PM 결정 대기
 항목이 아니다. 비로그인은 목록까지만 보고, 물건을 클릭하는 순간 로그인으로 이동한다.
-`middleware.ts`의 `/properties/*` 게이트가 이미 이 정책과 일치하므로 게이트 로직은 그대로 두되,
-로그인 redirect가 **쿼리스트링을 버리는 결함**은 수정 대상이다(`middleware.ts:42`가 `pathname`만
+`proxy.ts`(당시 `middleware.ts`)의 `/properties/*` 게이트가 이미 이 정책과 일치하므로 게이트 로직은 그대로 두되,
+로그인 redirect가 **쿼리스트링을 버리는 결함**은 수정 대상이다(당시 `middleware.ts:42`가 `pathname`만
 넘겨 상세의 `?ids=&i=` 이전/다음 물건 컨텍스트가 소실됨. `login/actions.ts`의 기본 복귀 경로도
 레거시 `/properties`라 `/`로 바뀌어야 함).
 
@@ -156,6 +161,28 @@
 
 ## 알려진 문제점
 
+### 2026-08-11 (Sprint 49) 실제 브라우저 검증에서 발견
+
+- ~~정렬 화살표가 실제 데이터 순서와 반대로 표시되고, 정렬 버튼을 눌러도 결과가 바뀌지 않음~~
+  → **해결** (`docs/BUGS.md` #29 — `SortBar`의 `sort_order` 기본값을 백엔드와 같은 `desc`로)
+- ~~정렬을 바꿔도 페이지 번호가 유지되어 "감정가 높은 순"인데 가장 싼 물건이 보임~~
+  → **해결** (#30 — 정렬 변경 시 `page=1`)
+- ~~페이지 번호가 범위를 벗어나면 "검색 결과가 없습니다"로 오인 안내 + 복구 링크가 검색조건을 버림~~
+  → **해결** (#31 — 두 상태 구분 + 검색조건 유지 1페이지 복귀 링크)
+- ~~`/favorites`·`/properties/recent`에서 상세로 들어가면 "이전/다음 물건" 바가 "1 / 1"로 죽은 채 노출~~
+  → **해결** (#32 — `navContext.ts` 순수 함수로 분리 + 빈 세그먼트/`i` 부재 처리)
+- **[미해결 · 결정 필요] 검색 물건종류 69개 중 60개가 항상 0건** (`docs/BUGS.md` #33).
+  `PropertyTypeTree`의 어휘는 Tank Auction HTML 전수 복사인데 DB는 크롤러 수집 원문 18종이고
+  백엔드는 `LIKE %값%` 매칭이라, `다세대`(246) `근린시설`(164) `상가,오피스텔,근린시설`(202)
+  `오피스텔`(102) 등이 **이름으로 아예 선택되지 않는다**(도달 불가 745/1,870 ≈ 40%).
+  어휘를 어느 쪽으로 통일할지가 제품 판단이라 임의 수정하지 않고 측정치만 기록했다
+- **[저심각도]** `?size=abc`·`?page=0`처럼 백엔드 검증(422)에 걸리는 파라미터가 URL로 들어오면
+  화면 전체가 "검색 결과를 불러오지 못했습니다" 한 줄이 된다(검색 Form은 남아 있어 복구는 가능).
+  UI 조작으로는 만들 수 없고 URL 직접 입력에서만 발생 — 별도 안내 문구는 미도입
+- **[저심각도]** 비로그인 상태에서 검색조건 이름을 입력하고 "저장"을 누르면 로그인으로 유도되는데,
+  복귀 후 **입력했던 이름은 남지 않는다**(검색조건 자체는 URL로 보존됨)
+
+
 - **데이터 소스 불일치(`/properties`만 해당, 2026-08-05 기준 범위 축소)**: `/properties`(목록)와 `/properties/[id]`의 물건 목록 진입 경로는 여전히 Supabase 테이블 `properties`(컬럼: `title`, `bid_date`, `case_number`, `detail_info`, `status` 등 — `auction_item`과 이름·구조가 다름)를 직접 조회해 크롤러 데이터(`auction_item`)가 노출되지 않는다. 반면 `/search`, `/favorites`, `/properties/recent`와 `/properties/[id]`의 상세 데이터 자체는 FastAPI(`auction_item` 경유)를 사용하므로 이 문제는 `/properties` 목록 화면에 한정된다 — `docs/decision-log.md`의 "검색은 SQLite 기반" 결정과는 `/search`에서는 이미 일치, `/properties`에서는 여전히 어긋남
 - ~~등기부 열람 로직 이중 구현~~ → 2026-08-05 해소됨: `properties/[id]/actions.ts`(Supabase `view_counts`) 삭제, `api/v1/registry.py` 하나로 일원화. 정책도 2026-08-06 확정 + **코드 반영 완료**(플랜별 월 단위: 베이직 5회/프로 10회, `registry.py:get_user_free_limit()`/`get_free_count()`). 이전 문서의 "코드는 아직 평생 누적 5회"는 2026-08-07 기준 stale
 - ~~`PLAN_OPTIONS` 확정 Spec 미반영~~ → **2026-08-06 완료**: `properties/[id]/page.tsx`가 월/연 결제주기 토글 + 플랜 카드(베이직 12,900원·월5회 / 프로 22,900원·월10회)를 표시하고, 연 결제 시 프로는 정상가 274,800원 취소선 + 판매가 198,000원을 함께 노출한다. 결제 요청에 `billing_cycle`을 함께 보내며 금액은 서버(`PLAN_CATALOG`)가 재검증한다. 할인은 `listPrice`/`price` 분리 구조라 이벤트 적용 시 값만 교체하면 된다
@@ -197,5 +224,7 @@
 - `/properties` 목록을 FastAPI(`auction_item`) 기반으로 전환할지, Supabase `properties`를 유지할지 결정 — PM 확인 필요 (미결정)
 - ~~등기부 열람 로직 일원화~~ (2026-08-05 완료, 위 참고)
 - ~~플랜 비교/선택 UI~~ (2026-08-06 완료), ~~검색조건 저장 UI~~ (완료 — `SearchPresets.tsx`)
-- 마이페이지, **Admin 화면**, 권리분석 화면 신규 구현 (전부 미착수)
+- ~~마이페이지~~ (2026-08-11 Sprint 54 완료 — `/mypage`)
+- **Admin 화면** — 운영자별 신원 체계 선행 필요 (위 참고)
+- 권리분석 전용 화면 — 데이터 커버리지 회복(BUGS #46)이 선행돼야 의미가 있다
 - ~~등기부 다운로드 UI~~ (2026-08-05 완료)

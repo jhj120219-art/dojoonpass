@@ -21,6 +21,7 @@ FastAPI TestClient로 api_server.app을 직접 호출하므로 라우팅/의존�
 """
 import sys
 import os
+import json
 import uuid
 import secrets
 from datetime import datetime, timedelta
@@ -60,16 +61,34 @@ failures = []
 ENVELOPE_KEYS = {"success", "data", "error", "meta", "message"}
 
 
+def _safe_out(text):
+    """콘솔 인코딩으로 표현할 수 없는 문자를 안전하게 치환한다.
+
+    2026-08-11 Sprint 53 — 변이 테스트 중에 발견한 **하네스 결함**을 고친 것이다.
+    이 파일 상단 규칙("출력은 ASCII만 사용한다")은 테스트가 직접 쓰는 문자열에만 적용되는데,
+    실패 시 출력하는 `detail`에는 **제품 코드가 만든 문자열**이 그대로 실린다. 거기에 em-dash(—)
+    같은 문자가 있으면 Windows cp949 콘솔에서 `UnicodeEncodeError`가 나고, 그 순간
+    **실패가 깔끔한 FAIL이 아니라 스위트 중단으로 바뀐다** — 남은 검사도 실행되지 않는다.
+    실제로 "서명 미검증 재처리 허용" 변이를 넣었을 때 FAIL 0건 + 크래시로 나타나
+    회귀의 성격을 오판하기 쉬운 상태였다.
+
+    개별 문자열을 ASCII로 다듬는 대신 출력 함수 한 곳에서 막는다 — 앞으로 어떤 제품 문자열이
+    들어와도 같은 사고가 재발하지 않는다.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return str(text).encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
 def check(name, actual, expected):
     ok = actual == expected
-    print("[%s] %s: %r (expected %r)" % ("PASS" if ok else "FAIL", name, actual, expected))
+    print(_safe_out("[%s] %s: %r (expected %r)" % ("PASS" if ok else "FAIL", name, actual, expected)))
     if not ok:
         failures.append(name)
 
 
 def check_true(name, cond, detail=""):
     ok = bool(cond)
-    print("[%s] %s%s" % ("PASS" if ok else "FAIL", name, ("" if ok else " -> " + str(detail))))
+    print(_safe_out("[%s] %s%s" % ("PASS" if ok else "FAIL", name, ("" if ok else " -> " + str(detail)))))
     if not ok:
         failures.append(name)
 
@@ -156,6 +175,111 @@ def test_search():
     r = client.get("/api/v1/search/regions?sido=서울")
     check("regions status", r.status_code, 200)
     check_true("regions returns list", isinstance(r.json()["sigungu"], list))
+
+
+# ---------------------------------------------------------------------------
+# 2-B. 물건종류 어휘 별칭 (docs/BUGS.md #33, 2026-08-11 Sprint 51 신규)
+# ---------------------------------------------------------------------------
+def test_property_type_aliases():
+    """
+    검색 UI(PropertyTypeTree)의 물건종류 어휘와 크롤러가 저장하는 법원 원문 어휘가 달라
+    69개 중 62개가 항상 0건이던 문제(#33)의 회귀 테스트.
+
+    핵심 불변식은 **가산성(additive)** 이다 — 별칭은 매칭을 넓히기만 하고 좁히지 않는다.
+    그래서 "0건이던 게 살아났는가"뿐 아니라 "원래 되던 게 그대로인가"를 함께 고정한다.
+    고정 건수를 단언하지 않고 **관계**로만 단언해 데이터가 늘어도 유효하다.
+    """
+    print("\n--- 2-B. property_type 어휘 별칭 (#33) ---")
+
+    def total(pt=None, **kw):
+        params = {"size": "1", "include_closed": "true"}
+        if pt is not None:
+            params["property_type"] = pt
+        params.update(kw)
+        qs = "&".join("%s=%s" % (k, v) for k, v in params.items())
+        return client.get("/api/v1/search?" + qs).json()["total"]
+
+    everything = total()
+    check_true("baseline: 전체 물건이 존재한다", everything > 0, everything)
+
+    # (1) 별칭이 붙은 UI 어휘가 실제로 결과를 돌려준다.
+    #
+    # **기대값을 코드에서 끌어오지 않는다.** 처음 작성했을 때는
+    # `for ui_label, db_tokens in PROPERTY_TYPE_ALIASES.items():`로 돌렸는데,
+    # 변이 테스트에서 **별칭 표를 통째로 비우면 루프가 0회 실행되어 아무것도 단언하지 않고
+    # 전부 통과**하는 것을 발견했다(검증 대상 자체를 기대값의 출처로 삼은 자기참조 결함).
+    # 그래서 여기 목록은 테스트가 직접 들고 있고, 구현 표는 아래에서 "이 목록을 덮는가"로만 본다.
+    REQUIRED_ALIASES = [
+        ("다세대주택", "다세대"),
+        ("오피스텔(주거)", "오피스텔"),
+        ("오피스텔(상업)", "오피스텔"),
+        ("근린생활시설", "근린시설"),
+        ("근린상가", "상가"),
+        ("자동차관련", "자동차"),
+        ("기타중기", "중기"),
+    ]
+    for ui_label, db_token in REQUIRED_ALIASES:
+        token_total = total(db_token)
+        if token_total == 0:
+            # 이 카테고리 데이터가 아직 없으면 건수 비교는 의미가 없다.
+            # 다만 별칭 매핑 자체가 사라진 것은 아닌지 아래 (1-b)에서 별도로 고정한다.
+            continue
+        alias_total = total(ui_label)
+        check_true("별칭 '%s' -> '%s' 결과가 나온다" % (ui_label, db_token),
+                   alias_total > 0, (ui_label, alias_total))
+        # 별칭은 원본 토큰이 잡는 행을 전부 포함해야 한다(부분집합이 아니라 상위집합).
+        check_true("별칭 '%s' 건수 >= 원본 토큰 '%s' 건수" % (ui_label, db_token),
+                   alias_total >= token_total, (alias_total, token_total))
+
+    # (1-b) 데이터가 비어 있는 카테고리까지 포함해 **매핑 표 자체**를 고정한다.
+    #       데이터가 다 빠져도 별칭이 조용히 사라지는 것을 막는다.
+    from api.v1.search import PROPERTY_TYPE_ALIASES, _property_type_patterns
+    for ui_label, db_token in REQUIRED_ALIASES:
+        check_true("별칭 표에 '%s' -> '%s'가 있다" % (ui_label, db_token),
+                   db_token in PROPERTY_TYPE_ALIASES.get(ui_label, []),
+                   (ui_label, PROPERTY_TYPE_ALIASES.get(ui_label)))
+        # 확장 결과에는 **원본이 항상 먼저** 포함돼야 한다(가산성의 코드 레벨 보장).
+        patterns = _property_type_patterns([ui_label])
+        check("확장의 첫 패턴은 원본 '%s'" % ui_label, patterns[0], ui_label)
+        check_true("확장에 '%s'가 포함된다" % db_token, db_token in patterns, patterns)
+
+    # (2) 가산성: 별칭이 **없는** 어휘의 결과는 별칭 도입과 무관하게 그대로여야 한다.
+    #     원본 토큰으로 직접 조회한 값과 자기 자신을 넣은 값이 같아야 한다(확장이 원본을 삼키지 않음).
+    for plain in ("아파트", "연립주택", "임야", "대지", "단독주택", "다가구주택", "기타"):
+        check_true("별칭 없는 '%s'는 그대로 동작" % plain, total(plain) > 0, plain)
+
+    # (3) 존재하지 않는 카테고리는 계속 0건이어야 한다 — 별칭이 과도하게 넓어지지 않았는지.
+    #     특히 개별 차종은 DB에 구분이 없어 의도적으로 매핑하지 않았다(제품 의미 훼손 방지).
+    for absent in ("승용차", "화물차", "덤프트럭", "선박", "광업권", "기숙사"):
+        check("과확장 없음: '%s'는 0건" % absent, total(absent), 0)
+
+    # (4) 필터를 걸면 전체보다 작거나 같아야 한다(어떤 어휘도 전체를 초과할 수 없다).
+    for label in ("다세대주택", "근린생활시설", "오피스텔(주거)", "근린상가"):
+        check_true("'%s' <= 전체" % label, total(label) <= everything, label)
+
+    # (5) 다중 선택(콤마 join)은 합집합이다 — 별칭 확장 후에도 유지되어야 한다.
+    a, b = total("임야"), total("다세대주택")
+    if a and b:
+        both = total("임야,다세대주택")
+        check_true("다중 선택은 합집합", max(a, b) <= both <= a + b, (a, b, both))
+
+    # (6) 별칭 확장이 SQL 파라미터 바인딩을 깨지 않는다(주입 방어 유지).
+    r = client.get("/api/v1/search?property_type=' OR 1=1--")
+    check("별칭 확장 후에도 주입 무해", r.status_code, 200)
+    check("주입 결과 0건", r.json()["total"], 0)
+
+    # (7) 토큰 개수 상한 — 클라이언트 입력으로 500을 만들 수 없어야 한다.
+    #     실측(Sprint 51): 상한 도입 전에는 2,000개를 보내면 SQLite 표현식 한계로 **500**이 났다.
+    #     UI 트리 전체가 69개이므로 상한 100은 정상 사용에 여유가 있다.
+    from api.v1.search import MAX_PROPERTY_TYPES
+    check_true("상한이 UI 트리 최대(69개)보다 크다", MAX_PROPERTY_TYPES > 69, MAX_PROPERTY_TYPES)
+    at_limit = ",".join("가나다%d" % i for i in range(MAX_PROPERTY_TYPES))
+    over_limit = ",".join("가나다%d" % i for i in range(MAX_PROPERTY_TYPES + 1))
+    check("상한 이내는 허용", client.get("/api/v1/search?property_type=" + at_limit).status_code, 200)
+    check("상한 초과는 400", client.get("/api/v1/search?property_type=" + over_limit).status_code, 400)
+    # 과거에 500이 나던 크기에서도 500이 아니라 400이어야 한다.
+    huge = ",".join("가나다%d" % i for i in range(2000))
+    check("대량 입력에도 서버 오류(5xx) 없음", client.get("/api/v1/search?property_type=" + huge).status_code, 400)
 
 
 # ---------------------------------------------------------------------------
@@ -676,9 +800,17 @@ def test_registry():
     check("other user cannot download",
           client.get("/api/v1/registry-requests/%d/download" % req_id, headers=other_h).status_code, 404)
 
-    # 미완료 상태 다운로드는 거짓 성공 없이 실패 메시지를 반환
+    # 미완료 상태 다운로드는 거짓 성공 없이 실패 메시지를 반환.
+    # ★ success=False만 보면 안 된다 (2026-08-11 Sprint 56): 상태 검사를 통째로 없애는
+    #   변이를 넣었더니 doc_url이 NULL이라 다른 오류(REGISTRY_DOCUMENT_NOT_FOUND)로 떨어져
+    #   테스트가 그대로 통과했다. **어느 가드가 막았는지**까지 고정해야 가드 제거가 검출된다.
     r = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
-    check("incomplete download not a file", r.json()["success"], False)
+    body = r.json()
+    check("incomplete download not a file", body["success"], False)
+    check("incomplete download blocked by status gate", body.get("error"), "REGISTRY_NOT_COMPLETED")
+    check_true("error message names the actual status",
+               "PENDING" in str(body.get("message", "")) or "PROCESSING" in str(body.get("message", "")),
+               body.get("message"))
 
     # 실제 성공 다운로드 — 지금까지 이 파일은 "COMPLETED인데 파일이 없는" 방어 경로만
     # 검증했고(위 admin 섹션의 doc_url이 항상 존재하지 않는 더미 파일이었다), 베타 사용자
@@ -805,6 +937,41 @@ def test_registry_overage_flow():
         check("target request still unlinked after failed payment", still_unclaimed["payment_id"], None)
     finally:
         conn.close()
+
+    # --- 미결제 신청을 관리자가 완료 처리할 수 없다 (2026-08-11 Sprint 56 신설) -------
+    # 이것이 초과 과금의 **실질적 우회 경로**다. PAYMENT_REQUIRED는 "돈을 아직 안 냈다"는
+    # 뜻이고, COMPLETED가 되면 다운로드 게이트(status==COMPLETED)가 열려 등기부를 공짜로
+    # 받게 된다. `ALLOWED_TRANSITIONS`에 PAYMENT_REQUIRED 키가 아예 없어 막혀 있지만,
+    # 그 사실을 고정하는 회귀가 없었다 — 키를 하나 추가하는 것만으로 조용히 뚫린다.
+    ah_guard = {"X-Admin-Key": TEST_ADMIN_KEY}
+    for target in ("COMPLETED", "PROCESSING", "FAILED"):
+        body = {"status": target}
+        if target == "COMPLETED":
+            body["doc_url"] = "qa-should-not-be-created.pdf"
+        if target == "FAILED":
+            body["reason"] = "qa"
+        rr = client.patch("/api/v1/admin/registry-requests/%d" % over["id"], json=body, headers=ah_guard)
+        check("PAYMENT_REQUIRED -> %s 는 거부" % target, rr.status_code, 400)
+
+    conn = get_connection()
+    try:
+        after = conn.execute(
+            "SELECT status, doc_url, completed_at FROM registry_requests WHERE id=?", (over["id"],)
+        ).fetchone()
+        check("거부된 전이 후에도 상태 불변", after["status"], "PAYMENT_REQUIRED")
+        check("거부된 전이가 doc_url을 남기지 않는다", after["doc_url"], None)
+        check("거부된 전이가 completed_at을 남기지 않는다", after["completed_at"], None)
+    finally:
+        conn.close()
+
+    # 그 상태로 다운로드도 당연히 막혀야 한다(가드가 두 겹인지 확인).
+    # 여기서도 **어느 가드가 막았는지**를 고정한다 — success=False만 보면 상태 검사를
+    # 없애도 doc_url NULL 때문에 다른 오류로 떨어져 통과해 버린다.
+    dl = client.get("/api/v1/registry-requests/%d/download" % over["id"], headers=h).json()
+    check("미결제 신청은 다운로드 불가", dl["success"], False)
+    check("미결제 다운로드는 상태 게이트가 막는다", dl.get("error"), "REGISTRY_NOT_COMPLETED")
+    check_true("오류 메시지가 PAYMENT_REQUIRED임을 밝힌다",
+               "PAYMENT_REQUIRED" in str(dl.get("message", "")), dl.get("message"))
 
     # 초과분 결제(실패 후 재시도, 정상 provider) -> 해당 신청이 PENDING으로 자동 전환
     r = client.post("/api/v1/payments",
@@ -1103,6 +1270,16 @@ EXPECTED_ENDPOINTS = {
     ("GET", "/api/v1/admin/subscriptions"),
     ("PATCH", "/api/v1/admin/subscriptions/{subscription_id}"),
     ("GET", "/api/v1/admin/audit-logs"),
+    # 2026-08-11 Sprint 52 신설 — 결제 도메인 내부 완성(환불 / Webhook 수신).
+    # 실제 PG 호출은 없다(MockProvider). 두 경로 모두 이 파일 §29에서 검증한다.
+    ("POST", "/api/v1/admin/payments/{payment_id}/refund"),
+    ("POST", "/api/v1/payments/webhook/{provider_name}"),
+    # 사용자가 자기 구독을 볼 수 있는 유일한 경로. 마이페이지 스펙과 무관하게 필요하다.
+    ("GET", "/api/v1/subscriptions/me"),
+    # 2026-08-11 Sprint 53 — Webhook 운영 도구(조회/상세/재처리). 실제 PG 호출 없음.
+    ("GET", "/api/v1/admin/payments/webhooks"),
+    ("GET", "/api/v1/admin/payments/webhooks/{webhook_id}"),
+    ("POST", "/api/v1/admin/payments/webhooks/{webhook_id}/reprocess"),
 }
 
 
@@ -1852,6 +2029,670 @@ def test_soft_delete_columns():
 
 
 # ---------------------------------------------------------------------------
+# 29. 환불 (2026-08-11 Sprint 52 신설) — SUPER_ADMIN 전용, MockProvider 기반
+#
+# Sprint 27~28에 준비만 되고 한 번도 실행되지 않던 경로를 검증한다:
+# 상태머신(PAID -> PARTIAL_REFUND/REFUNDED), cancel_payment(), EVENT_CANCEL 로그,
+# PAY_NOT_FOUND / PAY_INVALID_TRANSITION.
+# ---------------------------------------------------------------------------
+def _make_paid_payment(user_id):
+    """환불 대상 결제를 하나 만들고 (payment_id, amount)를 돌려준다."""
+    r = client.post("/api/v1/payments",
+                    json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                          "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                          "billing_cycle": BILLING_MONTHLY},
+                    headers=auth_headers(user_id))
+    body = r.json()
+    assert body.get("success"), body
+    payment = body["data"]["payment"]
+    return payment["id"], payment["amount"]
+
+
+def test_refund():
+    print("\n--- 29. refund (SUPER_ADMIN) ---")
+    sh = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
+    ah = {"X-Admin-Key": TEST_ADMIN_KEY}
+
+    # --- 권한 경계 ---
+    user = TEST_USER + "-refund-authz"
+    pid, amount = _make_paid_payment(user)
+    check("환불은 인증 없이 불가",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"reason": "x"}).status_code, 403)
+    check("환불은 ADMIN 등급으로 불가(SUPER_ADMIN 전용)",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"reason": "x"}, headers=ah).status_code, 403)
+    check("reason 없으면 400",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"reason": "   "}, headers=sh).status_code, 400)
+    check("없는 결제는 404",
+          client.post("/api/v1/admin/payments/99999999/refund",
+                      json={"reason": "x"}, headers=sh).status_code, 404)
+
+    # --- 전액 환불 ---
+    user = TEST_USER + "-refund-full"
+    pid, amount = _make_paid_payment(user)
+    r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                    json={"reason": "고객 요청"}, headers=sh)
+    check("전액 환불 200", r.status_code, 200)
+    data = r.json()["data"]
+    check("환불 금액 = 결제 금액", data["refunded_amount"], amount)
+    check("누적 환불 = 결제 금액", data["total_refunded"], amount)
+    check("잔여 환불 가능액 0", data["refundable_remaining"], 0)
+    check("상태가 REFUNDED", data["payment"]["status"], "REFUNDED")
+    check_true("구독은 자동 해지하지 않는다(정책 미결정)", data["subscription_untouched"])
+
+    # 멱등: 이미 전액 환불된 결제에 다시 요청해도 오류가 아니고 중복 차감도 없다
+    r2 = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                     json={"reason": "중복 요청"}, headers=sh)
+    check("재환불 요청도 200(멱등)", r2.status_code, 200)
+    check_true("already_refunded 플래그", r2.json()["data"]["already_refunded"])
+    check("재요청은 추가 환불 0원", r2.json()["data"]["refunded_amount"], 0)
+    check("누적 환불액이 늘지 않음", r2.json()["data"]["total_refunded"], amount)
+
+    # --- 부분 환불 (누적) ---
+    user = TEST_USER + "-refund-partial"
+    pid, amount = _make_paid_payment(user)
+    part = amount // 3
+    r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                    json={"amount": part, "reason": "부분1"}, headers=sh)
+    check("부분 환불 200", r.status_code, 200)
+    check("상태가 PARTIAL_REFUND", r.json()["data"]["payment"]["status"], "PARTIAL_REFUND")
+    check("잔여 = 총액 - 부분", r.json()["data"]["refundable_remaining"], amount - part)
+
+    r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                    json={"amount": part, "reason": "부분2"}, headers=sh)
+    check("부분 환불 반복 가능", r.json()["data"]["payment"]["status"], "PARTIAL_REFUND")
+    check("누적 환불액 합산", r.json()["data"]["total_refunded"], part * 2)
+
+    # 잔여를 초과하는 환불은 거부
+    check("잔여 초과 환불은 400",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"amount": amount, "reason": "초과"}, headers=sh).status_code, 400)
+    check("0원 환불은 400",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"amount": 0, "reason": "0원"}, headers=sh).status_code, 400)
+    check("음수 환불은 400",
+          client.post("/api/v1/admin/payments/%d/refund" % pid,
+                      json={"amount": -100, "reason": "음수"}, headers=sh).status_code, 400)
+
+    # 잔여 전액을 마저 환불하면 REFUNDED로 종결
+    r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                    json={"reason": "잔액 정리"}, headers=sh)
+    check("잔여 환불 시 REFUNDED로 종결", r.json()["data"]["payment"]["status"], "REFUNDED")
+    check("누적 = 결제 총액", r.json()["data"]["total_refunded"], amount)
+
+    # --- 상태머신 관문: 종결 상태는 환불 불가 ---
+    user = TEST_USER + "-refund-terminal"
+    pid, amount = _make_paid_payment(user)
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE payments SET status='FAILED' WHERE id=?", (pid,))
+        conn.commit()
+    finally:
+        conn.close()
+    r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                    json={"reason": "실패 결제 환불 시도"}, headers=sh)
+    check("FAILED 결제는 환불 불가(400)", r.status_code, 400)
+
+    # --- 원장(payment_logs)이 환불 궤적을 남기는가 ---
+    user = TEST_USER + "-refund-log"
+    pid, amount = _make_paid_payment(user)
+    client.post("/api/v1/admin/payments/%d/refund" % pid,
+                json={"amount": 100, "reason": "로그확인"}, headers=sh)
+    logs = client.get("/api/v1/admin/payments/%d/logs" % pid, headers=ah).json()["data"]
+    cancels = [l for l in logs if l["event_type"] == "CANCEL"]
+    check("CANCEL 이벤트가 기록됨", len(cancels), 1)
+    check("CANCEL 로그 금액", cancels[0]["amount"], 100)
+    check("CANCEL 로그 상태", cancels[0]["status"], "SUCCESS")
+
+    # --- 감사 로그(audit_logs) ---
+    # target_id는 **문자열**로 저장된다 — AuditTargetType.USER의 대상이 Supabase user_id
+    # (UUID 문자열)라 컬럼이 TEXT다. 정수 payment_id도 문자열로 들어간다.
+    # (이 계약을 모르고 int로 비교했다가 실제로 한 번 헛나갔다 — 그래서 명시적으로 고정한다.)
+    audit = client.get("/api/v1/admin/audit-logs?target_type=PAYMENT", headers=ah).json()["data"]
+    mine = [a for a in audit if str(a["target_id"]) == str(pid)]
+    check_true("환불이 감사 로그에 남는다", len(mine) >= 1, [a["target_id"] for a in audit[:5]])
+    if mine:
+        check("감사 action", mine[0]["action"], "PAYMENT_STATUS_CHANGE")
+        check_true("target_id는 문자열로 저장된다", isinstance(mine[0]["target_id"], str),
+                   type(mine[0]["target_id"]).__name__)
+        check_true("환불 전후 상태가 남는다",
+                   '"status"' in (mine[0]["before"] or "") and '"status"' in (mine[0]["after"] or ""),
+                   (mine[0]["before"], mine[0]["after"]))
+        check_true("환불 금액이 감사에 남는다", "refunded_amount" in (mine[0]["after"] or ""),
+                   mine[0]["after"])
+
+
+# ---------------------------------------------------------------------------
+# 31. 사용자용 구독 조회 (2026-08-11 Sprint 52 신설)
+#
+# 결제한 사용자가 자기 구독을 볼 방법이 없던 공백을 메운 경로. 소유권 격리가 핵심이다.
+# ---------------------------------------------------------------------------
+def test_my_subscriptions():
+    print("\n--- 31. GET /subscriptions/me ---")
+    check("인증 없으면 401/403",
+          client.get("/api/v1/subscriptions/me").status_code in (401, 403), True)
+
+    user_a = TEST_USER + "-mysub-a"
+    user_b = TEST_USER + "-mysub-b"
+
+    # 구독이 없는 사용자는 빈 리스트(오류가 아니다)
+    r = client.get("/api/v1/subscriptions/me", headers=auth_headers(user_b))
+    check("구독 없으면 200", r.status_code, 200)
+    check("빈 리스트", r.json()["data"], [])
+    check_true("envelope 형식", set(r.json().keys()) == ENVELOPE_KEYS, sorted(r.json()))
+
+    # A가 구독을 만든다
+    price = resolve_plan_price("PRO", BILLING_YEARLY)
+    pay = client.post("/api/v1/payments",
+                      json={"payment_type": "SUBSCRIPTION", "plan": "PRO",
+                            "amount": price, "billing_cycle": BILLING_YEARLY},
+                      headers=auth_headers(user_a)).json()
+    check_true("구독 결제 성공", pay["success"], pay)
+
+    r = client.get("/api/v1/subscriptions/me", headers=auth_headers(user_a))
+    data = r.json()["data"]
+    check("A는 자기 구독 1건", len(data), 1)
+    sub = data[0]
+    check("plan", sub["plan"], "PRO")
+    check("price", sub["price"], price)
+    check("status", sub["status"], "ACTIVE")
+    check_true("지금 이용 가능", sub["is_entitled"], sub)
+    check("effective_status", sub["effective_status"], "ACTIVE")
+    check_true("만료일이 있다", bool(sub["expires_at"]), sub)
+    check_true("유예 종료 시각 파생", bool(sub["grace_period_end"]), sub)
+    check("소유자 일치", sub["user_id"], user_a)
+
+    # 소유권 격리 — B는 A의 구독을 볼 수 없다
+    rb = client.get("/api/v1/subscriptions/me", headers=auth_headers(user_b)).json()["data"]
+    check("B에게 A의 구독이 보이지 않는다", len(rb), 0)
+
+    # lazy sync — 만료 시각을 과거로 밀면 조회만으로 상태가 따라와야 한다
+    conn = get_connection()
+    try:
+        past = (datetime.now() - timedelta(days=10)).isoformat()
+        conn.execute("UPDATE subscriptions SET expires_at=? WHERE id=?", (past, sub["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    r2 = client.get("/api/v1/subscriptions/me", headers=auth_headers(user_a)).json()["data"][0]
+    check("만료 경과 후 상태가 EXPIRED", r2["effective_status"], "EXPIRED")
+    check_true("만료 후에는 이용 불가", not r2["is_entitled"], r2)
+    conn = get_connection()
+    try:
+        stored = conn.execute("SELECT status FROM subscriptions WHERE id=?", (sub["id"],)).fetchone()[0]
+    finally:
+        conn.close()
+    check("lazy sync가 DB 상태도 맞춘다", stored, "EXPIRED")
+
+
+# ---------------------------------------------------------------------------
+# 30. Webhook 수신 (2026-08-11 Sprint 52 신설)
+#
+# **인증 없는 공개 경로**라 서명 검증이 유일한 방어선이다. 그래서 이 섹션의 첫 번째 관심사는
+# "정상 동작"이 아니라 **"검증 없이 상태를 바꿀 수 없는가"** 다.
+# ---------------------------------------------------------------------------
+WEBHOOK_SECRET = "qa-regression-webhook-secret"
+
+
+def _sign(body_bytes):
+    import hashlib as _h, hmac as _hm
+    return _hm.new(WEBHOOK_SECRET.encode(), body_bytes, _h.sha256).hexdigest()
+
+
+def _post_webhook(payload, provider="mock", signed=True, secret=None):
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if signed:
+        sig = _sign(body) if secret is None else __import__("hmac").new(
+            secret.encode(), body, __import__("hashlib").sha256).hexdigest()
+        headers["X-Webhook-Signature"] = sig
+    return client.post("/api/v1/payments/webhook/%s" % provider, content=body, headers=headers)
+
+
+def test_payment_webhook():
+    print("\n--- 30. payment webhook ---")
+    saved = os.environ.get("PAYMENT_WEBHOOK_SECRET")
+
+    # --- 시크릿 미설정이면 어떤 요청도 통과하지 못한다(fail-closed) ---
+    os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+    user = TEST_USER + "-wh-closed"
+    pid, _ = _make_paid_payment(user)
+    conn = get_connection()
+    try:
+        txid = conn.execute("SELECT pg_transaction_id FROM payments WHERE id=?", (pid,)).fetchone()[0]
+    finally:
+        conn.close()
+    r = _post_webhook({"event_id": "qa-wh-closed-1", "event_type": "PAYMENT_CANCELLED",
+                       "pg_transaction_id": txid})
+    check("시크릿 미설정이면 401(fail-closed)", r.status_code, 401)
+
+    os.environ["PAYMENT_WEBHOOK_SECRET"] = WEBHOOK_SECRET
+    try:
+        # --- 서명 없는/틀린 요청은 상태를 바꾸지 못한다 ---
+        user = TEST_USER + "-wh-authz"
+        pid, _ = _make_paid_payment(user)
+        conn = get_connection()
+        try:
+            txid = conn.execute("SELECT pg_transaction_id FROM payments WHERE id=?", (pid,)).fetchone()[0]
+        finally:
+            conn.close()
+
+        check("서명 없으면 401",
+              _post_webhook({"event_id": "qa-wh-nosig", "event_type": "PAYMENT_CANCELLED",
+                             "pg_transaction_id": txid}, signed=False).status_code, 401)
+        check("서명이 틀리면 401",
+              _post_webhook({"event_id": "qa-wh-badsig", "event_type": "PAYMENT_CANCELLED",
+                             "pg_transaction_id": txid}, secret="wrong-secret").status_code, 401)
+
+        def status_of(payment_id):
+            c = get_connection()
+            try:
+                return c.execute("SELECT status FROM payments WHERE id=?", (payment_id,)).fetchone()[0]
+            finally:
+                c.close()
+
+        check("위조 요청은 결제 상태를 바꾸지 못했다", status_of(pid), "SUCCESS")
+
+        # ★ 검증 실패는 **저장하지 않는다**(2026-08-11 Sprint 53 변경).
+        # 인증 없는 공개 경로라 익명 요청 하나당 행 하나가 무제한으로 늘어나는
+        # 저장소 증폭 통로였다(실측: 서명 없는 요청 5회 -> 행 5개). 탐지에 필요한 정보는
+        # 경고 로그로 남긴다 — 로그는 회전되지만 DB는 계속 쌓이기 때문이다.
+        conn = get_connection()
+        try:
+            stored = conn.execute(
+                "SELECT COUNT(*) FROM payment_webhooks"
+                " WHERE event_id IN ('qa-wh-nosig','qa-wh-badsig')").fetchone()[0]
+        finally:
+            conn.close()
+        check("검증 실패 요청은 DB에 저장되지 않는다", stored, 0)
+
+        # 저장소 증폭 방어: 익명 요청을 반복해도 행이 늘지 않아야 한다.
+        conn = get_connection()
+        try:
+            n_before = conn.execute("SELECT COUNT(*) FROM payment_webhooks").fetchone()[0]
+        finally:
+            conn.close()
+        for i in range(5):
+            _post_webhook({"event_id": "qa-wh-flood-%d" % i}, signed=False)
+        conn = get_connection()
+        try:
+            n_after = conn.execute("SELECT COUNT(*) FROM payment_webhooks").fetchone()[0]
+        finally:
+            conn.close()
+        check("익명 요청 5회가 행을 만들지 않는다", n_after - n_before, 0)
+
+        check("알 수 없는 provider는 404",
+              _post_webhook({"event_id": "qa-wh-prov"}, provider="nope").status_code, 404)
+
+        # --- 정상 적용 ---
+        user = TEST_USER + "-wh-apply"
+        pid, _ = _make_paid_payment(user)
+        conn = get_connection()
+        try:
+            txid = conn.execute("SELECT pg_transaction_id FROM payments WHERE id=?", (pid,)).fetchone()[0]
+        finally:
+            conn.close()
+        r = _post_webhook({"event_id": "qa-wh-apply-1", "event_type": "PAYMENT_REFUNDED",
+                           "pg_transaction_id": txid})
+        check("정상 서명 200", r.status_code, 200)
+        body = r.json()["data"]
+        check("적용됨", body["result"], "APPLIED")
+        check("전이 to", body["to"], "REFUNDED")
+        check("결제 상태 반영", status_of(pid), "REFUNDED")
+
+        # --- 멱등: 같은 event_id 재전송 ---
+        r = _post_webhook({"event_id": "qa-wh-apply-1", "event_type": "PAYMENT_REFUNDED",
+                           "pg_transaction_id": txid})
+        check("중복 event_id도 200", r.status_code, 200)
+        check_true("중복으로 표시", r.json()["data"]["duplicate"])
+        check("중복은 적용하지 않음", r.json()["data"]["result"], "SKIPPED")
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM payment_webhooks WHERE event_id='qa-wh-apply-1'").fetchone()[0]
+            applied = conn.execute(
+                "SELECT COUNT(*) FROM payment_logs WHERE payment_id=? AND event_type='WEBHOOK'",
+                (pid,)).fetchone()[0]
+        finally:
+            conn.close()
+        check("중복 수신은 행을 새로 만들지 않는다", rows, 1)
+        check("중복 수신은 WEBHOOK 로그를 두 번 남기지 않는다", applied, 1)
+
+        # --- 상태머신이 막는 전이는 반영하지 않는다 ---
+        r = _post_webhook({"event_id": "qa-wh-invalid", "event_type": "PAYMENT_CONFIRMED",
+                           "pg_transaction_id": txid})
+        check("REFUNDED -> PAID 전이는 적용되지 않음", r.json()["data"]["result"], "SKIPPED")
+        check("상태는 그대로 REFUNDED", status_of(pid), "REFUNDED")
+
+        # --- 알 수 없는 event_type / 모르는 거래 ---
+        check("알 수 없는 event_type은 무시",
+              _post_webhook({"event_id": "qa-wh-unknown", "event_type": "SOMETHING_ELSE",
+                             "pg_transaction_id": txid}).json()["data"]["result"], "SKIPPED")
+        check("모르는 거래는 무시",
+              _post_webhook({"event_id": "qa-wh-notx", "event_type": "PAYMENT_CANCELLED",
+                             "pg_transaction_id": "NOPE-does-not-exist"}).json()["data"]["result"],
+              "SKIPPED")
+
+        # --- 깨진 payload ---
+        bad = b"{not json"
+        check("깨진 payload는 400",
+              client.post("/api/v1/payments/webhook/mock", content=bad,
+                          headers={"X-Webhook-Signature": _sign(bad),
+                                   "Content-Type": "application/json"}).status_code, 400)
+
+        # --- 서명 검증이 payload 변조를 잡는가(서명 후 본문 변경) ---
+        original = json.dumps({"event_id": "qa-wh-tamper", "event_type": "PAYMENT_CANCELLED",
+                               "pg_transaction_id": txid}).encode()
+        tampered = json.dumps({"event_id": "qa-wh-tamper", "event_type": "PAYMENT_CONFIRMED",
+                               "pg_transaction_id": txid}).encode()
+        check("본문 변조 시 401",
+              client.post("/api/v1/payments/webhook/mock", content=tampered,
+                          headers={"X-Webhook-Signature": _sign(original),
+                                   "Content-Type": "application/json"}).status_code, 401)
+    finally:
+        if saved is None:
+            os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+        else:
+            os.environ["PAYMENT_WEBHOOK_SECRET"] = saved
+        # 이 섹션이 만든 webhook 행 정리
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 32. Webhook 운영 도구 (2026-08-11 Sprint 53) — 조회 / 상세 / 재처리
+#
+# 핵심 관심사는 **재처리가 보안 경계를 뚫지 않는가**다. 서명이 검증되지 않은 수신을
+# 운영자 손으로 적용할 수 있으면 Sprint 52의 서명 검증이 통째로 무의미해진다.
+# ---------------------------------------------------------------------------
+def test_webhook_ops():
+    print("\n--- 32. webhook ops (list / detail / reprocess) ---")
+    ah = {"X-Admin-Key": TEST_ADMIN_KEY}
+    sh = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
+    saved = os.environ.get("PAYMENT_WEBHOOK_SECRET")
+    os.environ["PAYMENT_WEBHOOK_SECRET"] = WEBHOOK_SECRET
+
+    def status_of(pid):
+        c = get_connection()
+        try:
+            return c.execute("SELECT status FROM payments WHERE id=?", (pid,)).fetchone()[0]
+        finally:
+            c.close()
+
+    def webhook_row(wid):
+        return client.get("/api/v1/admin/payments/webhooks/%d" % wid, headers=ah).json()["data"]
+
+    try:
+        # --- 권한 경계 ---
+        check("Webhook 목록은 인증 필요",
+              client.get("/api/v1/admin/payments/webhooks").status_code, 403)
+        check("Webhook 목록은 ADMIN으로 조회 가능",
+              client.get("/api/v1/admin/payments/webhooks", headers=ah).status_code, 200)
+        check("재처리는 ADMIN 등급으로 불가(SUPER_ADMIN 전용)",
+              client.post("/api/v1/admin/payments/webhooks/1/reprocess", headers=ah).status_code, 403)
+        check("없는 Webhook 상세는 404",
+              client.get("/api/v1/admin/payments/webhooks/99999999", headers=ah).status_code, 404)
+        check("없는 Webhook 재처리는 404",
+              client.post("/api/v1/admin/payments/webhooks/99999999/reprocess", headers=sh).status_code, 404)
+        check("허용되지 않는 processing_status 필터는 400",
+              client.get("/api/v1/admin/payments/webhooks?processing_status=NOPE",
+                         headers=ah).status_code, 400)
+
+        # --- 실제 재처리 시나리오: PG 노티가 payments row보다 먼저 도착 ---
+        # (수신 시점에는 거래를 못 찾아 IGNORED, 나중에 재처리하면 성공해야 한다)
+        user = TEST_USER + "-whops"
+        future_tx = "MOCK-whops-" + uuid.uuid4().hex[:10]
+        # event_type은 **상태머신이 허용하는 전이**여야 한다 — 결제는 SUCCESS로 생성되고
+        # SUCCESS에서 갈 수 있는 곳은 PARTIAL_REFUND/REFUNDED뿐이다(PAYMENT_CANCELLED를 쓰면
+        # 재처리해도 상태머신이 막아 SKIPPED가 된다 — 첫 작성에서 실제로 그렇게 헛나갔다).
+        r = _post_webhook({"event_id": "qa-wh-ops-early", "event_type": "PAYMENT_REFUNDED",
+                           "pg_transaction_id": future_tx})
+        check("이른 노티는 200으로 접수", r.status_code, 200)
+        check("적용되지 않음(거래 없음)", r.json()["data"]["result"], "SKIPPED")
+        wid = r.json()["data"]["webhook_id"]
+        row = webhook_row(wid)
+        check("상태 IGNORED", row["processing_status"], "IGNORED")
+        check_true("실패 사유가 보인다", bool(row["error_message"]), row)
+        check_true("재처리 가능으로 표시", row["reprocessable"], row)
+        check("차단 사유 없음", row["reprocess_blocked_reason"], None)
+
+        # 뒤늦게 결제가 생긴 상황을 만든다(같은 pg_transaction_id)
+        pid, _ = _make_paid_payment(user)
+        conn = get_connection()
+        try:
+            conn.execute("UPDATE payments SET pg_transaction_id=? WHERE id=?", (future_tx, pid))
+            conn.commit()
+        finally:
+            conn.close()
+
+        rr = client.post("/api/v1/admin/payments/webhooks/%d/reprocess" % wid, headers=sh)
+        check("재처리 200", rr.status_code, 200)
+        data = rr.json()["data"]
+        check("이번엔 적용됨", data["result"], "APPLIED")
+        check_true("재처리로 실행됐음을 명시", data["reprocessed"], data)
+        check("이전 상태를 알려준다", data["previous_status"], "IGNORED")
+        check("결제 상태가 반영됨", status_of(pid), "REFUNDED")
+
+        # --- 중복 재처리 방지 ---
+        row = webhook_row(wid)
+        check("재처리 후 PROCESSED", row["processing_status"], "PROCESSED")
+        check_true("더 이상 재처리 대상이 아니다", not row["reprocessable"], row)
+        again = client.post("/api/v1/admin/payments/webhooks/%d/reprocess" % wid, headers=sh)
+        check("두 번째 재처리는 400", again.status_code, 400)
+        check("결제 상태는 그대로", status_of(pid), "REFUNDED")
+
+        # --- 보안 경계: 서명 미검증 수신은 절대 재처리 불가 ---
+        bad = _post_webhook({"event_id": "qa-wh-ops-unsigned", "event_type": "PAYMENT_CONFIRMED",
+                             "pg_transaction_id": future_tx}, signed=False)
+        check("서명 없는 수신은 401", bad.status_code, 401)
+        conn = get_connection()
+        try:
+            stored = conn.execute(
+                "SELECT COUNT(*) FROM payment_webhooks WHERE event_id='qa-wh-ops-unsigned'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        # 2026-08-11 Sprint 53: 미검증 요청은 **행 자체를 만들지 않는다**(저장소 증폭 차단).
+        check("미검증 요청은 수신 기록을 만들지 않는다", stored, 0)
+
+        # ★ 그래도 서명 가드는 살아 있어야 한다 — **방어를 한 겹에만 의존하지 않기 위해서다.**
+        # 지금은 미검증 행이 애초에 생기지 않지만, 나중에 다른 경로가(예: 배치 임포트, 마이그레이션)
+        # 미검증 행을 만들 수 있다. 그때 재처리로 적용되면 서명 검증이 통째로 무의미해진다.
+        # 그런 행을 직접 만들어 **상태와 무관하게 미검증이면 막히는가**를 격리 검증한다.
+        # (재처리 가능한 상태 IGNORED로 두어, FAILED 가드가 아니라 서명 가드가 막는지 확인한다)
+        conn = get_connection()
+        try:
+            legacy_id = conn.execute(
+                "INSERT INTO payment_webhooks (provider, event_type, event_id, pg_transaction_id,"
+                " signature_verified, processing_status, raw_payload, received_at)"
+                " VALUES ('mock','PAYMENT_CONFIRMED','qa-wh-ops-legacy-unverified',?,0,'IGNORED',?,?)",
+                (future_tx, json.dumps({"event_type": "PAYMENT_CONFIRMED",
+                                        "pg_transaction_id": future_tx}),
+                 datetime.now().isoformat()),
+            ).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        row = webhook_row(legacy_id)
+        check("가드 격리: 상태는 재처리 가능 범위", row["processing_status"], "IGNORED")
+        check_true("가드 격리: 그래도 미검증이라 재처리 불가", not row["reprocessable"], row)
+        check_true("가드 격리: 차단 사유가 서명 때문임을 명시",
+                   "서명" in (row["reprocess_blocked_reason"] or ""),
+                   row["reprocess_blocked_reason"])
+        check("가드 격리: 재처리 시도 400",
+              client.post("/api/v1/admin/payments/webhooks/%d/reprocess" % legacy_id,
+                          headers=sh).status_code, 400)
+        check("가드 격리: 결제 상태 불변", status_of(pid), "REFUNDED")
+
+        # --- 목록 필터 ---
+        lst = client.get("/api/v1/admin/payments/webhooks?processing_status=PROCESSED",
+                         headers=ah).json()
+        check_true("PROCESSED 필터가 동작", all(i["processing_status"] == "PROCESSED"
+                                            for i in lst["data"]), lst["data"][:2])
+        check_true("meta.total 제공", "total" in lst["meta"], lst["meta"])
+        unv = client.get("/api/v1/admin/payments/webhooks?signature_verified=false",
+                         headers=ah).json()["data"]
+        check_true("미검증 필터가 동작", all(not i["signature_verified"] for i in unv), unv[:2])
+        check_true("미검증은 전부 재처리 불가", all(not i["reprocessable"] for i in unv), unv[:2])
+        ro = client.get("/api/v1/admin/payments/webhooks?reprocessable_only=true",
+                        headers=ah).json()
+        check_true("reprocessable_only는 가능한 것만", all(i["reprocessable"] for i in ro["data"]),
+                   ro["data"][:2])
+        check_true("필터 사실을 meta에 명시", ro["meta"]["reprocessable_only"] is True, ro["meta"])
+
+        # --- 감사 로그 ---
+        audit = client.get("/api/v1/admin/audit-logs?target_type=PAYMENT", headers=ah).json()["data"]
+        mine = [a for a in audit if str(a["target_id"]) == str(pid)]
+        check_true("재처리가 감사 로그에 남는다", len(mine) >= 1, [a["target_id"] for a in audit[:5]])
+    finally:
+        if saved is None:
+            os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+        else:
+            os.environ["PAYMENT_WEBHOOK_SECRET"] = saved
+        conn = get_connection()
+        try:
+            # ★ 순서가 중요하다: 감사 행을 **먼저** 지운다.
+            # PAYMENT_WEBHOOK 감사의 target_id는 payment_webhooks.id인데, webhook 행을 먼저
+            # 지우면 아래 cleanup()이 그 id를 더 이상 알 수 없어 감사 행만 남는다
+            # (실제로 dangling 1건으로 검출됐다 — Sprint 53).
+            ids = [str(r[0]) for r in conn.execute(
+                "SELECT id FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'")]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    "DELETE FROM audit_logs WHERE target_type='PAYMENT_WEBHOOK'"
+                    " AND target_id IN (%s)" % placeholders, ids)
+            conn.execute("DELETE FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 33. 인증 경계 전수 (2026-08-11 Sprint 53 신규)
+#
+# §4(authentication)는 **하드코딩된 5개 경로**만 검사했다. 그래서 새 엔드포인트를 추가해도
+# 인증 경계 검증이 자동으로 따라오지 않았다 — 실제로 Sprint 52~53에 6개가 늘었지만
+# §4의 목록은 그대로였다.
+#
+# 여기서는 OpenAPI 스펙에서 **모든 엔드포인트를 열거**해 익명 접근을 검사한다.
+# 분류되지 않은 새 엔드포인트가 나타나면 테스트가 실패하므로, 추가할 때 공개/사용자/관리자
+# 중 무엇인지 **반드시 의식적으로 선언**하게 된다(EXPECTED_ENDPOINTS와 같은 규율).
+# ---------------------------------------------------------------------------
+# 인증 없이 접근 가능한 것으로 **의도된** 경로.
+# `/payments/webhook/{provider}`는 사용자 인증이 없지만 서명 검증이 대신하므로 여기 둔다
+# (익명 요청은 401이어야 한다 — 아래에서 따로 확인).
+PUBLIC_ENDPOINTS = {
+    "/",
+    "/api/v1/stats",
+    "/api/v1/document-stats",
+    "/api/v1/search",
+    "/api/v1/search/regions",
+    "/api/v1/item/{item_id}",
+    "/api/v1/item/{item_id}/documents/{doc_type}",
+    "/api/v1/plans",
+}
+# 사용자 인증은 없지만 다른 수단(서명)으로 보호되는 경로.
+SIGNATURE_PROTECTED_ENDPOINTS = {"/api/v1/payments/webhook/{provider_name}"}
+
+_PATH_SAMPLE = {
+    "{item_id}": "1", "{payment_id}": "1", "{preset_id}": "1", "{request_id}": "1",
+    "{doc_type}": "SPEC", "{user_id}": "qa-authz-probe", "{subscription_id}": "1",
+    "{webhook_id}": "1", "{provider_name}": "mock",
+}
+
+
+def test_authz_coverage():
+    print("\n--- 33. 인증 경계 전수 (OpenAPI 기반) ---")
+    api_server.app.openapi_schema = None
+    spec = api_server.app.openapi()
+
+    unclassified, leaks = [], []
+    checked = {"public": 0, "user": 0, "admin": 0, "signature": 0}
+
+    for path, ops in sorted(spec["paths"].items()):
+        probe = path
+        for token, sample in _PATH_SAMPLE.items():
+            probe = probe.replace(token, sample)
+        for method in ops:
+            if path in PUBLIC_ENDPOINTS:
+                kind = "public"
+            elif path in SIGNATURE_PROTECTED_ENDPOINTS:
+                kind = "signature"
+            elif "/admin/" in path:
+                kind = "admin"
+            elif path.startswith("/api/v1/"):
+                kind = "user"
+            else:
+                unclassified.append((method.upper(), path))
+                continue
+            checked[kind] += 1
+
+            body = {} if method in ("post", "patch", "put") else None
+            code = client.request(method.upper(), probe, json=body).status_code
+
+            if kind == "public":
+                # 공개 경로는 인증 때문에 막히면 안 된다(파라미터 부족으로 인한 422/404는 무방).
+                if code in (401, 403):
+                    leaks.append(("public blocked", method.upper(), path, code))
+            else:
+                # 나머지는 전부 익명 거부여야 한다.
+                # 401/403이 아니면 **인증 없이 도달 가능**하다는 뜻이다.
+                if code not in (401, 403):
+                    leaks.append(("anon reachable", method.upper(), path, code))
+
+    check_true("분류되지 않은 신규 엔드포인트 없음", not unclassified, unclassified)
+    check_true("익명 접근이 가능한 보호 엔드포인트 없음", not leaks, leaks)
+    check_true("검사 대상이 실제로 존재한다",
+               checked["user"] >= 10 and checked["admin"] >= 10, checked)
+    print("   분류: %s" % checked)
+
+    # 인증이 **body 검증보다 먼저** 동작하는지 — 그래야 스키마 정보가 익명에게 새지 않는다.
+    # (POST에 빈 body를 보냈을 때 422가 아니라 401이어야 한다)
+    check("POST 익명 요청은 body 검증 전에 401",
+          client.post("/api/v1/payments", json={}).status_code, 401)
+    check("Admin POST 익명 요청은 body 검증 전에 403",
+          client.post("/api/v1/admin/registry-credits", json={}).status_code, 403)
+
+    # 서명 보호 경로는 익명이면 401이어야 한다(공개처럼 열려 있으면 안 된다).
+    # event_id는 cleanup 패턴(qa-wh-)을 따라야 한다 — 처음엔 'qa-authz'로 썼다가 정리되지
+    # 않고 남아, 다음 실행에서 **중복 경로**를 타 200이 나왔다(그 덕에 아래 oracle 결함을 발견).
+    check("Webhook은 서명 없이 401",
+          client.post("/api/v1/payments/webhook/mock",
+                      json={"event_id": "qa-wh-authz"}).status_code, 401)
+    # ★ 같은 event_id로 한 번 더 — **중복이어도** 서명이 없으면 401이어야 한다.
+    # 예전에는 중복 검사가 서명 검사보다 먼저라 이 경우 200이 나왔고, 익명 공격자가
+    # "이 event_id가 존재하는가"를 응답 코드로 알아낼 수 있었다(oracle).
+    # 지금은 검증 전에 저장 자체를 하지 않으므로 중복 판정에 도달하지도 않는다.
+    check("중복 event_id여도 서명 없으면 401(존재 여부 oracle 차단)",
+          client.post("/api/v1/payments/webhook/mock",
+                      json={"event_id": "qa-wh-authz"}).status_code, 401)
+    conn = get_connection()
+    try:
+        leaked = conn.execute(
+            "SELECT COUNT(*) FROM payment_webhooks WHERE event_id='qa-wh-authz'").fetchone()[0]
+    finally:
+        conn.close()
+    check("미검증 요청은 행을 남기지 않는다(저장소 증폭 차단)", leaked, 0)
+
+    # 사용자 간 격리 — 남의 결제/로그는 404로 존재조차 알리지 않는다.
+    owner, other = TEST_USER + "-authz-a", TEST_USER + "-authz-b"
+    pid, _ = _make_paid_payment(owner)
+    check("남의 결제 조회는 404",
+          client.get("/api/v1/payments/%d" % pid, headers=auth_headers(other)).status_code, 404)
+    check("남의 결제 로그 조회는 404",
+          client.get("/api/v1/payments/%d/logs" % pid, headers=auth_headers(other)).status_code, 404)
+    check("본인은 조회 가능",
+          client.get("/api/v1/payments/%d" % pid, headers=auth_headers(owner)).status_code, 200)
+
+
+# ---------------------------------------------------------------------------
 # cleanup: 이 테스트가 만든 행만 정리한다(실제 사용자 데이터는 건드리지 않음)
 # ---------------------------------------------------------------------------
 def cleanup():
@@ -1860,16 +2701,85 @@ def cleanup():
     try:
         like = "qa-reg-%"
         total = 0
+
+        # audit_logs / payment_webhooks는 user_id 컬럼이 없어 위 루프로는 지워지지 않는다.
+        # 그래서 실행할 때마다 QA 행이 쌓여 왔다(2026-08-11 Sprint 52에 785행 누적 발견 —
+        # 운영자가 감사 로그를 조회할 때 테스트 흔적이 섞여 보이는 상태였다).
+        # 지울 대상 id를 **부모 행을 지우기 전에** 미리 뽑아 정확히 그 행만 제거한다.
+        audit_targets = {
+            "PAYMENT": [str(r[0]) for r in conn.execute(
+                "SELECT id FROM payments WHERE user_id LIKE ?", (like,))],
+            "REGISTRY_REQUEST": [str(r[0]) for r in conn.execute(
+                "SELECT id FROM registry_requests WHERE user_id LIKE ?", (like,))],
+            "SUBSCRIPTION": [str(r[0]) for r in conn.execute(
+                "SELECT id FROM subscriptions WHERE user_id LIKE ?", (like,))],
+            # REGISTRY_CREDIT 감사의 target_id는 registry_credits.id다(user_id가 아니다 —
+            # admin.py:377이 credit_id를 넘긴다). 이 표를 빠뜨려서 509행이 쌓여 있었다.
+            "REGISTRY_CREDIT": [str(r[0]) for r in conn.execute(
+                "SELECT id FROM registry_credits WHERE user_id LIKE ?", (like,))],
+            # 결제에 연결되지 못한 Webhook 재처리 감사(2026-08-11 Sprint 53).
+            # target_id가 payment_webhooks.id다.
+            "PAYMENT_WEBHOOK": [str(r[0]) for r in conn.execute(
+                "SELECT id FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'")],
+        }
+        qa_tx_ids = [r[0] for r in conn.execute(
+            "SELECT pg_transaction_id FROM payments WHERE user_id LIKE ? AND pg_transaction_id IS NOT NULL",
+            (like,))]
+
         # FK가 런타임에 강제되므로 자식 -> 부모 순서로 지운다.
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
                       "payment_logs", "payments", "subscriptions", "favorites",
                       "recent_items", "search_presets", "registry_credits"):
             cur = conn.execute("DELETE FROM %s WHERE user_id LIKE ?" % table, (like,))
             total += cur.rowcount
+
+        for target_type, ids in audit_targets.items():
+            if not ids:
+                continue
+            placeholders = ",".join("?" * len(ids))
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type=? AND target_id IN (%s)" % placeholders,
+                [target_type] + ids)
+            total += cur.rowcount
+        # REGISTRY_CREDIT 감사는 target_id가 user_id 문자열이다(정수 id가 아님).
+        total += conn.execute(
+            "DELETE FROM audit_logs WHERE target_id LIKE ?", (like,)).rowcount
+        if qa_tx_ids:
+            placeholders = ",".join("?" * len(qa_tx_ids))
+            total += conn.execute(
+                "DELETE FROM payment_webhooks WHERE pg_transaction_id IN (%s)" % placeholders,
+                qa_tx_ids).rowcount
+        total += conn.execute(
+            "DELETE FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'").rowcount
+
         conn.commit()
         print("removed %d test rows" % total)
         left = conn.execute("SELECT COUNT(*) FROM registry_requests WHERE user_id LIKE ?", (like,)).fetchone()[0]
         check("no test rows left", left, 0)
+        # 이번 실행이 만든 감사 흔적도 남지 않아야 한다.
+        # ★ 부모 행을 이미 지웠으므로 "현재 존재하는 qa 결제"로 되묻는 서브쿼리는 항상 0을
+        #   돌려준다(공허하게 참). 삭제 **전에 캡처해 둔 id**로 확인해야 실제 검출력이 있다.
+        audit_left = 0
+        for target_type, ids in audit_targets.items():
+            if not ids:
+                continue
+            placeholders = ",".join("?" * len(ids))
+            audit_left += conn.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE target_type=? AND target_id IN (%s)"
+                % placeholders, [target_type] + ids).fetchone()[0]
+        check("no test audit rows left", audit_left, 0)
+        # 대상이 사라진 감사 행(dangling)이 남아 있으면 정리 규칙에 구멍이 있다는 뜻이다.
+        dangling = conn.execute("""
+            SELECT COUNT(*) FROM audit_logs a WHERE
+              (a.target_type='PAYMENT'          AND NOT EXISTS (SELECT 1 FROM payments t          WHERE CAST(t.id AS TEXT)=a.target_id))
+           OR (a.target_type='REGISTRY_REQUEST' AND NOT EXISTS (SELECT 1 FROM registry_requests t WHERE CAST(t.id AS TEXT)=a.target_id))
+           OR (a.target_type='SUBSCRIPTION'     AND NOT EXISTS (SELECT 1 FROM subscriptions t     WHERE CAST(t.id AS TEXT)=a.target_id))
+           OR (a.target_type='REGISTRY_CREDIT'  AND NOT EXISTS (SELECT 1 FROM registry_credits t  WHERE CAST(t.id AS TEXT)=a.target_id))
+           OR (a.target_type='PAYMENT_WEBHOOK'  AND NOT EXISTS (SELECT 1 FROM payment_webhooks t  WHERE CAST(t.id AS TEXT)=a.target_id))
+        """).fetchone()[0]
+        check("no dangling audit rows left", dangling, 0)
+        check("no test webhook rows left",
+              conn.execute("SELECT COUNT(*) FROM payment_webhooks WHERE event_id LIKE 'qa-wh-%'").fetchone()[0], 0)
     finally:
         conn.close()
 
@@ -1878,6 +2788,7 @@ def run():
     try:
         test_health_and_stats()
         test_search()
+        test_property_type_aliases()
         test_detail_and_documents()
         test_authentication()
         test_favorites()
@@ -1904,6 +2815,11 @@ def run():
         test_audit_and_credit_logs()
         test_admin_rest_structure()
         test_soft_delete_columns()
+        test_refund()
+        test_payment_webhook()
+        test_my_subscriptions()
+        test_webhook_ops()
+        test_authz_coverage()
     finally:
         cleanup()
 

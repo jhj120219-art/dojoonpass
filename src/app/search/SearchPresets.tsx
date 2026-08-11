@@ -36,7 +36,9 @@ export default function SearchPresets() {
   const [presets, setPresets] = useState<SearchPreset[]>([])
   const [listLoading, setListLoading] = useState(false)
   const [listError, setListError] = useState<string | null>(null)
-  const [name, setName] = useState('')
+  // 로그인 복귀 시 입력하던 이름을 되살린다(위 redirectToLogin 참고).
+  // 최초 렌더에서만 URL을 읽는다 — 이후 사용자의 타이핑을 URL이 덮어쓰면 안 되기 때문이다.
+  const [name, setName] = useState(() => searchParams.get('preset_name') ?? '')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
@@ -71,8 +73,19 @@ export default function SearchPresets() {
     init()
   }, [])
 
-  function redirectToLogin() {
-    const qs = searchParams.toString()
+  // 로그인 후 돌아왔을 때 입력하던 검색조건 이름을 되살리기 위한 쿼리 키.
+  // FILTER_PARAM_KEYS에 없는 값이라 검색 조건으로도, 저장되는 conditions로도 새어 들어가지
+  // 않는다(currentConditions/SearchForm 둘 다 FILTER_PARAM_KEYS만 읽는다).
+  const PRESET_NAME_PARAM = 'preset_name'
+
+  function redirectToLogin(pendingName?: string) {
+    // 검색조건(쿼리스트링)은 이미 보존되고 있었지만, **입력하던 이름은 사라졌다** —
+    // 이름을 쓰고 저장을 누른 비로그인 사용자가 로그인 후 돌아오면 빈 칸을 다시 채워야 했다
+    // (2026-08-11 Sprint 52). 복귀 URL에 이름을 실어 그대로 되살린다.
+    const params = new URLSearchParams(searchParams.toString())
+    if (pendingName) params.set(PRESET_NAME_PARAM, pendingName)
+    else params.delete(PRESET_NAME_PARAM)
+    const qs = params.toString()
     const target = qs ? `${pathname}?${qs}` : pathname
     const loginParams = new URLSearchParams()
     loginParams.set('redirect', target)
@@ -87,7 +100,8 @@ export default function SearchPresets() {
       return
     }
     if (!accessToken) {
-      redirectToLogin()
+      // 입력하던 이름을 들고 로그인으로 간다 — 복귀 후 그대로 이어서 저장할 수 있도록.
+      redirectToLogin(trimmedName)
       return
     }
     setSaving(true)

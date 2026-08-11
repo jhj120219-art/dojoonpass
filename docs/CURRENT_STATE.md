@@ -61,7 +61,9 @@ SUPABASE_ANON_KEY`가 유일한 코드 요구 이름이며 legacy anon/신규 pu
 부재) 후 `test_api_regression.py`/`test_subscription_policy.py`(jose로 실행 불가) 전체를
 정적 대조해 Sprint 30이 놓친 결함 2건 발견·수정: (1) `get_connection(enforce_foreign_keys=)`
 매개변수 부재 → 추가, (2) Soft Delete 컬럼(`favorites`/`search_presets`의 `deleted_at`/
-`deleted_by`, CTO 승인 10건 #6) 누락 → Migration 017 신설·적용. 신규 회귀
+`deleted_by`, CTO 승인 10건 #6) 누락 → Migration 신설·적용(2026-08-11 Sprint 51 정정:
+실제 파일 번호는 **016**이다. 이 기록의 "017"은 잘못된 번호였고, 017은 Sprint 51에서
+별도 용도로 신설됐다). 신규 회귀
 `test_schema_hygiene.py`(8검사). jose-free 테스트 4종 전부 재통과(136검사), fresh-clone
 부트스트랩(001~017) 재현 검증. HTTP 레벨 Auth/Admin/IDOR 등은 여전히 jose 부재로 Skip,
 정적 감사는 이전 Sprint 완료분 유효(중복 안 함)) 완료
@@ -466,3 +468,339 @@ KG이니시스) 대기로 수렴
   DB 컬럼명이 `court_code`라 내부 rename은 하지 않고 주석으로 근거 기록
 - Open Redirect 방어 회귀 테스트 추가(계약 테스트 29검사)
 - `storage/` git 미추적 소스 **22개** 전수 특정(BUGS #28의 구조적 원인)
+
+### 2026-08-11 (Sprint 49) 실제 사용자 흐름 완성 + 실행 검증
+
+API 서버 + `npm run dev`를 띄우고 **실제 브라우저**로 전 동선을 확인했다(코드 정적 확인만이
+아니라 실동작). 이 과정에서 결함 4건을 재현·수정하고 1건을 측정해 기록했다.
+
+**수정 (`docs/BUGS.md` #29~#32)**
+- 정렬 화살표가 데이터와 반대(#29) — `SortBar`의 `sort_order` 기본값을 백엔드와 같은 `desc`로
+- 정렬을 바꿔도 페이지 유지(#30) — "감정가 ↓"인데 가장 싼 물건이 보이던 문제. `page=1`로 초기화
+- 페이지 범위 초과를 "결과 없음"으로 오인 안내(#31) — 두 상태 구분 + 검색조건 유지 복구 동선
+- 목록 컨텍스트 없는 상세의 죽은 "이전/다음" 바(#32) — `navContext.ts` 순수 함수로 분리·수정
+
+**미해결 / 결정 필요 (`docs/BUGS.md` #33) — Release 전 판단 항목**
+- 검색 UI 물건종류 **69개 중 60개가 항상 0건**. UI 어휘(Tank Auction 전수 복사)와 크롤러가
+  저장하는 값(18종, 복합값 포함)이 다르다. `다세대`(246) `근린시설`(164)
+  `상가,오피스텔,근린시설`(202) `오피스텔`(102) 등 **이름으로 도달 불가한 행 745/1,870 ≈ 40%**.
+  해결책 3안(UI 어휘 교체 / 백엔드 동의어 매핑 / 크롤러 정규화)이 모두 기존 확정 결정을
+  뒤집으므로 임의 수정하지 않고 측정치와 함께 기록만 했다.
+
+**테스트** — 프론트 계약 테스트 29 → **50 검사**(`tests/nav-context.test.mjs` 신규 8 포함).
+"200이면 통과"를 넘어 정렬 순서·페이지 내용·결과 주소 등 **실제 응답 데이터**를 단언한다.
+
+**품질 게이트** — Python 회귀 15/15, 프론트 50/50, Type Check / Lint 0 / Build 전부 통과.
+QA 데이터 잔여 0건.
+
+### 2026-08-11 (Sprint 50) Release Readiness + 잔여 Backlog
+
+**완료**
+- **Next.js 16 `middleware` → `proxy` 규약 전환**: `src/middleware.ts` → `src/proxy.ts`.
+  인증 로직은 함수명을 빼면 **문자 단위로 동일**(정규화 비교로 확인). 유일한 실질 변화는
+  Next가 강제하는 런타임(Edge → Node.js)이며 `@supabase/ssr`은 양쪽 모두 지원한다.
+  빌드 경고 소멸, 게이트/redirect 동작 9항목 브라우저 실측 통과, 계약 테스트 +3검사(50→53)
+- **문서 stale 정정**: `FRONTEND_MASTER_SPEC.md` §5.1이 "공통 Header 없음"으로 남아
+  §11.2("중복 컴포넌트 금지")와 충돌하던 위험한 기록을 AS-IS로 명시하고 현재 상태를 추가.
+  컴포넌트 인벤토리(5→6), `docs/frontend.md`의 "`/`가 redirect한다"(자기 모순) 정정,
+  `middleware.ts` → `proxy.ts` 참조 정리(과거 기록은 보존)
+
+**측정만 하고 SKIP (승인/결정 필요)**
+- **BUGS #33 물건종류 어휘**: 기본 검색 화면에서 **69개 중 62개(90%)가 항상 0건**,
+  이름으로 도달 불가한 행 **진행 중 26/41(63.4%)**. 고쳐야 할 이름은 **6개뿐**이고
+  남은 쟁점은 복합값 `상가,오피스텔,근린시설`(202행) 처리 하나. 해결안 3안 비교표 작성.
+  **Release Blocking 아님 / 출시 전 결정 필요**
+- **BUGS #34 레거시 `/properties`**(신규 기록): 404가 아니라 **항상 엉뚱한 물건이 열린다**를
+  실측 확정(강남구 카드 → 관악구 물건). inbound 링크 0건이라 사용자 도달 경로 없음
+
+**Audit 결과** — dead code 0건, 프론트↔서버 API 계약 누락 0건, 아키텍처 불변식 유지,
+신규 TODO 0건, 성능 회귀 없음(`proxy.ts` 구간 5~12ms)
+
+**품질 게이트** — Python 회귀 15/15, 프론트 53/53, Type Check / Lint 0 / Build(경고 0) 통과
+
+### 2026-08-11 (Sprint 51) 검색 데이터 품질 + 레거시 정리 + 부트스트랩 복구
+
+사용자 확정 정책: **KG이니시스 실연동만 SKIP**, 나머지는 가능한 범위에서 전부 진행.
+
+**해결**
+- **BUG #33 물건종류 검색** — 전수 조사 결과 데이터는 완전히 깨끗했고(토큰 15개, 공백/NULL 0건),
+  원인은 **LIKE 방향**이었다(`'%다세대주택%'`이 DB값 `'다세대'`보다 길어 매치 불가).
+  `api/v1/search.py`에 어휘 별칭 7개를 **순수 가산**으로 추가 —
+  **도달 불가 745행 → 0행**, 기존 9개 항목 건수 전부 불변, UI 어휘·API 계약 무변경
+- **BUG #34 레거시 `/properties`** — `/`로 영구 이동. `SearchFilters.tsx`도 함께 제거
+- **`src/login/` 제거** — 도달 불가 증명 + §3.4 계약 위반(무방어 redirect) 구현
+- **Migration 017 신설** — fresh clone 부트스트랩에서 `document_collect_failures`가
+  생성되지 않던 것을 복구. **fresh clone이 운영 스키마를 25/25 완전 재현**
+- **`storage/` gitignore 정밀화** — load-bearing 소스 22개가 미추적이던 BUG #28의
+  구조적 원인 제거(소스만 추적, 데이터는 계속 무시)
+- **잘못된 검색 파라미터 UX** — 400/422를 서버 장애 문구로 오귀인하던 것을 원인별 분기 +
+  복구 동선으로 수정(검색/상세 양쪽). API 서버를 실제로 내려 재현 검증
+- **BUG #36 신규·해결** — `property_type` 2,000개 입력 시 500 → 상한 100 + 400
+
+**Audit** — 약한 테스트 결함 0건(기존 2건은 이미 강화돼 있음 확인), 별칭 성능 비용 +0.3ms,
+크롤러 원자적 쓰기 방어 전 계층 유지
+
+**테스트** — Python 회귀 469 → **494검사**, 프론트 53 → **59검사**, 변이 5종 검출 확인.
+테스트 자체의 자기참조 결함 1건 발견·수정
+
+**품질 게이트** — Python 15/15, 프론트 59/59, Type Check / Lint 0 / Build(경고 0) 통과
+
+### 2026-08-11 (Sprint 52) 결제 도메인 내부 완성 + 기술부채 정리
+
+확정 정책: **KG이니시스 실연동만 SKIP**.
+
+**결제 도메인 (`docs/BUGS.md` #38)** — 준비만 되고 호출부가 0건이던 경로를 전부 연결했다.
+- `POST /api/v1/admin/payments/{id}/refund` (SUPER_ADMIN) — 전액/부분/반복 환불.
+  누적 환불액은 스키마 변경 없이 `payment_logs` CANCEL 합계로 계산. 상태머신 관문 통과 필수,
+  멱등, 동시 환불 방어, 감사 로그 기록. provider 미구현이면 상태를 바꾸지 않는다
+- `POST /api/v1/payments/webhook/{provider}` — 인증 없는 경로라 서명 검증이 유일한 방어선.
+  `verify_webhook_signature()` 신설(**기본 False = fail-closed**), `PAYMENT_WEBHOOK_SECRET`
+  미설정이면 전부 401, `event_id` 멱등, 검증 실패도 감사 기록
+- `MockProvider.handle_webhook()`이 event_type과 무관하게 항상 SUCCESS를 주던 결함도 수정
+- **사업 정책은 만들지 않았다** — 환불 조건/비율, 셀프 환불, 환불 시 구독 해지 여부 SKIP
+
+**`GET /api/v1/subscriptions/me` 신설** — 결제한 사용자가 자기 구독(플랜/만료/유예/이용가능)을
+볼 방법이 아예 없던 공백. 마이페이지 화면 스펙은 미정이라 API만 완성했다.
+
+**Frontend 기술부채 3건** — 카드 "조회수 -"(항상 빈 죽은 UI) 제거 / `crawl_date` 정렬 UI 노출
+(도달 불가 정렬이었음) / 비로그인 검색조건 저장 시 입력하던 **이름** 보존
+
+**`audit_logs` QA 잔여 792행 정리 (#39)** — cleanup이 `user_id` 없는 테이블을 못 지우던 공백.
+검증 체크가 공허하게 참이던 허점도 수정. 이제 회귀 후 감사/Webhook/결제로그 전부 0행
+
+**테스트** — Python 494 → **569검사**, 프론트 59 → **64검사**, 변이 5종 검출
+
+**품질 게이트** — Python 15/15, 프론트 64/64, Type Check / Lint 0 / Build 통과
+
+**신규 환경변수** — `PAYMENT_WEBHOOK_SECRET`(선택, 미설정이 안전한 기본값. 값은 운영자 생성)
+
+### 2026-08-11 (Sprint 53) Webhook 운영 도구 + 인증 경계 전수 + 기술부채 정리
+
+**신설** — Webhook 운영 엔드포인트 3개(`docs/BUGS.md` #41)
+- `GET /admin/payments/webhooks` (ADMIN) — 필터·페이지네이션 + `reprocessable`/차단 사유
+- `GET /admin/payments/webhooks/{id}` (ADMIN) — 원문 payload·실패 사유
+- `POST /admin/payments/webhooks/{id}/reprocess` (**SUPER_ADMIN**) — 수신 경로와 같은
+  `_apply_webhook_event()`를 타므로 상태머신 우회 없음, 성공 시 PROCESSED로 중복 재처리 자동 차단
+
+**보안 결함 2건 수정 (#42)**
+- **저장소 증폭**: 인증 없는 Webhook이 익명 요청마다 DB 행 생성(5회→5행) → 검증 전 저장 금지.
+  실측 재검증 **익명 20회 → 0행**
+- **event_id oracle**: 중복 검사가 서명 검사보다 앞이라 서명 없이 존재 여부 탐지 가능 → 구조적 제거
+
+**테스트 강화**
+- **인증 경계 전수(§33)** — OpenAPI 전 엔드포인트 열거. 분류 안 된 신규 엔드포인트는 실패.
+  결과: 공개 8 / 사용자 16 / 관리자 16 / 서명보호 1, **익명 도달 가능 0건**
+- **하네스 결함 수정(#43)** — 실패 출력의 제품 문자열이 cp949에서 크래시해 회귀가
+  "FAIL"이 아니라 "중단"으로 보이던 문제. 출력 함수 한 곳에서 차단
+
+**기술부채 해소**
+- 계약 테스트 `before()` 서버 의존 → `tests/source-contract.test.mjs` 분리(서버 없이 10/10)
+- `.env` BOM 제거(#35 해결, 본문 SHA256 동일 — 값 무변경)
+- `storage/migrate_doc_collect.py` 제거(017로 대체, 부트스트랩 25/25 재현 재확인)
+- `AuditTargetType.PAYMENT_WEBHOOK` 신설, cleanup 순서 버그 수정
+
+**검토 후 유지 결정** — `TossProvider`/`PortOneProvider`(제거 시 운영자 진단이 나빠짐),
+개별 차종·면적·특수조건 검색(대응 컬럼 0개, 크롤러+스키마 선행 필요)
+
+**테스트** — Python 569 → **616검사**, 프론트 64검사, 변이 8종 검출, 3회 연속 잔여 0
+
+**품질 게이트** — Python 15/15, 프론트 64/64, Type Check / Lint 0 / Build(경고 0) 통과
+
+---
+
+## 2026-08-11 Sprint 54 기준 실측
+
+### Release Blocking (2건)
+
+1. **KG이니시스 실연동 미완** — 기존 항목. 결제 도메인은 Mock으로 end-to-end 동작하지만
+   실제 PG 호출은 없다. 외부 계약/Secret 발급이 필요해 Sprint 지침상 계속 SKIP.
+2. **크롤 파이프라인 8일 중단 (BUGS #46)** — 신규. 저장소 안의 원인 3개는 이번에 고쳤고
+   운영 조치 3개가 남았다. 조치 없이는 **2026-08-13부터 검색 결과가 0건**이 된다.
+
+### 데이터 실측 (2026-08-11)
+
+```
+auction_item                 1,870건
+  auction_date >= 오늘          41건   (08-11에 27, 08-12에 14)
+  crawl_date 최신          2026-08-01   (10일 경과)
+
+rights_summary                 162건 / 1,870  (8.7%)
+  진행 중 물건 중                  1건 / 41
+  19개 분석 컬럼 중 14개가 100% NULL
+  (risk_level / risk_reason / analysis_explanation / estimated_inheritance /
+   foreclosure_note / priority_right / total_deposit / lien_exists 등)
+tenant_rights                  523행  (SPEC 242 / STATUS 281)
+
+document_status    COLLECTING 5,593 / READY 14 / FAILED 3
+document_queue     pending 2,703 / done 591
+doc_raw                          0행
+parsed_document                  0행
+```
+
+권리분석 화면은 **거의 모든 항목이 "정보 없음"**으로 뜬다. 화면 결함이 아니라
+문서 수집·파싱이 멈춰 있어서다(#46과 같은 뿌리).
+
+### 실행 환경
+
+```
+인터프리터   C:\Users\jhj12\AppData\Local\Programs\Python\Python312\python.exe  (3.12.10)
+             (배치가 가리키던 C:\ProgramData\Anaconda3\python.exe 는 존재하지 않음)
+설치됨       fastapi 0.141.1 / uvicorn 0.52.1 / pydantic 2.13.4 / python-jose 3.5.0 /
+             cryptography 50.0.0 / python-dotenv 1.2.2 / requests 2.34.2 / httpx 0.28.1
+미설치       selenium / pandas / pdfplumber / webdriver-manager
+             -> test_db.py / test_docs.py / test_docs2.py 실행 불가, 크롤러 기동 불가
+예약 작업    등록된 248개 중 이 저장소를 가리키는 것 0개
+디스크       859.2 GB 여유 (2026-08-02의 "No space left on device"는 해소됨)
+```
+
+### 테스트 현황
+
+```
+Python  test_api_regression.py       616검사 PASS
+        나머지 18개 파일             15 PASS / 3 실행 불가(selenium)
+프런트  node --test tests/**          86검사 PASS  (35 suites)
+변이    rightsAnalysis 5/5 + requirements 4/4  전부 검출
+정적    tsc --noEmit 0 / eslint 0 / next build 성공 (/mypage 포함 10 페이지)
+```
+
+### 승인 대기로 막혀 있는 것
+
+- **Admin 운영 UI** — 인증이 공유 `X-Admin-Key` 하나뿐이고, `audit_logs.admin_id`에
+  사람이 아니라 역할 문자열(`admin_role`)이 기록된다. 환불(실제 금전)이 누구 소행인지
+  남지 않는다. 브라우저 UI는 그 키 보유자만 늘리므로 **운영자별 신원 체계가 선행**돼야 한다.
+- **권리분석 "정보원" 표기 (BUGS #45)** — 원본 문서 확보 여부와 파싱 데이터 존재 여부가
+  한 이름으로 표시돼 서로 모순된다. 표기 방식은 화면 설계 결정.
+
+---
+
+## 2026-08-11 Sprint 55 기준 실측
+
+### 파이프라인 연결 상태 (가장 중요한 발견)
+
+배치가 실행하는 것과 데이터를 채우는 것이 **끊겨 있다**.
+
+```
+스케줄러 도달 가능    mvp_scraper / migrate_execute / doc_worker / refresh_priority
+스케줄러 도달 불가    collect_documents.py  analyze_docs.py
+                     load_rights_data.py   load_spec_data.py
+```
+
+아래 네 스크립트가 `document_status`(Sprint 55 전) / `doc_raw` / `parsed_document` /
+`tenant_rights` / `rights_summary`를 쓰는 **유일한 코드**다. 배치 3종의 import를 재귀로
+따라가도 도달하지 않는다. 권리분석 커버리지 8.7%의 근본 원인이며, 배치에 넣는 것은
+운영 스케줄 결정이라 SKIP했다.
+
+### 데이터 실측
+
+```
+auction_item        1,870      document_queue      3,480 (pending 2,703 / done 591 / SKIPPED_EXPIRED 186)
+rights_summary        162      document_status     5,610 (READY 588 / COLLECTING 5,019 / FAILED 3)
+tenant_rights         523      doc_raw                 0
+                              parsed_document          0
+
+document_status READY   14 -> 588   (Sprint 55에서 574행 보정, 디스크 실물 기준)
+자기 item_no로 큐에 없는 물건  716 -> 구조 수정 완료, 기일 남은 대상 10건은 다음 수집 때 채워짐
+```
+
+### 데이터 무결성 (전수)
+
+```
+고아 행 (7개 참조 경로 전수)                    0
+필수 필드 결측  auction_date 1건 / sido 3건 / 그 외 0
+가격 이상 (최저가>감정가, bid_rate 범위 밖)      0
+큐에 있으나 auction_item에 없는 (사건,물건)      0
+property_type과 실제 내용 불일치                 2건 (id=317, id=11804)
+면적 10만㎡ 초과                                8건 (지분 매각이라 표기 면적이 전체 필지)
+```
+
+### 검색 Backlog 재조사 (면적 / 차종 / 특수조건)
+
+| 항목 | 데이터 존재 | 결론 |
+|---|---|---|
+| 면적 | **이미 수집됨** — `full_address`의 99.0%에 면적 수치(㎡ 1,952 / 평 14) | 크롤러 변경 불필요. 다만 2.4%가 층별 다중 면적이고 지분 매각은 표기가 전체 필지라, **어느 값을 색인할지가 제품 결정** |
+| 차종 | 텍스트로는 존재(`[카니발 리무진 2020년식 승용차]`) | 대상이 13건뿐이고 자유 텍스트라 신뢰도 낮음. 구조화 수집 선행 필요 |
+| 특수조건 | 없음 | 대응 컬럼·수집 항목 모두 없음 |
+
+로드맵의 "셋 다 크롤러 수집 항목 추가가 선행돼야 한다"는 서술은 **면적에 한해 부정확**했다.
+
+### 성능 (실측, 최적화 불필요)
+
+```
+document_status by item_id   0.028ms   index
+tenant_rights by item_id     0.034ms   index
+rights_summary by item_id    0.029ms   index
+Sprint 55 신규 JOIN 조회      0.027ms   index (COVERING)
+worker claim 쿼리            idx_queue_status + TEMP B-TREE (pending 2,703건 규모에선 무영향)
+```
+
+### Release Blocking (2건, 변동 없음)
+
+1. **KG이니시스 실연동** — 계속 SKIP
+2. **크롤 파이프라인 중단** — 저장소 측 원인은 Sprint 54·55에서 전부 제거했다.
+   남은 것은 운영 조치 3건(`pip install`, 예약 작업 등록, 크롤 1회 실행)뿐이다.
+   조치 없이는 **2026-08-13부터 검색 결과 0건**.
+
+### 승인 대기로 막혀 있는 것
+
+- **Admin 운영자 신원 체계** — 16개 라우트 전부 권한 가드가 있고 변경 6개 전부 감사 로그를
+  남긴다(전수 확인). 그러나 `record_audit(admin_id=admin_role)` — 사람이 아니라 역할
+  문자열이 기록된다. 환불이 누구 소행인지 남지 않으므로 브라우저 UI는 여전히 선행 조건 미충족.
+- **파이프라인 후반 4개 스크립트의 스케줄 편입** — 운영 스케줄 결정
+- **면적 색인 기준** — 다중 면적/지분 매각을 어떻게 다룰지는 제품 결정
+
+---
+
+## 2026-08-11 Sprint 56 기준 실측
+
+### 파이프라인 정합 (Sprint 55 수정 이후 재측정)
+
+```
+done 591건  -> 파일 없음 0 / document_status 없음 0 / READY 아님 0 / 대응 물건 없음 3
+파일 588개  -> 큐가 done 아님 0
+큐 상태     -> in_progress 정체 0 / retry 불일치 0 / 기일 남은 SKIPPED_EXPIRED 0
+고아 행     -> 5개 참조 경로 전부 0
+```
+
+단계 간 불일치가 **0**이고, `test_pipeline_integrity.py`(30검사)가 이를 불변식으로 고정한다.
+
+남은 공백은 파싱 단계 하나다.
+
+```
+SPEC   READY 197 / 파싱됨 116  (미파싱 81)
+STATUS READY 194 / 파싱됨 161  (미파싱 33)
+APPRAISAL           파싱 대상 테이블 없음
+진행 중 물건 41건 중 큐에 있는 것 31건 (나머지 10건은 다음 수집 때 충전)
+```
+
+### 동시성 방어 (BUGS #53 — 검증이 무의미했던 것을 정상화)
+
+| 가드 | 변이 검출 (수정 전 → 후) |
+|---|---|
+| 등기부 무료한도 `BEGIN IMMEDIATE` | 2/3 → **4/4** |
+| 관리자 전이 조건부 UPDATE | 0/4 → **4/4** (결정적 구조 검사) |
+| 결제 주문 `BEGIN IMMEDIATE` | 원래부터 검출됨 |
+| 환불 `BEGIN IMMEDIATE` | 원래부터 검출됨 |
+
+### 결제 도메인 감사 결과
+
+- Admin 16개 라우트: 권한 가드 16/16, 변경 6/6 감사 로그 (Sprint 55 확인 유지)
+- 미결제 → 완료 전이 **차단됨**(`ALLOWED_TRANSITIONS`에 `PAYMENT_REQUIRED` 키 없음) + 회귀 추가
+- 다운로드 게이트: 소유권 + `COMPLETED` + 경로 탈출 검사 3중
+- 무료/유료 판정, 멱등 처리, 원장 기록 전부 `BEGIN IMMEDIATE` 안에서 수행
+- 변이 5종 전부 검출
+
+### 테스트 현황
+
+```
+Python  test_api_regression.py       627검사
+        그 외 21개 파일              19 PASS / 3 설계상 건너뜀
+프런트  node --test tests/**          93검사 (37 suites)
+변이    파이프라인 9/9 · 결제 5/5 · TOCTOU 4/4 · 무료한도 4/4
+정적    tsc 0 / eslint 0 / build 성공
+```
+
+### 알아 둘 함정
+
+프런트엔드 테스트는 dev 서버가 없으면 `frontend-contract.test.mjs` 전체가 **cancelled**가 되고,
+출력이 `pass 45 / fail 0`으로 보인다(종료 코드는 정상적으로 1). `fail 0`만 읽으면 초록으로
+오인한다 — **`cancelled`와 종료 코드를 함께 봐야 한다.**

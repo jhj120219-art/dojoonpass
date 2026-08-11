@@ -1,0 +1,51 @@
+# DOJOONPASS(콕찰) Python 의존성
+#
+# 2026-08-11 Sprint 54 신설. 그 전까지 이 저장소에는 의존성 목록이 **하나도 없었다**
+# (requirements.txt / pyproject.toml / environment.yml 전부 부재).
+#
+# 왜 지금 만들었나 — 실제로 사고가 났다:
+#   1. 배치 3종이 `C:\ProgramData\Anaconda3\python.exe`를 하드코딩하고 있었다.
+#   2. 그 Anaconda가 제거되면서 일일 크롤이 멈췄다(마지막 성공 2026-08-02).
+#   3. 어떤 패키지가 그 환경에 있었는지 **아무 데도 기록돼 있지 않아** 복구할 수가 없었다.
+#   4. 현재 PATH의 인터프리터(Python 3.12.10)에는 selenium/pandas/pdfplumber/
+#      webdriver-manager가 없다 -> 배치 경로를 고쳐도 크롤러는 여전히 못 돈다.
+#
+# 목록은 추측이 아니라 **소스 153개 .py의 import를 전수 파싱**해서 뽑았다.
+# (표준 라이브러리와 저장소 내부 모듈 제외)
+#
+# 버전 표기 원칙:
+#   - 지금 설치돼 있어 **실측 가능한 것만** `==`로 고정했다.
+#   - 사라진 Anaconda 환경에 있던 버전은 확인할 방법이 없어 고정하지 않았다.
+#     추측해서 박아 넣으면 "검증된 핀"처럼 보이는 거짓 정보가 된다.
+#   - 아래 미고정 항목은 최초 설치 성공 후 `pip freeze`로 실제 버전을 확정할 것.
+#
+# 설치:  pip install -r requirements.txt
+# 검증:  python -c "import selenium, pandas, pdfplumber, webdriver_manager; print('OK')"
+
+# --- API 서버 (현재 설치됨 — 실측 버전 고정) ---------------------------------
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+python-dotenv==1.2.2
+requests==2.34.2
+
+# Supabase JWT 검증(ES256/HS256)에 쓰인다. `[cryptography]` extra가 없으면
+# ES256 검증이 런타임에 실패한다 — docs/BETA_RELEASE_CHECKLIST.local.md에도 적혀 있다.
+python-jose[cryptography]==3.5.0
+cryptography==50.0.0
+
+# --- 크롤러 / 문서 파이프라인 (현재 **미설치** — 크롤 중단의 직접 원인) --------
+# selenium          : crawler/base_crawler.py 등 19개 파일. 법원경매 사이트 수집의 핵심
+# webdriver-manager : ChromeDriver 자동 수급 (10개 파일)
+# pandas            : mvp_scraper.py 집계 (3개 파일)
+# pdfplumber        : collect_documents.py / analyze_docs.py PDF 파싱 (3개 파일)
+selenium
+webdriver-manager
+pandas
+pdfplumber
+
+# --- 테스트 -----------------------------------------------------------------
+# 회귀 스위트는 표준 라이브러리(urllib/sqlite3)만 쓴다 — 추가 의존성 없음.
+# test_docs.py / test_docs2.py / test_db.py는 selenium을 직접 import하므로
+# 위 크롤러 그룹이 설치돼야 실행된다.
+httpx==0.28.1

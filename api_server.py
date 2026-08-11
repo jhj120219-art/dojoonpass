@@ -31,6 +31,7 @@ from api.v1.registry import router as registry_router
 from api.v1.documents import router as documents_router
 from api.v1.payments import router as payments_router
 from api.v1.admin import router as admin_router
+from api.v1.subscriptions import router as subscriptions_router
 
 app = FastAPI(
     title="도준패스 법원경매 API",
@@ -67,6 +68,7 @@ app.include_router(registry_router, prefix="/api/v1", tags=["registry"])
 app.include_router(documents_router, prefix="/api/v1", tags=["documents"])
 app.include_router(payments_router, prefix="/api/v1", tags=["payments"])
 app.include_router(admin_router, prefix="/api/v1", tags=["admin"])
+app.include_router(subscriptions_router, prefix="/api/v1", tags=["subscriptions"])
 
 @app.get("/")
 def root():

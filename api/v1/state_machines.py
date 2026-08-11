@@ -8,8 +8,11 @@
 그 뒤로 상태가 바뀌는 경로가 없다. 이 모듈은 *앞으로* 상태를 바꾸려는 코드(환불/Webhook/
 Admin 조작)가 반드시 통과해야 할 관문이며, 지금 흐름에는 개입하지 않는다.
 """
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from api.constants import (
     PaymentStatus, SubscriptionStatus,
@@ -179,8 +182,18 @@ def grace_period_end(expires_at: str) -> Optional[str]:
 
 def _parse(value: str) -> Optional[datetime]:
     """ISO 문자열 파싱. 형식이 깨져 있으면 None을 돌려 호출부가 상태를 바꾸지 않게 한다
-    (파싱 실패를 '만료'로 해석하면 정상 구독자가 끊긴다)."""
+    (파싱 실패를 '만료'로 해석하면 정상 구독자가 끊긴다).
+
+    2026-08-11 Sprint 56: **반드시 로그를 남긴다.** 폴백 자체는 옳지만 예전에는 조용했다 —
+    `expires_at`이 깨진 구독은 `effective_status()`가 영원히 만료로 넘기지 않으므로
+    **무기한 유효한 구독**이 되고, 그 사실을 알 방법이 없었다. 안전한 방향으로 실패하는
+    것과 실패를 숨기는 것은 다르다.
+    """
     try:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
+        logger.warning(
+            "구독 만료 시각을 해석할 수 없습니다 (expires_at=%r) — 만료 판정을 보류합니다. "
+            "이 구독은 만료되지 않으므로 데이터 점검이 필요합니다", value
+        )
         return None

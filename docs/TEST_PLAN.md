@@ -1,7 +1,7 @@
 # Test Plan
 
 Status: Active
-Last Updated: 2026-08-09
+Last Updated: 2026-08-11 (Sprint 53)
 
 이전 버전(16줄짜리 체크리스트)은 "이미지 ☑", "권리분석 ☑"처럼 **존재하지 않는 기능을 완료로
 표시**하고 있었고 실제로 상시 실행 중인 회귀 테스트 2종도 전혀 언급하지 않았다.
@@ -11,11 +11,11 @@ Last Updated: 2026-08-09
 
 ## 1. 자동 회귀 테스트 (상시 실행 가능)
 
-### 1-A. Frontend 계약 테스트 (2026-08-10 Sprint 45 신규)
+### 1-A. Frontend 계약 테스트 (2026-08-10 Sprint 45 신규, 2026-08-11 Sprint 49~50 확장)
 
 ```bash
 npm run dev                  # 먼저 서버를 띄운다 (npm run start도 가능)
-npm run test:frontend        # tests/frontend-contract.test.mjs — 29 검사
+npm run test:frontend        # tests/**/*.test.mjs — 64 검사 (HTTP 계약 46 + 소스 계약 10 + navContext 8)
 ```
 
 `docs/FRONTEND_MASTER_SPEC.md`가 "절대 변경 금지"로 못박은 계약을 고정한다: `/` 무redirect,
@@ -24,6 +24,103 @@ npm run test:frontend        # tests/frontend-contract.test.mjs — 29 검사
 로그인 폼의 redirect 복귀 구조, 공개 라우트 무차단, 정렬/페이지 파라미터 비로그인 처리,
 개인화 라우트(`/properties/recent`·`/favorites`) 서버 게이트, **Empty State 안내·복구 동선**,
 1320px 컨테이너, 반응형 열 구성, **접근성 기본**(h1 단일/main·nav 랜드마크/select 접근 이름/lang), **Open Redirect 방어**(GET 단계 외부 origin 이탈 없음).
+
+**Sprint 49 확장 (29 → 50 검사)** — "200이면 통과"를 넘어 실제 결과 데이터까지 본다.
+기존 29검사는 정렬/페이지 파라미터를 붙여도 200인지까지만 봤기 때문에, **정렬 버튼을 눌러도
+결과 순서가 그대로**인 결함(`docs/BUGS.md` #29/#30)이 전부 통과한 채로 남아 있었다.
+
+- 정렬: asc/desc의 **렌더된 물건 id 순서가 실제로 다른가**, 화살표 표시가 백엔드 기본 정렬
+  (`sort_order` 기본 `desc`)과 일치하는가, 정렬 변경 시 `page=1`로 초기화하는가
+- 페이지: 1페이지와 2페이지의 물건이 **겹치지 않는가**, size 변경이 실제 건수에 반영되는가
+- 페이지 범위 초과(#31): "결과 없음"으로 오인시키지 않고, 복구 링크가 **검색조건을 유지**하는가
+- 검색조건: 지역 조건이 **결과 카드의 실제 주소**에 반영되는가(200만 보고 통과시키지 않음)
+- 비로그인 개인화 액션 노출 정책(§8.2), 로그인 성공 후 복귀·로그아웃 복귀 경로
+
+**Sprint 50 확장 (50 → 53 검사) — 서버 인증 게이트의 위치와 규약**
+
+Next.js 16이 `middleware` 파일 규약을 deprecate해 `src/middleware.ts` → `src/proxy.ts`로
+이전했다(로직 무변경). 게이트가 **어디에 있고 무엇을 보장하는가**를 소스 레벨로 고정한다.
+
+- `src/proxy.ts`가 존재하고 `src/middleware.ts`가 **동시에 존재하지 않는다**
+  (둘 다 있으면 Next가 빌드를 실패시킨다 — 실수로 되살아나는 것을 테스트가 막는다)
+- proxy 파일이 Next 규약(`proxy` 이름의 export 또는 default) + `config.matcher`를 지킨다
+- 보호 경로 목록(`['/properties','/favorites']`)과
+  **`pathname + search` 전체 보존**, `supabase.auth.getUser()` 서버 검증이 그대로다
+
+변이 테스트로 검출력 확인: `pathname + search` → `pathname`으로 되돌리면 **2검사 실패**
+(기존 HTTP 검사 + 신규 소스 검사). 두 규약 파일을 동시에 두거나 export 이름을 바꾸면
+Next가 앱 전체를 500으로 만들어 스위트 전체가 실패한다.
+
+**Sprint 51 확장 (53 → 59 검사)**
+
+- **잘못된 검색 파라미터**(`?size=500`/`?size=abc`/`?page=0`/`?sort_by=DROP` 등 6종):
+  원인을 특정해 안내하는가, 서버 장애 문구를 쓰지 않는가, 복구 링크가 basePath를 유지하는가
+- **레거시 라우트 정리**: `/properties`가 자체 화면을 렌더하지 않는가,
+  하위 경로(`[id]`/`recent`)가 여전히 게이트되고 redirect 경로를 잃지 않는가,
+  도달 불가 중복 코드 `src/login/`이 되살아나지 않았는가
+
+**Backend `test_api_regression.py` §2-B (Sprint 51 신규, 469 → 494 검사)** — 물건종류 어휘
+별칭(`docs/BUGS.md` #33)과 토큰 개수 상한(#36). 고정 건수를 단언하지 않고 **관계**로만 단언한다
+(별칭 건수 >= 원본 토큰 건수 / 다중 선택은 합집합 / 과확장 없음 / 상한 초과는 400).
+변이 5종 검출 확인: 별칭 표 비우기(28실패), 별칭 1개 제거(4실패), 가산성 파괴(7실패),
+과확장(2실패), 상한 무력화(스위트 중단).
+
+> **작성 교훈**: 처음에는 기대값을 `PROPERTY_TYPE_ALIASES`에서 끌어와 루프를 돌렸는데,
+> **표를 비우면 루프가 0회 실행돼 아무것도 단언하지 않고 전부 통과**했다(검증 대상을
+> 기대값의 출처로 삼은 자기참조 결함). 기대 목록은 테스트가 직접 들고, 구현 표는
+> "그 목록을 덮는가"로만 검사하도록 바꿨다.
+
+**Sprint 52 확장 (59 → 64 검사, 프론트)** — 기술부채 정리분 고정.
+카드에 채워질 수 없는 "조회수" 자리가 없는가 / `crawl_date` 정렬이 UI에 노출되고 **실제로
+순서를 바꾸는가** / **타입에 선언된 정렬을 UI가 전부 덮는가**(한쪽만 늘어나는 재발 방지) /
+비로그인 저장 시 입력하던 이름이 복귀 URL에 실리는가 / `preset_name`이 검색 결과를 바꾸지 않는가.
+
+**Backend §29~§31 (Sprint 52 신규, 494 → 569 검사)**
+
+- **§29 환불** — 권한 경계(무인증/ADMIN 거부, SUPER_ADMIN만 허용) / 전액·부분·반복 환불 /
+  멱등(`already_refunded`) / 잔여 초과·0원·음수 거부 / 상태머신 관문(FAILED 결제 환불 불가) /
+  `payment_logs` CANCEL 궤적 / `audit_logs` 전후 상태·금액 기록
+- **§30 Webhook** — **보안이 첫 관심사다**: 시크릿 미설정 401(fail-closed), 서명 없음/오류 401,
+  본문 변조 401, 위조 시도도 감사 기록, 위조가 결제 상태를 못 바꿈. 그 다음이 정상 동작 —
+  적용/멱등(재전송 시 행·로그 중복 없음)/상태머신이 막는 전이 무시/모르는 거래 무시/깨진 payload 400
+- **§31 사용자 구독 조회** — 인증 필수, **소유권 격리**(B가 A의 구독을 볼 수 없음),
+  파생 필드(`effective_status`/`is_entitled`/`grace_period_end`), lazy sync가 DB 상태까지 맞추는지
+
+변이 5종 전부 검출: 서명 검증 무력화(5실패) / 상태머신 관문 제거(1) / 멱등성 제거(1) /
+권한 SUPER_ADMIN→ADMIN 완화(1) / 환불 상한 제거(1).
+
+> **작성 교훈 2**: `no test audit rows left` 검사가 **부모 행을 이미 지운 뒤에** "지금 존재하는
+> qa 결제의 감사 행이 있는가"를 물어 **항상 0(공허하게 참)** 이었다. 삭제 전에 캡처한 id로
+> 확인하도록 바꾸고 "dangling 감사 행 0건"을 추가했다. Sprint 51의 자기참조 결함과 같은 부류다.
+
+**`tests/source-contract.test.mjs` (Sprint 53 신규 — frontend-contract.test.mjs에서 분리, 10 검사)**
+
+**서버가 필요 없다.** `frontend-contract.test.mjs`의 `before()`가 dev 서버를 확인하는데,
+Node 러너는 `before()` 실패 시 **그 파일의 모든 테스트를 취소**한다 — 서버가 잠깐 죽으면
+서버와 무관한 소스 검사까지 사라졌다(실측: 46건 전부 cancelled). 소스만 읽는 검사 10건을
+분리해, 서버가 꺼져 있어도 정상적으로 통과/실패를 보고한다.
+
+**Backend §32~§33 (Sprint 53 신규, 569 → 616 검사)**
+
+- **§32 Webhook 운영** — 권한 경계(ADMIN 조회 / SUPER_ADMIN 재처리) / "노티가 결제보다 먼저
+  도착" 시나리오의 실제 재처리 성공 / 중복 재처리 자동 차단 / **서명 미검증은 상태와 무관하게
+  재처리 불가**(가드 격리 검증) / 목록 필터 / 감사 로그
+- **§33 인증 경계 전수** — OpenAPI에서 **모든 엔드포인트를 열거**해 익명 접근을 검사한다.
+  분류되지 않은 신규 엔드포인트가 나타나면 실패하므로, 추가 시 공개/사용자/관리자 중 무엇인지
+  **반드시 의식적으로 선언**하게 된다. 인증이 body 검증보다 먼저인지, 사용자 간 결제 격리(404)도 확인
+
+변이 8종 전부 검출(서명 가드 / PROCESSED 재처리 / 권한 완화 / 상태머신 우회 /
+oracle 재도입 / 인증 의존성 제거 2종 / 저장소 증폭).
+
+> **작성 교훈 3**: 변이 테스트가 `FAIL 0건 + 크래시`로 나왔다 — 실패 출력에 **제품 코드의
+> em-dash**가 실려 cp949 콘솔에서 죽은 것이다(`docs/BUGS.md` #43). 회귀가 "FAIL"이 아니라
+> "중단"으로 보이면 성격을 오판하기 쉽다. 출력 함수 한 곳에서 인코딩을 방어하도록 고쳤다.
+
+**`tests/nav-context.test.mjs` (Sprint 49 신규, 8 검사)** — 상세의 "이전/다음 물건" 컨텍스트
+(`docs/BUGS.md` #32). 상세 화면은 로그인 필수 + 클라이언트 렌더라 HTTP 블랙박스로 관찰할 수
+없어, 계산을 순수 함수(`src/app/properties/[id]/navContext.ts`)로 분리해 직접 호출한다.
+Node 24의 내장 TypeScript type stripping을 쓰므로 새 의존성·빌드 단계가 없다.
+변이 테스트로 검출력 확인(빈 세그먼트 필터 제거 → 2검사 실패, `i` 부재를 0으로 폴백 → 1검사 실패).
 
 - **러너는 Node 내장 `node:test`** — 새 라이브러리를 설치하지 않았다(`docs/CLAUDE.md` 규칙).
   기존 Python 스크립트 방식과 중복되는 러너를 만들지 않기 위해 `npm run test:frontend` 하나만 추가.
@@ -40,7 +137,7 @@ npm run test:frontend        # tests/frontend-contract.test.mjs — 29 검사
 별도 러너(pytest 등) 설정은 없다. 아래 스크립트를 직접 실행한다.
 
 ```bash
-python test_api_regression.py       # 전 도메인 실제 HTTP 회귀 (434 검사, 2026-08-09 HEAD 프로브 + Admin 결제로그 조회 + 등기부/문서 실다운로드·경로탐색 + 등기부 중복신청 방지 + 구독 중복결제 방지 + 결제 실패 후 재시도 + 2026-08-10 Sprint 43 sort_by 화이트리스트 8개 전수(정렬 결과 body까지) 검증 추가, `docs/BUGS.md` #24)
+python test_api_regression.py       # 전 도메인 실제 HTTP 회귀 (616 검사, 2026-08-11 Sprint 53 §32 Webhook 운영 + §33 인증 경계 전수 추가, 2026-08-11 Sprint 52 §29 환불 + §30 Webhook + §31 사용자 구독 조회 추가, 2026-08-11 Sprint 51 §2-B 물건종류 어휘 별칭(#33)+토큰 상한(#36) 추가, 2026-08-09 HEAD 프로브 + Admin 결제로그 조회 + 등기부/문서 실다운로드·경로탐색 + 등기부 중복신청 방지 + 구독 중복결제 방지 + 결제 실패 후 재시도 + 2026-08-10 Sprint 43 sort_by 화이트리스트 8개 전수(정렬 결과 body까지) 검증 추가, `docs/BUGS.md` #24)
 python test_subscription_policy.py  # 구독 정책/할인/월 리셋/식별키 무결성/credit 원장 (48 항목)
 python test_state_machines.py       # Payment/Subscription 상태 전이·유예기간 순수 로직 (2026-08-08 신규, 82 검사)
 python test_registry_credits.py     # 등기부 credit 원장 순수 로직 (2026-08-08 신규, 20 검사)
@@ -212,3 +309,165 @@ npm run build       # Next.js 빌드 — 통과해야 함
   2026-08-10 Sprint 47에 `storage/checkpoint.py`의 원자적 쓰기(BUGS #23 수정분)가
   코드에서 사라진 것을 `test_checkpoint_atomicity.py`가 잡아냈다(BUGS #28).
   git 이력이 없으므로 **이 디렉터리의 회귀 테스트가 유일한 안전장치**다.
+
+---
+
+## Sprint 54 추가 (2026-08-11)
+
+### tests/rights-analysis.test.mjs (신규, 15검사)
+
+`src/app/properties/[id]/rightsAnalysis.ts`는 순수 로직인데도 **테스트가 0건**이었다.
+그 사이 신뢰도 등급이 뒤집혀 있었고(BUGS #44) HTTP 블랙박스로는 관찰되지 않았다
+(`/properties/[id]`는 로그인 필수 + 클라이언트 렌더).
+
+`nav-context.test.mjs`와 같은 방식 — 순수 함수를 직접 호출한다
+(Node 24 내장 TypeScript type stripping, 새 의존성 없음).
+
+고정한 계약:
+
+| 상황 | 기대 등급 | 근거 |
+|---|---|---|
+| 현황조사서만 | MEDIUM | 대조 상대가 없다 |
+| 명세서만 | MEDIUM | 대조 상대가 없다 |
+| 정보원 없음 | MEDIUM | 확인된 것이 없다 |
+| 둘 다 있고 인원수 일치 | HIGH | 교차 검증됨 |
+| 둘 다 있고 인원수 다름 | MEDIUM | AGGREGATION_DIFFERENCE |
+| 현황 0명 vs 명세서 N명 | LOW | DIRECT_CONFLICT |
+| 둘 다 있으나 비교값 NULL | HIGH 금지 | 비교한 적이 없다 |
+
+핵심 계약 한 줄: **"신뢰도 HIGH와 정보원 누락 경고는 동시에 나올 수 없다."**
+화면에 실제로 함께 떠 있던 모순이라 이것 자체를 테스트로 못 박았다.
+
+변이 감사 5종 전부 검출(5/5):
+대조불가→HIGH 복귀 / `canCrossCheck` 항상 true / NULL 비교값 무시 /
+SPEC 필터 제거 / DIRECT_CONFLICT 등급 하향.
+
+### test_schema_hygiene.py §4 — requirements.txt ↔ 소스 import 일치 (신규 4검사)
+
+의존성 목록을 사람이 관리하면 다음 import가 추가되는 순간 어긋난다. 그래서 **매번 소스에서
+재도출해 비교**한다.
+
+- 저장소의 모든 `.py`를 AST 파싱해 third-party 최상위 import를 수집
+  (표준 라이브러리·로컬 모듈 제외, import 이름 → pip 배포판 이름 매핑 포함)
+- **파싱 실패 파일이 하나라도 있으면 실패** — 파싱 안 된 파일의 import는 조용히 빠져
+  검사에 구멍이 생기기 때문
+- 양방향 검사: 목록에 빠진 것 / 목록에만 있고 아무도 안 쓰는 것
+
+변이 감사 4종 전부 검출(4/4):
+selenium 제거 / pdfplumber 제거 / 미사용 항목 추가 / `python-jose`를 `jose`로 오표기.
+
+### 실행 불가 테스트 (3건) — 회귀 실패 아님
+
+`test_db.py` / `test_docs.py` / `test_docs2.py`는 `selenium`을 직접 import한다.
+현재 인터프리터에 selenium이 없어 `ModuleNotFoundError`로 즉시 종료된다(BUGS #46).
+`pip install -r requirements.txt` 후 재실행해야 한다. **테스트가 깨진 것이 아니라
+환경이 빠진 것**이므로 회귀 실패로 집계하지 않는다.
+
+---
+
+## Sprint 55 추가 (2026-08-11)
+
+| 파일 | 검사 | 대상 |
+|---|---|---|
+| `test_crawl_exit_code.py` | 44 | 크롤/워커 성패 판정, 진입점 종료코드 전달, 배치 errorlevel·마커, 실접속 스크립트 가드 |
+| `test_document_queue.py` | 16 | 큐 UNIQUE 4축 독립성, 다물건 사건 적재, 018 마이그레이션 무손실 |
+| `test_document_status_sync.py` | 25 | 수집 결과가 화면 테이블까지 도달, 최종 실패만 FAILED, 경로 탈출 차단 |
+
+세 파일 모두 **selenium 없이** 실행된다. 판정 로직을 `models/crawl_outcome.py`로 분리하고,
+DB가 필요한 검사는 임시 DB(`tempfile.mkdtemp`)에 최소 스키마를 만들어 실제 함수를 호출한다.
+
+### 테스트를 약하게 만들지 않기 위해 지킨 것
+
+- **스키마를 테스트에 베껴 쓰지 않는다.** `test_document_queue.py`는 018 마이그레이션
+  파일에서 `CREATE TABLE`을 읽어 쓴다. 손으로 베낀 스키마는 진짜 스키마가 바뀌어도
+  계속 통과하고, 그것이 바로 BUGS #48이 오래 살아남은 방식이다(주석은 `item_no`가
+  있다고 했고 테이블에는 없었다).
+- **사유 문자열까지 고정한다.** "수집 0건"과 "저장 0건"은 손봐야 할 곳이 다르다
+  (크롤러 vs 저장 계층). 둘 다 "0건"으로 뭉개면 로그를 봐도 어디를 볼지 알 수 없다.
+  변이 M1이 이 느슨함을 뚫고 살아남아 단언을 강화했다.
+- **배치는 블록 단위로 검사한다.** "파일 어딘가에 `[FAILED]`가 있으면 통과"는 실제로
+  변이를 놓쳤다(인터프리터 분기의 마커가 다른 분기의 결손을 가렸다). 지금은 각
+  실패 분기 안에서 마커를 찾는다.
+
+### 실행 가드 (BUGS #51)
+
+`test_db.py` / `test_docs.py` / `test_docs2.py`는 이름과 달리 테스트가 아니다 —
+assert가 0개이고 실제 `courtauction.go.kr`에 접속한다. 이제 `ALLOW_LIVE_CRAWL=1` 없이는
+`[SKIPPED]`를 남기고 즉시 종료한다.
+
+회귀 스윕은 이 셋을 **"설계상 건너뜀"**으로 분류해야 한다(실패도, 환경부재도 아니다).
+
+```
+python test_api_regression.py          616검사
+그 외 test_*.py 20개                   18 PASS / 3 설계상 건너뜀
+npm run test:frontend                   86검사
+```
+
+### Sprint 55 프런트엔드 추가
+
+| 파일 | 추가 | 내용 |
+|---|---|---|
+| `tests/source-contract.test.mjs` | 3 | 검색 파라미터 계약 — 프런트가 만드는 쿼리 키가 백엔드 파라미터를 벗어나지 않는가 |
+| `tests/rights-analysis.test.mjs` | 4 | `MISSING_SPEC` vs `SPEC_NOT_PARSED` 구분, 문서 확보가 신뢰도를 바꾸지 않음 |
+
+**검색 파라미터 계약이 왜 필요했나** — `SearchForm.buildSearchQuery()`가 백엔드에 없는
+파라미터 5개(면적 4 + 특수조건 1)를 만들고 있었다. FastAPI는 모르는 쿼리 파라미터를
+**조용히 무시**하므로, 값이 실리는 순간 "조건을 걸었는데 전체 결과가 나오는" 상태가 된다.
+현재는 해당 UI가 "준비 중입니다" 자리표시자라 값이 실릴 수 없어 무해하지만, 그 사실이
+주석에만 있었다. 미지원 목록을 테스트에 고정해 **늘어나면 실패하고, 구현되면 목록에서
+빼도록** 강제한다. 변이 4종 전부 검출.
+
+프런트엔드 합계: **93검사** (Sprint 54 기준 86 → 93)
+
+---
+
+## Sprint 56 추가 (2026-08-11)
+
+| 파일 | 검사 | 대상 |
+|---|---|---|
+| `test_pipeline_integrity.py` (신규) | 30 | 파이프라인 단계 간 정합을 **불변식으로 고정** |
+| `test_state_machines.py` §8 | 14 | 깨진 만료 시각이 안전하게, 그러나 **조용하지 않게** 처리되는가 |
+| `test_race_conditions.py` §5 | 5 | TOCTOU 가드 결정적 구조 검사 |
+| `test_api_regression.py` §10 | 10 | 미결제 신청의 관리자 전이/다운로드 차단 |
+
+### 레이스 테스트는 가드를 제거해 보기 전까지 의미가 없다 (BUGS #53)
+
+`test_race_conditions.py`는 4가지 동시성 방어를 검증한다고 돼 있었지만, 실제로 가드를
+제거해 보니 **절반이 통과했다.** 스레드를 순서대로 `start()`만 해서 요청이 겹치지 않았다.
+
+```
+                                   수정 전   수정 후
+BEGIN IMMEDIATE 제거 (무료한도)      2/3      4/4    Barrier + 경합 폭 10->24
+조건부 UPDATE 제거 (관리자 TOCTOU)   0/4      4/4    결정적 구조 검사로 대체
+```
+
+관리자 TOCTOU는 스레드 수를 6으로 늘리자 검출률이 **오히려 1/5로 나빠졌다** —
+Barrier 해제가 계단식이라 첫 스레드가 커밋을 마친 뒤에야 나머지가 SELECT에 도달한다.
+창이 수 마이크로초라 실제 스레드로는 안정 재현이 불가능하다고 판단하고,
+확률적 테스트(2스레드)와 **결정적 구조 검사**를 함께 두는 방식으로 바꿨다.
+
+### "어느 가드가 막았는지"까지 봐야 한다 (BUGS #54)
+
+기존 "미완료 다운로드" 검사는 `success == False`만 봤다. 다운로드의 COMPLETED 검사를
+통째로 없애는 변이를 넣었더니 `doc_url`이 NULL이라 다른 오류로 떨어져 **그대로 통과했다.**
+지금은 `error` 코드와 메시지가 실제 상태를 밝히는지까지 고정한다.
+
+### 프런트엔드 결과는 `fail 0`만 보고 판단하지 말 것
+
+dev 서버가 내려가 있으면 `frontend-contract.test.mjs`의 `before()`가 실패해 그 파일 전체가
+**cancelled**가 된다. 그때 출력은 이렇게 보인다.
+
+```
+tests 93 / pass 45 / fail 0 / cancelled 48      exit code = 1
+```
+
+`fail 0`만 읽으면 초록으로 오인한다. **`cancelled`와 종료 코드를 함께** 봐야 한다
+(2026-08-11 이 저장소에서 실제로 겪음). 하네스 자체는 정상적으로 exit 1을 낸다.
+
+### 현재 게이트
+
+```
+python test_api_regression.py            627검사
+그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀
+npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
+```

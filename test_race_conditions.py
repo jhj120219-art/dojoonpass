@@ -52,6 +52,10 @@ def check(name, actual, expected):
         failures.append(name)
 
 
+def check_true(name, cond):
+    check(name, bool(cond), True)
+
+
 def auth_headers(user_id):
     token = jwt.encode({"sub": user_id}, SUPABASE_JWT_SECRET, algorithm="HS256")
     return {"Authorization": "Bearer " + token}
@@ -67,11 +71,18 @@ def pick_item_ids(n):
 
 
 def test_registry_free_limit_race():
-    """BASIC 플랜(월 5회 무료)에 대해 서로 다른 물건 10개를 정확히 동시에 신청한다.
-    BEGIN IMMEDIATE로 직렬화되어 정확히 5건만 무료(PENDING)여야 하고, 나머지 5건은
+    """BASIC 플랜(월 5회 무료)에 대해 서로 다른 물건 24개를 정확히 동시에 신청한다.
+    BEGIN IMMEDIATE로 직렬화되어 정확히 5건만 무료(PENDING)여야 하고, 나머지는
     PAYMENT_REQUIRED여야 한다 — 5보다 많거나 적게 무료 처리되면 레이스가 재발한 것이다.
+
+    2026-08-11 Sprint 56 강화 — 이 테스트는 **레이스를 재현하지 못하는 레이스 테스트**였다.
+    스레드 10개를 순서대로 start()만 했더니 생성/시작 오버헤드로 요청이 어긋나 겹치지
+    않았고, `BEGIN IMMEDIATE`를 제거하는 변이가 그대로 통과했다.
+    (1) Barrier로 모든 스레드의 진입 시점을 맞추고 (2) 경합 폭을 24로 올렸다.
+    변이를 넣고 반복 실행해 검출률이 올라가는 것까지 확인했다 —
+    레이스 테스트는 확률적이므로 "한 번 통과했다"로 판단하지 않는다.
     """
-    print("\n--- 1. registry free-limit race (10 threads, BASIC = 5/month) ---")
+    print("\n--- 1. registry free-limit race (24 threads, BASIC = 5/month) ---")
     conn = get_connection()
     try:
         now = datetime.now().isoformat()
@@ -85,12 +96,19 @@ def test_registry_free_limit_race():
     finally:
         conn.close()
 
-    item_ids = pick_item_ids(10)
-    check("have 10 distinct items to race with", len(item_ids), 10)
+    item_ids = pick_item_ids(24)
+    check("have 24 distinct items to race with", len(item_ids), 24)
 
     results = [None] * len(item_ids)
 
+    # 2026-08-11 Sprint 56: 예전에는 스레드를 만들고 순서대로 start()만 했다. 생성/시작
+    # 오버헤드 때문에 실제로는 요청이 어긋나 겹치지 않았고, `BEGIN IMMEDIATE`를 제거하는
+    # 변이가 **그대로 통과했다**(레이스를 재현하지 못하는 레이스 테스트).
+    # Barrier로 모든 스레드가 같은 순간에 HTTP 호출에 진입하도록 맞춘다.
+    start_barrier = threading.Barrier(len(item_ids))
+
     def worker(idx, item_id):
+        start_barrier.wait()
         r = client.post("/api/v1/registry-requests", json={"item_id": item_id},
                         headers=auth_headers(TEST_USER_LIMIT))
         results[idx] = r.json()
@@ -105,8 +123,8 @@ def test_registry_free_limit_race():
     free_count = sum(1 for s in statuses if s == "PENDING")
     paid_count = sum(1 for s in statuses if s == "PAYMENT_REQUIRED")
     check("exactly 5 free (PENDING)", free_count, 5)
-    check("exactly 5 required payment", paid_count, 5)
-    check("no request failed outright", len(statuses), 10)
+    check("나머지는 전부 PAYMENT_REQUIRED", paid_count, len(item_ids) - 5)
+    check("no request failed outright", len(statuses), len(item_ids))
 
     # DB 레벨에서도 이번 달 무료 사용 건수가 정확히 5여야 한다(응답과 실제 원장 일치).
     conn = get_connection()
@@ -278,18 +296,32 @@ def test_admin_registry_status_race():
         conn.close()
 
     admin_headers = {"X-Admin-Key": os.environ["ADMIN_API_KEY"]}
-    results = [None, None]
+    # 2026-08-11 Sprint 56: Barrier가 없으면 두 요청이 겹치지 않아 진 쪽이 **항상**
+    # SELECT를 나중에 하고, 그때는 이미 상태가 바뀌어 ALLOWED_TRANSITIONS에서 400으로
+    # 걸린다. 즉 이 테스트가 검증하려던 **조건부 UPDATE(TOCTOU 가드)에는 도달조차 못 했고**,
+    # 그 가드를 무력화하는 변이가 그대로 통과했다. 시작 시점을 맞춰 실제로 겹치게 한다.
+    # 스레드 수를 6으로 늘려 봤지만 검출률이 오히려 3/4 -> 1/5로 **나빠졌다**(2026-08-11 실측).
+    # Barrier 해제가 계단식이라 첫 스레드가 커밋을 마친 뒤에야 나머지가 SELECT에 도달한다.
+    # 이 창(SELECT -> UPDATE, 수 마이크로초)은 실제 스레드로 안정 재현이 불가능하다.
+    # 그래서 여기서는 2개로 두고, 가드 자체는 아래 `test_toctou_guard_is_structural()`이
+    # **결정적으로** 고정한다. 확률적 테스트와 구조적 테스트를 함께 둔다.
+    BODIES = [
+        {"status": "COMPLETED", "doc_url": "https://example.com/qa-race.pdf"},
+        {"status": "FAILED", "reason": "qa-race-fail"},
+    ]
+    results = [None] * len(BODIES)
+    start_barrier = threading.Barrier(len(BODIES))
 
     def worker(idx, body):
+        start_barrier.wait()
         r = client.patch(f"/api/v1/admin/registry-requests/{req_id}", json=body, headers=admin_headers)
         results[idx] = (r.status_code, r.json())
 
-    t1 = threading.Thread(target=worker, args=(0, {"status": "COMPLETED", "doc_url": "https://example.com/qa-race.pdf"}))
-    t2 = threading.Thread(target=worker, args=(1, {"status": "FAILED", "reason": "qa-race-fail"}))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    threads = [threading.Thread(target=worker, args=(i, b)) for i, b in enumerate(BODIES)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     # 두 스레드가 실제로 SELECT/판단을 동시에 통과했다면 진 쪽은 UPDATE의 조건부 WHERE에
     # 걸려 409를 받는다. 스케줄링이 덜 겹쳐 진 쪽이 SELECT를 나중에 하면, 그때는 이미 상태가
@@ -319,6 +351,35 @@ def test_admin_registry_status_race():
             check("winner is FAILED -> doc_url not set from the loser", row["doc_url"], None)
     finally:
         conn.close()
+
+
+
+def test_toctou_guard_is_structural():
+    """조건부 UPDATE(TOCTOU 가드)가 **모든 전이 분기에** 남아 있는가 — 결정적 검사.
+
+    위 시나리오 4는 실제 스레드로 경합을 재현하지만, 창이 너무 좁아 가드를 없애는 변이를
+    항상 잡지는 못한다(2026-08-11 실측: 2스레드 3/4, 6스레드 1/5). 확률에 기대는 검사만
+    두면 가드가 사라져도 통과하는 날이 생긴다. 그래서 소스 레벨에서 함께 못 박는다.
+
+    검사 대상: `update_registry_request_status()`의 UPDATE 세 갈래(COMPLETED/FAILED/그 외)가
+    전부 `WHERE id=? AND status=?` 형태이고, rowcount==0이면 409로 거부하는가.
+    """
+    import re
+    print("\n--- 5. TOCTOU 가드 구조 검사 (결정적) ---")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "v1", "admin.py"),
+               encoding="utf-8-sig").read()
+    i = src.index("def update_registry_request_status")
+    body = src[i:i + 4000]
+
+    updates = re.findall(r'"(UPDATE registry_requests SET [^"]*)"', body)
+    check("UPDATE 분기가 3개다", len(updates), 3)
+    missing = [u for u in updates if "WHERE id=? AND status=?" not in u]
+    check("모든 UPDATE가 현재 상태를 다시 확인한다", missing, [])
+
+    check_true("rowcount==0이면 거부한다", "cursor.rowcount == 0" in body)
+    check_true("거부 응답이 409다", "status_code=409" in body)
+    check_true("거부 시 롤백한다", "conn.rollback()" in body)
+
 
 
 def cleanup():
@@ -368,6 +429,7 @@ def run():
         test_overage_payment_race()
         test_subscription_race()
         test_admin_registry_status_race()
+        test_toctou_guard_is_structural()
     finally:
         cleanup()
 

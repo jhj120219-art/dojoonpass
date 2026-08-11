@@ -15,6 +15,7 @@ from crawler.doc_crawler import (
     collect_document, build_download_driver, restart_download_driver,
 )
 from crawler.base_crawler import go_to_case_detail
+from models.crawl_outcome import DocWorkerOutcome
 
 os.makedirs("logs", exist_ok=True)
 
@@ -37,7 +38,13 @@ def is_time_up() -> bool:
     return now >= end_dt
 
 
-def main() -> None:
+def main() -> int:
+    """종료 코드를 돌려준다. 0=성공(또는 처리할 것이 없음), 1=시도한 것이 전부 실패.
+
+    2026-08-11 Sprint 55 (BUGS #47): 예전에는 `-> None`이라 **큐의 모든 항목이 실패해도
+    종료 코드가 0**이었다. `run_doc_worker.bat`에는 errorlevel 검사조차 없어서, 실패가
+    로그 안쪽 줄에만 남고 스케줄러에는 성공으로 보고됐다.
+    """
     logger.info("===== PDF 수집 Worker 시작 (종료 예정: %s) =====", DOC_WORKER_END_TIME)
     start_ts = time_module.time()
 
@@ -118,6 +125,12 @@ def main() -> None:
         logger.info("===== PDF 수집 Worker 종료 - 시도: %d건, 성공: %d건, 소요시간: %.1f초 =====",
                      processed, succeeded, elapsed)
 
+    outcome = DocWorkerOutcome(processed=processed, succeeded=succeeded)
+    reason = outcome.failure_reason()
+    if reason:
+        logger.error("===== PDF 수집 실패: %s =====", reason)
+    return outcome.exit_code()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

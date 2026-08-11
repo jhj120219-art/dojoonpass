@@ -199,7 +199,47 @@ def mark_webhook_processed(conn, webhook_id: int, status: str,
     )
 
 
+# ---------------------------------------------------------------------------
+# 재처리 가능 여부 (2026-08-11 Sprint 53)
+#
+# 운영자가 실패한 Webhook을 다시 처리하려 할 때, **무엇을 다시 돌려도 되는지**를 한 곳에서
+# 정한다. 목록 조회와 재처리 엔드포인트가 같은 함수를 쓰므로 "목록에는 가능하다고 떴는데
+# 누르면 거부되는" 불일치가 생길 수 없다.
+#
+# 규칙은 기존 상태 의미에서 그대로 도출한 것이며 새 정책을 만들지 않았다:
+#
+#   RECEIVED  : 기록만 되고 처리가 끝나지 않았다(처리 도중 프로세스가 죽은 경우) -> 재처리 가능
+#   IGNORED   : 의도적으로 넘어갔다. 그런데 그 사유 중 일부는 **시간이 지나면 해소된다** —
+#               대표적으로 "해당 거래의 결제 내역을 찾을 수 없습니다"는 PG 노티가 우리
+#               payments row보다 먼저 도착한 경합이라, 나중에 다시 돌리면 성공한다 -> 재처리 가능
+#   PROCESSED : 이미 반영됐다 -> 재처리 대상 아님(다시 돌릴 이유가 없다)
+#   FAILED    : 서명 검증 실패 등. **절대 재처리하지 않는다** — 신뢰한 적 없는 payload다
+#
+# ★ 그리고 상태와 무관하게 `signature_verified=0`이면 언제나 불가다.
+#   검증되지 않은 payload를 운영자 손으로 적용할 수 있으면 서명 검증 자체가 무의미해진다.
+REPROCESSABLE_STATUSES = (WEBHOOK_RECEIVED, WEBHOOK_IGNORED)
+
+
+def webhook_reprocess_block_reason(row) -> Optional[str]:
+    """재처리를 막아야 하는 이유. 가능하면 None을 반환한다.
+
+    운영자가 상태를 오판하지 않도록 **왜 안 되는지**를 문자열로 돌려준다
+    (목록 응답에도 그대로 실어 "가능/불가"만 보여주는 것보다 판단하기 쉽게 한다).
+    """
+    if not row["signature_verified"]:
+        return "서명이 검증되지 않은 수신입니다 — 신뢰할 수 없는 payload라 재처리하지 않습니다"
+    status = row["processing_status"]
+    if status == WEBHOOK_PROCESSED:
+        return "이미 정상 처리된 Webhook입니다 — 다시 적용할 것이 없습니다"
+    if status == WEBHOOK_FAILED:
+        return "처리 실패로 기록된 수신입니다 — 실패 사유를 확인한 뒤 PG에 재전송을 요청하세요"
+    if status not in REPROCESSABLE_STATUSES:
+        return f"재처리를 지원하지 않는 상태입니다: {status}"
+    return None
+
+
 def row_to_webhook(row) -> dict:
+    block_reason = webhook_reprocess_block_reason(row)
     return {
         "id": row["id"],
         "provider": row["provider"],
@@ -213,4 +253,7 @@ def row_to_webhook(row) -> dict:
         "error_message": row["error_message"],
         "received_at": row["received_at"],
         "processed_at": row["processed_at"],
+        # --- 운영 판단용 파생 필드(2026-08-11 Sprint 53 추가) ---
+        "reprocessable": block_reason is None,
+        "reprocess_blocked_reason": block_reason,
     }

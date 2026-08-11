@@ -1,107 +1,32 @@
 import { redirect } from 'next/navigation'
-import { createServerSupabaseClient } from '@/lib/supabaseServer'
-import Link from 'next/link'
-import SearchFilters from './SearchFilters'
-import LogoutButton from './LogoutButton'
-import PrimaryNav from '@/components/PrimaryNav'
-// 상세 화면과 글자 단위로 동일했던 지역 formatPrice를 공용 구현으로 통합(동작 무변경).
-import { formatPriceEok as formatPrice } from '@/lib/format'
 
-type PropertiesPageProps = {
-  searchParams: Promise<{
-    sido?: string
-    sigungu?: string
-    minPrice?: string
-    maxPrice?: string
-  }>
-}
-
-export default async function PropertiesPage({ searchParams }: PropertiesPageProps) {
-  const supabase = await createServerSupabaseClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) redirect('/login')
-
-  const params = await searchParams
-  const minPrice = params.minPrice ? Number(params.minPrice) : 0
-  const maxPrice = params.maxPrice ? Number(params.maxPrice) : 0
-
-  let query = supabase
-    .from('properties')
-    .select('*')
-    .eq('status', 'active')
-
-  if (params.sido) {
-    query = query.ilike('address', `%${params.sido}%`)
-  }
-  if (params.sigungu) {
-    query = query.ilike('address', `%${params.sigungu}%`)
-  }
-  if (minPrice > 0) {
-    query = query.gte('appraisal_price', minPrice)
-  }
-  if (maxPrice > 0) {
-    query = query.lte('appraisal_price', maxPrice)
-  }
-
-  const { data: properties } = await query.order('bid_date', { ascending: true })
-
-  function formatDate(dateStr: string) {
-    const date = new Date(dateStr)
-    return `${date.getMonth() + 1}월 ${date.getDate()}일`
-  }
-
-  return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="bg-white px-5 py-4 flex items-center justify-between border-b border-gray-100">
-        <h1 className="text-lg font-bold text-gray-900">콕찰 경매 매물</h1>
-        <div className="flex items-center gap-3">
-          <PrimaryNav />
-          <span className="text-xs text-gray-400">{user.email}</span>
-          <LogoutButton />
-        </div>
-      </div>
-      <div className="px-4 py-4 space-y-3">
-        <SearchFilters
-          initialSido={params.sido ?? ''}
-          initialSigungu={params.sigungu ?? ''}
-          initialMinPrice={minPrice}
-          initialMaxPrice={maxPrice}
-        />
-        {properties && properties.length > 0 ? (
-          properties.map((property) => (
-            <Link key={property.id} href={`/properties/${property.id}`}>
-              <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 active:bg-gray-50 transition-all duration-200 mb-3">
-                <div className="flex items-start justify-between mb-2">
-                  <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">
-                    {property.property_type}
-                  </span>
-                  <span className="text-xs text-gray-400">{formatDate(property.bid_date)} 입찰</span>
-                </div>
-                <h2 className="text-base font-bold text-gray-900 mb-1">{property.title}</h2>
-                <p className="text-sm text-gray-400 mb-3">{property.address}</p>
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs text-gray-400">감정가</p>
-                    <p className="text-sm font-medium text-gray-700">{formatPrice(property.appraisal_price)}</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-xs text-gray-400">최저입찰가</p>
-                    <p className="text-base font-bold text-blue-500">{formatPrice(property.minimum_bid_price)}</p>
-                  </div>
-                </div>
-                <div className="mt-3 pt-3 border-t border-gray-50 flex items-center justify-between">
-                  <span className="text-xs text-gray-400">{property.court_name}</span>
-                  <span className="text-xs text-gray-400">{property.case_number}</span>
-                </div>
-              </div>
-            </Link>
-          ))
-        ) : (
-          <div className="text-center py-20">
-            <p className="text-gray-400">등록된 매물이 없습니다</p>
-          </div>
-        )}
-      </div>
-    </div>
-  )
+// ================================================================
+// 레거시 `/properties` — 검색 첫 화면(`/`)으로 영구 이동
+//
+// 2026-08-11 Sprint 51. 이 화면은 프로토타입 시절의 잔재였고, 남겨두는 것이
+// 사용자에게 **조용한 오답**을 보여주는 상태였다(`docs/BUGS.md` #34).
+//
+// 무엇이 문제였나
+//  - 목록은 Supabase `properties` 테이블(시드 5행: "강남구 역삼동 아파트 / …123-45")을
+//    직접 조회하면서, 카드 링크는 `/properties/{id}`(FastAPI `auction_item`)로 보냈다.
+//    두 id 채번 체계가 달라 **404도 나지 않고 전혀 다른 물건이 열렸다** —
+//    실측: "강남구 역삼동 아파트"를 누르면 "관악구 난곡로66가길 2층202호"가 열림
+//  - `docs/CLAUDE.md`의 아키텍처 규칙("경매 데이터는 항상 Python API 경유,
+//    Supabase에서 직접 조회하지 않는다")을 정면으로 위반하는 **유일한 화면**이었다
+//  - Sprint 48·50 전수 조사 결과 저장소 안에 이 경로로 향하는 링크가 **0건**(고아 라우트).
+//    `PrimaryNav`의 검색 링크·로그아웃 복귀·로그인 기본 복귀는 전부 `/`다
+//
+// 왜 redirect인가 (삭제도, 유지도 아닌)
+//  - 북마크·외부 링크가 있을 수 있으므로 404를 새로 만들지 않는다
+//  - `/`가 이미 같은 목적(경매 물건 목록)을 **정확한 데이터**로 수행한다
+//  - 하위 경로 `/properties/[id]`·`/properties/recent`에는 영향이 없다
+//    (Next.js는 더 구체적인 세그먼트를 먼저 매칭하고, 이 파일은 `/properties` 정확히 하나만 담당)
+//  - `src/proxy.ts`의 `PROTECTED_PREFIXES`에 `/properties`가 그대로 있어 로그인 게이트도 유지된다
+//
+// 되돌리는 법: `git show <이 변경 이전 커밋>:src/app/properties/page.tsx`로 원본 구현을,
+// 같은 방식으로 `src/app/properties/SearchFilters.tsx`를 복원하면 된다(둘 다 git 추적 중).
+// 단 복원하더라도 위 id 채번 불일치는 그대로이므로 FastAPI 기반으로 다시 써야 한다.
+// ================================================================
+export default function LegacyPropertiesPage() {
+  redirect('/')
 }

@@ -176,7 +176,14 @@ def renew(conn, subscription_id: int, period_days: int,
             if current_expiry > now:
                 base = current_expiry
         except (TypeError, ValueError):
-            pass  # 형식이 깨져 있으면 지금부터 센다
+            # 형식이 깨져 있으면 지금부터 센다. 폴백 방향은 옳지만(과거 시점에서 더하면
+            # 갱신하자마자 또 만료된다) 조용히 넘어가면 안 된다 — 사용자가 남은 기간을
+            # 잃는 쪽이므로 반드시 드러나야 한다 (2026-08-11 Sprint 56).
+            logger.warning(
+                "구독 %s의 만료 시각을 해석할 수 없습니다 (expires_at=%r) — "
+                "기존 잔여 기간을 이어 붙이지 못하고 지금부터 다시 셉니다",
+                subscription_id, row["expires_at"]
+            )
 
     new_expires = (base + timedelta(days=period_days)).isoformat()
     if row["status"] != SubscriptionStatus.ACTIVE:
@@ -190,3 +197,48 @@ def renew(conn, subscription_id: int, period_days: int,
                 subscription_id, row["expires_at"], new_expires, actor)
     updated = conn.execute("SELECT * FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
     return {"before": row_to_subscription(row), "after": row_to_subscription(updated)}
+
+
+# ---------------------------------------------------------------------------
+# 사용자용 조회 엔드포인트 (2026-08-11 Sprint 52 신설)
+#
+# 왜 지금 만드는가 — **결제한 사용자가 자기 구독을 볼 방법이 아예 없었다.**
+# `GET /api/v1/payments`(결제 내역)는 있는데 구독은 사용자용 경로가 하나도 없어서,
+# 프론트는 등기부 신청이 실패할 때 돌아오는 error code(REGISTRY_SUBSCRIPTION_REQUIRED)로
+# "구독이 없구나"를 **간접 추론**하는 것이 유일한 방법이었다. 플랜/만료일/유예기간을
+# 확인할 방법은 없었다(2026-08-09 Sprint 38이 "사용자용 엔드포인트 자체가 없다"고 기록).
+#
+# 마이페이지 화면의 **스펙은 미정**이라 화면은 만들지 않는다(`docs/FRONTEND_MASTER_SPEC.md` §16).
+# 다만 어떤 마이페이지 스펙이 나오든 반드시 필요한 이 조회 계약은 화면과 무관하게 성립하므로
+# 여기까지만 만든다. 새 개념을 도입하지 않고 이 모듈의 기존 함수를 그대로 재사용한다.
+#
+# 응답 형태는 `/payments`·`/favorites`·`/recent-items`와 동일한 **envelope + 리스트**다.
+# 새 관례를 만들지 않는다 — 어느 것이 지금 유효한지는 각 행의 `is_entitled`로 판단한다.
+# ---------------------------------------------------------------------------
+from fastapi import APIRouter, Depends  # noqa: E402  (모듈 하단 배치 — 위쪽은 순수 로직)
+
+from api.auth import get_current_user, success  # noqa: E402
+from storage.database import get_connection  # noqa: E402
+
+router = APIRouter()
+
+
+@router.get("/subscriptions/me")
+def get_my_subscriptions(user_id: str = Depends(get_current_user)):
+    """내 구독 목록(최신순). 인증 필수 — 본인 것만 반환한다.
+
+    조회 시점에 시간 경과분을 반영한다(lazy sync) — Admin 목록과 같은 규칙이라
+    "관리자 화면에서는 만료인데 사용자 화면에서는 아직 ACTIVE" 같은 불일치가 생기지 않는다.
+    """
+    conn = get_connection()
+    try:
+        # 이 사용자 것만 동기화한다. 읽기 경로라 여기서 확정해야 변경이 남는다(commit=True).
+        sync_expired_status(conn, user_id=user_id, commit=True)
+        rows = conn.execute(
+            # created_at 동률 시 순서가 흔들리지 않도록 id로 tie-break(전 도메인 공통 규칙).
+            "SELECT * FROM subscriptions WHERE user_id=? ORDER BY created_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        return success([row_to_subscription(r) for r in rows])
+    finally:
+        conn.close()

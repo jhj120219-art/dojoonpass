@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 import os
 import uuid
@@ -71,6 +73,19 @@ class PaymentProvider:
         """PG가 보내는 Webhook payload를 처리해 내부 이벤트로 정규화한다(서명 검증 포함, 실연동 시)."""
         raise NotImplementedError
 
+    def verify_webhook_signature(self, raw_body: bytes, headers: dict[str, str]) -> bool:
+        """Webhook 요청이 정말 이 PG에서 온 것인지 검증한다.
+
+        2026-08-11 Sprint 52 신설. Webhook 수신 엔드포인트를 만들면서 필요해졌다 —
+        수신 엔드포인트는 **사용자 인증이 없는 공개 경로**라, 서명 검증이 유일한 방어선이다.
+        검증되지 않은 요청으로 결제 상태를 바꿀 수 있으면 누구나 "결제 완료"를 위조할 수 있다.
+
+        **기본 구현은 항상 False(fail-closed)** — 검증 방법을 모르는 provider는 어떤 요청도
+        신뢰하지 않는다. 조용히 True를 돌려주는 기본값을 두면, 새 provider를 추가하면서
+        이 메서드를 잊었을 때 방어가 통째로 사라진다.
+        """
+        return False
+
 
 class MockProvider(PaymentProvider):
     """PG 미연동 상태의 Mock 결제. 항상 SUCCESS — 기존 api/v1/payments.py의 동작과 완전히 동일하다."""
@@ -102,14 +117,60 @@ class MockProvider(PaymentProvider):
         # (Mock 결제는 confirm_payment 시점에 이미 무조건 성공하므로 재확인할 실패 케이스가 없음).
         return ChargeResult(status=PaymentStatus.SUCCESS.value, pg_provider=None, pg_transaction_id=pg_transaction_id)
 
+    # Mock Webhook이 인정하는 이벤트 → 결제 상태 매핑.
+    # 값은 전부 api/constants.py:PaymentStatus에 이미 있는 것만 쓴다(새 상태를 만들지 않는다).
+    WEBHOOK_EVENT_STATUS = {
+        "PAYMENT_CONFIRMED": PaymentStatus.PAID.value,
+        "PAYMENT_FAILED": PaymentStatus.FAILED.value,
+        "PAYMENT_CANCELLED": PaymentStatus.CANCELLED.value,
+        "PAYMENT_EXPIRED": PaymentStatus.EXPIRED.value,
+        "PAYMENT_REFUNDED": PaymentStatus.REFUNDED.value,
+    }
+
     def handle_webhook(self, payload: dict[str, Any]) -> WebhookEvent:
-        # 실제 PG라면 서명(signature) 검증부터 해야 한다. Mock은 Webhook을 실제로 받지
-        # 않으므로(요청사항: Webhook 서버 구현 금지) payload를 그대로 신뢰해 정규화만 한다.
+        """Webhook payload를 내부 이벤트로 정규화한다.
+
+        2026-08-11 Sprint 52 정정: 예전 구현은 event_type과 무관하게 **항상 SUCCESS**를
+        돌려줬다. 그 상태로 수신 엔드포인트를 붙이면 `PAYMENT_FAILED` 노티를 받고도 결제를
+        성공으로 바꾸는 결함이 된다. event_type을 실제로 해석하도록 고쳤다.
+        알 수 없는 event_type은 상태를 바꾸지 않도록 빈 문자열을 돌려준다(호출부가 무시).
+
+        서명 검증은 이 메서드가 아니라 `verify_webhook_signature()`가 담당한다 —
+        수신 엔드포인트가 **정규화보다 먼저** 검증하도록 분리했다.
+        """
+        event_type = payload.get("event_type") or ""
         return WebhookEvent(
-            event_type=payload.get("event_type", "PAYMENT_CONFIRMED"),
+            event_type=event_type,
             pg_transaction_id=payload.get("pg_transaction_id"),
-            status=PaymentStatus.SUCCESS.value,
+            status=self.WEBHOOK_EVENT_STATUS.get(event_type, ""),
         )
+
+    def verify_webhook_signature(self, raw_body: bytes, headers: dict[str, str]) -> bool:
+        """공유 시크릿 HMAC-SHA256으로 검증한다.
+
+        Mock은 실제 PG가 아니므로 PG가 정한 서명 규격이 없다. 대신 **실연동과 같은 모양의
+        방어**(원문 바디에 대한 HMAC + 상수시간 비교)를 구현해, 수신 엔드포인트의 보안 경로가
+        실제로 동작하는지 테스트로 검증할 수 있게 한다.
+
+        `PAYMENT_WEBHOOK_SECRET`이 설정돼 있지 않으면 **항상 False**다(fail-closed) —
+        시크릿 없이 Webhook을 열어두면 누구나 결제 상태를 위조할 수 있다.
+        값은 운영자가 발급하며 이 코드가 만들어내지 않는다.
+        """
+        secret = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
+        if not secret:
+            logger.warning("PAYMENT_WEBHOOK_SECRET 미설정 — Webhook 서명 검증을 통과시키지 않습니다")
+            return False
+        # 헤더 이름은 대소문자를 가리지 않는다(HTTP 표준).
+        provided = ""
+        for key, value in headers.items():
+            if key.lower() == "x-webhook-signature":
+                provided = (value or "").strip()
+                break
+        if not provided:
+            return False
+        expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        # 상수 시간 비교 — admin.py의 require_admin()이 쓰는 것과 같은 방어다.
+        return hmac.compare_digest(expected, provided)
 
 
 class KGInicisProvider(PaymentProvider):
@@ -158,6 +219,22 @@ _PROVIDERS = {
 # 폐기 예정 PG 후보. get_payment_provider()가 선택 사실을 경고로 남긴다 — 운영 .env에
 # 남아있는 옛 값을 조용히 지나치지 않도록.
 _DEPRECATED_PROVIDERS = ("toss", "portone")
+
+
+def get_payment_provider_by_name(name: str) -> PaymentProvider:
+    """이름으로 provider를 만든다 (2026-08-11 Sprint 52 신설).
+
+    Webhook 수신 경로는 **URL의 provider 이름**으로 어떤 PG가 보낸 노티인지 판단한다 —
+    환경변수(`PAYMENT_PROVIDER`)가 아니다. PG를 교체하는 전환기에는 옛 PG의 노티가
+    한동안 계속 들어오기 때문이다. 알 수 없는 이름은 ValueError로 거부한다.
+    """
+    provider_cls = _PROVIDERS.get((name or "").strip().lower())
+    if provider_cls is None:
+        raise ValueError(
+            f"알 수 없는 PAYMENT_PROVIDER 값입니다: {name} "
+            f"(허용값: {', '.join(_PROVIDERS)})"
+        )
+    return provider_cls()
 
 
 def get_payment_provider() -> PaymentProvider:

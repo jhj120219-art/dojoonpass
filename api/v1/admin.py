@@ -533,6 +533,227 @@ def admin_payment_logs(payment_id: int, admin_role: str = Depends(require_admin)
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Webhook 운영 도구 (2026-08-11 Sprint 53)
+#
+# Sprint 52에 수신 경로를 만들었지만 **운영자가 볼 방법이 없었다** — `payment_webhooks`에
+# 쌓이기만 하고 조회/재처리 엔드포인트가 0건이었고, `row_to_webhook()`도 호출부가 없었다.
+# PG 노티는 "우리 payments row보다 먼저 도착"하는 경합이 실제로 발생하므로, 그때 IGNORED된
+# 노티를 되살릴 경로가 없으면 결제 상태가 영구히 어긋난 채 남는다.
+#
+# 실제 PG 호출은 하지 않는다 — 저장된 payload를 다시 해석해 적용할 뿐이다.
+# ---------------------------------------------------------------------------
+@router.get("/admin/payments/webhooks")
+def admin_list_webhooks(
+    processing_status: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    payment_id: Optional[int] = Query(None),
+    signature_verified: Optional[bool] = Query(None),
+    reprocessable_only: bool = Query(False),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    admin_role: str = Depends(require_admin),
+):
+    """Webhook 수신 목록(읽기 전용). 실패 조회·사유 확인·재처리 대상 선별에 쓴다.
+
+    각 행에 `reprocessable` / `reprocess_blocked_reason`이 함께 실린다 —
+    운영자가 "가능/불가"만 보고 오판하지 않도록 **왜 안 되는지**까지 돌려준다.
+    """
+    from api.v1.payment_logs import row_to_webhook, VALID_WEBHOOK_STATUSES
+
+    if processing_status and processing_status not in VALID_WEBHOOK_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"허용되지 않는 processing_status입니다: {processing_status} "
+                   f"(허용값: {', '.join(VALID_WEBHOOK_STATUSES)})",
+        )
+
+    conn = get_connection()
+    try:
+        conditions, params = ["1=1"], []
+        if processing_status:
+            conditions.append("processing_status = ?")
+            params.append(processing_status)
+        if provider:
+            conditions.append("provider = ?")
+            params.append(provider)
+        if payment_id is not None:
+            conditions.append("payment_id = ?")
+            params.append(payment_id)
+        if signature_verified is not None:
+            conditions.append("signature_verified = ?")
+            params.append(1 if signature_verified else 0)
+        where = " AND ".join(conditions)
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM payment_webhooks WHERE " + where, params).fetchone()[0]
+        rows = conn.execute(
+            "SELECT * FROM payment_webhooks WHERE " + where +
+            " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
+            params + [size, _offset(page, size)],
+        ).fetchall()
+        items = [row_to_webhook(r) for r in rows]
+        if reprocessable_only:
+            # 페이지 안에서 거르는 것이라 meta.total은 필터 이전 기준이다 —
+            # 응답에 filtered 개수를 함께 실어 운영자가 착각하지 않게 한다.
+            items = [i for i in items if i["reprocessable"]]
+        return success(items, meta={"total": total, "page": page, "size": size,
+                                    "returned": len(items),
+                                    "reprocessable_only": reprocessable_only})
+    finally:
+        conn.close()
+
+
+@router.get("/admin/payments/webhooks/{webhook_id}")
+def admin_get_webhook(webhook_id: int, admin_role: str = Depends(require_admin)):
+    """Webhook 수신 1건 상세 — 원문 payload와 실패 사유를 그대로 보여준다."""
+    from api.v1.payment_logs import row_to_webhook
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM payment_webhooks WHERE id=?", (webhook_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Webhook 수신 기록을 찾을 수 없습니다")
+        return success(row_to_webhook(row))
+    finally:
+        conn.close()
+
+
+@router.post("/admin/payments/webhooks/{webhook_id}/reprocess")
+def admin_reprocess_webhook(
+    webhook_id: int,
+    admin_role: str = Depends(require_super_admin),
+):
+    """저장된 Webhook을 다시 처리한다. **SUPER_ADMIN 전용.**
+
+    등급을 SUPER_ADMIN으로 둔 이유는 이 조작이 **결제 상태를 바꿀 수 있기 때문**이다 —
+    환불(`/admin/payments/{id}/refund`), 구독 상태 변경과 같은 기준이다.
+
+    안전 장치(전부 기존 경로를 그대로 재사용한다):
+      - `webhook_reprocess_block_reason()`이 **서명 미검증 / 이미 처리됨 / FAILED**를 차단
+      - 상태 변경은 수신 경로와 같은 `_apply_webhook_event()`가 하므로 상태머신 관문을 통과
+      - 성공하면 PROCESSED가 되어 **두 번째 재처리는 자동으로 차단**된다(중복 재처리 방지)
+      - `BEGIN IMMEDIATE`로 동시 재처리 방어
+    """
+    from api.v1.payments import reprocess_webhook, WebhookReprocessError
+
+    conn = get_connection()
+    try:
+        before = conn.execute(
+            "SELECT processing_status FROM payment_webhooks WHERE id=?", (webhook_id,)).fetchone()
+        try:
+            result = reprocess_webhook(conn, webhook_id, actor=admin_role)
+        except WebhookReprocessError as e:
+            conn.rollback()
+            raise HTTPException(status_code=e.http_status, detail=e.message) from e
+        except Exception:
+            conn.rollback()
+            raise
+
+        # 결제에 연결되지 못한 노티(아직 payments row가 없는 이른 노티 등)도 재처리 시도
+        # 자체는 남겨야 한다. 그때 대상은 결제가 아니라 **수신 기록**이므로 target_type을
+        # 나눈다 — PAYMENT으로 뭉뚱그리면 존재하지 않는 결제를 가리키는 감사 행이 생긴다.
+        linked_payment_id = result.get("payment_id")
+        record_audit(
+            conn, admin_id=admin_role,
+            action=AuditAction.PAYMENT_STATUS_CHANGE,
+            target_type=(AuditTargetType.PAYMENT if linked_payment_id
+                         else AuditTargetType.PAYMENT_WEBHOOK),
+            target_id=linked_payment_id if linked_payment_id else webhook_id,
+            before={"webhook_processing_status": before["processing_status"] if before else None,
+                    "payment_status": result.get("from")},
+            after={"webhook_id": webhook_id, "result": result.get("result"),
+                   "payment_status": result.get("to"), "reason": result.get("reason")},
+        )
+        logger.info("Admin Webhook 재처리: id=%s %s -> %s (by=%s)",
+                    webhook_id, before["processing_status"] if before else "-",
+                    result.get("result"), admin_role)
+        conn.commit()
+        return success(result)
+    finally:
+        conn.close()
+
+
+class PaymentRefundRequest(BaseModel):
+    # 미지정이면 잔여 전액 환불. 부분 환불은 금액을 명시한다.
+    amount: Optional[int] = None
+    reason: str
+
+
+@router.post("/admin/payments/{payment_id}/refund")
+def admin_refund_payment(
+    payment_id: int,
+    req: PaymentRefundRequest,
+    admin_role: str = Depends(require_super_admin),
+):
+    """결제 환불 (2026-08-11 Sprint 52 신설). **SUPER_ADMIN 전용.**
+
+    왜 Admin 전용인가 — 환불 조건·기간·비율 같은 **환불 정책은 사업 결정**이라 임의로 만들 수
+    없다. 사용자 셀프 환불을 열려면 그 정책이 먼저 있어야 한다(임의로 열면 악용 가능).
+    반면 "운영자가 환불 요청을 처리한다"는 어떤 정책에서도 필요한 최소 기능이라, 정책과
+    무관하게 지금 만들 수 있는 부분만 구현한다. 등급을 SUPER_ADMIN으로 둔 것은 등기부
+    무료횟수 조정과 같은 이유다 — **과금에 직접 영향을 주는 조작**이기 때문이다.
+
+    실제 PG 호출은 하지 않는다(MockProvider). `PAYMENT_PROVIDER=kginicis`처럼 미구현
+    provider를 고른 상태라면 `cancel_payment()`가 NotImplementedError를 던지고,
+    **결제 상태를 바꾸지 않은 채** 실패 로그만 남기고 400으로 응답한다 — PG에서는 환불되지
+    않았는데 DB만 환불로 바뀌는 상태를 만들지 않기 위해서다.
+    """
+    from api.v1.payments import refund_payment, RefundError, row_to_payment
+
+    if not req.reason or not req.reason.strip():
+        raise HTTPException(status_code=400, detail="환불에는 reason이 필요합니다")
+
+    conn = get_connection()
+    try:
+        before = conn.execute("SELECT status FROM payments WHERE id=?", (payment_id,)).fetchone()
+        try:
+            result = refund_payment(
+                conn, payment_id=payment_id, amount=req.amount,
+                reason=req.reason.strip(), actor=admin_role,
+            )
+        except RefundError as e:
+            raise HTTPException(status_code=e.http_status, detail=e.message) from e
+        except Exception:
+            conn.rollback()
+            raise
+
+        if not result.already_refunded:
+            record_audit(
+                conn, admin_id=admin_role,
+                action=AuditAction.PAYMENT_STATUS_CHANGE,
+                target_type=AuditTargetType.PAYMENT,
+                target_id=payment_id,
+                before={"status": before["status"] if before else None},
+                after={"status": result.target_status,
+                       "refunded_amount": result.refunded_amount,
+                       "total_refunded": result.total_refunded,
+                       "reason": req.reason.strip()},
+            )
+            logger.info(
+                "Admin 환불: payment id=%s %s -> %s (금액 %s, 누적 %s, by=%s, reason=%s)",
+                payment_id, before["status"] if before else "-", result.target_status,
+                result.refunded_amount, result.total_refunded, admin_role, req.reason.strip(),
+            )
+        conn.commit()
+
+        return success({
+            "payment": row_to_payment(result.payment_row),
+            "refunded_amount": result.refunded_amount,
+            "total_refunded": result.total_refunded,
+            "refundable_remaining": result.payment_row["amount"] - result.total_refunded,
+            # 이미 전액 환불된 결제에 다시 요청이 온 경우(멱등) — 오류가 아니다.
+            "already_refunded": result.already_refunded,
+            # ★ 구독 결제를 환불해도 **구독을 자동 해지하지 않는다.** 환불과 이용권 회수를
+            #   함께 처리할지는 사업 정책이라 임의로 정하지 않았다. 필요하면 운영자가
+            #   PATCH /admin/subscriptions/{id} 로 별도 처리한다(그 경로는 이미 있다).
+            "subscription_untouched": True,
+        })
+    finally:
+        conn.close()
+
+
 @router.get("/admin/subscriptions")
 def admin_list_subscriptions(
     user_id: Optional[str] = Query(None),

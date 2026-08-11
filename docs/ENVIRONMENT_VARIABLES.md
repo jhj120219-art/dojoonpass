@@ -85,7 +85,7 @@ Owner: CTO
 | 언제 필요한지 | 로그인/회원가입 등 인증 기능 전체 |
 | 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
 | 발급 위치 | Supabase 대시보드 → Project Settings → API → Project URL |
-| 코드 참조 여부 | 프론트는 `NEXT_PUBLIC_SUPABASE_URL`로 참조(`src/lib/supabaseClient.ts`, `src/lib/supabaseServer.ts`, `src/middleware.ts`) |
+| 코드 참조 여부 | 프론트는 `NEXT_PUBLIC_SUPABASE_URL`로 참조(`src/lib/supabaseClient.ts`, `src/lib/supabaseServer.ts`, `src/proxy.ts`(구 `middleware.ts`)) |
 | 비고 | 프론트에서 쓰려면 반드시 `NEXT_PUBLIC_` 접두사 버전이 `.env.local`에 있어야 한다. 비밀값이 아니므로 노출되어도 무방 |
 | 예시 | `NEXT_PUBLIC_SUPABASE_URL=https://abcdefghijklm.supabase.co` |
 
@@ -99,7 +99,7 @@ Owner: CTO
 | 언제 필요한지 | 로그인/회원가입/세션 갱신 |
 | 현재 필요한가 | **예 (이미 설정되어 동작 중)** |
 | 발급 위치 | Supabase 대시보드 → Project Settings → API → Project API keys → `anon` `public` |
-| 코드 참조 여부 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` (`supabaseClient.ts`/`supabaseServer.ts`/`middleware.ts`) |
+| 코드 참조 여부 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` (`supabaseClient.ts`/`supabaseServer.ts`/`proxy.ts`) |
 | 비고 | 공개 키지만 RLS가 없으면 데이터가 열린다 — Supabase 쪽 RLS 설정과 함께 관리할 것 |
 | 예시 | `NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.<...>` |
 
@@ -274,11 +274,26 @@ anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SD
 | 설명 | Webhook(입금통보/결제결과 노티) 요청이 실제 KG이니시스에서 왔는지 검증하는 키 |
 | 필수 여부 | 론칭 시 **필수** |
 | 언제 필요한지 | 가상계좌 입금통보, 비동기 결제결과 수신 |
-| 현재 필요한가 | **아니오 — 지금 Skip 가능** (Webhook 수신 엔드포인트 자체가 아직 없음) |
+| 현재 필요한가 | **아니오 — KG 실연동 시점에 필요** (수신 엔드포인트는 2026-08-11 Sprint 52에 생겼으나, KG용 서명 검증은 `KGInicisProvider` 구현과 함께 붙는다) |
 | 발급 위치 | KG이니시스 가맹점 관리자 → 노티(Noti) 설정 |
-| 코드 참조 여부 | **없음.** `PaymentProvider.handle_webhook()` 인터페이스는 있으나 호출하는 엔드포인트가 없다 |
+| 코드 참조 여부 | **아직 없음.** 수신 엔드포인트(`POST /api/v1/payments/webhook/{provider}`)와 `verify_webhook_signature()` 인터페이스는 준비됐고, `KGInicisProvider`가 이 값을 읽도록 구현하면 된다 |
 | 비고 | 서명 검증 없이 Webhook을 신뢰하면 결제 위조가 가능하다 — 구현 시 반드시 검증 먼저 |
 | 예시 | `KG_WEBHOOK_SECRET=whsec_<랜덤문자열>` |
+
+## PAYMENT_WEBHOOK_SECRET (2026-08-11 Sprint 52 신규)
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | Payment (Webhook 수신) |
+| 설명 | `POST /api/v1/payments/webhook/{provider}`로 들어오는 요청의 **HMAC-SHA256 서명**을 검증하는 공유 시크릿 |
+| 필수 여부 | Webhook을 실제로 받기 시작하는 시점에 **필수** |
+| 언제 필요한지 | 지금은 불필요 — `MockProvider` 기준 구현이고, 값이 없으면 **모든 Webhook이 401로 거부**된다(fail-closed) |
+| 현재 필요한가 | **아니오 — Skip 가능.** 미설정 상태가 곧 "Webhook으로 결제 상태를 바꿀 수 없음"이라 안전한 기본값이다 |
+| 발급 위치 | **운영자가 직접 생성**하는 랜덤 문자열(외부 발급 아님). 이 저장소의 코드나 문서가 값을 만들지 않는다 |
+| 코드 참조 여부 | `api/v1/payment_providers.py:MockProvider.verify_webhook_signature()` |
+| 검증 방식 | 요청 **원문 바디**에 대한 HMAC-SHA256 hex를 `X-Webhook-Signature` 헤더와 `hmac.compare_digest()`로 상수시간 비교 |
+| 비고 | KG 실연동 시에는 KG가 정한 서명 규격을 `KGInicisProvider`가 따로 구현한다 — 이 값은 Mock/자체 노티용이다 |
+| 예시 | `PAYMENT_WEBHOOK_SECRET=<운영자가 생성한 랜덤 문자열>` |
 
 ---
 

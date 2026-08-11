@@ -166,6 +166,11 @@ class AuditTargetType(StrEnum):
     REGISTRY_CREDIT = "REGISTRY_CREDIT"
     SUBSCRIPTION = "SUBSCRIPTION"
     PAYMENT = "PAYMENT"
+    # 2026-08-11 Sprint 53 신설. Webhook 재처리는 결제에 연결되지 못한 노티에도 시도할 수 있어
+    # (예: 아직 우리 payments row가 없는 이른 노티) 대상이 결제가 아니라 **수신 기록**인 경우가
+    # 있다. 그때 PAYMENT으로 기록하면 존재하지 않는 결제를 가리키는 감사 행이 생긴다 —
+    # 실제로 `target_id="webhook:234"` 같은 값을 넣었다가 dangling 감사 행으로 검출됐다.
+    PAYMENT_WEBHOOK = "PAYMENT_WEBHOOK"
     USER = "USER"
 
 

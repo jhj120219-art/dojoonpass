@@ -1,6 +1,6 @@
 import Link from 'next/link'
 
-export type PrimaryNavCurrent = 'search' | 'recent' | 'favorites'
+export type PrimaryNavCurrent = 'search' | 'recent' | 'favorites' | 'mypage'
 
 type PrimaryNavProps = {
   current?: PrimaryNavCurrent
@@ -12,6 +12,9 @@ const NAV_ITEMS: { key: PrimaryNavCurrent; href: string; label: string }[] = [
   { key: 'search', href: '/', label: '검색' },
   { key: 'recent', href: '/properties/recent', label: '최근 본 물건' },
   { key: 'favorites', href: '/favorites', label: '관심물건' },
+  // 2026-08-11 Sprint 54 — 마이페이지. 비로그인 상태에서도 메뉴는 노출하고
+  // 클릭 시 로그인으로 유도한다(docs/FRONTEND_MASTER_SPEC.md §7.2와 동일한 규칙).
+  { key: 'mypage', href: '/mypage', label: '마이페이지' },
 ]
 
 // properties/page.tsx의 검색/최근 본 물건 링크 스타일을 그대로 재사용해 세 화면(검색/최근 본

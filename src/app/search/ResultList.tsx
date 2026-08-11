@@ -103,12 +103,16 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
 
       {/* 일정 그룹: 절대 매각기일 + 법원, 상대일수는 위 물건 그룹 배지로 이미 노출됨.
           법원명 길이가 들쭉날쭉해도 이 줄이 항상 한 줄로 유지되도록, 가변 길이인 법원명만
-          truncate로 줄이고 나머지 고정 길이 항목은 줄바꿈되지 않게 고정한다. */}
+          truncate로 줄이고 나머지 고정 길이 항목은 줄바꿈되지 않게 고정한다.
+
+          "조회수 -" 제거(2026-08-11 Sprint 52): `auction_table`에 조회수 컬럼이 없어
+          **어떤 물건에서도 값이 채워질 수 없는** 자리였다. 값이 생길 가능성이 있는 빈 칸이
+          아니라 구조적으로 항상 "-"인 죽은 UI라, 사용자에게 "집계가 안 되고 있다"는
+          잘못된 인상만 주고 카드 폭을 차지했다. 조회수 기능이 실제로 생기면(스키마 + 집계)
+          그때 다시 넣는다. */}
       <div className="mt-2 flex items-center justify-between gap-2 text-xs text-gray-400">
         <span className="min-w-0 truncate">{item.court_name || '-'}</span>
         <span className="shrink-0 whitespace-nowrap">{item.auction_date || '-'} 매각 · {item.status || '-'}</span>
-        {/* 조회수: auction_item에 조회수 컬럼 없음 (TODO) */}
-        <span className="shrink-0 whitespace-nowrap">조회수 -</span>
       </div>
     </div>
     </Link>
@@ -118,8 +122,42 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
 // basePath: 이 검색 화면이 렌더된 경로(`/` 또는 `/search`). Empty State의 "조건 없이 다시 보기"가
 // 사용자를 다른 화면으로 옮기지 않고 **지금 있는 화면의 조건만** 비우도록 하기 위해 받는다
 // (docs/FRONTEND_MASTER_SPEC.md §8.2 "검색 실행이 현재 pathname을 유지한다"와 같은 규칙).
-export default function ResultList({ data, basePath }: { data: SearchResponse; basePath: string }) {
+//
+// firstPageHref: 현재 검색조건은 그대로 두고 page만 뗀 URL. 아래 "페이지 범위 초과" 안내의
+// 복구 동선으로 쓴다.
+export default function ResultList({
+  data,
+  basePath,
+  firstPageHref,
+}: {
+  data: SearchResponse
+  basePath: string
+  firstPageHref: string
+}) {
   if (data.items.length === 0) {
+    // 결과가 0건인 것과 **페이지 번호가 범위를 벗어난 것**은 원인도 해결책도 다르다.
+    // 조건에 맞는 물건이 41건 있는데도 `?page=9`로 들어오면 예전에는 "검색 결과가 없습니다 /
+    // 조건을 줄여보세요"라는 틀린 안내가 나오고, 복구 동선인 "조건 없이 전체 물건 보기"는
+    // 사용자의 검색조건까지 버렸다. 북마크·공유 URL에서 실제로 도달한다 — 기본 필터가
+    // `auction_date >= 오늘`이라 결과 건수가 매일 줄어들어, 어제 유효했던 3페이지 링크가
+    // 오늘은 범위 밖이 될 수 있기 때문이다.
+    if (data.total > 0) {
+      return (
+        <div className="text-center py-20">
+          <p className="text-gray-500 font-medium">이 페이지에는 표시할 물건이 없습니다</p>
+          <p className="mt-1 text-sm text-gray-400">
+            조건에 맞는 물건은 총 {data.total.toLocaleString()}건이지만, 요청한 페이지
+            ({data.page}페이지)가 마지막 페이지({Math.max(data.total_pages, 1)}페이지)를 넘어섰습니다
+          </p>
+          <Link
+            href={firstPageHref}
+            className="mt-4 inline-block rounded-xl bg-blue-500 px-4 py-2 text-sm font-medium text-white"
+          >
+            검색조건 유지하고 1페이지로 이동
+          </Link>
+        </div>
+      )
+    }
     // Empty State: 예전에는 회색 한 줄만 덩그러니 떠 있어서, 조건을 잘못 넣은 사용자가
     // 무엇을 해야 하는지도 어떻게 되돌리는지도 알 수 없었다. 원인 안내 + 복구 동선을 준다.
     return (

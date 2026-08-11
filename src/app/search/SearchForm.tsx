@@ -245,7 +245,11 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
 
   // Tank Auction의 주소선택 toggleBtn(주소/법원)과 동일한 2-way 탭.
   const [addressMode, setAddressMode] = useState<'address' | 'court'>(() => parseAddressMode(searchParams))
-  // Tank Auction의 물건종류 체크박스 트리 선택값. TODO 참고(단일 선택시에만 API 연동).
+  // Tank Auction의 물건종류 체크박스 트리 선택값.
+  // (Sprint 49 정정: 예전 주석은 "단일 선택시에만 API 연동"이라고 적고 있었으나 stale이다 —
+  //  백엔드 api/v1/search.py가 콤마로 join된 다중 선택을 OR 조건으로 처리한다. 실측:
+  //  임야 8건 + 다세대 11건, "임야,다세대" 19건으로 합집합이 정확히 나온다.
+  //  아래 buildSearchQuery()의 property_type 주석이 실제 동작을 설명한다.)
   const [propertyCategories, setPropertyCategories] = useState<string[]>(() => parsePropertyCategories(searchParams))
 
   // 시/도에 종속된 시/군/구 목록 — GET /api/v1/search/regions?sido=에서 실제 auction_item

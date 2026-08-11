@@ -19,7 +19,7 @@ Owner: Project Management
 
 | 도메인 | 상태 | 근거 |
 |---|---|---|
-| 회원가입 / 로그인 | ✅ | Supabase Auth 실동작, `middleware.ts` 세션 게이트, Open Redirect 방어(`sanitizeRedirectPath`) |
+| 회원가입 / 로그인 | ✅ | Supabase Auth 실동작, `proxy.ts` 세션 게이트(구 `middleware.ts`), Open Redirect 방어(`sanitizeRedirectPath`) |
 | 로그아웃 | ⚠️ | 동작하지만 노출 경로가 `/properties` 한 곳뿐 (P1) |
 | 크롤링 데이터 무결성 | ✅ | `auction_case`(#14) · `auction`/`auction_item`(#18) 전부 법원 포함 식별키로 해결. ID 전수 Audit 결과 orphan/중복/불일치 **0건** |
 | 검색 | ✅ | 정렬 화이트리스트·페이지네이션·인덱스 확인, 회귀 커버 |
@@ -197,7 +197,10 @@ CTO 승인 하에 Migration 012/013 실행. `auction` → `UNIQUE(court_code, ca
 - **[2026-08-07 신규]** Soft Delete가 컬럼 추가까지만 적용됐다. 실제 전환은
   `UNIQUE(user_id,item_id)` 때문에 재등록이 막히는 문제를 먼저 풀어야 한다
 - DB 백업 체계 없음(수동 타임스탬프 백업만), SQLite 단일 파일 운영
-- selenium 미설치로 크롤러 계열 테스트(`test_db.py` 등)를 이 환경에서 실행할 수 없다
+- 크롤러 계열 스크립트(`test_db.py` 등)는 이 환경에서 실행되지 않는다 — 이유가 두 겹이다:
+  (1) selenium 미설치, (2) **2026-08-11부터 `ALLOW_LIVE_CRAWL=1` 없이는 실행 자체가 막힌다**
+  (BUGS #51 — 이름은 test_*.py지만 assert가 0개이고 실제 법원 사이트에 접속한다).
+  회귀 스윕은 이 셋을 '실패'가 아니라 '설계상 건너뜀'으로 분류해야 한다
   (패키지 설치 승인 필요)
 - 권리분석 화면이 스텁 — `registry_rights` 테이블 + OCR/파싱 파이프라인 신규 구축 필요(Beta v2)
 - 등기부 발급기관 자동 연동(Beta v2 범위, Beta v1 출시를 막지 않음)

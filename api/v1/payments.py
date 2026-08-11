@@ -1,20 +1,26 @@
 import json
+import logging
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import (
-    ErrorCode, PaymentType, BillingCycle as BillingCycleEnum,
+    ErrorCode, PaymentType, PaymentStatus, BillingCycle as BillingCycleEnum,
     SubscriptionStatus, is_paid,
 )
 from api.v1.registry import OVERAGE_FEE, get_entitled_subscription
-from api.v1.payment_providers import get_payment_provider
+from api.v1.payment_providers import get_payment_provider, get_payment_provider_by_name
+from api.v1.state_machines import assert_payment_transition, InvalidTransition
 from api.v1.payment_logs import (
     log_payment_event, get_payment_logs,
-    EVENT_CREATE_ORDER, EVENT_CONFIRM, EVENT_VERIFY,
-    LOG_SUCCESS, LOG_PENDING,
+    record_webhook, mark_webhook_processed, webhook_reprocess_block_reason,
+    EVENT_CREATE_ORDER, EVENT_CONFIRM, EVENT_VERIFY, EVENT_CANCEL, EVENT_WEBHOOK,
+    LOG_SUCCESS, LOG_PENDING, LOG_FAILED,
+    WEBHOOK_PROCESSED, WEBHOOK_FAILED, WEBHOOK_IGNORED,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -423,6 +429,352 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
         })
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 환불 (2026-08-11 Sprint 52)
+#
+# 인프라는 Sprint 28~27에 전부 준비돼 있었는데 **호출부가 없어 한 번도 실행되지 않았다**:
+#   - `state_machines.PAYMENT_TRANSITIONS`의 PAID -> PARTIAL_REFUND/REFUNDED 전이
+#   - `PaymentProvider.cancel_payment()` (MockProvider는 REFUNDED 반환)
+#   - `payment_logs.EVENT_CANCEL`, `ErrorCode.PAY_NOT_FOUND/PAY_INVALID_TRANSITION`
+# 이번에 그 관문들을 실제로 통과하는 경로를 만든다. **PG 실호출은 없다**(MockProvider).
+#
+# 누적 환불액을 어디에 두는가 — payments 테이블에 컬럼을 추가하지 않았다.
+# `payment_logs`가 이미 append-only 원장이고 CANCEL 이벤트가 `amount`를 갖는다. 그 합이
+# 곧 누적 환불액이라 **스키마 변경 없이** 부분환불을 여러 번 처리할 수 있다.
+# (컬럼을 새로 만들면 원장과 컬럼이 어긋날 수 있는 두 번째 진실이 생긴다.)
+#
+# ★ 이 함수는 "얼마를 환불할지"를 스스로 정하지 않는다. 환불 사유·비율·기간 같은 **환불 정책은
+#   사업 결정**이라 임의로 만들지 않았다(예: 구독 잔여기간 일할 계산). 금액은 호출자가 명시한다.
+# ---------------------------------------------------------------------------
+def get_refunded_amount(conn, payment_id: int) -> int:
+    """이 결제에 대해 지금까지 성공한 환불 금액의 합. 원장(payment_logs)이 유일한 근거다."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM payment_logs"
+        " WHERE payment_id=? AND event_type=? AND status=?",
+        (payment_id, EVENT_CANCEL, LOG_SUCCESS),
+    ).fetchone()
+    return row["total"] or 0
+
+
+class RefundResult:
+    """refund_payment()의 결과. 라우터가 응답 형태를 정할 수 있도록 값만 담는다."""
+
+    def __init__(self, payment_row, refunded_amount: int, total_refunded: int,
+                 target_status: str, already_refunded: bool = False):
+        self.payment_row = payment_row
+        self.refunded_amount = refunded_amount
+        self.total_refunded = total_refunded
+        self.target_status = target_status
+        self.already_refunded = already_refunded
+
+
+class RefundError(Exception):
+    """환불 거부. `code`는 api/constants.py:ErrorCode 값이다."""
+
+    def __init__(self, code: str, message: str, http_status: int = 400):
+        self.code, self.message, self.http_status = code, message, http_status
+        super().__init__(message)
+
+
+def refund_payment(conn, payment_id: int, amount: int | None, reason: str,
+                   actor: str, user_id: str | None = None) -> RefundResult:
+    """결제를 환불한다. commit은 호출부 책임이다.
+
+    `amount=None`이면 **잔여 전액**을 환불한다. `user_id`를 주면 소유권까지 확인한다
+    (사용자 경로용 — 지금 호출자는 Admin뿐이라 None).
+
+    동시 환불 방어: `BEGIN IMMEDIATE`로 쓰기 락을 먼저 잡고, UPDATE의 WHERE에 현재 상태를
+    다시 걸어 rowcount로 검증한다(registry.py/payments.py의 기존 패턴과 동일).
+    """
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+
+    query = "SELECT * FROM payments WHERE id=?"
+    params = [payment_id]
+    if user_id is not None:
+        query += " AND user_id=?"
+        params.append(user_id)
+    payment = conn.execute(query, params).fetchone()
+    if not payment:
+        raise RefundError(ErrorCode.PAY_NOT_FOUND, "결제 내역을 찾을 수 없습니다", 404)
+
+    current_status = payment["status"]
+
+    # 멱등성: 이미 전액 환불된 결제에 다시 요청이 와도 오류로 만들지 않는다.
+    # (등기부 중복신청 `already_requested`, 구독 중복결제 `already_subscribed`와 같은 규약)
+    if current_status == PaymentStatus.REFUNDED.value:
+        return RefundResult(payment, 0, get_refunded_amount(conn, payment_id),
+                            current_status, already_refunded=True)
+
+    already = get_refunded_amount(conn, payment_id)
+    refundable = payment["amount"] - already
+    if refundable <= 0:
+        raise RefundError(ErrorCode.PAY_ALREADY_PROCESSED, "환불 가능한 잔액이 없습니다")
+
+    if amount is None:
+        amount = refundable
+    if amount <= 0:
+        raise RefundError(ErrorCode.PAY_AMOUNT_MISMATCH, "환불 금액은 1원 이상이어야 합니다")
+    if amount > refundable:
+        raise RefundError(
+            ErrorCode.PAY_AMOUNT_MISMATCH,
+            f"환불 가능 금액을 초과했습니다 (잔여 {refundable}원)",
+        )
+
+    target_status = (PaymentStatus.REFUNDED.value if amount == refundable
+                     else PaymentStatus.PARTIAL_REFUND.value)
+
+    # 상태머신 관문 — FAILED/CANCELLED/EXPIRED처럼 돈을 받지 않은 결제는 여기서 막힌다.
+    try:
+        assert_payment_transition(current_status, target_status)
+    except InvalidTransition as e:
+        raise RefundError(ErrorCode.PAY_INVALID_TRANSITION, str(e)) from e
+
+    provider = get_payment_provider()
+    provider_name = _provider_name()
+    try:
+        provider.cancel_payment(pg_transaction_id=payment["pg_transaction_id"], reason=reason)
+    except NotImplementedError as e:
+        # 실연동 전 provider(kginicis 등)를 선택한 상태. 상태를 바꾸지 않고 실패를 남긴다 —
+        # PG에서 실제로 환불되지 않았는데 DB만 REFUNDED가 되는 것이 최악의 결과다.
+        log_payment_event(
+            conn, EVENT_CANCEL, LOG_FAILED, user_id=payment["user_id"], payment_id=payment_id,
+            provider=provider_name, pg_transaction_id=payment["pg_transaction_id"],
+            amount=amount, error_message=str(e),
+            request_payload={"reason": reason, "actor": actor},
+        )
+        conn.commit()
+        raise RefundError(ErrorCode.PAY_FAILED, f"환불 처리에 실패했습니다: {e}", 400) from e
+
+    now = datetime.now().isoformat()
+    cursor = conn.execute(
+        "UPDATE payments SET status=?, updated_at=? WHERE id=? AND status=?",
+        (target_status, now, payment_id, current_status),
+    )
+    if cursor.rowcount == 0:
+        conn.rollback()
+        raise RefundError(
+            ErrorCode.PAY_ALREADY_PROCESSED,
+            f"다른 요청이 먼저 결제 상태를 바꿨습니다 (기대한 현재 상태: {current_status})",
+            409,
+        )
+
+    log_payment_event(
+        conn, EVENT_CANCEL, LOG_SUCCESS, user_id=payment["user_id"], payment_id=payment_id,
+        provider=provider_name, pg_transaction_id=payment["pg_transaction_id"],
+        amount=amount,
+        request_payload={"reason": reason, "actor": actor},
+        response_payload={"from": current_status, "to": target_status},
+    )
+
+    updated = conn.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+    return RefundResult(updated, amount, already + amount, target_status)
+
+
+# ---------------------------------------------------------------------------
+# Webhook 수신 (2026-08-11 Sprint 52)
+#
+# `payment_webhooks` 테이블과 `record_webhook()`/`mark_webhook_processed()`는 Sprint 27에
+# 만들어졌지만 **수신 엔드포인트가 없어 한 번도 호출되지 않았다.** 여기서 연결한다.
+#
+# 보안 — 이 경로는 **사용자 인증이 없다**(PG 서버가 호출하므로 Bearer 토큰이 없다).
+# 따라서 서명 검증이 유일한 방어선이며, 검증 실패 시 **상태를 절대 바꾸지 않는다.**
+# `MockProvider.verify_webhook_signature()`는 `PAYMENT_WEBHOOK_SECRET` 기반 HMAC이고,
+# 시크릿이 없으면 항상 실패한다(fail-closed) — 즉 기본 배포 상태에서는 Webhook으로
+# 결제 상태를 바꿀 수 없다. 시크릿 값은 운영자가 발급하며 이 코드가 만들지 않는다.
+#
+# 멱등성 — PG는 우리 응답이 늦으면 같은 노티를 여러 번 보낸다. `event_id` UNIQUE로
+# 중복을 걸러내고, 중복이면 아무 것도 다시 적용하지 않고 200을 돌려준다(재전송 중단 유도).
+# ---------------------------------------------------------------------------
+WEBHOOK_APPLIED = "APPLIED"
+WEBHOOK_SKIPPED = "SKIPPED"
+
+
+@router.post("/payments/webhook/{provider_name}")
+async def receive_payment_webhook(provider_name: str, request: Request):
+    """PG Webhook 수신. 사용자 인증 없음 — 서명으로만 신뢰를 판단한다."""
+    raw_body = await request.body()
+    headers = dict(request.headers)
+
+    # 알 수 없는 provider 이름은 저장도 하지 않는다(임의 문자열로 행을 무한히 만들 수 없게).
+    try:
+        provider = get_payment_provider_by_name(provider_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="알 수 없는 결제 provider입니다")
+
+    # ★ 서명 검증이 **가장 먼저**다 — 파싱보다도, DB 쓰기보다도 앞이다 (2026-08-11 Sprint 53).
+    #
+    # 예전에는 검증 실패도 `payment_webhooks`에 한 행씩 기록했다(공격 탐지 목적). 그런데 이
+    # 엔드포인트는 **인증이 없는 공개 경로**라, 익명 요청 하나당 행 하나가 무제한으로 늘어난다 —
+    # 실측 재현: 서명 없는 요청 5회 -> 행 5개 증가(누적 10행이 그렇게 쌓여 있었다).
+    # 인터넷에 노출되면 그대로 저장소 증폭(DoS) 통로가 된다.
+    #
+    # 그래서 **검증되지 않은 요청은 저장하지 않는다.** 탐지에 필요한 정보는 경고 로그로 남긴다 —
+    # 로그는 회전(rotate)되지만 DB는 계속 쌓이므로, 거절된 요청의 텔레메트리는 로그가 맞는 자리다.
+    # 부수 효과로 "존재하는 event_id면 200"이라는 oracle도 구조적으로 사라진다(중복 판정 자체를
+    # 검증 통과 후에만 하므로).
+    verified = provider.verify_webhook_signature(raw_body, headers)
+    if not verified:
+        logger.warning(
+            "Webhook 서명 검증 실패 — 저장하지 않고 거절 (provider=%s, bytes=%d, client=%s)",
+            provider_name, len(raw_body), getattr(request.client, "host", "?"),
+        )
+        raise HTTPException(status_code=401, detail="Webhook 서명 검증에 실패했습니다")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload가 객체가 아닙니다")
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Webhook payload를 해석할 수 없습니다")
+
+    event_id = payload.get("event_id")
+    conn = get_connection()
+    try:
+        # 여기 도달했다는 것은 이미 서명이 검증됐다는 뜻이다 — 저장되는 행은 항상
+        # signature_verified=1이다(미검증 행은 애초에 만들어지지 않는다).
+        webhook_id, is_duplicate = record_webhook(
+            conn, provider=provider_name, raw_payload=payload,
+            event_type=payload.get("event_type"), event_id=event_id,
+            pg_transaction_id=payload.get("pg_transaction_id"),
+            signature_verified=True,
+        )
+
+        if is_duplicate:
+            # 이미 처리한 이벤트 — 다시 적용하지 않는다. 200으로 답해 PG의 재전송을 멈춘다.
+            conn.commit()
+            return success({"webhook_id": webhook_id, "duplicate": True,
+                            "result": WEBHOOK_SKIPPED, "reason": "이미 수신한 이벤트입니다"})
+
+        event = provider.handle_webhook(payload)
+        result = _apply_webhook_event(conn, webhook_id, provider_name, event)
+        conn.commit()
+        return success(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("Webhook 처리 중 오류 (provider=%s)", provider_name)
+        raise HTTPException(status_code=500, detail="Webhook 처리 중 오류가 발생했습니다") from e
+    finally:
+        conn.close()
+
+
+def _apply_webhook_event(conn, webhook_id: int, provider_name: str, event) -> dict:
+    """정규화된 Webhook 이벤트를 결제 상태에 반영한다.
+
+    반영하지 않는 경우(전부 정상 동작이며 200으로 답한다):
+      - 알 수 없는 event_type       -> 바꿀 상태가 없다
+      - 모르는 pg_transaction_id     -> 우리 결제가 아니다
+      - 상태머신이 막는 전이         -> 이미 종결됐거나 순서가 뒤집힌 노티(늦게 도착한 재전송)
+      - 이미 목표 상태               -> 멱등
+    """
+    def skip(reason: str, status: str = WEBHOOK_IGNORED) -> dict:
+        mark_webhook_processed(conn, webhook_id, status, reason)
+        return {"webhook_id": webhook_id, "duplicate": False,
+                "result": WEBHOOK_SKIPPED, "reason": reason}
+
+    if not event.status:
+        return skip(f"처리 대상이 아닌 event_type입니다: {event.event_type or '(없음)'}")
+    if not event.pg_transaction_id:
+        return skip("pg_transaction_id가 없습니다")
+
+    payment = conn.execute(
+        "SELECT * FROM payments WHERE pg_transaction_id=?", (event.pg_transaction_id,)
+    ).fetchone()
+    if not payment:
+        return skip("해당 거래의 결제 내역을 찾을 수 없습니다")
+
+    current = payment["status"]
+    if current == event.status:
+        # 같은 상태로의 노티 — 멱등하게 성공 처리한다(PG 재전송의 정상 결과).
+        mark_webhook_processed(conn, webhook_id, WEBHOOK_PROCESSED, "이미 동일한 상태입니다")
+        return {"webhook_id": webhook_id, "duplicate": False, "result": WEBHOOK_SKIPPED,
+                "reason": "이미 동일한 상태입니다", "payment_id": payment["id"], "status": current}
+
+    try:
+        assert_payment_transition(current, event.status)
+    except InvalidTransition as e:
+        return skip(str(e))
+
+    now = datetime.now().isoformat()
+    cursor = conn.execute(
+        "UPDATE payments SET status=?, updated_at=? WHERE id=? AND status=?",
+        (event.status, now, payment["id"], current),
+    )
+    if cursor.rowcount == 0:
+        # 조회와 UPDATE 사이에 다른 경로(환불/다른 노티)가 먼저 바꿨다.
+        return skip("다른 요청이 먼저 상태를 바꿨습니다")
+
+    log_payment_event(
+        conn, EVENT_WEBHOOK, LOG_SUCCESS, user_id=payment["user_id"], payment_id=payment["id"],
+        provider=provider_name, pg_transaction_id=event.pg_transaction_id,
+        amount=payment["amount"],
+        request_payload={"event_type": event.event_type},
+        response_payload={"from": current, "to": event.status},
+    )
+    conn.execute("UPDATE payment_webhooks SET payment_id=? WHERE id=?", (payment["id"], webhook_id))
+    mark_webhook_processed(conn, webhook_id, WEBHOOK_PROCESSED)
+    return {"webhook_id": webhook_id, "duplicate": False, "result": WEBHOOK_APPLIED,
+            "payment_id": payment["id"], "from": current, "to": event.status}
+
+
+class WebhookReprocessError(Exception):
+    """재처리 거부. 호출부가 HTTP 상태로 변환한다."""
+
+    def __init__(self, message: str, http_status: int = 400):
+        self.message, self.http_status = message, http_status
+        super().__init__(message)
+
+
+def reprocess_webhook(conn, webhook_id: int, actor: str) -> dict:
+    """저장된 Webhook을 다시 처리한다 (2026-08-11 Sprint 53). commit은 호출부 책임.
+
+    수신 당시 처리되지 못한 노티를 운영자가 되살리는 경로다. 대표적인 실제 상황은
+    **PG 노티가 우리 `payments` row보다 먼저 도착한 경합** — 그때는 "결제 내역을 찾을 수
+    없습니다"로 IGNORED 되지만, 나중에 다시 돌리면 정상 적용된다.
+
+    ★ **서명을 다시 검증하지 않는다.** 수신 시점의 `signature_verified` 플래그가 신뢰 기록이고,
+    서명 헤더 원문은 저장하지 않으므로 재검증 자체가 불가능하다. 대신
+    `webhook_reprocess_block_reason()`이 **검증되지 않은 수신을 아예 재처리 대상에서 제외**한다 —
+    즉 신뢰 판단은 수신 시점에 한 번만 내려지고, 재처리는 그 판단을 뒤집지 않는다.
+
+    ★ 상태는 `_apply_webhook_event()`가 바꾸므로 **수신 경로와 완전히 동일한 관문**을 통과한다
+    (상태머신 / 이미 같은 상태면 멱등 / 조건부 UPDATE). 재처리 전용 우회로가 없다.
+    """
+    # 동시에 두 번 눌러도 하나만 적용되도록 쓰기 락을 먼저 잡는다(환불과 같은 패턴).
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+
+    row = conn.execute("SELECT * FROM payment_webhooks WHERE id=?", (webhook_id,)).fetchone()
+    if not row:
+        raise WebhookReprocessError("Webhook 수신 기록을 찾을 수 없습니다", 404)
+
+    blocked = webhook_reprocess_block_reason(row)
+    if blocked:
+        raise WebhookReprocessError(blocked, 400)
+
+    try:
+        provider = get_payment_provider_by_name(row["provider"])
+    except ValueError as e:
+        raise WebhookReprocessError(f"알 수 없는 provider입니다: {row['provider']}", 400) from e
+
+    try:
+        payload = json.loads(row["raw_payload"]) if row["raw_payload"] else {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload가 객체가 아닙니다")
+    except (TypeError, ValueError) as e:
+        raise WebhookReprocessError("저장된 payload를 해석할 수 없습니다", 400) from e
+
+    event = provider.handle_webhook(payload)
+    result = _apply_webhook_event(conn, webhook_id, row["provider"], event)
+    # 재처리로 실행됐음을 응답에 명시한다 — 운영자가 원래 수신 결과와 혼동하지 않도록.
+    result["reprocessed"] = True
+    result["actor"] = actor
+    result["previous_status"] = row["processing_status"]
+    return result
 
 
 @router.get("/payments")

@@ -1,14 +1,16 @@
 'use client'
 import { useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
+import { resolveNavContext } from './navContext'
 import { formatDday } from '@/app/search/ResultList'
 import { CONTAINER } from '@/lib/layout'
 // '억' 고정 표기(0 -> "0.0억"). 공용 formatPrice()와 표기 기준이 다르며,
 // 어느 쪽으로 통일할지는 미결정이라 중복만 제거했다 — src/lib/format.ts 주석 참고.
-import { formatPriceEok as formatPrice } from '@/lib/format'
+import { formatPriceEok as formatPrice, formatWon } from '@/lib/format'
 import SiteHeader from '@/components/SiteHeader'
 
 interface DocumentStatusItem {
@@ -137,14 +139,10 @@ export default function PropertyDetailPage() {
   }, [id])
   // Search 결과 목록에서 넘어온 경우에만 존재하는 이동 컨텍스트(같은 페이지 안에서의 id 순서 + 현재 인덱스).
   // 직접 링크로 들어온 경우 등 컨텍스트가 없으면 이전/다음 버튼을 아예 노출하지 않는다.
-  const navIds = (searchParams.get('ids') ?? '')
-    .split(',')
-    .map((v) => Number(v))
-    .filter((n) => Number.isInteger(n))
-  const navIndexRaw = Number(searchParams.get('i'))
-  const navIndex = Number.isInteger(navIndexRaw) && navIndexRaw >= 0 && navIndexRaw < navIds.length ? navIndexRaw : -1
-  const prevNavId = navIndex > 0 ? navIds[navIndex - 1] : null
-  const nextNavId = navIndex >= 0 && navIndex < navIds.length - 1 ? navIds[navIndex + 1] : null
+  // 컨텍스트 해석은 순수 함수(navContext.ts)로 분리해 회귀 테스트로 고정한다 —
+  // 이 화면은 로그인 필수 + 클라이언트 렌더라 HTTP 계약 테스트로는 볼 수 없다.
+  const { ids: navIds, index: navIndex, prevId: prevNavId, nextId: nextNavId } =
+    resolveNavContext(searchParams.get('ids'), searchParams.get('i'))
   function goToNav(targetId: number, targetIndex: number) {
     router.push(`/properties/${targetId}?ids=${navIds.join(',')}&i=${targetIndex}`)
   }
@@ -159,7 +157,10 @@ export default function PropertyDetailPage() {
   }
   const [property, setProperty] = useState<AuctionItemDetail | null>(null)
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState(false)
+  // 실패 원인을 구분한다. 예전에는 어떤 실패든 "매물을 찾을 수 없습니다"였는데, API 서버가
+  // 내려간 상황(물건은 존재함)에서도 같은 문구가 나와 사용자가 "없는 물건"으로 오해했다.
+  // 검색 화면(SearchScreen)의 bad_request/unavailable 분기와 같은 기준을 적용한다.
+  const [loadError, setLoadError] = useState<'notfound' | 'unavailable' | null>(null)
   const [registryRequest, setRegistryRequest] = useState<RegistryRequestSummary | null>(null)
   const [registryLoading, setRegistryLoading] = useState(true)
   const [registryBusy, setRegistryBusy] = useState(false)
@@ -221,7 +222,7 @@ export default function PropertyDetailPage() {
       // 컴포넌트가 재마운트되지 않는다 — 이전 물건에서 남은 열람/문서뷰어 상태가 새 물건에
       // 그대로 노출되지 않도록 id가 바뀔 때마다 명시적으로 초기화한다.
       setLoading(true)
-      setLoadError(false)
+      setLoadError(null)
       setProperty(null)
       setRegistryRequest(null)
       setRegistryMessage(null)
@@ -245,9 +246,9 @@ export default function PropertyDetailPage() {
         if (idRef.current !== requestId) return
         setProperty(data)
         setFavorited(data.is_favorited)
-      } catch {
+      } catch (err) {
         if (idRef.current !== requestId) return
-        setLoadError(true)
+        setLoadError(err instanceof ApiError && err.status === 404 ? 'notfound' : 'unavailable')
       }
       // 등기부 신청 여부/상태는 백엔드(registry_requests)가 유일한 근거다 — 프론트는 무료횟수를
       // 스스로 계산하지 않고, 이미 신청한 기록이 있는지만 조회해 그 상태를 그대로 보여준다.
@@ -488,7 +489,6 @@ export default function PropertyDetailPage() {
     }
   }
 
-  function formatWon(amount: number) { return amount.toLocaleString() + '원' }
   const specView = property ? mapSpecView(property.tenants) : undefined
   const statusTenants = property ? property.tenants.filter((t) => t.source === 'STATUS') : []
   const rightsAnalysis = property
@@ -510,7 +510,19 @@ export default function PropertyDetailPage() {
   if (loadError || !property) return (
     <div className="min-h-screen bg-gray-50">
       <SiteHeader />
-      <div className="flex items-center justify-center py-20"><p className="text-gray-400">매물을 찾을 수 없습니다</p></div>
+      <div className="flex flex-col items-center justify-center py-20 gap-1">
+        {loadError === 'unavailable' ? (
+          <>
+            <p className="text-gray-500 font-medium">물건 정보를 불러오지 못했습니다</p>
+            <p className="text-sm text-gray-400">일시적인 오류일 수 있습니다. 잠시 후 다시 시도해주세요</p>
+          </>
+        ) : (
+          <p className="text-gray-400">매물을 찾을 수 없습니다</p>
+        )}
+        <Link href="/" className="mt-4 rounded-xl bg-gray-100 px-4 py-2 text-sm font-medium text-gray-600">
+          검색 화면으로
+        </Link>
+      </div>
     </div>
   )
   return (

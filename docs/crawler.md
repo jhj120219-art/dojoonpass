@@ -51,19 +51,23 @@
 ## 스케줄링 방식
 
 - Windows Task Scheduler, 작업명 `LawAuctionDailyCrawl`
+  > **2026-08-11 실측: 이 예약 작업은 현재 등록돼 있지 않다.** 등록된 248개를 전수 조회했으나
+  > 이 저장소를 가리키는 항목이 하나도 없다. 재등록은 운영 조치다 — 아래 "실행 환경" 절 참고.
 - 실행 대상: `C:\Users\jhj12\OneDrive\Desktop\dojoonpass\run_daily.bat` (2026-07-26 수정, 이전에는 존재하지 않는 `dojun-pass` 경로를 가리켜 실행이 실패했음)
   ```bat
   @echo off
   cd /d %~dp0
 
-  C:\ProgramData\Anaconda3\python.exe mvp_scraper.py >> logs\daily_run.log 2>&1
+  REM (인터프리터 해석 블록 — 아래 "실행 환경" 절 참고. %PY%가 여기서 정해진다)
+
+  "%PY%" mvp_scraper.py >> logs\daily_run.log 2>&1
   if errorlevel 1 (
       echo ===================================== >> logs\daily_run.log
       echo [FAILED] mvp_scraper.py exited with code %errorlevel% at %date% %time% >> logs\daily_run.log
       exit /b 1
   )
 
-  C:\ProgramData\Anaconda3\python.exe migrate_execute.py >> logs\migrate_execute.log 2>&1
+  "%PY%" migrate_execute.py >> logs\migrate_execute.log 2>&1
   if errorlevel 1 (
       echo ===================================== >> logs\daily_run.log
       echo [FAILED] migrate_execute.py exited with code %errorlevel% at %date% %time% >> logs\daily_run.log
@@ -171,3 +175,141 @@
 - DB 연결 코드 검색 시 `sqlite3.connect()` 직접 호출과 `get_connection()` 경유를 모두 프로젝트 전체 범위에서 확인. 파일 1~2개만으로 판단하지 않음
 - 원인 분석 단계에서 실행 금지 원칙을 벗어난 이력(수동 `migrate_execute.py` 실행, `run_daily.bat` 수정) 존재. 승인 기록 없음
 - `DB_PATH`가 상대경로이므로 모든 스크립트 실행 전 Working Directory 확인 필수
+
+---
+
+## 실행 환경 (2026-08-11 Sprint 54 갱신)
+
+### 배치 실행
+
+```
+run_daily.bat            mvp_scraper.py  ->  migrate_execute.py     (logs/daily_run.log)
+run_doc_worker.bat       doc_worker.py                              (logs/doc_run.log)
+run_priority_refresh.bat refresh_priority.py                        (logs/doc_run.log)
+```
+
+세 배치 모두 Python 인터프리터를 다음 순서로 해석한다.
+
+1. `C:\ProgramData\Anaconda3\python.exe` 가 **존재하면** 그것을 쓴다 (기존 환경 무변경)
+2. 없으면 `where python` 결과의 첫 항목
+3. 둘 다 없으면 **로그에 `[FAILED]`를 남기고 `exit /b 1`**
+
+3번이 그냥 방어 코드가 아니다. 예전에는 1번 경로를 하드코딩했는데 그 Anaconda가 제거되면서
+배치가 실행 즉시 실패했고, **리다이렉트 대상 명령 자체가 실행되지 않아 로그가 비어 있었다**.
+그래서 2026-08-03부터 8일 동안 크롤이 멈춘 사실을 아무도 몰랐다(BUGS #46).
+Sprint 13이 `errorlevel` 검사로 없앤 "실패 은폐 구조"가 한 단계 위에서 재발한 것이다.
+
+### 의존성
+
+크롤러는 `selenium` / `webdriver-manager` / `pandas` / `pdfplumber`를 필요로 한다.
+`requirements.txt`에 있으며 **현재 인터프리터(Python 3.12.10)에는 설치돼 있지 않다**.
+
+```
+pip install -r requirements.txt
+python -c "import selenium, pandas, pdfplumber, webdriver_manager; print('OK')"
+```
+
+### 스케줄
+
+등록된 Windows 예약 작업 248개 중 이 저장소를 가리키는 것이 **없다**
+(`LawAuctionDailyCrawl` / `PDF우선순위갱신` 모두 부재).
+재등록은 실제 정기 수집을 시작시키는 운영 결정이므로 Sprint 54에서는 하지 않았다.
+
+### 마지막 실행 기록
+
+```
+logs/daily_run.log  2026-08-02 06:02:49
+  [Errno 28] No space left on device
+  오류 발생: 59 곳
+  총 저장 건수: 0 건
+```
+
+디스크는 현재 859.2 GB 여유로 해소됐다. 다만 **59/60 법원 오류가 디스크 때문만이었는지는
+아직 모른다** — 사이트 구조 변경이 겹쳤을 수 있고, 이는 실제로 한 번 돌려 봐야 확인된다.
+크롤러 실행은 외부 네트워크 접근 + 장시간 작업이라 회귀 스위트에 포함하지 않는다.
+
+---
+
+## 파이프라인 실제 연결 상태 (2026-08-11 Sprint 55 실측)
+
+### 스케줄러가 실제로 실행하는 것
+
+```
+run_daily.bat            mvp_scraper.py -> migrate_execute.py
+run_doc_worker.bat       doc_worker.py
+run_priority_refresh.bat refresh_priority.py
+```
+
+이 경로가 채우는 것: `auction_item` / `auction_case` / `document_queue` /
+`auction.has_*_pdf` / `document_status`(Sprint 55부터) / `documents/*.pdf` / `document_version_log`
+
+### 어떤 배치도 실행하지 않는 것
+
+```
+collect_documents.py    <- document_status / doc_raw / document_collect_failures 를 쓰는 유일한 코드
+analyze_docs.py         <- PDF 파싱
+load_rights_data.py     <- rights_summary / tenant_rights
+load_spec_data.py       <- tenant_rights (SPEC)
+```
+
+배치 3종의 import를 재귀적으로 따라가도 이 넷에는 **도달하지 않는다**(2026-08-11 전수 확인).
+그래서 `doc_raw` 0행 / `parsed_document` 0행이고, `rights_summary` 162건은 과거에 사람이
+한 번 돌린 결과가 남아 있는 것이다.
+
+이것이 권리분석 커버리지가 8.7%(162/1,870)에 머무는 근본 원인이다. 화면 결함이 아니다.
+
+**이 넷을 배치에 넣는 것은 운영 스케줄 변경이므로 Sprint 55 범위 밖(SKIP)이다.**
+넣기 전에 결정해야 할 것: 실행 순서, 소요 시간(PDF 파싱은 길다), 실패 시 재시도 정책.
+
+### 종료 코드 규약 (Sprint 55 확립)
+
+| 스크립트 | 0 (성공) | 1 (실패) |
+|---|---|---|
+| `mvp_scraper.py` | 수집·저장이 한 건이라도 됨 | 전 법원 실패 / 수집 0건 / DB 저장 0건 |
+| `doc_worker.py` | 큐가 비었거나 한 건이라도 성공 | 시도했는데 **전건** 실패 |
+| `migrate_execute.py` | 정상 | 예외 |
+| `refresh_priority.py` | 정상 | 예외 |
+
+부분 실패는 **경고만 남기고 성공**으로 둔다. 임계값을 임의로 정하면 그 자체가 새 정책이고,
+멀쩡한 실행이 매일 실패로 보고되면 경보가 무시당해 결국 같은 자리로 돌아온다.
+
+배치는 모든 실패 분기에서 `[FAILED]`를, 정상 종료에서 `[SUCCESS]`를 로그에 남긴다.
+**두 마커가 모두 있어야** "돌았는데 할 일이 없었다"와 "아예 실행되지 않았다"가 구분된다 —
+2026-08-02까지의 로그에는 이 마커가 한 번도 없었다.
+
+---
+
+## 문서 적재 경로가 두 벌이다 (2026-08-11 Sprint 56 실측, BUGS #55)
+
+| | 파일 저장 | 해시 | `doc_raw` | `document_status` | 스케줄러 |
+|---|---|---|---|---|---|
+| `crawler/doc_crawler.py:collect_document()` | O | O | **X** | `mark_queue_done`이 대신(Sprint 55~) | **연결됨** |
+| `collect_documents.py` | O | O | O | O | 연결 안 됨 |
+
+`doc_raw`(storage_path / file_hash / file_size / page_count)를 채우는 것은 아래쪽뿐이라
+현재 **0행**이다. 라이브 경로는 해시를 계산해 `document_version_log`에만 쓰고 나머지는 버린다.
+
+라이브 경로가 `doc_raw`를 쓰게 하려면 `page_count`에 pdfplumber가 필요하고(미설치),
+무엇보다 **어느 코드가 적재를 소유할지**가 정해져야 한다 — roadmap 16-A/16-B.
+
+## 파이프라인 정합 현황 (2026-08-11)
+
+Sprint 55의 수정 이후 단계 간 불일치가 0이 됐고, `test_pipeline_integrity.py`가 이를
+불변식으로 고정한다.
+
+```
+done 591건  -> 파일 없음 0 / document_status 없음 0 / READY 아님 0
+파일 588개  -> 큐가 done 아님 0
+큐 상태     -> in_progress 정체 0 / retry 불일치 0 / 기일 남은 SKIPPED_EXPIRED 0
+고아 행     -> 5개 참조 경로 전부 0
+```
+
+남은 공백은 **파싱 단계**다(스케줄러 미연결).
+
+```
+SPEC   READY 197 / 파싱됨 116  (미파싱 81)
+STATUS READY 194 / 파싱됨 161  (미파싱 33)
+APPRAISAL           파싱 대상 테이블 자체가 없다(감정평가서 파서 미구현)
+```
+
+미파싱 문서는 상세 화면에서 `SPEC_NOT_PARSED` 경고로 표시된다(FRONTEND_MASTER_SPEC §9.5-A).

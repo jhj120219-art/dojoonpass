@@ -18,3 +18,20 @@ export function formatPrice(price: number) {
 export function formatPriceEok(price: number) {
   return (price / 100000000).toFixed(1) + '억'
 }
+
+// 정확한 원 단위 표기 — **사용자에게 실제로 청구되는 금액**에 쓴다.
+//
+// 2026-08-11 Sprint 54: `properties/[id]/page.tsx`에만 지역 함수로 있던 것을 공용으로 옮겼다
+// (마이페이지 결제 내역이 같은 표기를 필요로 하면서 중복이 될 상황이었다 — Sprint 18/48이
+// formatPrice/formatPriceEok를 여기로 모은 것과 같은 이유).
+//
+// ★ 금액 종류에 따라 함수가 다른 것은 **의도된 구분**이다:
+//   - `formatPrice()` : 감정가·최저입찰가 등 **물건 시세**. 억/만 축약이 이 도메인의 관례이고
+//                       천원 단위 오차가 의미 없다
+//   - `formatWon()`   : 구독료·환불액 등 **청구 금액**. 축약하면 안 된다 —
+//                       `formatPrice(12900)`은 "1만"이 되어 실제 청구액과 2,900원(22%) 어긋난다.
+//                       구독 카드가 이미 `price.toLocaleString() + '원'`으로 정확히 표시하고
+//                       있어서, 내역만 축약하면 같은 결제가 화면마다 다른 금액으로 보인다.
+export function formatWon(amount: number) {
+  return amount.toLocaleString() + '원'
+}
