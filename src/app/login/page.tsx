@@ -13,7 +13,7 @@ export default function LoginPage() {
   )
 }
 
-// middleware.ts가 붙이는 `?redirect=` 쿼리를 읽으려면 useSearchParams가 필요하고,
+// src/proxy.ts가 붙이는 `?redirect=` 쿼리를 읽으려면 useSearchParams가 필요하고,
 // 이 훅은 Suspense 경계 안에서만 정적 렌더링과 함께 안전하게 쓸 수 있어 별도 컴포넌트로 분리했다.
 function LoginPageInner() {
   const searchParams = useSearchParams()

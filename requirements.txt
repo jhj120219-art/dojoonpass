@@ -9,6 +9,8 @@
 #   3. 어떤 패키지가 그 환경에 있었는지 **아무 데도 기록돼 있지 않아** 복구할 수가 없었다.
 #   4. 현재 PATH의 인터프리터(Python 3.12.10)에는 selenium/pandas/pdfplumber/
 #      webdriver-manager가 없다 -> 배치 경로를 고쳐도 크롤러는 여전히 못 돈다.
+#      **2026-08-12 Sprint 61에 해소** — 아래 4개를 실제로 설치했고, 크롤러 계열
+#      19개 모듈이 전부 import되는 것까지 확인했다(실제 크롤 실행은 하지 않음).
 #
 # 목록은 추측이 아니라 **소스 153개 .py의 import를 전수 파싱**해서 뽑았다.
 # (표준 라이브러리와 저장소 내부 모듈 제외)
@@ -34,15 +36,19 @@ requests==2.34.2
 python-jose[cryptography]==3.5.0
 cryptography==50.0.0
 
-# --- 크롤러 / 문서 파이프라인 (현재 **미설치** — 크롤 중단의 직접 원인) --------
+# --- 크롤러 / 문서 파이프라인 (2026-08-12 Sprint 61에 설치 완료 — 실측 버전 고정) ---
 # selenium          : crawler/base_crawler.py 등 19개 파일. 법원경매 사이트 수집의 핵심
 # webdriver-manager : ChromeDriver 자동 수급 (10개 파일)
 # pandas            : mvp_scraper.py 집계 (3개 파일)
 # pdfplumber        : collect_documents.py / analyze_docs.py PDF 파싱 (3개 파일)
-selenium
-webdriver-manager
-pandas
-pdfplumber
+#
+# 설치 후 확인한 것: 위 19개 모듈 + mvp_scraper/doc_worker/migrate_execute/collect_documents/
+# analyze_docs/load_rights_data/load_spec_data/refresh_priority가 전부 import 성공(0건 실패).
+# 아직 남은 운영 조치: 예약 작업 등록 + 크롤 1회 실행(외부 사이트 접속이라 이번에 하지 않음).
+selenium==4.47.0
+webdriver-manager==4.1.2
+pandas==3.0.5
+pdfplumber==0.11.10
 
 # --- 테스트 -----------------------------------------------------------------
 # 회귀 스위트는 표준 라이브러리(urllib/sqlite3)만 쓴다 — 추가 의존성 없음.

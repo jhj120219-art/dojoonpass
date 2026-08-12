@@ -26,6 +26,7 @@ from crawler.doc_paths import (  # noqa: F401  (하위 호환 재노출)
     DOCUMENT_ROOT,
     get_doc_dir,
     doc_exists,
+    status_overlay_has_data,
     _PRIMARY_EXT,
 )
 
@@ -282,8 +283,14 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
         )
         # 요소 존재만이 아니라, 내부 텍스트가 채워질 때까지 대기 (Step 2에서 지적된
         # "데이터가 비동기로 채워지는 동안 빈 상태로 읽어가는" 타이밍 문제 방지)
+        #
+        # 2026-08-12 Sprint 62 — "비어 있지 않음"으로는 부족하다. 오버레이 골격에 고정
+        # 라벨("사건번호", "조사일시" 등)이 이미 들어 있어 이 조건이 데이터 도착 전에
+        # 즉시 참이 됐고, 내용 없는 페이지가 그대로 저장됐다(실측 33건).
+        # 실제 사건 데이터가 채워졌는지로 판정한다.
         WebDriverWait(driver, OVERLAY_TIMEOUT).until(
-            lambda d: len((d.find_element(By.CSS_SELECTOR, overlay_selector).text or "").strip()) > 0
+            lambda d: status_overlay_has_data(
+                d.find_element(By.CSS_SELECTOR, overlay_selector).text or "")
         )
     except Exception:
         logger.warning("[%s-%s] status 오버레이 등장/데이터 채움 타임아웃", case_no, item_no)
@@ -291,6 +298,15 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
 
     try:
         outer_html = driver.execute_script("return arguments[0].outerHTML;", overlay)
+
+        # 저장 직전 마지막 관문 (2026-08-12 Sprint 62).
+        # 위 대기를 통과했더라도 실제로 저장할 HTML에 사건 데이터가 없으면 **저장하지
+        # 않는다**. 한 번 저장되면 `doc_exists()`가 "수집 완료"로 판정해 그 물건은 영구히
+        # 재수집 대상에서 빠지므로, 빈 캡처를 남기느니 실패로 두고 큐에 남기는 편이 옳다.
+        if not status_overlay_has_data(outer_html):
+            logger.warning("[%s-%s] status 내용이 비어 있어 저장하지 않는다(재시도 대상으로 남김)",
+                           case_no, item_no)
+            return result
 
         # 임시 파일에 먼저 쓰고 os.replace()로 원자적 교체한다(2026-08-09 Sprint 40 File/DB
         # Consistency Audit). 목적지 경로에 직접 쓰면 쓰기 도중 프로세스가 강제 종료됐을 때

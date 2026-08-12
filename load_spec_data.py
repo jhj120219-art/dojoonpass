@@ -181,6 +181,36 @@ def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -
     return "loaded"
 
 
+def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
+    """근거 문서(spec.pdf)가 사라진 물건의 SPEC 파생 행을 제거한다.
+
+    `load_rights_data.py:purge_orphans()`와 같은 이유·같은 안전장치다(그쪽 docstring 참고).
+    `load_item()`이 파일 부재 시 DELETE 이전에 early return 하므로, 한 번 적재된 뒤
+    근거 문서가 사라지면 파생 행이 영원히 남는다(2026-08-12 Sprint 62에 1건 실측 발견 —
+    STATUS/SPEC 양쪽 모두 같은 물건에서 발생했다).
+
+    `evidence_found == 0`이면 아무것도 지우지 않는다 — documents/ 를 통째로 못 읽는
+    상황에서 전체 임차인 데이터를 날리지 않기 위해서다.
+
+    파싱 실패(`parse_error`)나 표가 없는 경우(`no_tenant_table`)는 **지우지 않는다** —
+    파서/라이브러리 회귀로도 같은 증상이 나오므로 파일 부재라는 명확한 근거일 때만 지운다.
+    """
+    if evidence_found == 0:
+        print("[안전장치] spec.pdf를 하나도 찾지 못해 정리를 건너뛴다 "
+              "(documents/ 경로 문제일 수 있으므로 데이터를 지우지 않는다)")
+        return 0
+    if not missing_file_item_ids:
+        return 0
+
+    placeholders = ",".join("?" * len(missing_file_item_ids))
+    removed = conn.execute(
+        "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)" % placeholders,
+        missing_file_item_ids,
+    ).rowcount
+    conn.commit()
+    return removed
+
+
 def main():
     conn = get_connection()
     try:
@@ -189,14 +219,22 @@ def main():
         ).fetchall()
 
         stats = {}
+        missing_file_item_ids = []
         for item in items:
             result = load_item(conn, item["id"], item["court_name"], item["case_no"], item["item_no"])
             stats[result] = stats.get(result, 0) + 1
+            if result == "no_spec_file":
+                missing_file_item_ids.append(item["id"])
+
+        # spec.pdf를 실제로 연 물건 수 — 파일 부재를 뺀 나머지 전부가 근거가 된다.
+        evidence_found = sum(v for k, v in stats.items() if k != "no_spec_file")
+        removed = purge_orphans(conn, missing_file_item_ids, evidence_found)
 
         print("=== SPEC 적재 결과 ===")
         print(f"전체 물건: {len(items)}")
         for k, v in sorted(stats.items()):
             print(f"{k}: {v}")
+        print(f"근거 문서가 사라져 정리한 파생 행: {removed}")
     finally:
         conn.close()
 

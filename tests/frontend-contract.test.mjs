@@ -358,8 +358,19 @@ describe('기술부채 정리 (Sprint 52)', () => {
     assert.equal(res.status, 200, 'crawl_date 정렬이 거부됐습니다')
     assert.ok(plain(body).includes('수집일 ↓'), '수집일 정렬 상태가 표시되지 않습니다')
     // 실제로 순서가 바뀌는지 — 200만 보고 통과시키지 않는다.
-    const asc = renderedIdOrder((await getText('/?sort_by=crawl_date&sort_order=asc')).body)
-    const desc = renderedIdOrder((await getText('/?sort_by=crawl_date&sort_order=desc')).body)
+    //
+    // 2026-08-12 Sprint 61 정정: 기본 검색 결과(D7 진행 중 물건)에는 `include_closed`를
+    // 함께 걸어야 한다. 크롤이 2026-08-01 이후 멈춰 있어(BUGS #46) **아직 기일이 남은
+    // 물건 14건이 전부 같은 crawl_date**가 됐고, 정렬 키가 상수인 집합에서는 asc/desc가
+    // 같은 순서(= id tie-break)로 나오는 것이 **올바른 동작**이다. 그 상태에서 이 검사가
+    // 실패하는 것은 제품 결함이 아니라 검사 설계 결함이었다(정렬 자체는 전체 집합에서
+    // 정상 동작함을 실측 확인: asc 2026-07-06 / desc 2026-08-01).
+    //
+    // 그래서 `include_closed=true`로 **crawl_date가 실제로 여러 값인 집합**을 대상으로
+    // 검증한다. 이 집합은 오늘 날짜에 좌우되지 않아 시간이 지나도 무효가 되지 않는다.
+    const q = 'sort_by=crawl_date&include_closed=true'
+    const asc = renderedIdOrder((await getText(`/?${q}&sort_order=asc`)).body)
+    const desc = renderedIdOrder((await getText(`/?${q}&sort_order=desc`)).body)
     if (asc && desc) {
       assert.notEqual(asc, desc, 'crawl_date asc/desc의 결과 순서가 같습니다')
     }

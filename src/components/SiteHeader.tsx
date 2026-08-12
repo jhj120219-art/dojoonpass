@@ -31,7 +31,7 @@ export default function SiteHeader({ current, title }: SiteHeaderProps) {
   useEffect(() => {
     const supabase = createClient()
     let cancelled = false
-    // getSession()으로 충분하다. middleware가 모든 요청에서 getUser()로 세션을 서버 검증하고
+    // getSession()으로 충분하다. src/proxy.ts가 모든 요청에서 getUser()로 세션을 서버 검증하고
     // 쿠키를 갱신한 뒤에 이 페이지가 렌더되므로, 여기서 읽는 쿠키는 이미 신선하다.
     // 헤더에서 getUser()를 또 부르면 로그인 사용자의 매 페이지 로드에 Supabase 왕복이
     // 한 번씩 더 붙을 뿐 얻는 정확도가 없다.

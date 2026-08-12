@@ -247,12 +247,23 @@ run_priority_refresh.bat refresh_priority.py
 
 ```
 collect_documents.py    <- document_status / doc_raw / document_collect_failures 를 쓰는 유일한 코드
-analyze_docs.py         <- PDF 파싱
 load_rights_data.py     <- rights_summary / tenant_rights
 load_spec_data.py       <- tenant_rights (SPEC)
+
+analyze_docs.py         <- 파이프라인 단계가 **아니다**. 배치에 넣으면 안 된다 (아래 참고)
 ```
 
-배치 3종의 import를 재귀적으로 따라가도 이 넷에는 **도달하지 않는다**(2026-08-11 전수 확인).
+**2026-08-12 Sprint 63 정정 — `analyze_docs.py`를 "PDF 파싱" 단계로 묶어 온 것은 사실이
+아니었다.** 이 파일은 DB에 아무것도 쓰지 않고(`get_connection` 0회, SQL 0회) 첫 번째 물건을
+하드코딩으로 열어 PDF 텍스트를 화면에 출력하는 **1회성 조사 스크립트**다. 게다가 마지막이
+`input("엔터를 누르면 종료...")`라, Task Scheduler에서 실행되면 stdin이 없어 **매달리거나
+즉시 죽고 같은 배치의 뒷 단계가 통째로 멈춘다.** 문서의 분류만 믿고 배치에 넣는 순간
+사고가 나는 자리였다 — 이제 `test_crawl_exit_code.py`가 구조로 막는다(배치 후보 9종에
+입력 대기가 없는지 + `analyze_docs.py`가 여전히 대화형인지 양방향 검사).
+
+따라서 배치 편입을 검토할 대상은 **넷이 아니라 셋**이다.
+
+배치 3종의 import를 재귀적으로 따라가도 이들에는 **도달하지 않는다**(2026-08-11 전수 확인).
 그래서 `doc_raw` 0행 / `parsed_document` 0행이고, `rights_summary` 162건은 과거에 사람이
 한 번 돌린 결과가 남아 있는 것이다.
 
@@ -289,8 +300,16 @@ load_spec_data.py       <- tenant_rights (SPEC)
 `doc_raw`(storage_path / file_hash / file_size / page_count)를 채우는 것은 아래쪽뿐이라
 현재 **0행**이다. 라이브 경로는 해시를 계산해 `document_version_log`에만 쓰고 나머지는 버린다.
 
-라이브 경로가 `doc_raw`를 쓰게 하려면 `page_count`에 pdfplumber가 필요하고(미설치),
-무엇보다 **어느 코드가 적재를 소유할지**가 정해져야 한다 — roadmap 16-A/16-B.
+라이브 경로가 `doc_raw`를 쓰게 하려면 `page_count`에 pdfplumber가 필요한데,
+**2026-08-11 Sprint 61에 설치돼 이 제약은 해소됐다**(`pdfplumber==0.11.10`).
+남은 것은 **어느 코드가 적재를 소유할지**뿐이다 — roadmap 16-A/16-B.
+
+덧붙여 `doc_raw`는 **읽는 코드가 저장소 전체에 0곳**이다(자기 writer 안의
+`MAX(doc_version)` 조회 제외). `parsed_document`는 **쓰는 코드도 읽는 코드도 0곳**으로
+완전히 죽은 테이블이다(roadmap 16-C / BUGS #49에 이미 등록됨). 즉 "파싱 단계가 연결만
+안 됐다"가 아니라 **그 단계의 구현 자체가 없다** — 실제로 동작 중인 파싱은
+`load_spec_data.py` / `load_rights_data.py`가 `tenant_rights` / `rights_summary`에
+쓰는 경로뿐이다(2026-08-12 Sprint 63 전수 확인).
 
 ## 파이프라인 정합 현황 (2026-08-11)
 
@@ -307,9 +326,46 @@ done 591건  -> 파일 없음 0 / document_status 없음 0 / READY 아님 0
 남은 공백은 **파싱 단계**다(스케줄러 미연결).
 
 ```
-SPEC   READY 197 / 파싱됨 116  (미파싱 81)
-STATUS READY 194 / 파싱됨 161  (미파싱 33)
+SPEC   READY 197 / 파싱됨 116  (나머지 81 = 임차인 없음)
+STATUS READY 194 / 파싱됨 161  (나머지 33 = 빈 캡처, Sprint 62에 복구)
 APPRAISAL           파싱 대상 테이블 자체가 없다(감정평가서 파서 미구현)
 ```
 
-미파싱 문서는 상세 화면에서 `SPEC_NOT_PARSED` 경고로 표시된다(FRONTEND_MASTER_SPEC §9.5-A).
+**2026-08-12 Sprint 62 정정 — 위 "나머지"를 미파싱으로 기록해 온 것은 사실이 아니었다.**
+실제로 파일을 전수 확인한 결과 둘은 성격이 완전히 다르다.
+
+- **SPEC 81건은 파싱 실패가 아니다.** 표를 정상적으로 찾았고, 그 표에 적힌 내용이
+  literally `조사된 임차내역없음`이다. 즉 **임차인이 없는 물건**이며 파서는 올바르게
+  동작했다. "미파싱 81"이라는 기록은 정상 동작을 결함으로 보이게 만들었다.
+  (다만 "확인된 임차인 없음"이라는 정보를 저장하지 않아 화면에서 "정보 없음"과
+  구분되지 않는다 — 표기 방식은 제품 결정이라 `docs/roadmap.md` Backlog로 남겼다.)
+- **STATUS 33건은 진짜 결함이었다** — 내용이 비어 있는 캡처가 정상 수집으로 저장된
+  것이다(`docs/BUGS.md` #61). Sprint 62에 크롤러를 고치고 33건을 재수집 대상으로 복구했다.
+
+파싱 결과가 없는 문서는 상세 화면에서 `SPEC_NOT_PARSED` 경고로 표시된다(FRONTEND_MASTER_SPEC §9.5-A).
+
+---
+
+## 실행 소요 시간 실측 (2026-08-12 Sprint 65 — 저장소 최초 측정)
+
+그동안 "소요 시간"은 배치 편입을 미루는 근거로 여러 문서에 언급됐지만 **실제로 측정된
+값은 어디에도 없었다.** 이번에 크롤러를 실제로 돌려 처음 측정했다.
+
+```
+환경     Chrome 151 / ChromeDriver 자동 확보 / 헤드리스
+대상     서울중앙지방법원 (목록 9건, 각 건 상세 진입 포함)
+
+crawl_court() 1개 법원        약 168초
+  -> 60개 법원 전체 추정      약 2.8시간
+문서 수집 collect_status() 1건  약 12초 (상세 진입 포함)
+```
+
+운영 판단에 필요한 것:
+- 일일 크롤이 06:00에 시작하면 **약 08:50경 종료**된다. `migrate_execute.py`는 그 뒤에
+  돌아야 하므로 배치 순서(`run_daily.bat`)는 이미 올바르다(순차 실행).
+- `doc_worker.py`는 `DOC_WORKER_END_TIME`으로 스스로 종료 시각을 지키므로 큐가 아무리
+  길어도 정해진 시간에 멈춘다. 현재 대기 큐가 2,700건대라 **하루에 다 비우지 못한다** —
+  우선순위(`calc_priority`)가 기일 임박 순으로 처리 순서를 정하는 이유가 이것이다.
+- 사이트 목록은 **시점에 따라 반환 건수가 달라진다**(같은 법원 재실행 시 9건 → 1건 관측).
+  수집 건수가 줄었다고 곧바로 결함으로 판단하면 안 된다 — `CrawlOutcome`의 실패 판정이
+  "전 법원 실패" 또는 "저장 0건" 기준인 이유다.

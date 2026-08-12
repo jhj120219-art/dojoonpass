@@ -220,8 +220,13 @@ def test_parsing_gap_is_measurable():
         status_parsed = one("""SELECT COUNT(*) FROM document_status ds
             WHERE ds.doc_type='STATUS' AND ds.status='READY'
               AND EXISTS (SELECT 1 FROM rights_summary r WHERE r.item_id=ds.item_id)""")
-        print("    SPEC   READY %d / 파싱됨 %d (미파싱 %d)" % (spec_ready, spec_parsed, spec_ready - spec_parsed))
-        print("    STATUS READY %d / 파싱됨 %d (미파싱 %d)" % (status_ready, status_parsed, status_ready - status_parsed))
+        # "미파싱"이라고 부르지 않는다 — 2026-08-12 Sprint 62 실측 결과 SPEC의 차이분은
+        # 파싱 실패가 아니라 표에 `조사된 임차내역없음`이라고 적힌 **임차인 없는 물건**이었다.
+        # 정상 동작을 결함처럼 보이게 하는 표현이라 "결과 행 없음"으로 바꾼다.
+        print("    SPEC   READY %d / 파싱결과 있음 %d (결과 행 없음 %d — 임차인 없음 포함)"
+              % (spec_ready, spec_parsed, spec_ready - spec_parsed))
+        print("    STATUS READY %d / 파싱결과 있음 %d (결과 행 없음 %d)"
+              % (status_ready, status_parsed, status_ready - status_parsed))
 
         check_true("조회 경로가 유효하다(READY 문서가 존재)", spec_ready > 0 and status_ready > 0)
         check_true("파싱된 것이 하나라도 있다", spec_parsed > 0 and status_parsed > 0)
@@ -262,6 +267,55 @@ def test_no_orphan_rows_in_pipeline_tables():
         check("document_status.doc_type 표기", kinds, ["APPRAISAL", "SPEC", "STATUS"])
         kinds_q = sorted(r[0] for r in conn.execute("SELECT DISTINCT doc_type FROM document_queue"))
         check("document_queue.doc_type 표기", kinds_q, ["appraisal", "spec", "status"])
+    finally:
+        conn.close()
+
+
+def test_rights_data_has_evidence():
+    """권리분석 파생 데이터에 근거 문서가 실제로 남아 있는가 (2026-08-12 Sprint 62 신설).
+
+    `rights_summary` / `tenant_rights(source='STATUS')`는 `load_rights_data.py`가
+    현황조사서(status.html)만 근거로 만든다. 그런데 이 스크립트는 파일이 없으면 DELETE
+    이전에 early return 해서, **한 번 적재된 뒤 근거 문서가 사라지면 파생 행이 영원히
+    남았다**(Sprint 62에 1건 실측 발견 — item_id=540, 사건 디렉터리 자체가 부재).
+
+    화면은 그 근거를 확인할 방법이 없는 "현황조사서 임차인 N명"을 계속 보여주게 되므로,
+    "명시된 내용만 근거로 사용한다"는 이 도메인의 대원칙에 정면으로 어긋난다.
+    """
+    print("\n--- 6. 권리분석 파생 데이터의 근거 문서 존재 ---")
+    conn = connect()
+    try:
+        rows = conn.execute("""
+            SELECT rs.item_id, ai.court_name, ai.case_no, ai.item_no
+            FROM rights_summary rs JOIN auction_item ai ON rs.item_id = ai.id
+        """).fetchall()
+        # connect()는 row_factory를 쓰지 않는다(이 파일의 다른 검사와 동일하게 인덱스 접근).
+        missing = [r for r in rows
+                   if not os.path.exists(os.path.join(doc_dir(r[1], r[2], r[3]), "status.html"))]
+        for r in missing[:5]:
+            print("    근거 없음: item_id=%s %s %s-%s" % (r[0], r[1], r[2], r[3]))
+        check("rights_summary 전 행에 status.html이 존재한다 (%d행 검사)" % len(rows),
+              len(missing), 0)
+
+        # tenant_rights는 두 근거에서 온다 — 각각 자기 근거 파일이 있어야 한다.
+        # (source별 파일이 다르므로 한쪽만 검사하면 나머지 절반을 놓친다)
+        for source, filename in (("STATUS", "status.html"), ("SPEC", "spec.pdf")):
+            trows = conn.execute("""
+                SELECT DISTINCT tr.item_id, ai.court_name, ai.case_no, ai.item_no
+                FROM tenant_rights tr JOIN auction_item ai ON tr.item_id = ai.id
+                WHERE tr.source = ?
+            """, (source,)).fetchall()
+            tmissing = [r for r in trows
+                        if not os.path.exists(os.path.join(doc_dir(r[1], r[2], r[3]), filename))]
+            for r in tmissing[:3]:
+                print("    근거 없음(%s): item_id=%s %s %s-%s" % (source, r[0], r[1], r[2], r[3]))
+            check("tenant_rights(%s) 전 물건에 %s가 존재한다 (%d물건 검사)"
+                  % (source, filename, len(trows)), len(tmissing), 0)
+
+        # source 값 자체도 두 종류뿐이어야 한다 — 새 값이 생기면 위 검사가 그 행을 통째로
+        # 건너뛰어(검사 대상에서 빠져) 조용히 커버리지 구멍이 된다.
+        sources = sorted(r[0] for r in conn.execute("SELECT DISTINCT source FROM tenant_rights"))
+        check("tenant_rights.source 표기", sources, ["SPEC", "STATUS"])
     finally:
         conn.close()
 
@@ -327,6 +381,7 @@ def run():
     test_files_are_reflected_in_queue()
     test_parsing_gap_is_measurable()
     test_no_orphan_rows_in_pipeline_tables()
+    test_rights_data_has_evidence()
     test_property_type_matches_content()
 
     print("\n" + "=" * 55)

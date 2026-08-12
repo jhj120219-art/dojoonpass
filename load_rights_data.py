@@ -124,6 +124,42 @@ def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -
     return "loaded"
 
 
+def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
+    """근거 문서(status.html)가 사라진 물건의 파생 행을 제거한다.
+
+    이 스크립트의 대원칙은 "STATUS.html에 명시된 내용만 근거로 사용한다"인데,
+    `load_item()`은 파일이 없으면 DELETE 이전에 early return 하므로 **한 번 적재된 뒤
+    근거 문서가 사라지면 파생 데이터가 영원히 남았다**. 화면은 그 근거를 확인할 수 없는
+    "현황조사서 임차인 N명"을 계속 보여준다(2026-08-12 Sprint 62에 1건 실측 발견).
+
+    안전장치 — `evidence_found == 0`이면 아무것도 지우지 않는다.
+    documents/ 디렉터리가 통째로 안 보이는 상황(경로 변경/드라이브 미마운트/권한)에서
+    "전부 근거 없음"으로 오판해 **전체 권리분석 데이터를 날리는 것**을 막는다.
+    실제로 지울 근거는 "다른 물건에서는 문서를 정상적으로 찾았다"는 사실이다.
+
+    파일은 있는데 추출 결과가 비어 있는 경우(`no_extractable_data`)는 **지우지 않는다** —
+    파서 회귀로도 같은 증상이 나오므로, 파일 부재라는 명확한 근거가 있을 때만 지운다.
+    """
+    if evidence_found == 0:
+        print("[안전장치] status.html을 하나도 찾지 못해 정리를 건너뛴다 "
+              "(documents/ 경로 문제일 수 있으므로 데이터를 지우지 않는다)")
+        return 0
+    if not missing_file_item_ids:
+        return 0
+
+    placeholders = ",".join("?" * len(missing_file_item_ids))
+    removed = conn.execute(
+        "DELETE FROM rights_summary WHERE item_id IN (%s)" % placeholders,
+        missing_file_item_ids,
+    ).rowcount
+    removed += conn.execute(
+        "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)" % placeholders,
+        missing_file_item_ids,
+    ).rowcount
+    conn.commit()
+    return removed
+
+
 def main():
     conn = get_connection()
     try:
@@ -132,15 +168,24 @@ def main():
         ).fetchall()
 
         stats = {"loaded": 0, "no_status_file": 0, "no_extractable_data": 0}
+        missing_file_item_ids = []
         for item in items:
             result = load_item(conn, item["id"], item["court_name"], item["case_no"], item["item_no"])
             stats[result] = stats.get(result, 0) + 1
+            if result == "no_status_file":
+                missing_file_item_ids.append(item["id"])
+
+        removed = purge_orphans(
+            conn, missing_file_item_ids,
+            evidence_found=stats["loaded"] + stats["no_extractable_data"],
+        )
 
         print("=== 적재 결과 ===")
         print(f"전체 물건: {len(items)}")
         print(f"적재 완료(loaded): {stats['loaded']}")
         print(f"STATUS 파일 없음: {stats['no_status_file']}")
         print(f"STATUS 파일은 있으나 추출 가능한 데이터 없음: {stats['no_extractable_data']}")
+        print(f"근거 문서가 사라져 정리한 파생 행: {removed}")
     finally:
         conn.close()
 

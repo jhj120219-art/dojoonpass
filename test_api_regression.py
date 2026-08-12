@@ -125,6 +125,70 @@ def test_health_and_stats():
     check("document-stats status", r.status_code, 200)
     check_true("document-stats has total_items", "total_items" in r.json())
 
+    # 2026-08-12 Sprint 66: 위 두 줄은 "200이고 키가 하나 있다"까지만 봤다. 이 엔드포인트는
+    # 숫자 8개를 돌려주는데 **그중 어느 것도 값이 맞는지 확인한 적이 없었다** — 집계 쿼리가
+    # doc_type을 잘못 세거나 status 필터를 빠뜨려도 검사는 그대로 통과한다.
+    # 각 숫자를 **자기 출처 테이블과 직접 대조**한다.
+    stats = r.json()
+    conn = get_connection()
+    try:
+        db_total = conn.execute("SELECT COUNT(*) FROM auction_item").fetchone()[0]
+        pairs = {(row[0], row[1]): row[2] for row in conn.execute(
+            "SELECT doc_type, status, COUNT(*) FROM document_status"
+            " WHERE doc_type IN ('SPEC','STATUS','APPRAISAL') AND status IN ('READY','FAILED')"
+            " GROUP BY doc_type, status")}
+        db_failures = conn.execute("SELECT COUNT(*) FROM document_collect_failures").fetchone()[0]
+    finally:
+        conn.close()
+
+    check("document-stats total_items = auction_item 건수", stats["total_items"], db_total)
+    for key, doc_type, status in (
+        ("spec_success", "SPEC", "READY"), ("status_success", "STATUS", "READY"),
+        ("appraisal_success", "APPRAISAL", "READY"), ("spec_failed", "SPEC", "FAILED"),
+        ("status_failed", "STATUS", "FAILED"), ("appraisal_failed", "APPRAISAL", "FAILED"),
+    ):
+        check("document-stats %s = document_status(%s,%s)" % (key, doc_type, status),
+              stats[key], pairs.get((doc_type, status), 0))
+    # total_failures는 document_status가 아니라 **다른 테이블**에서 온다.
+    # 우연히 합계와 같아질 수 있으므로 자기 출처로 확인해야 의미가 있다.
+    check("document-stats total_failures = document_collect_failures 건수",
+          stats["total_failures"], db_failures)
+
+    # ★ 위 한 줄만으로는 부족하다 — 현재 DB에서 document_collect_failures(3)와
+    #   document_status FAILED(3)가 **우연히 같아서**, 출처 테이블을 바꿔치기하는 변이가
+    #   그대로 살아남는다(2026-08-12 Sprint 66에 변이 테스트로 실제 확인).
+    #   한쪽에만 행을 하나 더해 두 값을 어긋나게 만든 뒤, 엔드포인트가 **어느 쪽을 세는지**
+    #   확인한다. 넣은 행은 곧바로 되돌린다.
+    conn = get_connection()
+    probe_id = None
+    try:
+        probe_item = pick_item_ids(1)[0]
+        probe_id = conn.execute(
+            "INSERT INTO document_collect_failures (item_id, doc_type, error_message, created_at)"
+            " VALUES (?,?,?,?)",
+            (probe_item, "SPEC", "qa-doc-stats-probe", datetime.now().isoformat())).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        bumped = client.get("/api/v1/document-stats").json()
+        check("total_failures가 document_collect_failures를 따라 증가한다",
+              bumped["total_failures"], db_failures + 1)
+        # 같은 요청에서 document_status 기반 숫자는 **변하지 않아야** 한다(출처가 다르므로)
+        check("같은 변경이 spec_failed에는 영향을 주지 않는다",
+              bumped["spec_failed"], stats["spec_failed"])
+    finally:
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM document_collect_failures WHERE id=?", (probe_id,))
+            conn.commit()
+            left = conn.execute("SELECT COUNT(*) FROM document_collect_failures").fetchone()[0]
+        finally:
+            conn.close()
+        check("probe 행이 정리됐다", left, db_failures)
+    check_true("집계 대상이 실제로 존재한다(공허한 0 비교가 아님)",
+               db_total > 0 and sum(pairs.values()) > 0, (db_total, pairs))
+
 
 # ---------------------------------------------------------------------------
 # 2. Search (비로그인 접근 가능 + 필터/정렬/페이지네이션)
@@ -444,8 +508,36 @@ def test_favorites():
         check("search reflects favorite", found[0]["is_favorited"], True)
 
     # 다른 유저는 이 즐겨찾기를 보면 안 된다
-    other = client.get("/api/v1/favorites", headers=auth_headers("qa-reg-other-" + uuid.uuid4().hex[:6]))
+    other_user = "qa-reg-other-" + uuid.uuid4().hex[:6]
+    other = client.get("/api/v1/favorites", headers=auth_headers(other_user))
     check("other user isolated", other.json()["data"], [])
+
+    # 남의 즐겨찾기를 지우려는 시도는 실패해야 하고, **실제로 지워지지도 않아야 한다**.
+    # success=False만 확인하면 "지워놓고 에러를 반환하는" 구현도 통과한다 —
+    # 거부 여부와 부수효과 없음을 함께 단언한다(2026-08-12 Sprint 61).
+    other_del = client.delete("/api/v1/favorites/%d" % item_id, headers=auth_headers(other_user))
+    check("other user cannot delete my favorite", other_del.json()["success"], False)
+    check_true("my favorite survives other user's delete attempt",
+               any(i["id"] == item_id for i in client.get("/api/v1/favorites", headers=h).json()["data"]))
+
+    # 개인화 데이터는 요청자 기준이어야 한다 — 같은 물건이라도 다른 로그인 사용자에게는
+    # is_favorited=false여야 한다(소유자 true만 검증하면 "전역 true" 구현도 통과한다).
+    conn = get_connection()
+    try:
+        fav_case_no = conn.execute(
+            "SELECT case_no FROM auction_item WHERE id=?", (item_id,)).fetchone()["case_no"]
+    finally:
+        conn.close()
+    fav_url = "/api/v1/search?size=100&include_closed=true&case_no=" + fav_case_no
+    owner_rows = [i for i in client.get(fav_url, headers=h).json()["items"] if i["id"] == item_id]
+    other_rows = [i for i in client.get(fav_url, headers=auth_headers(other_user)).json()["items"]
+                  if i["id"] == item_id]
+    anon_rows = [i for i in client.get(fav_url).json()["items"] if i["id"] == item_id]
+    check("search personalization: owner sees favorited", [r["is_favorited"] for r in owner_rows], [True])
+    check("search personalization: other user sees not-favorited",
+          [r["is_favorited"] for r in other_rows], [False])
+    check("search personalization: anonymous sees not-favorited",
+          [r["is_favorited"] for r in anon_rows], [False])
 
     check("nonexistent item -> 404",
           client.post("/api/v1/favorites", json={"item_id": 99999999}, headers=h).status_code, 404)
@@ -474,6 +566,51 @@ def test_recent_items():
     rows = [i for i in client.get("/api/v1/recent-items", headers=h).json()["data"] if i["id"] == item_id]
     check("no duplicate recent row", len(rows), 1)
 
+    # --- 2026-08-12 Sprint 61: 아래 3개는 그동안 검사가 0건이던 영역이다 ---
+    # (1) 최근 조회는 개인화 데이터다 — 다른 사용자에게 새어나가면 안 된다.
+    other_user = "qa-reg-recent-other-" + uuid.uuid4().hex[:6]
+    other_recent = client.get("/api/v1/recent-items", headers=auth_headers(other_user)).json()["data"]
+    check("recent items isolated from other user", other_recent, [])
+
+    # (2) 정렬: viewed_at DESC.
+    #
+    # 주의 — 여기서 HTTP로 연속 조회해 정렬을 검증하려 하면 안 된다. Windows의
+    # datetime.now() 분해능(~1~16ms)보다 요청이 빨라 viewed_at이 **같은 값으로 묶이고**,
+    # 그러면 정렬이 tie-break(ri.id)로 결정돼 ORDER BY를 ASC로 뒤집어도 검사가 통과한다
+    # (2026-08-12 Sprint 61에 변이 테스트로 실제 확인 — 실데이터에는 동률 0건이라
+    # 운영 문제가 아니라 테스트 설계 문제였다).
+    # 그래서 viewed_at을 **명시적으로 다른 값**으로 심고 순서를 단언한다.
+    ids = pick_item_ids(25)
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM recent_items WHERE user_id=?", (TEST_USER,))
+        base = datetime.now() - timedelta(days=1)
+        for offset, iid in enumerate(ids[:3]):
+            conn.execute(
+                "INSERT INTO recent_items (user_id, item_id, viewed_at) VALUES (?,?,?)",
+                (TEST_USER, iid, (base + timedelta(minutes=offset)).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    data = client.get("/api/v1/recent-items", headers=h).json()["data"]
+    check("recent items sorted by viewed_at DESC",
+          [x["id"] for x in data], [ids[2], ids[1], ids[0]])
+
+    # 다시 조회하면 viewed_at이 갱신되어 맨 앞으로 온다(ON CONFLICT DO UPDATE).
+    # 위에서 심은 값이 전부 하루 전이라 지금 시각과 충돌할 수 없다 — 결정적이다.
+    client.get("/api/v1/item/%d" % ids[0], headers=h)
+    data = client.get("/api/v1/recent-items", headers=h).json()["data"]
+    check("re-viewed item moves to front", data[0]["id"], ids[0])
+    check("re-view does not duplicate the row", len([x for x in data if x["id"] == ids[0]]), 1)
+    check("re-view does not drop the other rows", len(data), 3)
+
+    # (3) 응답은 LIMIT 20으로 잘린다 — 상한이 사라지면 사용자가 볼수록 응답이 무한정 커진다.
+    for i in ids:
+        client.get("/api/v1/item/%d" % i, headers=h)
+    capped = client.get("/api/v1/recent-items", headers=h).json()["data"]
+    check("recent items response capped at 20", len(capped), 20)
+    check("capped response has no duplicate items", len({x["id"] for x in capped}), 20)
+
 
 # ---------------------------------------------------------------------------
 # 7. Search presets
@@ -493,9 +630,19 @@ def test_search_presets():
     check("conditions round-trip", mine[0]["conditions"], conditions)
 
     # 다른 유저가 남의 preset을 지울 수 없어야 한다
+    preset_other = "qa-reg-other-" + uuid.uuid4().hex[:6]
     other = client.delete("/api/v1/search-presets/%d" % preset_id,
-                          headers=auth_headers("qa-reg-other-" + uuid.uuid4().hex[:6]))
+                          headers=auth_headers(preset_other))
     check("other user cannot delete", other.json()["success"], False)
+    # 거부만 확인하면 부족하다 — 실제로 남아 있는지, 그리고 남의 목록에 새어나가지
+    # 않는지까지 단언한다(2026-08-12 Sprint 61).
+    check_true("preset survives other user's delete attempt",
+               any(p["id"] == preset_id
+                   for p in client.get("/api/v1/search-presets", headers=h).json()["data"]))
+    check("other user's preset list does not leak mine",
+          [p for p in client.get("/api/v1/search-presets",
+                                 headers=auth_headers(preset_other)).json()["data"]
+           if p["id"] == preset_id], [])
 
     check("delete own preset", client.delete("/api/v1/search-presets/%d" % preset_id, headers=h).json()["success"], True)
 
@@ -1474,6 +1621,86 @@ def test_registry_credits():
                all(h["created_by"] == "SUPER_ADMIN" for h in history),
                [h["created_by"] for h in history])
 
+    # -----------------------------------------------------------------------
+    # 20-B. 조정과 **실제 사용**이 뒤섞였을 때의 산술 (2026-08-12 Sprint 64 신규)
+    #
+    # 위 검사들은 관리자 조정만 따로 본다 — 실제 등기부 사용과 섞인 적이 없었다.
+    # 이 원장은 잔액 컬럼이 아니라 조정 누계이므로, 사용이 끼어들면
+    #   effective_limit = plan_limit + adjustment
+    #   remaining       = effective_limit - used
+    # 두 항등식이 계속 성립해야 한다. 특히 **이미 사용한 뒤의 DEDUCT**가 `used`를
+    # 건드리면(혹은 remaining을 두 번 깎으면) 사용자는 쓰지도 않은 횟수를 잃는다.
+    # -----------------------------------------------------------------------
+    mix_user = TEST_USER + "-creditmix"
+    conn = get_connection()
+    try:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO subscriptions (user_id,plan,price,status,started_at,expires_at,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (mix_user, "BASIC", 12900, "ACTIVE", now,
+             (datetime.now() + timedelta(days=30)).isoformat(), now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+    def credit_state():
+        d = client.get("/api/v1/admin/registry-credits/%s" % mix_user, headers=ah).json()["data"]
+        return d
+
+    def check_identities(label, d):
+        check("%s: effective = plan + adjustment" % label,
+              d["effective_limit"], d["plan_limit"] + d["adjustment"])
+        check("%s: remaining = effective - used" % label,
+              d["remaining"], max(0, d["effective_limit"] - d["used"]))
+
+    base_state = credit_state()
+    plan_limit = base_state["plan_limit"]
+    check_identities("초기", base_state)
+    check("초기 사용 0", base_state["used"], 0)
+
+    # GRANT +3 -> 한도만 늘고 사용량은 그대로
+    client.post("/api/v1/admin/registry-credits",
+                json={"user_id": mix_user, "reason_type": "GRANT", "amount": 3,
+                      "reason": "qa mix"}, headers=sh)
+    d = credit_state()
+    check_identities("GRANT 후", d)
+    check("GRANT는 한도만 늘린다", d["effective_limit"], plan_limit + 3)
+    check("GRANT가 사용량을 건드리지 않는다", d["used"], 0)
+
+    # 실제 등기부 2건 신청(무료 소모) -> used만 증가
+    mix_items = pick_item_ids(2)
+    for iid in mix_items:
+        rr = client.post("/api/v1/registry-requests", json={"item_id": iid},
+                         headers=auth_headers(mix_user))
+        check_true("무료 신청 성공", rr.json()["success"], rr.json())
+    d = credit_state()
+    check_identities("사용 2건 후", d)
+    check("사용 2건이 used에 반영", d["used"], 2)
+    check("사용은 adjustment를 바꾸지 않는다", d["adjustment"], 3)
+    check("remaining이 정확히 2 줄어든다", d["remaining"], plan_limit + 3 - 2)
+
+    # 사용 이후의 DEDUCT -1 -> 한도만 줄고, 이미 쓴 횟수는 그대로여야 한다
+    client.post("/api/v1/admin/registry-credits",
+                json={"user_id": mix_user, "reason_type": "DEDUCT", "amount": 1,
+                      "reason": "qa mix"}, headers=sh)
+    d = credit_state()
+    check_identities("사용 후 DEDUCT", d)
+    check("DEDUCT는 used를 건드리지 않는다", d["used"], 2)
+    check("DEDUCT가 한도를 1 줄인다", d["effective_limit"], plan_limit + 2)
+    check("remaining도 1만 줄어든다", d["remaining"], plan_limit + 2 - 2)
+
+    # 원장에는 조정 2건 + 사용 2건이 각각 남는다(사용이 조정 원장을 오염시키지 않는다)
+    clogs = client.get("/api/v1/admin/registry/credit-logs/%s" % mix_user,
+                       headers=ah).json()["data"]
+    kinds = sorted(l["reason_type"] for l in clogs)
+    check("원장에 조정 2건 + 사용 2건", kinds, ["DEDUCT", "GRANT", "USAGE", "USAGE"])
+    check("조정 원장(history)에는 조정 2건만",
+          sorted(h["reason_type"] for h in credit_state()["history"]), ["DEDUCT", "GRANT"])
+    # 사용 로그의 delta는 1회당 -1이어야 한다(두 번 깎으면 사용자가 횟수를 잃는다)
+    check("사용 로그 delta는 -1", sorted(l["delta"] for l in clogs if l["reason_type"] == "USAGE"),
+          [-1, -1])
+
 
 # ---------------------------------------------------------------------------
 # 21. 결제 로그 / Webhook 구조 (CTO 승인 5번) — 실제 PG API는 호출하지 않는다
@@ -1932,6 +2159,23 @@ def test_admin_rest_structure():
     check("legacy path still works", legacy.status_code, 200)
     check("new path works", modern.status_code, 200)
     check("both paths identical", legacy.json()["data"]["total"], modern.json()["data"]["total"])
+    # total만 같으면 "둘 다 빈 결과"여도 통과한다 — 실제 행과 필터 동작까지 대조한다
+    # (2026-08-12 Sprint 64: 신규 경로는 위임 함수라 조용히 갈라져도 total은 같을 수 있다).
+    lj, mj = legacy.json()["data"], modern.json()["data"]
+    check("both paths return the same rows",
+          [i["id"] for i in mj["items"]], [i["id"] for i in lj["items"]])
+    check("both paths agree on page/size", (mj["page"], mj["size"]), (lj["page"], lj["size"]))
+    for params in ("?status=PENDING", "?page=2&size=1", "?status=BOGUS"):
+        a = client.get("/api/v1/admin/registry-requests" + params, headers=ah)
+        b = client.get("/api/v1/admin/registry/requests" + params, headers=ah)
+        check("alias matches legacy for %s (status)" % params, b.status_code, a.status_code)
+        if a.status_code == 200:
+            # 전체 body를 그대로 비교하되(강도 유지), 출력에는 결과만 남긴다 —
+            # 응답 본문을 통째로 찍으면 회귀 로그가 수천 자로 뒤덮여 실제 실패를 못 찾는다.
+            check_true("alias matches legacy for %s (body)" % params,
+                       b.json()["data"] == a.json()["data"],
+                       "legacy=%d rows / alias=%d rows"
+                       % (len(a.json()["data"]["items"]), len(b.json()["data"]["items"])))
 
     # /admin/users: 집계값이 정확한지 + 페이지네이션이 안쪽 LIMIT로 잘려도 결과가 같은지
     conn = get_connection()
@@ -2127,6 +2371,79 @@ def test_soft_delete_columns():
     check_true("favorite gone from list",
                all(i["id"] != item_id
                    for i in client.get("/api/v1/favorites", headers=h).json()["data"]))
+
+    # -----------------------------------------------------------------------
+    # 28-B. `deleted_at`은 **아직 어떤 조회도 보지 않는다** (2026-08-12 Sprint 71 신규)
+    #
+    # 컬럼은 소프트 삭제 전환을 위해 미리 만들어 뒀지만(Migration 016), 실제로 그 값을
+    # 쓰는 코드는 저장소 전체에 0곳이고 조회 쿼리에도 `deleted_at IS NULL` 조건이 없다.
+    # 즉 지금은 하드 삭제만이 유일한 삭제 경로이며 **그것이 의도된 현재 동작**이다.
+    #
+    # 위험은 나중이다 — 누군가 "컬럼이 있으니 값만 채우면 되겠지" 하고 `deleted_at`을
+    # 쓰기 시작하면, 행은 **사라지지 않고 그대로 조회된다**(검색 결과의 하트까지 켜진 채로).
+    # Migration 016 주석도 정확히 이 위험을 적어 뒀다("컬럼만 늘리면 모든 조회에
+    # deleted_at IS NULL을 붙여야 한다").
+    #
+    # 그래서 **현재 동작을 그대로 못 박는다.** 소프트 삭제를 배선하는 순간 이 검사가 실패해,
+    # 아래 열거된 조회들을 함께 고쳐야 한다는 사실을 강제로 알려 준다.
+    # 전환 여부 자체는 제품 판단이라 여기서 정하지 않는다.
+    # -----------------------------------------------------------------------
+    soft_user = TEST_USER + "-softdel"
+    sh_hdr = auth_headers(soft_user)
+    client.post("/api/v1/favorites", json={"item_id": item_id}, headers=sh_hdr)
+    preset = client.post("/api/v1/search-presets",
+                         json={"name": "soft-delete probe", "conditions": {}},
+                         headers=sh_hdr).json()
+    check("사전 조건: 즐겨찾기 1건", len(client.get("/api/v1/favorites", headers=sh_hdr).json()["data"]), 1)
+    check("사전 조건: 검색조건 1건",
+          len(client.get("/api/v1/search-presets", headers=sh_hdr).json()["data"]), 1)
+
+    conn = get_connection()
+    try:
+        now = datetime.now().isoformat()
+        for table in ("favorites", "search_presets"):
+            conn.execute("UPDATE %s SET deleted_at=?, deleted_by=? WHERE user_id=?" % table,
+                         (now, soft_user, soft_user))
+        conn.commit()
+    finally:
+        conn.close()
+
+    favs = client.get("/api/v1/favorites", headers=sh_hdr).json()["data"]
+    presets = client.get("/api/v1/search-presets", headers=sh_hdr).json()["data"]
+    check("[현재 동작] deleted_at을 채워도 즐겨찾기 조회에서 사라지지 않는다", len(favs), 1)
+    check("[현재 동작] deleted_at을 채워도 검색조건 조회에서 사라지지 않는다", len(presets), 1)
+
+    # 검색 결과의 개인화(하트)도 같은 테이블을 읽으므로 함께 켜진 채로 남는다
+    conn = get_connection()
+    try:
+        soft_case_no = conn.execute("SELECT case_no FROM auction_item WHERE id=?",
+                                    (item_id,)).fetchone()["case_no"]
+    finally:
+        conn.close()
+    hearts = [i["is_favorited"] for i in client.get(
+        "/api/v1/search?size=100&include_closed=true&case_no=" + soft_case_no,
+        headers=sh_hdr).json()["items"] if i["id"] == item_id]
+    check("[현재 동작] 검색 결과의 하트도 켜진 채로 남는다", hearts, [True])
+
+    # 소프트 삭제를 배선할 때 **함께 고쳐야 하는 조회 지점**을 소스로 고정해 둔다.
+    # (지금은 어느 곳에도 조건이 없어야 정상 — 하나라도 생기면 전환이 시작된 것이다)
+    fav_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "api", "v1", "favorites.py"), encoding="utf-8-sig").read()
+    pre_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "api", "v1", "search_presets.py"), encoding="utf-8-sig").read()
+    sea_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "api", "v1", "search.py"), encoding="utf-8-sig").read()
+    check("favorites.py에 deleted_at 조건이 아직 없다", "deleted_at" in fav_src, False)
+    check("search_presets.py에 deleted_at 조건이 아직 없다", "deleted_at" in pre_src, False)
+    check("search.py(하트 조회)에 deleted_at 조건이 아직 없다", "deleted_at" in sea_src, False)
+
+    conn = get_connection()
+    try:
+        for table in ("favorites", "search_presets"):
+            conn.execute("DELETE FROM %s WHERE user_id=?" % table, (soft_user,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2326,6 +2643,90 @@ def test_my_subscriptions():
     finally:
         conn.close()
     check("lazy sync가 DB 상태도 맞춘다", stored, "EXPIRED")
+
+    # -----------------------------------------------------------------------
+    # 31-B. Admin의 변경이 사용자 상태에 그대로 반영되는가 (2026-08-12 Sprint 64 신규)
+    #
+    # 그동안 Admin 변경(§27)과 사용자 조회(§31)가 **서로 만난 적이 없었다** — 각자 자기
+    # 쪽만 확인했다. 그런데 이 둘이 어긋나면 "관리자 화면에서는 해지했는데 사용자는 계속
+    # 이용 가능"이라는, 과금에 직접 영향을 주는 모순이 조용히 성립한다.
+    # 한 구독을 **세 관점**(사용자 조회 / Admin 목록 / 이용권 게이트)에서 동시에 본다.
+    # -----------------------------------------------------------------------
+    from api.v1.registry import has_active_subscription
+    from api.constants import ErrorCode
+
+    ah = {"X-Admin-Key": TEST_ADMIN_KEY}
+    sh = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
+    user_c = TEST_USER + "-mysub-c"
+
+    def three_views(sub_id, user_id):
+        """사용자 조회 / Admin 목록 / 이용권 게이트를 한 번에 본다."""
+        mine = [s for s in client.get("/api/v1/subscriptions/me",
+                                      headers=auth_headers(user_id)).json()["data"]
+                if s["id"] == sub_id]
+        adm = [s for s in client.get("/api/v1/admin/subscriptions?user_id=%s" % user_id,
+                                     headers=ah).json()["data"] if s["id"] == sub_id]
+        conn = get_connection()
+        try:
+            gate = has_active_subscription(conn, user_id)
+            db_status = conn.execute("SELECT status FROM subscriptions WHERE id=?",
+                                     (sub_id,)).fetchone()[0]
+        finally:
+            conn.close()
+        return (mine[0] if mine else None), (adm[0] if adm else None), gate, db_status
+
+    pay_c = client.post("/api/v1/payments",
+                        json={"payment_type": "SUBSCRIPTION", "plan": "PRO",
+                              "amount": price, "billing_cycle": BILLING_YEARLY},
+                        headers=auth_headers(user_c)).json()
+    check_true("C 구독 결제 성공", pay_c["success"], pay_c)
+    sub_c = client.get("/api/v1/subscriptions/me", headers=auth_headers(user_c)).json()["data"][0]["id"]
+
+    me_v, adm_v, gate, db_status = three_views(sub_c, user_c)
+    check("[ACTIVE] 사용자/Admin status 일치", (me_v["status"], adm_v["status"]), ("ACTIVE", "ACTIVE"))
+    check("[ACTIVE] effective_status 일치", me_v["effective_status"], adm_v["effective_status"])
+    check("[ACTIVE] 이용권 게이트가 사용자 표시와 일치", gate, me_v["is_entitled"])
+    check("[ACTIVE] 게이트 True", gate, True)
+
+    # Admin이 일시정지 -> 사용자는 즉시 이용 불가여야 한다
+    rp = client.patch("/api/v1/admin/subscriptions/%d" % sub_c,
+                      json={"status": "PAUSED", "reason": "qa"}, headers=sh)
+    check("Admin PAUSED 성공", rp.status_code, 200)
+    me_v, adm_v, gate, db_status = three_views(sub_c, user_c)
+    check("[PAUSED] 사용자 조회에 반영", me_v["status"], "PAUSED")
+    check("[PAUSED] Admin 목록에 반영", adm_v["status"], "PAUSED")
+    check("[PAUSED] DB에도 반영", db_status, "PAUSED")
+    check("[PAUSED] effective_status 일치", me_v["effective_status"], adm_v["effective_status"])
+    check("[PAUSED] 사용자는 이용 불가", me_v["is_entitled"], False)
+    check("[PAUSED] 이용권 게이트도 차단", gate, False)
+
+    # 재개하면 이용권이 되살아나야 한다 (되돌릴 수 없으면 CS가 복구를 못 한다)
+    rr = client.patch("/api/v1/admin/subscriptions/%d" % sub_c,
+                      json={"status": "ACTIVE", "reason": "qa resume"}, headers=sh)
+    check("Admin 재개 성공", rr.status_code, 200)
+    me_v, adm_v, gate, db_status = three_views(sub_c, user_c)
+    check("[재개] 사용자 조회 ACTIVE", me_v["status"], "ACTIVE")
+    check("[재개] 이용권 회복", me_v["is_entitled"], True)
+    check("[재개] 게이트도 회복", gate, True)
+
+    # Admin이 해지 -> 사용자는 이용 불가 + 등기부 신청이 구독 요구로 막혀야 한다.
+    # (해지했는데 계속 무료로 쓸 수 있으면 그대로 매출 누수다)
+    rc = client.patch("/api/v1/admin/subscriptions/%d" % sub_c,
+                      json={"status": "CANCELLED", "reason": "qa cancel"}, headers=sh)
+    check("Admin 해지 성공", rc.status_code, 200)
+    me_v, adm_v, gate, db_status = three_views(sub_c, user_c)
+    check("[해지] 사용자 조회 CANCELLED", me_v["status"], "CANCELLED")
+    check("[해지] Admin 목록 CANCELLED", adm_v["status"], "CANCELLED")
+    check("[해지] DB CANCELLED", db_status, "CANCELLED")
+    check("[해지] effective_status 일치", me_v["effective_status"], adm_v["effective_status"])
+    check("[해지] 사용자 이용 불가", me_v["is_entitled"], False)
+    check("[해지] 이용권 게이트 차단", gate, False)
+
+    reg = client.post("/api/v1/registry-requests",
+                      json={"item_id": pick_item_ids(1)[0]}, headers=auth_headers(user_c))
+    check("[해지] 등기부 신청이 구독 요구로 막힌다",
+          reg.json()["error"], ErrorCode.REGISTRY_SUBSCRIPTION_REQUIRED.value)
+    check_true("[해지] 신청 행이 생기지 않는다", reg.json()["data"] is None, reg.json())
 
 
 # ---------------------------------------------------------------------------
@@ -2857,6 +3258,21 @@ def cleanup():
         print("removed %d test rows" % total)
         left = conn.execute("SELECT COUNT(*) FROM registry_requests WHERE user_id LIKE ?", (like,)).fetchone()[0]
         check("no test rows left", left, 0)
+
+        # 이 정리 루틴은 `qa-reg-%`(자동 회귀가 만드는 유일한 접두사)만 지운다. 그런데
+        # 과거 **수동 QA**가 `qa-download-001`/`qa-race-001`처럼 다른 `qa-` 접두사를 썼고,
+        # 그 행들은 어떤 정리에도 걸리지 않아 운영 DB에 그대로 남아 있었다
+        # (2026-08-12 Sprint 61에 `recent_items` 10행 발견·제거 — 전부 2026-08-05자).
+        # 접두사를 넓혀 확인만 한다(삭제는 하지 않는다 — 남의 데이터일 수 있으므로).
+        stray = []
+        for table in ("registry_requests", "registry_usage", "payments", "subscriptions",
+                      "favorites", "recent_items", "search_presets", "registry_credits"):
+            n = conn.execute(
+                "SELECT COUNT(*) FROM %s WHERE user_id LIKE 'qa-%%' AND user_id NOT LIKE ?" % table,
+                (like,)).fetchone()[0]
+            if n:
+                stray.append("%s=%d" % (table, n))
+        check("no stray qa-* rows outside qa-reg-* (manual QA residue)", stray, [])
         # 이번 실행이 만든 감사 흔적도 남지 않아야 한다.
         # ★ 부모 행을 이미 지웠으므로 "현재 존재하는 qa 결제"로 되묻는 서브쿼리는 항상 0을
         #   돌려준다(공허하게 참). 삭제 **전에 캡처해 둔 id**로 확인해야 실제 검출력이 있다.

@@ -229,6 +229,56 @@ def test_live_crawl_scripts_are_guarded():
                    "회귀가 조용히 건너뛰어집니다")
 
 
+def test_batch_candidates_are_non_interactive():
+    """배치가 부를 수 있는 스크립트에 사람 입력 대기가 없는가 (2026-08-12 Sprint 63 신설).
+
+    `docs/crawler.md` / `docs/roadmap.md`가 "어떤 배치도 실행하지 않는 것"으로 네 스크립트를
+    묶어 놓고 배치 편입을 Backlog로 두고 있었는데, 그중 `analyze_docs.py`는 **애초에 배치에
+    넣으면 안 되는 스크립트**다 — DB에 아무것도 쓰지 않고(관련 코드 0줄), 마지막에
+    `input("엔터를 누르면 종료...")`로 사람 입력을 기다린다.
+
+    Task Scheduler에서 이것이 실행되면 stdin이 없어 **영원히 매달리거나 즉시 죽고**,
+    같은 배치의 뒷 단계가 통째로 멈춘다. 문서의 분류만 믿고 배치에 넣는 순간 사고가 난다.
+    규약이 아니라 구조로 막는다.
+    """
+    print("\n--- 8. 배치 후보 스크립트에 입력 대기가 없는가 ---")
+    import re as _re
+
+    # 실제로 배치가 부르거나, 문서가 배치 편입 후보로 거론하는 스크립트 전부.
+    candidates = (
+        "mvp_scraper.py", "doc_worker.py", "migrate_execute.py", "refresh_priority.py",
+        "collect_documents.py", "load_rights_data.py", "load_spec_data.py",
+        "repair_document_status.py", "repair_empty_status_capture.py",
+    )
+    # 주석/문자열 안의 input( 은 세지 않도록 줄 단위로 코드만 본다.
+    call = _re.compile(r"(?<![\w.])input\s*\(")
+    for name in candidates:
+        path = os.path.join(ROOT, name)
+        if not os.path.exists(path):
+            check_true("%s 존재" % name, False, "배치 후보 파일이 사라졌습니다")
+            continue
+        hits = [i + 1 for i, line in enumerate(io.open(path, encoding="utf-8-sig"))
+                if call.search(line.split("#")[0])]
+        check("%s: 사람 입력 대기 없음" % name, hits, [])
+
+    # 반대로 `analyze_docs.py`는 **대화형 조사 스크립트**임이 분명해야 한다.
+    # 여기가 조용히 바뀌면(=input이 사라지면) 위 목록에 넣어야 한다는 신호다.
+    ad = os.path.join(ROOT, "analyze_docs.py")
+    if os.path.exists(ad):
+        src = io.open(ad, encoding="utf-8-sig").read()
+        check_true("analyze_docs.py는 대화형이라 배치 후보가 아니다",
+                   bool(call.search(src)),
+                   "입력 대기가 사라졌다면 배치 후보 목록과 문서를 함께 갱신하십시오")
+        # DB에 아무것도 쓰지 않는다 = 파이프라인 단계가 아니다(문서가 그렇게 적고 있었다).
+        # 주의: 단순히 "INSERT" 문자열을 찾으면 `sys.path.insert(...)`가 걸린다 —
+        # 실제로 이 검사를 처음 썼을 때 그렇게 오검출됐다. SQL 형태로만 판정한다.
+        sql_write = _re.search(r"\b(INSERT\s+(OR\s+\w+\s+)?INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b",
+                               src, _re.IGNORECASE)
+        check_true("analyze_docs.py는 DB를 쓰지 않는다(파이프라인 단계 아님)",
+                   "get_connection" not in src and sql_write is None,
+                   "DB를 쓰기 시작했다면 파이프라인 문서를 갱신하십시오")
+
+
 def run():
     test_the_actual_2026_08_02_run()
     test_success_cases()
@@ -238,6 +288,7 @@ def run():
     test_entrypoints_propagate_exit_code()
     test_batches_check_errorlevel()
     test_live_crawl_scripts_are_guarded()
+    test_batch_candidates_are_non_interactive()
 
     print("\n" + "=" * 55)
     if failures:

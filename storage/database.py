@@ -385,21 +385,30 @@ def refresh_queue_priority() -> int:
     06:00에 enqueue 했을 때보다 시간이 지나 매각기일이 임박해진 사건의 우선순위를 끌어올리기 위함.
     """
     conn = get_connection()
-    updated = 0
+    changed = 0
+    examined = 0
     try:
         rows = conn.execute(
             "SELECT id, auction_date FROM document_queue WHERE status='pending'"
         ).fetchall()
         for row in rows:
             new_priority = calc_priority(row["auction_date"])
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE document_queue SET priority=? WHERE id=? AND priority!=?",
                 (new_priority, row["id"], new_priority)
             )
-            updated += 1
+            examined += 1
+            # UPDATE에 `AND priority!=?`가 걸려 있어 대부분의 행은 실제로 바뀌지 않는다.
+            # 예전에는 검토한 행 수를 그대로 반환해서, 배치 로그가 매일 밤
+            # "우선순위 재계산 완료: 2,736건"을 남겼다 — 실제로 바뀐 것이 0건인 날에도
+            # 똑같이 찍혀 운영자가 "매일 수천 건이 갱신된다"고 오해하게 만들었다
+            # (BUGS #47과 같은 부류 — 배치 로그가 사실이 아닌 것을 말하는 문제).
+            # 이제 **실제로 바뀐 행 수**를 반환한다.
+            if cur.rowcount > 0:
+                changed += 1
         conn.commit()
-        logger.info("document_queue 우선순위 재계산: %d건 검토", updated)
-        return updated
+        logger.info("document_queue 우선순위 재계산: %d건 검토, %d건 변경", examined, changed)
+        return changed
     finally:
         conn.close()
 

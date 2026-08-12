@@ -33,6 +33,7 @@ import api_server
 from api.auth import SUPABASE_JWT_SECRET
 from api.v1.payments import resolve_plan_price, BILLING_MONTHLY
 from storage.database import get_connection
+from api.constants import ErrorCode
 
 client = TestClient(api_server.app)
 # 두 레이스 시나리오는 서로 다른 user_id를 쓴다 — 같은 사용자를 재사용하면 시나리오 1이
@@ -601,6 +602,183 @@ def test_subscription_status_guard_is_structural():
     check_true("거부 시 롤백한다", "conn.rollback()" in body)
 
 
+def test_registry_credit_adjust_race():
+    """무료 횟수 조정이 동시에 들어와도 원장 합계가 정확한가 (2026-08-12 Sprint 67 신설).
+
+    이 저장소의 다른 경합 지점(등기부 무료한도/결제/환불/구독 상태)은 전부
+    "읽고 -> 판단하고 -> 쓴다" 구조라 `BEGIN IMMEDIATE`나 조건부 UPDATE로 막아야 했다.
+    반면 `adjust_registry_credit`은 **append-only 원장**이다 — `add_credit()`은 현재 합계를
+    읽지 않고 행 하나를 INSERT할 뿐이고, 상한 검사도 **1회 조정량**에만 걸린다(누적 아님).
+
+    구조상 lost update가 생길 수 없다는 뜻인데, **그 사실이 검증된 적은 없었다.**
+    누군가 나중에 "누적 상한"이나 "현재 잔액 확인 후 조정" 같은 읽기-판단을 넣으면
+    조용히 경합이 생긴다 — 그때 이 검사가 잡는다.
+    """
+    print("\n--- 11. 등기부 무료횟수 조정 동시 요청 (append-only 원장) ---")
+    user = "qa-race-credit-" + uuid.uuid4().hex[:10]
+    sh = {"X-Admin-Key": os.environ["SUPER_ADMIN_API_KEY"]}
+
+    N_GRANT, N_DEDUCT = 8, 4
+    GRANT_AMT, DEDUCT_AMT = 3, 1
+    results, errors = [], []
+    lock = threading.Lock()
+
+    def adjust(reason_type, amount):
+        try:
+            r = client.post("/api/v1/admin/registry-credits",
+                            json={"user_id": user, "reason_type": reason_type,
+                                  "amount": amount, "reason": "race"},
+                            headers=sh)
+            with lock:
+                results.append((reason_type, r.status_code))
+        except Exception as e:  # noqa: BLE001 - 예외 자체가 검사 대상이다
+            with lock:
+                errors.append(repr(e))
+
+    threads = ([threading.Thread(target=adjust, args=("GRANT", GRANT_AMT)) for _ in range(N_GRANT)]
+               + [threading.Thread(target=adjust, args=("DEDUCT", DEDUCT_AMT)) for _ in range(N_DEDUCT)])
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    check("동시 조정 중 예외 없음", errors, [])
+    check("모든 요청이 200", sorted({c for _, c in results}), [200])
+    check("요청 수만큼 처리됨", len(results), N_GRANT + N_DEDUCT)
+
+    expected_adjustment = N_GRANT * GRANT_AMT - N_DEDUCT * DEDUCT_AMT
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT reason_type, amount FROM registry_credits WHERE user_id=?", (user,)).fetchall()
+        ledger_sum = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM registry_credits WHERE user_id=?",
+            (user,)).fetchone()[0]
+    finally:
+        conn.close()
+
+    # 원장에 요청 하나당 정확히 한 행 — 유실도 중복도 없어야 한다
+    check("원장 행 수 = 요청 수 (유실/중복 없음)", len(rows), N_GRANT + N_DEDUCT)
+    check("GRANT 행 수", sum(1 for r in rows if r["reason_type"] == "GRANT"), N_GRANT)
+    check("DEDUCT 행 수", sum(1 for r in rows if r["reason_type"] == "DEDUCT"), N_DEDUCT)
+    check("원장 합계가 정확하다 (lost update 없음)", ledger_sum, expected_adjustment)
+
+    # API가 보고하는 값도 같은 합계여야 한다
+    body = client.get("/api/v1/admin/registry-credits/%s" % user,
+                      headers={"X-Admin-Key": os.environ["ADMIN_API_KEY"]}).json()["data"]
+    check("API adjustment가 원장 합계와 일치", body["adjustment"], expected_adjustment)
+    check("effective_limit = plan_limit + adjustment",
+          body["effective_limit"], body["plan_limit"] + expected_adjustment)
+
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM audit_logs WHERE target_type='REGISTRY_CREDIT'"
+                     " AND target_id IN (SELECT CAST(id AS TEXT) FROM registry_credits WHERE user_id=?)",
+                     (user,))
+        conn.execute("DELETE FROM registry_credit_logs WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM registry_credits WHERE user_id=?", (user,))
+        conn.commit()
+        left = conn.execute("SELECT COUNT(*) FROM registry_credits WHERE user_id=?",
+                            (user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("이 시나리오의 QA 데이터 정리됨", left, 0)
+
+
+def test_search_preset_cap_race():
+    """저장 개수 상한이 동시 요청에서도 지켜지는가 (2026-08-12 Sprint 67, BUGS #66).
+
+    `create_preset()`은 COUNT로 상한을 판정한 뒤 INSERT한다 — 전형적인 "확인 후 쓰기"다.
+    이 저장소는 등기부 무료한도·결제·환불·구독 상태 등 다른 경합 지점을 전부
+    `BEGIN IMMEDIATE`나 조건부 UPDATE로 굳혔는데 **이 경로만 빠져 있었다.**
+
+    실측 재현(수정 전): 99개 상태에서 12개 동시 요청 -> 2건 성공 -> 최종 101개.
+    상한이 조용히 뚫린다.
+    """
+    print("\n--- 12. 검색조건 저장 상한 동시 요청 (BUGS #66) ---")
+    from api.v1.search_presets import MAX_PRESETS_PER_USER
+
+    user = "qa-race-preset-" + uuid.uuid4().hex[:10]
+    h = auth_headers(user)
+
+    # 상한 직전(99개)까지 채운다 — 남은 자리는 정확히 하나다.
+    conn = get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO search_presets (user_id,name,conditions,created_at) VALUES (?,?,?,?)",
+            [(user, "seed-%d" % i, "{}", "2026-01-01") for i in range(MAX_PRESETS_PER_USER - 1)])
+        conn.commit()
+        seeded = conn.execute("SELECT COUNT(*) FROM search_presets WHERE user_id=?",
+                              (user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("상한 직전까지 채웠다", seeded, MAX_PRESETS_PER_USER - 1)
+
+    n = 12
+    barrier = threading.Barrier(n)
+    results = [None] * n
+
+    def worker(idx):
+        barrier.wait()   # 동시 진입을 맞춘다(Sprint 56 교훈: start()만으로는 겹치지 않는다)
+        r = client.post("/api/v1/search-presets",
+                        json={"name": "race-%d" % idx, "conditions": {}}, headers=h)
+        results[idx] = r.json()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    succeeded = [r for r in results if r and r.get("success")]
+    rejected = [r for r in results if r and not r.get("success")]
+
+    conn = get_connection()
+    try:
+        final = conn.execute("SELECT COUNT(*) FROM search_presets WHERE user_id=?",
+                             (user,)).fetchone()[0]
+    finally:
+        conn.close()
+
+    # 핵심: 남은 자리는 하나뿐이므로 정확히 1건만 성공해야 하고, 총량이 상한을 넘으면 안 된다.
+    check("정확히 1건만 성공", len(succeeded), 1)
+    check("나머지는 전부 거부", len(rejected), n - 1)
+    check("최종 개수가 상한을 넘지 않는다", final, MAX_PRESETS_PER_USER)
+    check("거부 응답이 상한 초과 코드",
+          sorted({r.get("error") for r in rejected}),
+          [ErrorCode.SEARCH_PRESET_LIMIT_EXCEEDED.value])
+
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM search_presets WHERE user_id=?", (user,))
+        conn.commit()
+        left = conn.execute("SELECT COUNT(*) FROM search_presets WHERE user_id=?",
+                            (user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("이 시나리오의 QA 데이터 정리됨", left, 0)
+
+
+def test_search_preset_cap_guard_is_structural():
+    """상한 가드가 원자적 구조를 유지하는가 (결정적 검사).
+
+    스레드 재현은 확률적이라 좁은 창을 놓칠 수 있다(Sprint 58/59에서 실제로 겪었다).
+    소스에 가드가 남아 있는지 결정적으로 확인해 둔다.
+    """
+    print("\n--- 13. 검색조건 상한 가드 구조 검사 ---")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "api", "v1", "search_presets.py"), encoding="utf-8-sig").read()
+    body = src[src.index("def create_preset("):src.index("def get_presets(")]
+    check_true("BEGIN IMMEDIATE로 확인+삽입을 원자화한다", "BEGIN IMMEDIATE" in body)
+    check_true("상한 초과 시 ROLLBACK한다", "ROLLBACK" in body)
+    check_true("성공 시 명시적으로 COMMIT한다", "COMMIT" in body)
+    # COUNT가 트랜잭션 안에 있어야 의미가 있다 — 밖에 있으면 가드가 무력하다
+    begin_i = body.index("BEGIN IMMEDIATE")
+    count_i = body.index("SELECT COUNT(*) FROM search_presets")
+    insert_i = body.index("INSERT INTO search_presets")
+    check_true("COUNT와 INSERT가 모두 트랜잭션 안에 있다", begin_i < count_i < insert_i)
+
+
 def cleanup():
     print("\n--- cleanup (test user rows only) ---")
     conn = get_connection()
@@ -689,6 +867,9 @@ def run():
         test_webhook_reprocess_guard_is_structural()
         test_admin_subscription_status_race()
         test_subscription_status_guard_is_structural()
+        test_registry_credit_adjust_race()
+        test_search_preset_cap_race()
+        test_search_preset_cap_guard_is_structural()
     finally:
         cleanup()
 

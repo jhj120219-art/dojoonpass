@@ -7,7 +7,7 @@ import { createClient } from '@/lib/supabaseClient'
 // Detail 페이지(properties/[id]/page.tsx)의 handleToggleFavorite와 동일한 토큰 확보 →
 // POST/DELETE /api/v1/favorites → 401/403 처리 흐름을 그대로 재사용한다. 차이는 리다이렉트
 // 대상뿐: Detail은 고정 경로(/properties/{id})지만, 여기서는 검색 조건(쿼리스트링)을 잃지
-// 않도록 현재 검색 URL 전체를 redirect 대상으로 쓴다(middleware.ts와 동일하게
+// 않도록 현재 검색 URL 전체를 redirect 대상으로 쓴다(src/proxy.ts와 동일하게
 // URLSearchParams로 인코딩).
 export default function FavoriteButton({ itemId, initialFavorited }: { itemId: number; initialFavorited: boolean }) {
   const router = useRouter()

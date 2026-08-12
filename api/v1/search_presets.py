@@ -32,20 +32,33 @@ def create_preset(req: SearchPresetRequest, user_id: str = Depends(get_current_u
         return error_response(ErrorCode.SEARCH_PRESET_TOO_LARGE, "검색조건이 너무 큽니다")
 
     conn = get_connection()
+    # 저장 개수 상한은 COUNT(집계)로 판정하므로 "row 하나를 조건부로 잠그는" 방식으로는
+    # 막을 수 없다. COUNT 확인과 INSERT 사이에 다른 요청이 끼어들면 둘 다 통과해 상한을
+    # 넘긴다 — 2026-08-12 Sprint 67에 실제로 재현했다(99개 상태에서 12개 동시 요청 ->
+    # 2건 성공 -> 최종 101개). `api/v1/registry.py:create_registry_request()`가 무료횟수
+    # COUNT에 쓰는 것과 **같은 패턴**으로, BEGIN IMMEDIATE로 확인+삽입을 원자화한다.
+    conn.isolation_level = None
     try:
-        saved_count = conn.execute(
-            "SELECT COUNT(*) FROM search_presets WHERE user_id=?", (user_id,)
-        ).fetchone()[0]
-        if saved_count >= MAX_PRESETS_PER_USER:
-            return error_response(ErrorCode.SEARCH_PRESET_LIMIT_EXCEEDED, f"저장 가능한 검색조건은 최대 {MAX_PRESETS_PER_USER}개입니다")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            saved_count = conn.execute(
+                "SELECT COUNT(*) FROM search_presets WHERE user_id=?", (user_id,)
+            ).fetchone()[0]
+            if saved_count >= MAX_PRESETS_PER_USER:
+                conn.execute("ROLLBACK")
+                return error_response(ErrorCode.SEARCH_PRESET_LIMIT_EXCEEDED, f"저장 가능한 검색조건은 최대 {MAX_PRESETS_PER_USER}개입니다")
 
-        now = datetime.now().isoformat()
-        cur = conn.execute(
-            "INSERT INTO search_presets (user_id, name, conditions, created_at) VALUES (?,?,?,?)",
-            (user_id, name, conditions_json, now)
-        )
-        conn.commit()
-        return success({"id": cur.lastrowid, "name": name, "created_at": now})
+            now = datetime.now().isoformat()
+            cur = conn.execute(
+                "INSERT INTO search_presets (user_id, name, conditions, created_at) VALUES (?,?,?,?)",
+                (user_id, name, conditions_json, now)
+            )
+            preset_id = cur.lastrowid
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return success({"id": preset_id, "name": name, "created_at": now})
     finally:
         conn.close()
 

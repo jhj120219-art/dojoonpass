@@ -25,7 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 가져왔는데, 그 모듈이 최상단에서 selenium을 import하는 탓에 selenium이 없는 환경에서는
 # 이 테스트가 ModuleNotFoundError로 아예 실행되지 못했다(2026-08-10 Sprint 47).
 # 검증 대상 함수는 **동일한 그 함수**다 — 우회가 아니라 불필요한 의존성을 끊은 것이다.
-from crawler.doc_paths import get_doc_dir, doc_exists, DOCUMENT_ROOT
+from crawler.doc_paths import (
+    get_doc_dir, doc_exists, DOCUMENT_ROOT, status_overlay_has_data,
+    canonical_doc_path, CANONICAL_DOC_FILENAME, PDF_DOWNLOADABLE_DOC_TYPES,
+)
 from storage.database import get_connection, mark_queue_done
 
 failures = []
@@ -175,6 +178,131 @@ def test_mark_queue_done_rolls_back_on_partial_failure():
         conn.close()
 
 
+def test_status_overlay_has_data():
+    """빈 현황조사서 캡처를 "수집 완료"로 저장하지 않는가 (2026-08-12 Sprint 62 신설).
+
+    `collect_status()`는 오버레이 텍스트가 **비어 있지만 않으면** 저장했다. 그런데
+    오버레이 골격에는 "사건번호"/"조사일시"/"검색결과가 없습니다" 같은 **고정 라벨**이
+    처음부터 들어 있어 데이터 도착 전에도 그 조건이 참이 됐고, 내용 없는 페이지가
+    정상 수집으로 저장됐다(실측: status.html 194건 중 33건).
+
+    그리고 한 번 저장되면 `doc_exists()`가 완료로 판정해 **영구히 재수집에서 빠진다**
+    (BUGS #22/#50과 같은 부류). 그래서 "빈 캡처는 저장하지 않는다"가 불변식이다.
+    """
+    print("\n--- 4. 빈 현황조사서 캡처 판별 (Sprint 62) ---")
+
+    # 실제 빈 캡처 파일에서 확인된 골격 — 라벨과 안내문은 있지만 사건 데이터가 없다.
+    empty_skeleton = (
+        '<div id="curstExmndcPopUp"><table>'
+        '<tr><th>사건번호</th><td></td><th>조사일시</th><td></td></tr>'
+        '<tr><td>번호</td><td>소재지</td><td>임대차관계</td></tr>'
+        '<tr><td>검색결과가 없습니다</td></tr></table>'
+        '<span>부동산의 현황 및 점유관계 조사서</span></div>'
+    )
+    filled = empty_skeleton.replace(
+        '<th>사건번호</th><td></td>', '<th>사건번호</th><td>2023타경5035 부동산임의경매</td>')
+
+    check("빈 골격은 데이터 없음으로 판정", status_overlay_has_data(empty_skeleton), False)
+    check("사건번호가 채워지면 데이터 있음으로 판정", status_overlay_has_data(filled), True)
+    check("빈 문자열", status_overlay_has_data(""), False)
+    check("None 안전", status_overlay_has_data(None), False)
+    # 라벨만으로는 절대 통과하면 안 된다(이것이 원래 버그의 정확한 형태다)
+    check("'검색결과가 없습니다'만으로는 통과하지 않는다",
+          status_overlay_has_data("사건번호 조사일시 검색결과가 없습니다"), False)
+    # 표기 흔들림(공백)도 허용해야 한다 — 원본 서식이 글자 사이 공백을 넣는 경우가 있다
+    check("공백이 섞인 사건번호도 인식", status_overlay_has_data("사건번호 2023 타경 5035"), True)
+
+    # collect_status()가 이 판정을 **저장 전에** 실제로 쓰고 있는지 (배선 확인).
+    # 함수만 있고 호출되지 않으면 이 저장소에 반복된 "준비만 되고 배선 안 됨" 패턴이 된다.
+    crawler_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "crawler", "doc_crawler.py")
+    src = open(crawler_py, encoding="utf-8-sig").read()
+    body = src[src.index("def collect_status("):src.index("def collect_appraisal(")]
+    check("collect_status가 대기 조건에서 데이터 유무를 본다",
+          body.count("status_overlay_has_data") >= 2, True)
+    save_idx = body.index("html_tmp = html_path")
+    guard_idx = body.rindex("status_overlay_has_data", 0, save_idx)
+    check_true("저장 직전에 빈 캡처 관문이 있다", guard_idx < save_idx)
+
+
+def test_collect_documents_saves_where_viewer_serves():
+    """`collect_documents.py`가 뷰어가 서빙하는 경로에 저장하는가 (2026-08-12 Sprint 66).
+
+    이 스크립트는 다운로드한 PDF를 `storage/docs/<type>/<원본파일명>`에 둔 채로
+    `document_status`를 READY로 바꿨다. 그런데 `api/v1/documents.py`가 서빙하는 경로는
+    `documents/<법원>/<사건>/<물건>/spec.pdf`라 **완전히 다른 위치**다.
+
+    지금은 이 스크립트가 한 번도 실행된 적이 없어 무해하지만, `docs/roadmap.md` 16-A가
+    **배치 편입을 Backlog로 올려 둔 스크립트**다 — 스케줄에 넣는 순간 손대는 문서마다
+    "화면에는 열람 가능인데 뷰어는 404"가 된다(Sprint 55가 고친 BUGS #50의 재발).
+    """
+    print("\n--- 5. collect_documents 저장 경로 (Sprint 66) ---")
+
+    # 뷰어가 찾는 파일명과 canonical 정의가 같아야 한다. 두 곳에 정의가 있는 이유는
+    # doc_paths가 fastapi 무의존이어야 하기 때문이다 — 그래서 소스를 대조해 고정한다.
+    docs_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "api", "v1", "documents.py")
+    src = open(docs_py, encoding="utf-8-sig").read()
+    import re as _re
+    viewer = dict(_re.findall(r'"(SPEC|STATUS|APPRAISAL)":\s*\("([^"]+)"', src))
+    check("뷰어 파일명과 canonical 정의가 일치한다", CANONICAL_DOC_FILENAME, viewer)
+
+    # canonical 경로가 실제로 뷰어 루트(documents/) 아래에 만들어지는가
+    p = canonical_doc_path("서울중앙지방법원", "2024타경126346", "1", "SPEC")
+    check_true("canonical 경로가 documents/ 아래에 있다",
+               os.path.commonpath([os.path.abspath(p), os.path.abspath(DOCUMENT_ROOT)])
+               == os.path.abspath(DOCUMENT_ROOT), p)
+    check("canonical 파일명이 spec.pdf", os.path.basename(p), "spec.pdf")
+    check("STATUS는 status.html",
+          os.path.basename(canonical_doc_path("A", "B", "1", "STATUS")), "status.html")
+
+    # STATUS는 PDF 다운로드 대상이 아니다 — 시도하면 매번 FAILED가 찍힌다
+    check("PDF 다운로드 대상에 STATUS가 없다", "STATUS" in PDF_DOWNLOADABLE_DOC_TYPES, False)
+    check("SPEC/APPRAISAL은 대상이다",
+          sorted(PDF_DOWNLOADABLE_DOC_TYPES), ["APPRAISAL", "SPEC"])
+
+    # collect_documents가 실제로 그 규칙을 쓰고 있는지 (배선 확인)
+    cd_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collect_documents.py")
+    cd = open(cd_py, encoding="utf-8-sig").read()
+    body = cd[cd.index("def collect_all("):]
+    check_true("collect_all이 STATUS를 건너뛴다",
+               "PDF_DOWNLOADABLE_DOC_TYPES" in body,
+               "STATUS를 그대로 시도하면 매번 FAILED가 기록됩니다")
+    check_true("save_doc_raw에 최종 경로를 넘긴다",
+               "finalize_download(" in body and "save_doc_raw(conn, item_id, doc_type, final_path)" in body,
+               "다운로드 위치를 그대로 기록하면 뷰어가 404입니다")
+    # 원자적 이동을 쓰는가(옮기는 도중 강제 종료 시 잘린 파일 방지)
+    check_true("finalize_download가 os.replace로 원자적 이동",
+               "os.replace(downloaded_path, final_path)" in cd)
+
+
+def test_finalize_download_moves_file():
+    """실제로 파일이 뷰어 경로로 옮겨지는가 (동작 검증)."""
+    print("\n--- 6. finalize_download 실동작 (Sprint 66) ---")
+    import collect_documents as CD
+
+    tmp_dir = os.path.join(DOCUMENT_ROOT, "..", "storage", "docs", "SPEC")
+    os.makedirs(tmp_dir, exist_ok=True)
+    src_path = os.path.join(tmp_dir, "qa_sprint66_download.pdf")
+    with open(src_path, "wb") as f:
+        f.write(b"%PDF-1.4 qa fixture")
+
+    court, case_no, item_no = QA_COURT, QA_CASE, "1"
+    try:
+        final = CD.finalize_download(src_path, court, case_no, item_no, "SPEC")
+        check("최종 경로가 canonical과 같다", final,
+              canonical_doc_path(court, case_no, item_no, "SPEC"))
+        check_true("파일이 실제로 옮겨졌다", os.path.exists(final))
+        check_true("원본 위치에는 남지 않는다", not os.path.exists(src_path))
+        check("내용이 보존된다", open(final, "rb").read(), b"%PDF-1.4 qa fixture")
+        # 이 경로는 doc_exists()가 "수집 완료"로 인정하는 바로 그 경로여야 한다
+        check("doc_exists가 완료로 인정한다", doc_exists(court, case_no, item_no, "spec"), True)
+    finally:
+        for p in (src_path, canonical_doc_path(court, case_no, item_no, "SPEC")):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def cleanup():
     print("\n--- cleanup (qa test doc dir only) ---")
     root = os.path.join(DOCUMENT_ROOT, QA_COURT)
@@ -188,6 +316,9 @@ def run():
         test_get_doc_dir_and_doc_exists()
         test_atomic_replace_never_leaves_truncated_file()
         test_mark_queue_done_rolls_back_on_partial_failure()
+        test_status_overlay_has_data()
+        test_collect_documents_saves_where_viewer_serves()
+        test_finalize_download_moves_file()
     finally:
         cleanup()
 

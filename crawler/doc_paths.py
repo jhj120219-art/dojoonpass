@@ -48,3 +48,58 @@ def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bo
     ext = _PRIMARY_EXT.get(doc_type, "pdf")
     path = os.path.join(get_doc_dir(court_code, case_no, item_no), doc_type + "." + ext)
     return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+# 현황조사서 오버레이가 "실제 데이터가 채워진 상태"인지 판정한다 (2026-08-12 Sprint 62).
+# --------------------------------------------------------------------------------
+# 왜 필요한가 — `doc_crawler.collect_status()`는 오버레이의 텍스트가 **비어 있지만 않으면**
+# 데이터가 채워진 것으로 보고 저장했다. 그런데 오버레이 골격에는 "사건번호", "조사일시",
+# "검색결과가 없습니다" 같은 **고정 라벨**이 처음부터 들어 있어서, 비동기 데이터가 도착하기
+# 전에도 그 조건이 즉시 참이 된다. 그 결과 내용이 하나도 없는 페이지가 정상 수집으로
+# 저장됐다(2026-08-12 실측: status.html 194건 중 33건).
+#
+# 더 나쁜 것은 그 다음이다 — `doc_exists()`는 "파일이 있고 0바이트 초과"만 보므로 이 빈
+# 파일들은 **영구히 재수집 대상에서 제외**된다(BUGS #22/#50과 같은 부류의 함정).
+#
+# 판정 기준으로 사건번호(YYYY타경NNNNN)를 쓴다. 이 표기는 현황조사서 본문에 반드시
+# 채워지는 값이고, 실측에서 정상 161건은 161건 모두 매칭 / 빈 캡처 33건은 0건 매칭으로
+# **완전히 분리**됐다(원본 HTML 문자열 기준).
+import re as _re
+
+_CASE_NO_PATTERN = _re.compile(r"\d{4}\s*타경\s*\d+")
+
+
+def status_overlay_has_data(text: str) -> bool:
+    """현황조사서 오버레이 텍스트/HTML에 실제 사건 데이터가 들어 있으면 True.
+
+    라벨만 있는 빈 골격은 False가 되어야 한다 — 이 함수가 False면 저장하지 않고
+    실패로 처리해 **큐에 남겨 재시도**하는 것이 올바른 동작이다.
+    """
+    if not text:
+        return False
+    return bool(_CASE_NO_PATTERN.search(text))
+
+
+# 뷰어가 실제로 서빙하는 파일 경로 (2026-08-12 Sprint 66).
+# --------------------------------------------------------------------------------
+# `api/v1/documents.py:DOC_TYPE_FILES`가 찾는 파일명과 **같은 규칙**이어야 한다 —
+# 여기가 갈라지면 "document_status는 READY인데 뷰어는 404"가 된다(BUGS #50과 같은 부류).
+# `api.v1.documents`를 import하지 않는 이유는 그쪽이 fastapi를 끌어오기 때문이다
+# (이 모듈은 selenium/fastapi 무의존이어야 테스트에서 그대로 쓸 수 있다).
+# 두 정의가 어긋나지 않는지는 회귀 테스트가 소스를 대조해 확인한다.
+CANONICAL_DOC_FILENAME = {
+    "SPEC": "spec.pdf",
+    "STATUS": "status.html",
+    "APPRAISAL": "appraisal.pdf",
+}
+
+# 이 경로로 "다운로드된 PDF"를 옮겨 완성할 수 있는 문서 종류.
+# STATUS는 PDF 다운로드가 아니라 오버레이 HTML을 긁어오는 방식이라 여기 속하지 않는다
+# (`crawler/doc_crawler.py:collect_status()`가 담당한다).
+PDF_DOWNLOADABLE_DOC_TYPES = ("SPEC", "APPRAISAL")
+
+
+def canonical_doc_path(court_name: str, case_no: str, item_no: str, doc_type: str) -> str:
+    """뷰어가 서빙하는 최종 저장 경로. `doc_type`은 대문자(document_status 표기)다."""
+    filename = CANONICAL_DOC_FILENAME[doc_type.upper()]
+    return os.path.join(get_doc_dir(court_name, case_no, item_no), filename)

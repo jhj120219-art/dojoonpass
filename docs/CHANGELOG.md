@@ -3062,3 +3062,326 @@ Admin 구독 상태 변경 동시성 결함 발견·수정 (BUGS #58)
 테스트(최종): test_api_regression.py 646검사, test_race_conditions.py 49검사, Python
 회귀 15개 파일 전부 PASS, 프런트 계약 93/93(cancelled 0). TypeCheck/Lint(0)/Build(경고 0)
 전부 통과.
+
+---
+
+2026-08-12 (Sprint 61)
+
+개인화 도메인 IDOR 전수 감사 + 크롤러 복구 경로 회귀 + 크롤러 의존성 설치
+
+**감사 결과 — 제품 결함 0건**
+- Admin 41개 엔드포인트 중 목록/필터 계약을 실측 검증(필터 정확성 / 페이지네이션 무중복·무누락 /
+  page·size 경계 / 404 / 잘못된 path param) — 결함 0건
+- Favorites / Search Presets / Recent Items의 IDOR·소유권 경계 실측 — 결함 0건
+  (A가 B의 데이터를 조회·수정·삭제할 수 있는 경로 없음, 위조 토큰도 개인화 미적용)
+- Frontend↔API 계약: 프런트 TS 인터페이스가 선언한 필드가 실제 응답에 전부 존재(누락 0건),
+  프런트가 호출하는 경로가 전부 백엔드에 존재
+
+**신규 회귀 (646 → 660검사, `test_document_queue.py` +8검사)**
+- 남의 즐겨찾기/preset 삭제 시도가 거부될 뿐 아니라 **실제로 지워지지 않는지**까지 단언
+- 검색 개인화 3갈래(소유자 true / 다른 사용자 false / 비로그인 false)
+- Recent Items 격리·정렬·LIMIT 20 — 그동안 검사 0건이던 영역
+- `reset_stale_queue()` 직접 회귀 — `doc_worker.py` 크래시 복구 경로. **살아있는 Worker의
+  in_progress를 건드리지 않는지**(중복 수집 방지)를 핵심으로 검증
+- 변이 11종 전부 검출, 소스는 SHA256 대조로 byte 단위 원복 확인
+
+**테스트 결함 수정 (`docs/BUGS.md` #60)**
+- 프런트 계약 테스트의 crawl_date 정렬 검사가 실패했으나 **제품은 정상**이었다 —
+  크롤 중단(#46)으로 진행 중 물건이 14건까지 줄고 전부 같은 crawl_date가 되어, 정렬 키가
+  상수인 집합에서 asc/desc가 같은 순서를 내는 올바른 동작이 실패로 보인 것.
+  검사 대상을 crawl_date가 실제로 여러 값인 집합으로 교체(assertion 무약화)
+- recent-items 정렬 검사도 같은 축의 함정(시계 분해능으로 viewed_at 동률 → tie-break로
+  통과)을 변이 테스트로 발견해 결정적 설계로 교체
+
+**실행 환경**
+- `selenium==4.47.0` / `webdriver-manager==4.1.2` / `pandas==3.0.5` / `pdfplumber==0.11.10`
+  설치(Sprint 54부터 크롤 중단의 직접 원인으로 기록돼 있던 항목). 크롤러 계열 19개 모듈
+  import 전수 확인. `requirements.txt` stale 서술 정정 + 실측 버전 고정
+- 실제 크롤 실행·예약 작업 등록은 하지 않았다(외부 사이트 접속/운영 판단)
+
+**Release Blocking 실측 (긴급)**
+- 2026-08-12 기준 매각기일이 남은 물건 **14건, 전부 오늘(08-12)이 기일**.
+  → **2026-08-13부터 기본 검색 결과가 0건**이 된다(Sprint 54 예측 시점과 정확히 일치)
+
+품질 게이트 — Python 20 PASS / 3 설계상 SKIP, 프런트 93/93(cancelled 0),
+compileall / tsc / eslint(0) / next build 전부 통과. 코드 변경은 테스트·문서뿐이며
+`api/`·`storage/` 제품 소스는 이번 Sprint에서 **변경하지 않았다**.
+
+---
+
+2026-08-12 (Sprint 62)
+
+파이프라인 후반(문서 파싱 / 권리분석) 실제 결함 2건 수정 — Sprint 61의 의존성 설치로
+비로소 실행 검증이 가능해진 영역이다.
+
+**BUGS #61 — 빈 현황조사서 캡처가 정상 수집으로 저장됨 (33건)**
+- `collect_status()`의 대기 조건("텍스트가 비어 있지 않음")이 고정 라벨 때문에 데이터
+  도착 전 즉시 참이 되어, 내용 없는 페이지가 저장되고 `doc_exists()`가 이를 완료로 판정해
+  **영구히 재수집에서 제외**됐다
+- 대기 조건을 "실제 사건 데이터가 채워짐"으로 교체 + **저장 직전 관문** 추가
+- `crawler/doc_paths.py:status_overlay_has_data()` 신설(selenium 무의존 순수 함수)
+- `repair_empty_status_capture.py` 신설 — 기존 33건을 격리 후 재수집 대상으로 복구
+- 결과: STATUS 파싱 갭 33 → **0** (161 READY / 161 파싱)
+
+**BUGS #62 — 근거 문서가 사라져도 권리분석 파생 행이 영원히 남음**
+- `load_rights_data.py` / `load_spec_data.py`에 `purge_orphans()` 추가
+- **안전장치**: 근거 파일을 하나도 못 찾으면 아무것도 지우지 않는다(경로 문제로 전체
+  권리분석 데이터가 삭제되는 것을 방지 — 안전장치를 끈 변이에서 실제로 재현 확인)
+- 파일은 있는데 추출 결과가 빈 경우는 지우지 않는다(파서 회귀와 구분 불가하므로 보수적)
+- `rights_summary` 162 → 161, `tenant_rights` 523 → 519
+
+**문서 정정 — "미파싱 81건"은 사실이 아니었다**
+- SPEC 81건은 파싱 성공이며 표 내용이 `조사된 임차내역없음`, 즉 **임차인 없는 물건**이다.
+  정상 동작을 결함처럼 기록해 온 서술을 `docs/crawler.md`/`docs/roadmap.md`/
+  `docs/CURRENT_STATE.md` 및 테스트 출력에서 실측 기준으로 정정
+- 남은 것은 "확인된 임차인 없음"의 표기 방식(제품 결정) 하나뿐이며 Backlog로 남겼다
+
+**신규 테스트**
+- `test_rights_data_load.py`(27검사) — 정상 적재 / 공실 / 고아 정리 / **안전장치** /
+  보수적 미삭제 / 멱등성 / SPEC 정리 / SPEC 안전장치
+- `test_doc_storage_atomicity.py` +8검사 — 빈 캡처 판별 + 크롤러 배선(관문 위치) 확인
+- `test_pipeline_integrity.py` — "파생 데이터에는 근거 문서가 존재한다" 불변식 +
+  `tenant_rights.source` 표기 검사
+
+**품질 게이트** — Python 24개 파일 전부 PASS, 변이 14/14 검출(원래 버그 형태 재현 변이 포함),
+compileall / tsc / eslint(0) / next build 전부 통과. 소스는 변이 후 SHA256 대조로 byte 단위 원복.
+
+---
+
+2026-08-12 (Sprint 63)
+
+문서가 만든 운영 함정 제거 + 크롤러 동시성 핵심 경로 회귀 신설
+
+**운영 함정 (문서 오류가 사고로 이어지는 형태)**
+- `docs/roadmap.md` 16-A / `docs/crawler.md`가 파이프라인 후반 **4개 스크립트**의 배치
+  편입을 Backlog로 두고 있었으나, 그중 `analyze_docs.py`는 DB에 아무것도 쓰지 않고
+  마지막이 `input()`인 **1회성 조사 스크립트**다. 배치에 넣으면 stdin이 없어 매달리거나
+  죽고 뒷 단계까지 멈춘다. 편입 대상은 **넷이 아니라 셋**으로 정정
+- `test_crawl_exit_code.py` §8 신설 — 배치 후보 9종에 입력 대기가 없는지 + `analyze_docs.py`가
+  여전히 대화형/비DB인지 **양방향** 검사(나중에 진짜 단계가 되면 실패해 갱신을 요구한다)
+
+**동시성 핵심 경로 회귀 (`test_document_queue.py` §7~9, 17검사)**
+- `claim_next_queue_item()`은 Worker가 일감을 집는 유일한 경로인데 검사가 **0건**이었다
+- 선택 규칙 / 상태 필터 / 재시도 간격(30분) / `last_attempt_at` 기록 /
+  **8스레드 동시 클레임 12건 중복 0** 검증
+- `mark_queue_skipped_expired()`도 검사 0건이었다 — 특히 **재시도 횟수를 소모하지 않는지**
+  (실패가 아니라 "대상 아님"이므로) 확인
+- **이 저장소에서 처음으로 스레드 재현이 신뢰할 수 있는 검출기**였다. 조건부 UPDATE 제거
+  변이를 8스레드 재현이 3회 연속 전부 검출 — `BEGIN IMMEDIATE`로 직렬화된 결제 경로(Sprint 58)와
+  달리 이 함수는 배타 트랜잭션이 없어 경합 창이 실제로 넓기 때문이다
+
+**문서 정정 (실측 기반)**
+- `parsed_document`: 쓰는 코드 0곳 / 읽는 코드 0곳 — "연결만 안 된 단계"가 아니라
+  **구현 자체가 없음**. `doc_raw`도 읽는 코드 0곳
+- `docs/crawler.md`의 "`doc_raw` 적재에 pdfplumber 필요(미설치)"는 Sprint 61에 해소됨
+
+**품질 게이트** — Python 24개 파일 전부 PASS, 프런트 93/93(cancelled 0),
+변이 21/21 검출(Sprint 61~63 누적), compileall / tsc / eslint(0) 전부 통과.
+이번 Sprint의 제품 소스 변경은 **0건**이며 테스트·문서만 추가/정정했다.
+
+**BUGS #63 (같은 Sprint 63)** — `refresh_queue_priority()`가 검토 행 수를 "변경 건수"로
+보고해 매일 밤 배치 로그가 "재계산 완료: 2,736건"을 남기던 문제. `cur.rowcount`로 실제
+변경만 세도록 수정하고 검토/변경을 나눠 로그에 남긴다. 실제 배치 실행으로 137건 변경 확인
+(크롤 중단으로 기일이 지나 p2 22 + p3 115 → p1 승격). `calc_priority` /
+`refresh_queue_priority`는 매일 도는 배치 로직인데 검사가 0건이었다 — 17검사 신설.
+
+---
+
+2026-08-12 (Sprint 64)
+
+Admin↔사용자 경계 및 조정·사용 혼합 산술 회귀 신설 (제품 결함 0건 / 제품 소스 변경 0건)
+
+**§31-B — Admin 변경이 사용자 상태에 반영되는가 (25검사)**
+- §27(Admin 변경)과 §31(사용자 조회)이 서로 만난 적이 없어, "관리자는 해지했는데 사용자는
+  계속 이용 가능"이라는 과금 직결 모순이 검증되지 않고 있었다
+- 한 구독을 **세 관점**(사용자 조회 / Admin 목록 / 이용권 게이트) + DB 값으로 동시에 확인
+- PAUSED / 재개 / 해지 각 단계에서 status·effective_status·is_entitled·게이트가 모두 일치
+- 해지 후 등기부 신청이 `REGISTRY_SUBSCRIPTION_REQUIRED`로 막히고 **신청 행도 생기지 않음**
+
+**§20-B — 관리자 조정과 실제 사용의 혼합 산술 (20검사)**
+- 기존 검사는 GRANT/DEDUCT/RESET을 따로만 봤고 실제 사용과 섞인 적이 없었다
+- `effective_limit = plan_limit + adjustment` / `remaining = effective_limit - used`
+  두 항등식을 GRANT → 사용 2건 → DEDUCT 각 단계에서 검증
+- **사용 후 DEDUCT가 `used`를 건드리지 않음**(건드리면 쓰지도 않은 횟수를 잃는다),
+  사용 로그 delta가 1회당 정확히 -1, 사용이 조정 원장을 오염시키지 않음
+
+**오탐 2건을 재현으로 걸러냄** — "만료 구독인데 게이트가 True"(그 사용자가 다른 ACTIVE
+구독을 갖고 있었음), "해지 후 PAYMENT_REQUIRED가 아님"(구독이 없으면
+SUBSCRIPTION_REQUIRED가 맞다). 재현 없이 보고했다면 없는 버그를 만들어낸 사례가 됐을 것이다.
+
+**기록만 하고 미수정** — `registry_credit_logs.balance_after`가 행 종류에 따라 "조정 누계"와
+"잔여 무료횟수"를 번갈아 담아 running balance로 읽으면 `3 → 7 → 6 → 2`로 앞뒤가 안 맞는다.
+산술 자체는 정확하고, 이미 노출된 API 계약이라 의미 변경은 계약 변경 + 표기 제품 결정이다.
+
+**품질 게이트** — `test_api_regression.py` 686 → **708검사**(연속 2회 잔여 0),
+Python 24개 파일 전부 PASS, 프런트 93/93(cancelled 0), 변이 30/30 검출(Sprint 61~64 누적),
+compileall / tsc / eslint(0) / next build 전부 통과.
+
+---
+
+2026-08-12 (Sprint 65)
+
+**크롤 파이프라인 실제 실행 검증 — Release Blocker #1 해소 입증**
+
+Sprint 54부터 8일간 Release Blocking으로 기록돼 온 크롤 중단을, 실제로 크롤러를 돌려
+전 구간 동작을 확인했다(저장소 역사상 처음).
+
+**선행 조건** — Chrome 151 설치됨 / ChromeDriver 자동 확보 성공 / 헤드리스 기동 성공 /
+courtauction.go.kr 접속 200. 크롤러를 막던 저장소·환경 측 원인은 **0건**.
+
+**전 구간 실행**(서울중앙지방법원 1개로 범위 한정, 법원당 약 168초)
+- 수집 9건(기일 2026-08-19) → 검증/정규화 통과 → upsert(신규 6/갱신 3/실패 0, exit 0)
+- `enqueue_documents` added 18 → `migrate_execute` 건수 일치 [OK]
+- **검색 API 실조회: 기일 남은 물건 14 → 23건**, 신규 9건이 실제로 노출됨
+- → **2026-08-13에 검색 결과 0건이 되는 상황은 더 이상 발생하지 않는다**
+
+**중복 수집 방지** — 같은 법원 재실행 시 inserted 0 / enqueue added 0 /
+auction·auction_item·document_queue 증가 0으로 완전 멱등
+
+**실행 후 무결성** — 실크롤 데이터 반영 후에도 `test_pipeline_integrity.py`,
+`test_schema_hygiene.py`, Python 회귀 24개 파일 전부 PASS(불변식 무손상)
+
+**SKIP(운영 판단)** — 전체 60개 법원 1회 실행(약 2.8시간, 정부 사이트 부하),
+예약 작업 등록(실행 계정·시각 결정 필요). 둘 다 기술적 장애물은 없다.
+
+백업: `auction.db.backup_before_sprint65_crawl_20260812_143616`
+
+---
+
+2026-08-12 (Sprint 66)
+
+`collect_documents.py` 잠재 결함 2건 수정 (BUGS #64) + 감정평가서 파서 실측 스코핑
+
+**BUGS #64 — 배치 편입 시 즉시 발현될 결함 2건** (현재 피해 0건: 아직 실행된 적 없음)
+- 저장 경로가 뷰어 서빙 경로와 완전히 달랐다(`storage/docs/<type>/` vs
+  `documents/<법원>/<사건>/<물건>/`). `save_doc_raw()`가 READY로 바꾸므로 배치에 넣는 순간
+  "화면은 열람 가능, 뷰어는 404"가 된다 — BUGS #50 재발
+- STATUS는 `download_doc()`이 `.pdf`만 받아 **구조적으로 성공 불가**인데 매번 FAILED로 기록됐다
+- 수정: `crawler/doc_paths.py`에 `canonical_doc_path()`/`PDF_DOWNLOADABLE_DOC_TYPES` 신설,
+  `finalize_download()`가 `os.replace()`로 뷰어 경로에 원자적 이동 후 그 경로를 기록,
+  STATUS는 건너뜀(doc_worker 담당)
+- `test_doc_storage_atomicity.py` +14검사, 변이 5/5 검출(2종은 수정 전 동작 재현)
+
+**감정평가서 파서 — 실측 스코핑 후 SKIP**
+- 198개 PDF 표본 30개 측정: 페이지당 문자 중앙값 526자, **80%가 텍스트 추출 가능**,
+  20%는 스캔 이미지(OCR 별개 과제)
+- 막는 것은 기술이 아니라 결정이다 — 추출 항목(제품)·저장 스키마(신설 필요)·화면 표기
+- 초기에 소표본으로 "대부분 이미지"라 판단했다가 표본을 늘려 정정함
+
+**Dead code 재확인** — 참조 0건 함수는 여전히 3개(전부 기존 기록), `overwrite=True` 호출 0건
+재확인(Sprint 41의 유지 결정 존중). 이번 추가분은 전부 실제 배선됨(6~8회 참조).
+
+**품질 게이트** — Python 24개 파일 PASS, 프런트 93/93, 변이 36/36 누적,
+compileall/tsc/eslint(0) 통과.
+
+---
+
+2026-08-12 (Sprint 67)
+
+doc_raw 소유권 실측 + `collect_documents.py` 저장/실패 경로 회귀 신설 (BUGS #65)
+
+**doc_raw 소유권 매트릭스 확정 (roadmap 16-B 결정 입력)**
+- 코드 전수 추적으로 "누가 무엇을 기록하는가"를 표로 확정. Sprint 66 수정 이후
+  **두 경로가 같은 canonical 경로에 저장**하며, 남은 비대칭은 두 칸뿐이다
+  (`doc_worker`는 `doc_raw` 미기록 / `collect_documents`는 `document_queue` 미갱신)
+- `document_queue` 미갱신의 영향을 추적: 파일+READY인데 큐가 pending으로 남아 불변식이
+  일시 실패하지만 **자가 치유**된다(다음 doc_worker가 `doc_exists()` 가드로 즉시 성공
+  반환 → `mark_queue_done`). 데이터 손실·중복 다운로드 없음
+- 실데이터 전수 교차 검증: READY인데 파일 없음 0 / 파일 있는데 READY 아님 0 /
+  `doc_raw` 경로 부재 0
+- **소유권 결정 자체는 SKIP** — 결정 없이 한쪽을 구현하면 반대 결정 시 낭비
+
+**BUGS #65 — 0바이트 다운로드가 READY로 기록됨 (수정)**
+- `save_doc_raw()`가 크기를 보지 않아 화면(READY)·뷰어(0바이트 서빙)·재수집 판정
+  (`doc_exists()`=False) 세 곳이 어긋났다. BUGS #50/#61과 같은 부류
+- `doc_exists()`가 이미 쓰는 "크기>0" 기준에 맞춰 `size<=0`이면 실패 반환하도록 수정
+  (새 정책이 아니라 기존 기준과의 정합)
+
+**신규 `test_collect_documents.py` (26검사)** — 배치 편입 후보인데 저장·실패 경로가 한 번도
+검증되지 않았던 코드. 정상 저장 / 실패가 READY를 만들지 않음 / 이동 실패 / `save_failure`
+이중 기록 / 재실행 버전 이력 / 0바이트. selenium 불필요.
+
+**품질 게이트** — Python 25개 파일 전부 PASS, 프런트 93/93(cancelled 0),
+변이 누적 48회 시도 → 47 검출 / 1 등가, compileall / tsc / eslint(0) 통과.
+
+**Sprint 67 이어서** — self-healing 수렴을 코드 추적이 아니라 **실제 재현**으로 확정하고
+`test_collect_documents.py` §7~8로 고정(30 → 53검사).
+`collect_documents` 수집 직후 큐가 pending으로 남는 불일치가 실재함을 재현하고,
+다음 `doc_worker` 실행에서 **재다운로드 없이** 큐 done + document_status READY로 완전히
+수렴함을 확인했다(데이터 손실·중복 없음). 실패 → 재시도 간격(30분) → 성공 경로도 함께 고정.
+따라서 이 차이는 버그가 아니라 roadmap 16-B **소유권 결정** 대상이라는 결론이 실측으로
+확정됐고, 코드는 수정하지 않았다. 변이 3/3 검출. 누적 51회 시도 → 50 검출 / 1 등가.
+
+**Sprint 67 이어서 (BUGS #66)** — Concurrency Audit에서 마지막 TOCTOU 경로 발견·수정.
+`create_preset()`이 COUNT 확인 후 INSERT하는 구조라 상한이 동시 요청에서 뚫렸다
+(99개 상태 + 12 동시 요청 → 최종 101개 재현). `registry.py`와 같은 `BEGIN IMMEDIATE`
+패턴으로 수정(3회 반복 전부 정확히 100). 새 정책이 아니라 기존 상한의 정확한 집행이며
+API 계약 무변경. 함께 `adjust_registry_credit`의 append-only 안전성도 12스레드로 검증
+(원장 합계 정확, 유실·중복 0) — 이쪽은 결함이 없어 수정하지 않았다.
+`test_race_conditions.py` 49 → 58검사, 변이 4종 전부 검출(2종은 수정 전 동작 재현).
+
+---
+
+2026-08-12 (Sprint 68)
+
+**Beta 사용자 여정 Release Gate 신설** — `test_beta_journey.py` (66검사)
+
+도메인별 회귀는 촘촘했지만 **도메인 사이의 이음매**는 어느 테스트의 책임도 아니어서
+검증되지 않고 있었다(상세→최근조회, 관심물건→검색 반영, 로그인→복귀 URL).
+검색부터 검색조건 저장까지 11단계를 하나의 흐름으로 묶어 고정했다.
+
+- 여정 대상을 **DB에서 조건으로 선택**한다(문서 3종 READY + 기일 남음). 고정 id를 박지 않는다
+- 각 단계에서 HTTP status가 아니라 **응답 본문 + DB 상태**를 확인
+- 프런트 게이트는 dev 서버가 없으면 **SKIPPED로 명시 출력**(조용히 통과 금지 —
+  "cancelled를 fail 0으로 오인"하는 기존 함정을 반복하지 않는다). 서버 유/무 양쪽 실행 확인
+- 변이 3/3 검출 — 상세가 최근조회를 기록하지 않게 하거나, 관심물건이 검색에 반영되지 않게
+  하면 즉시 실패한다. **어느 도메인 테스트도 잡지 못하던 결함 형태**다
+
+**품질 게이트** — Python 26개 파일 전부 PASS, 변이 누적 58회 시도 → 56 검출 / 2 등가,
+compileall / tsc / eslint(0) 통과.
+
+---
+
+2026-08-12 (Sprint 69)
+
+**감정평가서 파서 기술 검증(전수) + API 장애 복원력 실측** — 제품 소스 변경 0건
+
+- 감정평가액 추출을 **197건 전수** 측정: match 48.7% / mismatch 23.4% / 텍스트 없음 18.3%
+- **불일치 원인이 파서가 아님을 원문 대조로 확정** — PDF의 감정평가액은 **사건 전체 총액**,
+  `appraisal_price`는 **물건별** 값이라 개념이 다르다(물건 2건 사건에서 합계와 정확히 일치)
+- → 감정평가액은 추출 가치가 낮고(화면에 이미 물건별 감정가 존재, 혼동 위험),
+  가치 있는 후보는 토지/건물 내역·면적·구조 등 현재 없는 항목. **표기·스키마는 제품 결정이라 SKIP**
+- 작업 중 자체 오류를 걸러냄 — 문자 중복 제거 정규식이 `2,000,000`을 `2,0,0`으로 뭉개
+  잘못된 결론을 낼 뻔했고, 원문 재확인으로 정정
+- `SearchScreen`의 `unavailable` 분기를 **실제로 API를 내려** 검증: HTTP 200 유지,
+  안내 문구 표시, 헤더·검색 폼 유지(부분 저하), API 복구 시 정상 복원
+
+---
+
+2026-08-12 (Sprint 70)
+
+미검증 화면 상태 실측 + **기술부채 1건 철회** (제품 소스 변경 0건)
+
+- 잘못된 물건 ID(99999999/0/-1/abc), 빈 검색 결과, 페이지 범위 초과를 API·화면 양쪽에서 확인.
+  빈 결과와 페이지 초과가 **서로 다른 문구 + 각각의 복구 동선**으로 갈리는 것을 재확인
+  (BUGS #31 유지)
+- **"Recent Items 무제한 누적" 기술부채를 실측으로 철회.** `UNIQUE(user_id, item_id)` +
+  `ON CONFLICT DO UPDATE` 구조라 같은 물건을 100번 다시 봐도 행이 0개 늘어난다.
+  상한은 "본 서로 다른 물건 수"(≤ 전체 물건 수)이며, 최악의 경우(1,876행)에서도
+  최근조회 조회는 0.000ms(인덱스 seek), DB 1.1MB. **pruning 도입 이유 없음**
+
+---
+
+2026-08-12 (Sprint 71)
+
+소프트 삭제 함정 회귀 고정 + `middleware.ts` 잔재 정리
+
+- **`deleted_at`이 어떤 조회에도 반영되지 않는다는 현재 동작을 §28-B(8검사)로 못 박았다.**
+  기존 검사는 컬럼 존재 여부만 봤고, 값을 채웠을 때 어떻게 되는지는 미검증이었다.
+  실제로 채우니 즐겨찾기·검색조건 목록에 그대로 남고 검색 하트도 켜진 채였다
+  (지금은 하드 삭제만 쓰므로 정상). 소프트 삭제를 배선하는 순간 이 검사가 실패하며
+  함께 고쳐야 할 조회 3곳(`favorites.py`/`search_presets.py`/`search.py`)을 지목한다.
+  부분 배선을 재현해 가드가 실제로 발동하는 것까지 확인했다. **전환 여부는 제품 판단이라 SKIP**
+- Sprint 50의 `middleware.ts` → `src/proxy.ts` 전환 후에도 **현재 동작을 서술하며 없어진
+  파일명을 가리키던 주석 5곳**을 정정. 과거 이력 서술은 보존
+- `test_api_regression.py` 727 → **735검사**

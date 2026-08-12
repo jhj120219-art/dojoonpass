@@ -23,7 +23,7 @@ export async function createServerSupabaseClient() {
               cookieStore.set(name, value, options)
             })
           } catch {
-            // 서버 컴포넌트에서 쿠키 쓰기 제한 시 무시 (middleware가 처리)
+            // 서버 컴포넌트에서 쿠키 쓰기 제한 시 무시 (src/proxy.ts가 처리)
           }
         },
       },

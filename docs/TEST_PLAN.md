@@ -574,3 +574,553 @@ test_race_conditions.py                  49검사 (무변동, 구조 검사 갱�
 그 외 test_*.py 21개                     19 PASS / 3 설계상 건너뜀
 npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
 ```
+
+---
+
+## Sprint 61 (2026-08-12) — 개인화 도메인 IDOR 커버리지 + 크롤러 복구 경로 회귀
+
+### 배경 — 결함이 아니라 "검증된 적 없음"을 찾은 Sprint
+
+Admin API 계약과 Favorites/Search Presets/Recent Items를 전수 감사했다. **제품 결함은
+0건**이었다(모든 소유권 경계가 실제로 지켜지고 있었다). 대신 **검증 공백**을 찾아 메웠다.
+
+### `test_api_regression.py` +14검사 (646 → 660)
+
+**§5 favorites (+6)**
+- 남의 즐겨찾기 삭제 시도가 거부되고 **실제로 지워지지도 않는다**
+  (`success=False`만 보면 "지워놓고 에러 반환"하는 구현도 통과한다)
+- 검색 결과 개인화 3갈래: 소유자 `is_favorited=true` / **다른 로그인 사용자 false** /
+  비로그인 false. 소유자 true만 검증하면 "전역 true" 구현이 통과한다
+
+**§6 recent items (+6)** — 이 섹션은 그동안 **격리·정렬·상한 검사가 전부 0건**이었다
+- 다른 사용자에게 최근 조회가 새어나가지 않는다
+- `viewed_at DESC` 정렬 / 재조회 시 맨 앞으로 이동 / 중복 행 없음 / 다른 행 유실 없음
+- 응답이 `LIMIT 20`으로 잘린다
+
+**§7 search presets (+2)**
+- 남의 preset 삭제 거부 후 **실제로 남아 있는지** + 남의 목록에 새지 않는지
+
+### `test_document_queue.py` +8검사 — `reset_stale_queue()` 직접 회귀 (신규)
+
+`doc_worker.py`가 기동 시 **가장 먼저 부르는 크래시 복구 함수**인데 직접 검사가 0건이었다
+(`test_pipeline_integrity.py`는 "지금 정체된 행이 없다"는 결과만 볼 뿐 로직을 검사하지 않는다).
+
+회수해야 하는 것(죽은 Worker의 in_progress / 하루 지난 failed + retry_count 초기화)보다
+**회수하면 안 되는 것**이 더 중요하다 — 살아있는 Worker의 in_progress를 되돌리면 같은
+문서를 두 프로세스가 동시에 수집한다. 그래서 in_progress(최근)/failed(최근)/SKIPPED_EXPIRED/
+done/pending 5종이 **그대로 남는지**를 함께 단언한다.
+
+### 변이 검증 11/11 검출
+
+| 대상 | 변이 | 결과 |
+|---|---|---|
+| `recent_items.py` | `WHERE ri.user_id=?` 무력화 | 검출 |
+| `recent_items.py` | `LIMIT 20` → 50 | 검출 |
+| `recent_items.py` | `ORDER BY viewed_at DESC` → ASC | 검출 |
+| `recent_items.py` | `DO UPDATE SET viewed_at` 무력화 | 검출 |
+| `search.py` | favorites 조회에서 user 필터 무력화 | 검출 |
+| `search_presets.py` | DELETE의 user_id 조건 무력화 | 검출 |
+| `favorites.py` | DELETE의 user_id 조건 무력화 | 검출 |
+| `database.py` | in_progress 10분 가드 제거 | 검출 |
+| `database.py` | failed 1일 가드 → 1분 | 검출 |
+| `database.py` | `retry_count=0` 초기화 제거 | 검출 |
+| `database.py` | in_progress 회수에 done 포함 | 검출 |
+
+전부 변이 후 **byte 단위 원복 확인**(SHA256 대조, `git diff` 0).
+
+### 함정 — 시계 분해능 때문에 통과하던 정렬 검사 (기록해 둘 것)
+
+recent-items 정렬 검사를 처음에는 "HTTP로 연속 조회 후 순서 확인"으로 썼는데,
+`ORDER BY ... DESC`를 `ASC`로 뒤집어도 **통과했다**. 원인은 Windows `datetime.now()`
+분해능(~1~16ms)보다 요청이 빨라 `viewed_at`이 **같은 값으로 묶이고**, 정렬이 tie-break
+(`ri.id`)로 결정된 것이었다. 실데이터에는 동률이 0건이라 운영 문제가 아니라 **테스트 설계
+문제**였다. `viewed_at`을 명시적으로 다른 값으로 심는 방식으로 바꿔 결정적으로 만들었다.
+
+"정렬 검사는 정렬 키가 실제로 여러 값인 데이터에서만 의미가 있다" — 아래 BUGS #60도 같은 축이다.
+
+### `tests/frontend-contract.test.mjs` — 데이터 의존 검사 정정 (BUGS #60)
+
+crawl_date 정렬 검사가 실패했으나 **제품은 정상**이었다. 크롤 중단(#46)으로 기일이 남은
+물건이 14건까지 줄고 전부 같은 `crawl_date`가 되어, 정렬 키가 상수인 집합에서 asc/desc가
+같은 순서를 내는 **올바른 동작**이 실패로 보인 것이다. 검사 대상을 `include_closed=true`
+집합(crawl_date가 실제로 여러 값)으로 바꿨다 — **assertion은 약화하지 않았다.**
+
+### 현재 게이트 (Sprint 61)
+
+```
+python test_api_regression.py            660검사 (646 -> 660)
+test_document_queue.py                    +8검사 (reset_stale_queue 신규)
+그 외 test_*.py                          20 PASS / 3 설계상 건너뜀 (총 23개 파일)
+npm run test:frontend                     93검사 PASS (cancelled 0 확인)
+변이 검증                                 11/11 검출, 소스 byte 단위 원복
+python -m compileall / tsc / eslint / next build   전부 통과
+```
+
+### 실행 환경 변화 (Sprint 61)
+
+`selenium` / `webdriver-manager` / `pandas` / `pdfplumber`를 **실제로 설치**했다
+(Sprint 54부터 크롤 중단의 직접 원인으로 기록돼 있던 항목). 크롤러 계열 19개 모듈이
+전부 import되는 것까지 확인했다. `test_db.py`/`test_docs.py`/`test_docs2.py`는 selenium이
+생긴 뒤에도 `ALLOW_LIVE_CRAWL=1` 가드 때문에 여전히 정상적으로 SKIP된다(의도된 동작).
+**실제 크롤 실행은 하지 않았다** — 외부 사이트 접속이라 운영 판단 영역이다.
+
+---
+
+## Sprint 62 (2026-08-12) — 파이프라인 후반 실행 검증 + 결함 2건 회귀
+
+### 왜 지금 가능해졌나
+
+`load_rights_data.py` / `load_spec_data.py`는 이 저장소에서 `rights_summary` /
+`tenant_rights`를 쓰는 **유일한 코드**인데 테스트가 0건이었다. pdfplumber/pandas가 없어
+실행 자체가 불가능했기 때문이다(Sprint 61에 설치). 이번에 처음 실제로 돌려 보고
+**결함 2건**을 찾았다 — "문서만 읽고 정상이라고 판단하면 안 된다"의 또 다른 사례다.
+
+### 신규 `test_rights_data_load.py` (27검사)
+
+실제 `auction.db` / `documents/`를 건드리지 않는다 — 임시 DB(스키마는 `migrate_v4_1.py`
+**실제 코드**로 생성)와 임시 documents 디렉터리에서만 수행한다.
+
+| # | 검사 | 왜 중요한가 |
+|---|---|---|
+| 1 | 정상 적재 + 근거 없는 컬럼 NULL 유지 | 이 도메인의 대원칙(추정/생성 금지) |
+| 2 | 임차인 0명(공실) | `is_vacant` 성공 경로 |
+| 3 | 근거 문서 사라지면 파생 행 정리 | BUGS #62 회귀 |
+| 4 | **안전장치**: 문서 0건이면 아무것도 안 지움 | 경로 문제로 **전체 삭제**되는 최악 시나리오 방어 |
+| 5 | 파일은 있는데 결과가 비면 지우지 않음 | 파서 회귀와 구분 불가하므로 보수적 |
+| 6 | 멱등성 | 반복 실행 시 행 중복/증식 없음 |
+| 7~8 | SPEC 정리 + SPEC 안전장치 | 같은 결함이 두 스크립트에 있었다 |
+
+SPEC 검사는 **유효한 PDF 없이** 수행한다 — `load_item()`이 파싱 실패를 `parse_error`로
+처리하므로 "파일이 존재한다"는 사실만으로 근거 판정에 필요한 조건이 성립한다.
+
+### `test_doc_storage_atomicity.py` +8검사 — 빈 캡처 판별 (BUGS #61)
+
+순수 함수 판별(빈 골격 / 채워진 데이터 / 빈 문자열 / None / 라벨만 있는 경우 / 공백 표기)에
+더해, **크롤러가 그 판정을 저장 전에 실제로 쓰고 있는지**(관문 위치)까지 소스로 확인한다 —
+함수만 만들고 배선하지 않는 이 저장소의 반복 패턴을 막기 위해서다.
+
+### `test_pipeline_integrity.py` — 근거 존재 불변식
+
+`rights_summary` / `tenant_rights`의 모든 행에 대해 근거 문서(status.html / spec.pdf)가
+실제로 존재하는지 검사한다. `tenant_rights.source` 표기 검사도 함께 둔다 — 새 source 값이
+생기면 위 검사가 그 행을 통째로 건너뛰어 **조용한 커버리지 구멍**이 되기 때문이다.
+
+### 변이 검증 14/14 검출
+
+가장 중요한 것은 **원래 버그 형태를 재현한 변이**다. 판별 함수를 `bool(text)`(= 수정 전
+동작)로 되돌리면 검사가 실패한다 — 이 회귀가 과거 실제 결함을 검출할 수 있음을 뜻한다.
+안전장치를 끈 변이에서는 권리분석 데이터 162행/281행이 전부 삭제되는 것을 확인했다.
+
+전 변이에서 소스를 SHA256 대조로 **byte 단위 원복** 확인(`git diff` 잔여 0).
+
+### 현재 게이트 (Sprint 62)
+
+```
+python test_api_regression.py            661검사
+test_rights_data_load.py                  27검사 (신규)
+그 외 test_*.py                          24개 파일 전부 PASS (3개는 설계상 SKIP)
+npm run test:frontend                     93검사 (dev 서버 필요 — cancelled 확인 필수)
+변이 검증                                 14/14 검출
+compileall / tsc / eslint(0) / next build 전부 통과
+```
+
+### Sprint 62 dead code 스캔 (AST 기준, 저장소 전체 참조 대조)
+
+`api/` `storage/` `crawler/` `normalizer/` `validator/` `models/` `config/` 전체 함수 정의를
+AST로 뽑아 저장소 전체(.py/.ts/.tsx/.mjs) 텍스트에서 참조 횟수를 셌다. 라우트 핸들러는
+데코레이터로 등록되므로 제외했다.
+
+```
+정의됐지만 어디서도 참조되지 않는 함수: 3개
+  api/v1/subscriptions.py:99   get_active_subscription   (Sprint 29부터 알려진 항목, P3)
+  config/courts.py:66          get_court_by_code         (Sprint 43부터 알려진 항목, P3)
+  crawler/doc_crawler.py:153   _hash_bytes               (Sprint 62 신규 확인, P3)
+```
+
+셋 다 **삭제하지 않았다** — "사용 여부가 확실하지 않은 코드는 임의로 삭제하지 않는다"는
+프로젝트 규칙에 따른다. 신규 발견은 `_hash_bytes` 하나뿐이며, 같은 파일이 파일 경로 기반
+해시(`calc_file_hash`)를 쓰고 있어 바이트 기반 변형만 남은 형태다.
+
+TODO/FIXME 재탐색: 소스 전체에 3건이며 전부 `TODO(API 미지원)` 표기가 붙은 알려진 항목이다
+(`tests/source-contract.test.mjs`가 이 표기 자체를 계약으로 고정하고 있다). 신규 0건.
+
+---
+
+## Sprint 63 (2026-08-12) — 배치 안전성 가드 + 큐 클레임 동시성 회귀
+
+### `test_crawl_exit_code.py` §8 (12검사) — 배치 후보의 비대화성
+
+문서가 배치 편입 후보로 거론하던 스크립트 중 하나가 `input()`으로 사람 입력을 기다리고
+있었다. 스케줄러에서 실행되면 매달리거나 죽고 뒷 단계까지 멈춘다 — **문서 분류를 믿고
+배치에 넣는 순간 사고**가 나는 자리였다.
+
+배치 후보 9종(`mvp_scraper` / `doc_worker` / `migrate_execute` / `refresh_priority` /
+`collect_documents` / `load_rights_data` / `load_spec_data` / 복구 스크립트 2종)에 입력
+대기가 없는지 검사한다. 주석 안의 `input(` 은 세지 않도록 코드 부분만 본다.
+
+반대 방향도 함께 둔다 — `analyze_docs.py`가 **여전히 대화형이고 DB를 쓰지 않는지**.
+나중에 이것이 진짜 파이프라인 단계가 되면 검사가 실패해 "배치 후보 목록과 문서를 함께
+갱신하라"고 알린다.
+
+> 이 검사를 처음 썼을 때 `sys.path.insert(...)`가 `"INSERT"` 문자열에 걸려 오검출됐다.
+> SQL 형태(`INSERT INTO` / `UPDATE ... SET` / `DELETE FROM`)로만 판정하도록 고쳤다.
+
+### `test_document_queue.py` §7~9 (17검사) — 큐 클레임/스킵
+
+`claim_next_queue_item()`은 Worker가 일감을 집는 **유일한 경로**이자 동시 클레임을 막는
+가드인데 검사가 0건이었다. `mark_queue_skipped_expired()`도 마찬가지였다.
+
+| 검사 | 내용 |
+|---|---|
+| 선택 규칙 | 우선순위 ASC → 기일 ASC 순, 반복 호출 시 순서대로 소진 |
+| 상태 필터 | done / failed / SKIPPED_EXPIRED / in_progress 는 집지 않는다 |
+| 전이 | pending → in_progress + `last_attempt_at` 기록 |
+| 재시도 간격 | 30분 전에는 안 집고, 지나면 다시 집는다 |
+| **동시성** | **8스레드가 12건을 동시 클레임 — 중복 0, 전건 정확히 1회씩** |
+| 스킵 | `SKIPPED_EXPIRED`는 **재시도 횟수를 소모하지 않는다** |
+
+### 스레드 재현이 유효한 경우와 아닌 경우 (이번에 갈린 지점)
+
+Sprint 58/59는 "스레드 재현은 변이를 놓치고 구조 검사만 잡아냈다"고 기록했다. 원인은
+`BEGIN IMMEDIATE`가 구간을 이미 직렬화해 안쪽 가드까지 창이 벌어지지 않기 때문이었다.
+
+`claim_next_queue_item()`은 배타 트랜잭션 없이 조건부 UPDATE만 쓰므로 경합 창이 실제로 넓다.
+조건부 UPDATE를 제거한 변이에서 **8스레드 재현이 3회 연속 전부 검출**했다(중복 배분 발생).
+
+**교훈** — "스레드 재현은 못 믿는다"가 아니라 **가드 구조에 따라 다르다**. 배타 락으로
+직렬화된 경로는 구조 검사가 필요하고, 조건부 UPDATE만 있는 경로는 스레드 재현이 유효하다.
+
+### 변이 검증 5/5 검출 (Sprint 63분)
+
+```
+조건부 UPDATE 제거      DETECTED  <- 스레드 재현이 잡음 (3회 연속)
+rowcount 가드 제거      DETECTED
+정렬 역전               DETECTED
+재시도 간격 무력화       DETECTED
+SKIPPED_EXPIRED가 재시도 소모   DETECTED
+```
+
+소스는 SHA256 대조로 byte 단위 원복 확인.
+
+### 변이 테스트의 함정 — `__pycache__` 때문에 "원복했는데도 변이가 살아있다" (Sprint 63 실측)
+
+이번 Sprint에 실제로 겪은 일이라 반드시 기록해 둔다.
+
+`calc_priority()`의 `except: return 3`을 `return 1`로 바꾸는 변이를 넣고, 검사 후
+원본 바이트로 되돌린 뒤 SHA256을 대조해 **"restored byte-exact: True"를 확인**했다.
+그런데 바로 다음에 돌린 전체 스위트에서 그 변이의 증상(`형식 오류 -> 3`이 `1`로 나옴)이
+그대로 재현됐다.
+
+원인은 소스가 아니라 **바이트코드 캐시**였다. Python은 `.pyc` 유효성을 `(mtime, size)`로
+판단하는데, `return 3` → `return 1`은 **길이가 같다**. 되돌리는 쓰기가 같은 mtime 눈금
+안에서 일어나면 캐시가 여전히 유효하다고 판정돼, **변이 버전으로 컴파일된 `.pyc`가 계속
+쓰인다.** git diff도 SHA256도 깨끗한데 실행만 오염된 상태다.
+
+이것이 위험한 이유는 두 방향 모두다.
+- 원복 후 스위트가 **거짓 실패**한다(이번 경우).
+- 반대로 변이를 넣었는데 캐시가 남아 **거짓 통과**하면 "검출됨"이라는 결론 자체가 틀린다.
+
+**규칙** — 변이 테스트 전후에는 `__pycache__`를 지운다. 길이가 같은 변이
+(`3`→`1`, `>`→`<`, `True`→`False`)일수록 반드시 필요하다.
+
+```bash
+find . -name "__pycache__" -type d -not -path "./node_modules/*" -exec rm -rf {} +
+```
+
+이번 Sprint의 변이 결과는 캐시를 지운 뒤 전부 재확인했다.
+
+---
+
+## Sprint 64 (2026-08-12) — 경계가 만나는 지점 검증
+
+### 왜 이 두 곳인가
+
+이 저장소의 검사는 도메인별로는 촘촘한데, **두 도메인이 만나는 지점**은 비어 있었다.
+Admin이 바꾼 것이 사용자에게 보이는지, 관리자 조정이 실제 사용량과 섞였을 때 산술이
+맞는지는 어느 쪽 테스트의 책임도 아니어서 아무도 확인하지 않았다.
+
+### §31-B Admin↔사용자 일관성 (25검사)
+
+한 구독을 세 관점에서 동시에 본다 — 하나라도 어긋나면 실패한다.
+
+| 관점 | 무엇을 보는가 |
+|---|---|
+| `GET /subscriptions/me` | 사용자가 화면에서 보는 상태 |
+| `GET /admin/subscriptions` | 운영자가 보는 상태 |
+| `has_active_subscription()` | 실제 기능 접근을 결정하는 게이트 |
+| DB `subscriptions.status` | 저장된 진실 |
+
+PAUSED → 재개 → 해지 순으로 돌리며 매 단계 네 값이 일치하는지 확인하고, 마지막에
+**해지 사용자가 등기부를 무료로 쓸 수 없는지**까지 확인한다(매출 누수 방지).
+
+### §20-B 조정 × 사용 혼합 산술 (20검사)
+
+`effective_limit = plan_limit + adjustment`, `remaining = effective_limit - used`
+두 항등식을 GRANT +3 → 실제 사용 2건 → DEDUCT -1 각 단계에서 단언한다.
+핵심은 **사용 후 DEDUCT가 `used`를 건드리지 않는 것** — 건드리면 사용자가 쓰지도 않은
+횟수를 잃는다.
+
+### 오탐을 걸러낸 과정 (기록해 둘 가치가 있는 실패)
+
+조사 중 두 건이 버그처럼 보였다.
+
+1. "만료 구독인데 이용권 게이트가 True" → 재현해 보니 그 사용자가 **다른 ACTIVE 구독**을
+   함께 갖고 있었다. 게이트는 사용자 단위 판정이므로 정상. 깨끗한 사용자로 다시 확인하니
+   만료 단독 False / 유예 기간 True로 설계대로였다.
+2. "해지 후 신청이 PAYMENT_REQUIRED가 아님" → 구독이 아예 없으면
+   `REGISTRY_SUBSCRIPTION_REQUIRED`가 맞다. `PAYMENT_REQUIRED`는 구독은 있는데 한도를
+   초과한 경우다. **내 기대가 틀렸다.**
+
+probe가 빨간 줄을 보였다고 곧바로 버그로 기록하면 없는 결함을 만들어낸다 —
+**격리 재현으로 확인한 뒤에만** 기록한다.
+
+### 변이 검증 5/5 (Sprint 64분)
+
+```
+is_entitled 항상 True                DETECTED (11개 검사 실패)
+is_entitled가 만료를 무시(상태만)      DETECTED (6개)
+remaining이 사용량 무시               DETECTED (4개)
+effective_limit이 조정 무시           DETECTED (9개)
+사용이 balance_after를 2배 차감        DETECTED (1개)
+```
+
+전 변이에서 `__pycache__`를 지우고 실행했다(Sprint 63의 캐시 함정 규칙 적용).
+
+### 테스트 잔여 데이터에 관한 실측 메모
+
+작업 중 `no dangling audit rows left` 검사가 두 번 실패했는데, **둘 다 제품이 아니라
+내 쪽 문제**였다.
+- 한 번은 테스트가 NameError로 중단돼 cleanup이 끝까지 못 간 잔여
+- 한 번은 scratchpad probe의 cleanup이 `audit_logs.target_id`를 user_id로 잘못 지운 것
+  (REGISTRY_CREDIT 감사의 target_id는 **credit_id**다)
+
+이 검사는 정확히 제 역할을 했다. 정리 후 **연속 2회** 실행해 잔여 0을 확인했다.
+
+---
+
+## Sprint 66 (2026-08-12) — 배치 편입 전 감사 + 약한 검사 강화
+
+### `test_doc_storage_atomicity.py` +14검사 — collect_documents 저장 경로 (BUGS #64)
+
+배치 편입 Backlog에 올라 있던 스크립트가 **뷰어가 서빙하지 않는 경로**에 저장하면서
+`document_status`를 READY로 바꾸고 있었다. 실행된 적이 없어 피해는 0건이었지만,
+스케줄에 넣는 순간 손대는 문서마다 "화면은 열람 가능, 뷰어는 404"가 된다.
+
+검사 구성:
+- 뷰어(`api/v1/documents.py`)의 파일명 정의와 `CANONICAL_DOC_FILENAME`을 **소스 대조**
+  (두 곳에 정의가 있는 이유는 `doc_paths`가 fastapi 무의존이어야 하기 때문 — 갈라지면 404)
+- canonical 경로가 `documents/` 아래인지, 파일명이 `spec.pdf`/`status.html`인지
+- STATUS가 PDF 다운로드 대상에서 제외됐는지(포함하면 매번 FAILED가 찍힌다)
+- **배선 확인** — `collect_all`이 실제로 최종 경로를 `save_doc_raw()`에 넘기는지
+- **실동작** — 파일이 실제로 옮겨지고, 원본이 남지 않고, 내용이 보존되고,
+  `doc_exists()`가 그 경로를 완료로 인정하는지
+
+### `test_api_regression.py` — `/document-stats` 약한 검사 강화
+
+기존 검사는 이랬다.
+
+```python
+check("document-stats status", r.status_code, 200)
+check_true("document-stats has total_items", "total_items" in r.json())
+```
+
+숫자 8개를 돌려주는 엔드포인트인데 **어느 값도 맞는지 확인하지 않았다.** 집계 쿼리가
+doc_type을 잘못 세도 통과한다. 각 숫자를 **자기 출처 테이블과 직접 대조**하도록 바꿨다
+(`total_items` ↔ `auction_item`, 6개 성공/실패 ↔ `document_status`,
+`total_failures` ↔ `document_collect_failures`).
+
+### 데이터가 우연히 같아 변이가 살아남은 사례 (반드시 기록해 둘 것)
+
+`total_failures`의 출처를 다른 테이블로 바꿔치기하는 변이가 **살아남았다.**
+현재 DB에서 `document_collect_failures`(3)와 `document_status FAILED`(3)가 **우연히
+같았기 때문**이다. 값 비교만으로는 두 출처를 구분할 수 없었다.
+
+해결: 한쪽에만 행을 하나 넣어 두 값을 어긋나게 만든 뒤, 엔드포인트가 **어느 쪽을 따라
+움직이는지** 확인하고 넣은 행을 즉시 되돌린다. 이후 같은 변이가 **DETECTED**로 바뀌었다.
+
+> 교훈 — "출처가 다른 두 값"을 검사할 때는 값이 같은 상태에서 단언하면 아무것도 증명하지
+> 못한다. 의도적으로 어긋나게 만들어야 검출력이 생긴다.
+
+### 등가 변이(equivalent mutant) 1건 — 테스트 약점이 아님
+
+`doc_stats.py`의 `WHERE ... status IN ('READY','FAILED')` 필터를 제거하는 변이도
+살아남았지만, 이것은 **동작이 실제로 같다**. `count_status()`가 `('SPEC','READY')` 같은
+키만 조회하므로 dict에 COLLECTING 항목이 더 들어와도 절대 읽히지 않는다.
+검출되지 않는 것이 정상이며, 억지로 잡으려고 검사를 만들지 않았다.
+
+### 변이 검증 (Sprint 66분)
+
+```
+collect_documents가 다운로드 경로를 기록 (수정 전 동작)   DETECTED
+STATUS를 PDF 경로로 시도 (수정 전 동작)                 DETECTED
+canonical 파일명이 뷰어와 불일치                        DETECTED
+PDF 대상 집합에 STATUS 추가                            DETECTED
+비원자적 이동(shutil.copy)                             DETECTED
+doc-stats: spec_success가 FAILED를 셈                  DETECTED
+doc-stats: total_failures 출처 바꿔치기                 DETECTED (강화 후)
+doc-stats: status 필터 제거                            등가 변이(정상적으로 미검출)
+```
+
+---
+
+## Sprint 67 (2026-08-12) — collect_documents 저장/실패 경로 (신규 `test_collect_documents.py`, 26검사)
+
+### 왜 필요했나
+
+Sprint 66이 이 스크립트의 **경로** 결함(BUGS #64)을 고쳤지만, 검증 범위는 경로 계산과
+파일 이동까지였다. **DB 기록 쪽(성공/실패 상태 전이)은 여전히 미검증**이었고,
+그 공백에서 실제 결함(BUGS #65)이 나왔다.
+
+### 구성 (selenium 불필요)
+
+브라우저가 필요한 `download_doc()`은 대상이 아니다. 그 뒤 단계인
+`finalize_download()` / `save_doc_raw()` / `save_failure()`만 직접 호출한다.
+임시 DB + 임시 documents 루트를 쓰며 실제 `auction.db`/`documents/`는 건드리지 않는다.
+
+스키마는 손으로 베끼지 않는다 — v4.1은 `storage/migrate_v4_1.py` 실제 코드로,
+`document_collect_failures`는 Migration 017 SQL 파일로 만든다.
+(테스트에 스키마를 복제하면 진짜 스키마가 바뀌어도 통과한다.)
+
+### 잡아낸 것
+
+`save_doc_raw()`가 0바이트 파일을 성공으로 처리해 READY로 기록하고 있었다(BUGS #65).
+`doc_exists()`는 같은 파일을 미완료로 보므로 **화면·뷰어·재수집 판정 3자가 어긋난다.**
+이 저장소가 이미 두 번 고친 "READY인데 못 쓰는 파일"(BUGS #50/#61)의 세 번째 형태다.
+
+### 변이 검증 5/5
+
+```
+0바이트 가드 제거 (수정 전 동작)        DETECTED
+0바이트가 READY로 흘러감 (수정 전 동작)  DETECTED
+성공인데 FAILED로 기록                 DETECTED
+버전이 증가하지 않음                    DETECTED
+실패를 성공으로 보고                    DETECTED
+```
+
+### 참고 — 이 스크립트를 배치에 넣기 전 남은 확인
+
+`collect_documents`는 `document_queue`를 갱신하지 않는다. 실행하면
+`test_pipeline_integrity.py`의 "파일이 있으면 큐도 done" 불변식이 일시적으로 실패한다
+(다음 `doc_worker` 실행에서 자가 치유). 이것은 버그가 아니라 **소유권 결정**(roadmap 16-B)
+대상이므로 Sprint 67은 표만 남기고 구현하지 않았다.
+
+### Sprint 67 이어서 — `test_collect_documents.py` §7~8 (수렴 시나리오, 총 53검사)
+
+**selenium 없이 doc_worker 경로를 재현하는 방법**
+
+`collect_spec()`은 `doc_exists()`가 참이면 **driver를 건드리기 전에** `success=True`로
+단락한다. 그래서 `driver=None`으로 실제 함수를 그대로 호출할 수 있다. 이 단락이 사라지면
+테스트가 크래시하므로(변이로 확인), 이 방식은 우회가 아니라 **단락이 load-bearing임을
+함께 검증**하는 셈이다.
+
+| § | 시나리오 | 확인 대상 |
+|---|---|---|
+| 7 | collect_documents 수집 → doc_worker | 큐/document_status/파일/doc_raw/version log |
+| 8 | 실패 → 재시도 간격 → 성공 | 큐 상태·retry_count·document_status·doc_exists |
+
+두 시나리오 모두 **HTTP status가 아니라 4개 저장소(큐·상태·원장·파일시스템)를 함께**
+확인한다.
+
+**fixture가 운영과 달라 생긴 실패 — assertion을 낮추지 않고 fixture를 고쳤다**
+
+`auction_case` 연결 없이 `auction_item`만 만들었더니 §8에서 "큐는 done인데
+document_status는 COLLECTING"이 나왔다. 원인은 제품이 아니라 fixture였다 —
+`_set_document_status()`가 `auction_case` JOIN으로 item_id를 찾기 때문이다.
+(코드는 이 상황을 조용히 넘기지 않고 경고를 남긴다.)
+
+fixture를 운영과 같게(=`migrate_execute.py`가 만드는 형태로) 고쳐 통과시켰고,
+그 결과 **`mark_queue_done`의 상태 동기화가 case 연결에 의존한다**는 사실도 회귀에 고정됐다.
+
+스키마 준비도 실제 부트스트랩 절차 그대로다 — `init_db()` → `migrate_v4_1()` →
+`run_migrations()`. 필요한 것만 골라 적용하다 Migration 011의 `auction_case.court_code`를
+빠뜨려 깨진 적이 있다. **부분 적용은 진짜 스키마와 어긋난다.**
+
+### Sprint 67 이어서 — Concurrency Audit 완결 (`test_race_conditions.py` 49 → 58검사)
+
+**§11 등기부 크레딧 조정 (append-only 원장)**
+
+다른 경합 지점과 달리 방어 코드가 **없어도 되는** 경로다 — `add_credit()`은 현재 합계를
+읽지 않고 INSERT만 한다. 그런데 그 안전성이 검증된 적이 없었다. 12스레드 동시 조정으로
+원장 행 수 = 요청 수, 합계 정확(유실·중복 0)을 고정했다.
+
+> 이 검사의 목적은 "지금 안전함"이 아니라 **"나중에 읽기-판단이 들어오면 잡는 것"**이다.
+> 누적 상한이나 잔액 확인을 추가하는 순간 조용히 경합이 생긴다.
+
+**§12~13 검색조건 저장 상한 (BUGS #66)**
+
+§12는 실스레드 재현(99개 + 12 동시 요청 → 정확히 1건 성공, 최종 100개),
+§13은 결정적 구조 검사(`BEGIN IMMEDIATE`/ROLLBACK/COMMIT 존재 + **COUNT와 INSERT가 모두
+트랜잭션 안에 있는지** 인덱스 비교).
+
+스레드 재현과 구조 검사를 함께 두는 이유는 Sprint 58/59의 교훈 때문이다 — 배타 락으로
+직렬화된 경로에서는 스레드 재현이 창을 못 벌려 변이를 놓친다. 다만 이번 경로는
+**수정 전에 락이 아예 없었으므로 스레드 재현이 확실히 잡았다**(변이 시 최종 103개).
+
+**변이 검증 4/4**
+
+```
+BEGIN IMMEDIATE 제거 (수정 전 동작)   DETECTED  최종 103개로 상한 초과 재현
+상한 검사 자체 제거                    DETECTED  최종 111개
+크레딧 합계 SUM -> MAX                 DETECTED  API adjustment 불일치
+크레딧 INSERT OR IGNORE                등가 변이(UNIQUE 제약이 없어 무시 조건 자체가 없음)
+```
+
+등가 변이는 억지로 잡으려 하지 않았다 — `registry_credits`에 UNIQUE 제약이 없어
+`INSERT OR IGNORE`가 무시할 상황 자체가 존재하지 않음을 스키마로 확인했다.
+
+---
+
+## Sprint 68 (2026-08-12) — Beta 사용자 여정 Release Gate (`test_beta_journey.py`, 66검사)
+
+### 이 파일이 메우는 공백
+
+도메인별 테스트는 **자기 도메인만** 본다. 그래서 도메인 **사이**가 끊겨도 전부 초록이다.
+
+```
+검색 테스트      "검색이 된다"           OK
+상세 테스트      "상세가 나온다"          OK
+최근조회 테스트   "목록이 나온다"          OK
+                 -> 그런데 상세에 들어가도 최근조회에 안 남으면? 아무도 안 잡는다
+```
+
+이 파일은 그 이음매만 노린다.
+
+### 실행 방법과 대상 선택
+
+```
+python test_beta_journey.py           # dev 서버 없어도 실행됨(프런트 단계만 SKIPPED)
+BASE_URL=... python test_beta_journey.py
+```
+
+여정 대상은 **DB에서 조건으로 고른다** — 문서 3종이 READY이고 기일이 남은 물건.
+고정 id를 박아 두면 데이터가 바뀌는 순간 검사가 무의미해지거나 깨진다.
+
+### dev 서버가 없을 때의 규약 (중요)
+
+프런트 로그인 게이트 단계는 dev 서버가 필요하다. 없으면 **`[SKIPPED]`를 출력하고 요약에도
+남긴다.** `docs/TEST_PLAN.md`에 이미 기록된 함정 — `frontend-contract.test.mjs`가 서버 없이
+`cancelled`가 되면서 `fail 0`으로 보여 초록으로 오인되던 문제 — 를 반복하지 않기 위해서다.
+서버를 내린 채와 올린 채 각각 실행해 두 동작을 확인했다.
+
+### 변이 검증 3/3 — 다른 어떤 테스트도 잡지 못하는 것
+
+```
+item.py의 record_view() 호출 제거     DETECTED  (recent_items DB 0건 + 목록 빈 값)
+search.py의 favorited_ids를 빈 집합으로  DETECTED  (로그인 검색 하트가 False)
+registry.py의 중복 방지 플래그 제거      DETECTED
+```
+
+각 도메인 테스트는 이 변이들을 **통과시킨다** — `record_view`가 안 불려도 최근조회 API 자체는
+정상이고, `favorited_ids`가 비어도 검색 API는 200이기 때문이다. 여정 테스트만 잡는다.
+
+### 현재 게이트 (Sprint 68)
+
+```
+python test_api_regression.py      727검사
+python test_race_conditions.py      69검사
+python test_beta_journey.py         66검사   <- 신규 Release Gate
+python test_collect_documents.py    53검사
+그 외 test_*.py                     전부 PASS (총 26개 파일)
+npm run test:frontend               93검사 (dev 서버 필요 — cancelled 확인 필수)
+변이 누적                           58회 시도 → 56 검출 / 2 등가
+```

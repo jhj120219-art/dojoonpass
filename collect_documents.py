@@ -18,6 +18,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 from storage.database import get_connection
 from config.settings import random_delay
+# 경로 규칙은 selenium 무의존 모듈에서 가져온다 — 여기서 규칙을 따로 만들면
+# 뷰어(api/v1/documents.py)·doc_worker와 갈라져 "READY인데 404"가 된다.
+from crawler.doc_paths import canonical_doc_path, PDF_DOWNLOADABLE_DOC_TYPES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -218,9 +221,47 @@ def download_doc(driver, doc_type: str, item_id: int) -> Optional[str]:
             pass
         return None
 
+def finalize_download(downloaded_path: str, court_name: str, case_no: str,
+                      item_no: str, doc_type: str) -> Optional[str]:
+    """다운로드된 파일을 뷰어가 서빙하는 최종 경로로 옮긴다 (2026-08-12 Sprint 66).
+
+    이 스크립트는 `storage/docs/<type>/<원본파일명>`에 받은 파일을 그대로 두고
+    `document_status`만 READY로 바꿨다. 그런데 `api/v1/documents.py`가 서빙하는 경로는
+    `documents/<법원>/<사건>/<물건>/spec.pdf`라 **완전히 다른 위치**다. 그래서 이 스크립트를
+    배치에 넣는 순간(roadmap 16-A) 손대는 문서마다 "화면에는 열람 가능인데 뷰어는 404"가
+    된다 — Sprint 55가 이미 한 번 고친 BUGS #50과 같은 부류의 결함이다.
+
+    `os.replace()`로 옮긴다 — 같은 파일시스템 안에서 원자적이라, 옮기는 도중 강제 종료돼도
+    목적지에 잘린 파일이 남지 않는다(`crawler/doc_crawler.py`가 쓰는 것과 같은 불변식).
+    """
+    try:
+        final_path = canonical_doc_path(court_name, case_no, item_no, doc_type)
+        os.replace(downloaded_path, final_path)
+        return final_path
+    except Exception as e:
+        logger.warning("finalize_download 실패 [%s]: %s", doc_type, str(e))
+        return None
+
+
 def save_doc_raw(conn, item_id: int, doc_type: str, pdf_path: str) -> bool:
     try:
         size = os.path.getsize(pdf_path)
+
+        # 0바이트 파일을 "수집 완료"로 기록하지 않는다 (2026-08-12 Sprint 67).
+        # 이 저장소에는 "완료"의 기준이 이미 있다 — `doc_paths.doc_exists()`는
+        # **크기가 0보다 커야** 완료로 본다. 그런데 여기서는 크기를 보지 않고
+        # document_status를 READY로 바꿔서 두 정의가 어긋났다:
+        #   화면        READY (열람 가능하다고 표시)
+        #   뷰어        0바이트 파일을 그대로 서빙 -> 깨진 문서
+        #   재수집 판정  doc_exists()=False (미완료로 보고 계속 재시도)
+        # 다운로드가 시작 직후 끊기면 실제로 0바이트 .pdf가 남을 수 있다.
+        # 새 정책을 만드는 것이 아니라 **이미 있는 완료 기준에 맞추는** 수정이다.
+        # (BUGS #50 / #61과 같은 부류 — "READY인데 실제로는 못 쓰는 파일")
+        if size <= 0:
+            logger.warning("[item %s] %s 다운로드 파일이 0바이트다. 실패로 처리한다: %s",
+                           item_id, doc_type, pdf_path)
+            return False
+
         fhash = file_hash(pdf_path)
         now = datetime.now().isoformat()
 
@@ -313,6 +354,15 @@ def collect_all(limit: int = 10):
                     continue
 
                 for doc_type in pending_types:
+                    # STATUS는 PDF 다운로드가 아니라 오버레이 HTML을 긁어오는 방식이라
+                    # 이 경로로는 **구조적으로 성공할 수 없다**(download_doc은 .pdf만 받는다).
+                    # 예전에는 그대로 시도해서 매번 "다운로드 실패"로 FAILED를 찍었다 —
+                    # 실제로는 실패가 아니라 담당 코드가 다른 것뿐이다
+                    # (`crawler/doc_crawler.py:collect_status()`, doc_worker 경로).
+                    if doc_type not in PDF_DOWNLOADABLE_DOC_TYPES:
+                        logger.info("  [%s] 이 경로의 담당이 아님(doc_worker가 처리). 건너뜀", doc_type)
+                        continue
+
                     logger.info("  [%s] 다운로드 시도...", doc_type)
                     # download_dir 변경
                     save_dir = os.path.join(BASE_STORAGE, doc_type)
@@ -320,9 +370,18 @@ def collect_all(limit: int = 10):
 
                     pdf_path = download_doc(driver, doc_type, item_id)
                     if pdf_path:
-                        ok2 = save_doc_raw(conn, item_id, doc_type, pdf_path)
+                        # 다운로드된 파일을 **뷰어가 서빙하는 경로**로 옮긴 뒤 기록한다.
+                        # 예전에는 `storage/docs/<type>/<원본파일명>`에 둔 채로
+                        # document_status를 READY로 바꿔서, 화면에는 "열람 가능"으로
+                        # 보이지만 뷰어는 404가 되는 상태를 만들었다(BUGS #50과 같은 부류).
+                        final_path = finalize_download(pdf_path, court_name, case_no,
+                                                       item_no, doc_type)
+                        if not final_path:
+                            save_failure(conn, item_id, doc_type, "저장 경로 이동 실패")
+                            continue
+                        ok2 = save_doc_raw(conn, item_id, doc_type, final_path)
                         if ok2:
-                            logger.info("  [%s] 저장 완료: %s", doc_type, pdf_path)
+                            logger.info("  [%s] 저장 완료: %s", doc_type, final_path)
                         else:
                             save_failure(conn, item_id, doc_type, "DB 저장 실패")
                     else:
