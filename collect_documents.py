@@ -22,6 +22,16 @@ from config.settings import random_delay
 # 뷰어(api/v1/documents.py)·doc_worker와 갈라져 "READY인데 404"가 된다.
 from crawler.doc_paths import canonical_doc_path, PDF_DOWNLOADABLE_DOC_TYPES
 
+# `logs/`는 .gitignore 대상이라 **새로 받은 저장소에는 존재하지 않는다.** 아래
+# `logging.FileHandler`는 **import 시점에** 파일을 여므로, 디렉터리가 없으면 이 모듈을
+# import하는 것만으로 FileNotFoundError가 나서 문서 수집이 시작조차 못 한다
+# (2026-08-13 Sprint 98 — 새 체크아웃에서 `test_collect_documents.py`,
+# `test_doc_storage_atomicity.py`가 이 이유로 죽는 것을 실측).
+#
+# 이 저장소의 다른 진입점들은 이미 같은 줄을 갖고 있다 — `doc_worker.py:20`,
+# `mvp_scraper.py:19`, `refresh_priority.py:7`. 여기만 빠져 있었다.
+os.makedirs("logs", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",

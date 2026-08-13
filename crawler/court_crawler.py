@@ -1,4 +1,5 @@
-﻿import time
+﻿import os
+import time
 import json
 import logging
 from datetime import datetime
@@ -27,6 +28,11 @@ def log_error(case_no: str, step: str, error: Exception, retry: int) -> None:
         "timestamp": datetime.now().isoformat(),
     }
     try:
+        # `logs/`는 .gitignore 대상이라 새 체크아웃/배포에는 없다. 아래 except가 모든 예외를
+        # 삼키므로, 디렉터리가 없으면 **크롤 오류 기록이 통째로 조용히 사라진다** — 정작
+        # 가장 필요한 순간에 남는 게 없다(2026-08-13 Sprint 98).
+        # 저장소의 다른 진입점(`doc_worker.py:20` 등)이 쓰는 것과 같은 한 줄이다.
+        os.makedirs("logs", exist_ok=True)
         with open("logs/errors.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:

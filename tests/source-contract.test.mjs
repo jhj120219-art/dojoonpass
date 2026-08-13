@@ -179,6 +179,50 @@ describe('로그인 성공 후 복귀 계약 (MASTER_SPEC §3.4) — 소스 계�
     )
   })
 
+  // ★ 소비자(loginAction)만 고정돼 있고 **생산자(로그인 폼)가 비어 있던 자리**
+  //   (2026-08-13 Sprint 98 신설).
+  //
+  //   위 검사는 `loginAction`이 `formData.get('redirect')`를 읽는다는 것만 고정한다.
+  //   그런데 로그인 **화면**이 그 값을 폼에 싣지 않으면 `formData.get('redirect')`는
+  //   조용히 null이 되고, `sanitizeRedirectPath(null)`이 기본값 '/'을 돌려주므로
+  //   **오류 없이 첫 화면으로 보내진다.** 사용자는 보던 물건으로 돌아오지 못하는데
+  //   어디에도 실패가 남지 않는다 — MASTER_SPEC §3.4가 막으려던 바로 그 회귀다.
+  //
+  //   `frontend-contract.test.mjs`에 이 검사가 있었지만 **원리상 통과할 수 없었다**:
+  //   `/login`은 `'use client'` + `<Suspense fallback={null}>`이라 서버가 내려주는 HTML은
+  //   빈 껍데기이고, hidden input은 하이드레이션 이후에야 생긴다. HTTP로 받은 HTML을
+  //   정규식으로 훑는 방식으로는 볼 수 없는 값이다(그 검사는 서버를 띄우고 돌린 적이
+  //   없어 실패가 드러나지 않고 있었다).
+  //
+  //   실제 브라우저에서 하이드레이션 후를 확인한 결과 **제품은 정상**이다 —
+  //   `input[name=redirect]`가 type=hidden으로 존재하고 값이 원래 URL과 정확히 일치했다.
+  //   즉 고칠 대상은 제품이 아니라 검사 방법이었다. 관측 가능한 곳(소스)으로 옮긴다.
+  test('로그인 화면이 redirect 값을 폼에 hidden input으로 싣는다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile('src/app/login/page.tsx', 'utf8')
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+
+    // 1) URL의 ?redirect=를 읽는다
+    assert.ok(
+      /useSearchParams\(\)/.test(code) && /searchParams\.get\('redirect'\)/.test(code),
+      '로그인 화면이 URL의 redirect 파라미터를 읽지 않습니다'
+    )
+    // 2) 읽은 값을 **폼 안에** name="redirect"로 싣는다.
+    //    loginAction이 formData.get('redirect')로 꺼내므로 이름이 정확히 일치해야 한다.
+    assert.ok(
+      /<input[^>]*type="hidden"[^>]*name="redirect"[^>]*value=\{redirectParam\}/.test(code),
+      'redirect 값을 hidden input(name="redirect")으로 폼에 싣지 않습니다'
+    )
+    // 3) 그 input이 실제 제출되는 <form> 안에 있어야 한다 — 폼 밖이면 formData에 실리지 않는다.
+    const formStart = code.indexOf('<form')
+    const formEnd = code.indexOf('</form>')
+    assert.ok(formStart !== -1 && formEnd > formStart, '로그인 <form>을 찾지 못했습니다')
+    assert.ok(
+      code.slice(formStart, formEnd).includes('name="redirect"'),
+      'redirect hidden input이 <form> 바깥에 있어 제출되지 않습니다'
+    )
+  })
+
   test('로그아웃 후에는 첫 화면(검색)으로 보낸다', async () => {
     const { promises: fs } = await import('node:fs')
     const src = await fs.readFile('src/app/properties/LogoutButton.tsx', 'utf8')

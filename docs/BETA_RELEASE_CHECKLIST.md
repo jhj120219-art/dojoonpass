@@ -67,9 +67,31 @@ Owner: Project Management
   두 메서드는 인터페이스에만 있고 호출부가 없다
 - **승인/외부 절차 필요 → 코드로 해결 불가**
 
-### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — 변수명은 존재, 값 유효성 미확인
+### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — **미설정 확정** (2026-08-13 실측)
 
-- **2026-08-08 재확인**: `.env`에 `ADMIN_API_KEY=`/`SUPER_ADMIN_API_KEY=` **변수명 자체는
+> **2026-08-13 실측 (Sprint 78 Release Audit)** ― "값 유효성 미확인"이던 이 항목을
+> **비밀값을 열람하지 않고** 확정했다. 이름 존재 여부(값이 아니라 키 이름만)와 서버 응답
+> 두 가지로 판정할 수 있다.
+>
+> ```
+> .env 의 이름            ADMIN_API_KEY        없음   <- 2026-08-08 기록("이름은 있음")과 다르다
+>                         SUPER_ADMIN_API_KEY  없음
+>                         PAYMENT_WEBHOOK_SECRET 없음  <- Webhook 서명 검증도 fail-closed 상태
+> 실제 서버 응답(키 없이)   /admin/users /admin/payments /admin/subscriptions /admin/audit-logs
+>                         전부 500 "관리자 키 미설정"
+> ```
+>
+> 즉 **Admin API 전체가 지금도 사용 불가**이며, 준비도 표의 "키 미설정으로 현재 전체 500"은
+> 정확하다. 값을 읽지 않고도 판정된 이유: `os.getenv()`가 빈 값을 falsy로 주고
+> `_require_role()`이 두 키가 모두 없을 때 500을 반환하기 때문이다(코드 계약).
+>
+> `PAYMENT_WEBHOOK_SECRET`도 없어 `MockProvider.verify_webhook_signature()`가 설계대로
+> 항상 False다(fail-closed) — Webhook 수신은 401로 막힌다. 이것은 결함이 아니라 의도된
+> 안전 기본값이지만, **결제 Webhook을 실제로 받으려면 이 값도 필요**하다는 점을 함께 기록한다.
+>
+> `.env` 수정은 승인 영역이라 손대지 않았다. 값 생성 명령은 아래 그대로 유효하다.
+
+- **2026-08-08 기록(당시)**: `.env`에 `ADMIN_API_KEY=`/`SUPER_ADMIN_API_KEY=` **변수명 자체는
   존재한다**(이전 문서가 "미설정"으로 기록했던 것과 달리 이름은 있음). 다만 이 세션은
   Secret 값을 열람/출력하지 않는 원칙이라 **실제로 유효한 값이 채워져 있는지는 확인하지
   않았다** — 값이 비어 있거나 형식이 잘못됐다면 여전히 `/api/v1/admin/*` 전체가
@@ -85,6 +107,30 @@ Owner: Project Management
 - 이 값이 `localhost:3000`인 채로 배포되면 **운영 사용자가 회원가입을 끝낼 수 없다.**
   코드로는 확인할 수 없는 외부 대시보드 설정이라 배포 전 반드시 눈으로 확인해야 한다.
 - 2026-08-07 신규 등록 (`docs/API_KEY_CHECKLIST.md` 5절)
+
+### ~~P0-4. `.env`에 `SUPABASE_JWT_SECRET` 변수명 자체가 없음~~ → **2026-08-13 이 환경에서 해소 확인 (Sprint 78)**
+
+> **2026-08-13 실측 (Sprint 78 Release Audit)** ― 아래 서술은 **이미 낡았다.** 이 작업
+> 환경의 `.env`를 이름 기준으로 확인한 결과(값은 열람하지 않았다):
+>
+> ```
+> .env 의 변수명        SUPABASE_JWT_SECRET  있음 (값 88자)
+>                       JWT_SECRET           없음  <- 아래 "조치"대로 이름이 바뀌었다
+>                       SUPABASE_URL         있음 (값은 비어 있음)
+> .env.local            NEXT_PUBLIC_SUPABASE_URL  있음 (40자)
+> ```
+>
+> 즉 아래 §조치의 "`JWT_SECRET`의 값을 `SUPABASE_JWT_SECRET` 이름으로 옮긴다"가 **이미
+> 수행돼 있다.** `SUPABASE_URL`은 이름만 있고 값이 비어 있는데, `api/auth.py`가
+> `SUPABASE_URL or NEXT_PUBLIC_SUPABASE_URL` 순으로 읽으므로 JWKS 주소는 정상 구성된다
+> (이 폴백 경로는 Sprint 78에 회귀로 고정했다 — `test_auth_jwt.py` §6).
+>
+> **다만 이것이 증명하는 것은 "이 로컬 환경의 이름이 맞다"까지다.** 값이 진짜 Supabase JWT
+> Signing Secret인지는 실제 Supabase 발급 토큰으로만 확인할 수 있고(외부 의존 → SKIP),
+> 운영 배포 환경의 `.env`는 여전히 별도로 채워야 한다. `.env` 수정은 승인 영역이라
+> 이 세션에서도 손대지 않았다 — **확인만** 했다.
+
+<details><summary>원래 서술 (2026-08-08~08-09 기준, 기록 보존)</summary>
 
 ### P0-4. **[2026-08-08 신규]** `.env`에 `SUPABASE_JWT_SECRET` 변수명 자체가 없음 (인증 전체 불가)
 
@@ -122,6 +168,8 @@ Owner: Project Management
   `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY`를 이미 입력해 둔 것으로
   보아(2026-08-08, `docs/API_KEY_CHECKLIST.md` 8절) Supabase 키 자체는 준비돼 있을 가능성이
   높다 — `SUPABASE_JWT_SECRET`이라는 정확한 이름으로 옮겨 담는 작업만 남았을 수 있다
+
+</details>
 
 ---
 

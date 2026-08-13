@@ -9,6 +9,7 @@
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from storage.database import get_connection
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,6 +22,60 @@ def run():
     # 하는데, DROP 직후 RENAME 전까지 자식 행이 잠시 고아가 된다. FK를 켠 채로는 그 지점에서
     # 마이그레이션 자체가 실패한다. 런타임(API/크롤러)은 기본값대로 FK가 켜진 커넥션을 쓴다.
     conn = get_connection(enforce_foreign_keys=False)
+
+    # ── 선행 스키마 확인 (2026-08-13 Sprint 99 신설) ────────────────────────────
+    #
+    # 이 마이그레이션들은 **빈 DB에서 시작하지 않는다.** 008(검색 인덱스)부터
+    # `auction_item`을, 011/013은 `auction_case`/`auction_item`을 이미 있다고 가정한다.
+    # 그 테이블들을 만드는 것은 `storage/migrate_v4_1.py`이고, 이 러너가 아니다.
+    #
+    # 그래서 새로 clone한 저장소에서 안내대로 `init_db()` -> 이 러너 순으로 돌리면
+    # **008에서 죽는다**(실측):
+    #
+    #     [FAIL] 008_create_search_indexes.sql: no such table: main.auction_item
+    #
+    # 더 나쁜 것은 그 다음이다 — 001~007은 이미 적용돼 `migration_history`에 남으므로
+    # DB가 **절반만 마이그레이션된 상태**로 남는다. 원인 메시지는 "auction_item이 없다"뿐이라
+    # 무엇을 먼저 돌려야 하는지 알 수 없다.
+    #
+    # 아무것도 적용하기 전에 먼저 확인하고, **무엇을 어떤 순서로 돌려야 하는지** 알려준다.
+    # (올바른 순서로 돌리면 19개가 전부 적용되고 26개 테이블이 만들어지는 것을 실측 확인했다.)
+    #
+    # 필요 여부는 **실제 .sql 내용에서 도출한다** — 목록을 여기 박아 두면 두 가지가 어긋난다.
+    # (1) 앞으로 선행 테이블을 요구하는 마이그레이션이 늘어도 이 목록이 안 따라온다.
+    # (2) 테스트가 자기만의 마이그레이션 디렉터리로 러너를 부를 때, 그 SQL은 auction_item을
+    #     쓰지도 않는데 무조건 막혀 버린다(`test_schema_hygiene.py`의 러너 검사가 그렇다).
+    # 지금 적용할 SQL이 그 테이블을 실제로 언급할 때만 확인한다.
+    PREREQ_TABLES = ("auction_item", "auction_case")
+    existing = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+    referenced = set()
+    for _f in sorted(f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql")):
+        try:
+            _sql = open(os.path.join(MIGRATIONS_DIR, _f), encoding="utf-8").read()
+        except OSError:
+            continue
+        for _t in PREREQ_TABLES:
+            # `auction_item_new`처럼 새로 만드는 테이블에 오탐하지 않도록 경계를 본다.
+            if re.search(r"\b%s\b(?!_new)" % re.escape(_t), _sql):
+                referenced.add(_t)
+
+    missing = [t for t in sorted(referenced) if t not in existing]
+    if missing:
+        conn.close()
+        raise SystemExit(
+            "\n[중단] 선행 스키마가 없습니다: %s\n"
+            "\n이 마이그레이션들은 기존 테이블을 변경하는 것이라 빈 DB에서는 돌 수 없습니다."
+            "\n아래 순서로 실행하십시오:\n"
+            "\n  1) python -c \"from storage.database import init_db; init_db()\""
+            "\n  2) python storage/migrate_v4_1.py"
+            "\n  3) python storage/migrations/run_migrations.py   (이 스크립트)\n"
+            "\n(2번이 auction_item / auction_case / document_status / tenant_rights /"
+            "\n rights_summary를 만듭니다. 지금 중단했으므로 DB는 변경되지 않았습니다.)\n"
+            % ", ".join(missing)
+        )
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS migration_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

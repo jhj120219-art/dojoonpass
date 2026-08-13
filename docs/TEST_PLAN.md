@@ -14,9 +14,42 @@ Last Updated: 2026-08-11 (Sprint 53)
 ### 1-A. Frontend 계약 테스트 (2026-08-10 Sprint 45 신규, 2026-08-11 Sprint 49~50 확장)
 
 ```bash
-npm run dev                  # 먼저 서버를 띄운다 (npm run start도 가능)
-npm run test:frontend        # tests/**/*.test.mjs — 64 검사 (HTTP 계약 46 + 소스 계약 10 + navContext 8)
+python -m uvicorn api_server:app --host 127.0.0.1 --port 8000   # ① 백엔드 (필수)
+npm run dev                  # ② 먼저 서버를 띄운다 (npm run start도 가능)
+npm run test:frontend        # tests/**/*.test.mjs — 106 검사 (2026-08-13 Sprint 81 기준)
 ```
+
+**Python 회귀 스위트는 API 서버를 내리고 돌린다** (2026-08-13 Sprint 82 확인).
+`test_*.py`의 상당수가 실제 `auction.db`에 쓰고(롤백하더라도 쓰기 잠금은 잡는다),
+`uvicorn`이 떠 있으면 같은 파일을 붙들고 있어 **무작위로 1~3개 파일이 실패한다.**
+코드 문제가 아니라 SQLite 쓰기 잠금 경합이다.
+
+```
+API 서버 켠 채   28개 중 1~3개가 실행마다 다르게 실패
+API 서버 내린 뒤 28/28 PASS (2회 연속 확인)
+```
+
+증상이 **매번 다른 파일에서 나기 때문에** 원인을 코드에서 찾게 되기 쉽다. 순서는
+"프런트 계약 테스트(서버 필요) -> 서버 종료 -> Python 회귀"가 안전하다.
+
+**`npm run build` 직후 `npm run dev`를 띄우면 첫 화면이 500이 난다** (2026-08-13 Sprint 79 확인).
+production 빌드 산출물과 dev 서버가 같은 `.next`를 공유해 충돌한다. 이것도 제품 결함이 아니다 —
+`.next`를 지우고 dev를 다시 띄우면 정상이다. **프런트 계약 테스트를 돌리기 전에는 build를
+하지 말거나, 했다면 `.next`를 지우고 dev를 띄운다.**
+
+**`npm run build`가 `EPERM ... unlink '.next/static/...'`으로 실패하면** 제품 결함이 아니다
+(2026-08-13 Sprint 79 확인). 이 저장소는 OneDrive 동기화 폴더 안에 있어서, 방금 쓴 빌드
+산출물을 OneDrive가 잡고 있는 동안 다음 빌드가 그 파일을 지우지 못한다. dev 서버가 떠
+있을 때도 같은 증상이 난다. `.next`를 지우고 다시 빌드하면 정상 통과한다.
+
+    Remove-Item -Recurse -Force .next ; npm run build
+
+**FastAPI 백엔드도 반드시 떠 있어야 한다** (2026-08-13 Sprint 72에 명시). 이 스위트는 Sprint 49
+이후 "200이면 통과"가 아니라 **실제 결과 데이터**를 단언하기 때문에, 백엔드가 없으면 검색 결과가
+0건이 되고 관련 검사들이 줄줄이 실패한다. 예전에는 그 상황이 `비로그인 결과 카드에 즐겨찾기
+버튼이 없습니다`처럼 **원인과 무관한 문구**로 보고됐다. 지금은 `before()` 훅이 두 서버를 각각
+확인하고 무엇이 빠졌는지(그리고 띄우는 명령을) 지목한다. 물건이 0건인 경우도 "기능이 깨진 것"과
+구분해서 알려준다.
 
 `docs/FRONTEND_MASTER_SPEC.md`가 "절대 변경 금지"로 못박은 계약을 고정한다: `/` 무redirect,
 첫 화면이 로그인 폼이 아님, 비로그인 목록 노출, 검색 실행의 pathname 유지, `/search` 호환,
@@ -1124,3 +1157,304 @@ python test_collect_documents.py    53검사
 npm run test:frontend               93검사 (dev 서버 필요 — cancelled 확인 필수)
 변이 누적                           58회 시도 → 56 검출 / 2 등가
 ```
+
+### 현재 게이트 (Sprint 78 실측 — 2026-08-13)
+
+Sprint 68 표기의 "총 26개 파일"이 낡았다(Sprint 74에 `test_normalizer.py`가 늘어 27개).
+숫자를 손으로 관리하면 반드시 어긋나므로, **실측값으로 갱신하고 무엇을 셌는지 함께 적는다**
+(`grep -cE "^\[PASS\]"` 기준. 파일마다 검사 단위가 달라 합계는 참고값이다).
+
+```
+python test_api_regression.py      786검사   (727 -> 786, Sprint 74~78 신규 포함)
+python test_document_queue.py      110검사
+python test_subscription_policy.py  98검사   (renew 동시성 9 신규)
+python test_normalizer.py           75검사   (배치 격리 5 신규)
+python test_document_status_sync.py 69검사   (재시도 복구 15 + 고아 측정 4 신규)
+python test_race_conditions.py      69검사
+python test_beta_journey.py         66검사
+python test_collect_documents.py    53검사
+python test_search.py               48검사   (필터 20 신규)
+python test_auction_identity.py     43검사   (upsert 격리 16 신규)
+python test_auth_jwt.py             35검사   (JWKS 12 신규)
+python test_schema_hygiene.py       34검사   (UNIQUE 6 + BOM 1 신규)
+그 외 test_*.py                     전부 PASS (총 27개 파일)
+npm run test:frontend               93검사 (dev 서버 + FastAPI 둘 다 필요 — cancelled 확인 필수)
+tsc 0 / eslint 0 / next build 성공 / compileall 0
+변이 누적                           Sprint 78에 22종 추가 시도 -> 22 검출
+                                    (그 중 2건은 **검사 자체의 결함**을 드러냈다 — 아래)
+```
+
+**Sprint 78에서 변이가 잡아낸 무력한 검사 2건** (변이 시험을 하지 않았다면 남았을 것):
+
+```
+검색 필터 검사    "court_name -> status 컬럼 오배선" 변이가 통과했다
+                  -> 필터가 엉뚱한 컬럼에 걸리면 0건이 되고, "모든 행이 조건을 만족한다"가
+                     공허하게 참이 된다. **구분력 단언**(최소 1건은 나와야 한다)을 먼저 두어 고침
+하네스(3곳)      가드 제거 변이가 FAIL이 아니라 **크래시**로 끝나 남은 검사가 실행되지 않았다
+                  -> `upsert_batch` / JWKS / `normalize_batch` 호출을 감싸 예외를 FAIL로 전환
+```
+
+### Sprint 78 최종 실측 (2026-08-13 세션 종료 시점)
+
+```
+python test_api_regression.py      826검사   (727 -> 826)
+python test_document_queue.py      110검사
+python test_subscription_policy.py  98검사
+python test_normalizer.py           75검사
+python test_document_status_sync.py 69검사
+python test_race_conditions.py      69검사
+python test_beta_journey.py         66검사
+python test_validation_engine.py    62검사   <- 신규 파일(28번째)
+python test_collect_documents.py    53검사
+python test_search.py               48검사
+python test_auction_identity.py     43검사
+python test_schema_hygiene.py       42검사   (UNIQUE 6 + BOM 1 + 법원목록 8 신규)
+python test_auth_jwt.py             35검사
+그 외 test_*.py                     전부 PASS (총 28개 파일)
+npm run test:frontend              106검사 (dev 서버 + FastAPI **둘 다** 필요 - cancelled 0 확인)
+tsc 0 / eslint 0 / next build 성공 / compileall 0
+```
+
+커버리지 변화(전체 스위트 기준):
+
+```
+api/auth.py                 81% -> 96%
+api/v1/search.py            82% -> 95%
+api/v1/payment_providers.py 54% -> 99%   (Sprint 78에 계약을 넓힌 뒤 재측정)
+normalizer/normalizer.py    85% -> 100%
+validator/validation_engine 52% -> 100%
+storage/database.py         80% -> 84%
+전체                        71% -> 73%   (남은 미커버는 대부분 selenium 의존 crawler/*)
+```
+
+## 2026-08-13 Sprint 85 ― 실측 갱신 (미검증 경로 4개 태운 뒤)
+
+전체 회귀를 파일별 개별 프로세스로 돌려 집계한 값이다(2회 연속 측정).
+
+```
+파일 28개                24 PASS / 4 SKIPPED / 0 FAIL
+검사 총합                2,097 PASS / 0 FAIL      <- 회차마다 ±수 건(데이터 의존 분기)
+총 소요                  16초 (파일별 순차 실행)
+```
+
+SKIPPED 4개는 설계상 그렇다: `test_db.py` / `test_docs.py` / `test_docs2.py`(실크롤,
+`ALLOW_LIVE_CRAWL=1` 필요)와 `test_beta_journey.py`(62검사까지 돌고 남은 구간은 외부 의존).
+
+이번에 늘어난 검사(파일별 증가분):
+
+```
+test_doc_storage_atomicity.py   +8   wait_for_download 완료 판정 (§8, BUGS #84)
+test_race_conditions.py         +8   admin 409 결정적 검증 (§14, BUGS #85)
+test_schema_hygiene.py          +24  init_db 옛 스키마(§10, #82) + 레거시 플래그 가드(§11, #83)
+test_search.py                  +12  프론트가 보내지만 무시되는 필터 (§6, BUGS #81)
+```
+
+측정 방법에 대한 주의(이번에 실제로 겪은 것):
+
+- **변이가 적용됐는지 반드시 확인한다.** 패턴을 바이너리로 읽은 텍스트에 `\n`으로 맞추면
+  CRLF 파일에서 0곳 일치한다 ― 변이가 안 들어간 채 "SURVIVED"로 보인다. 일치 수가 1이
+  아니면 즉시 표시하도록 스크립트를 짰다.
+- **변이가 크래시를 만들면 그건 하네스 결함이다.** 결함이 FAIL이 아니라 예외로 나타나면
+  집계에서 사라진다. 없는 칼럼 읽기/예외를 내는 함수 호출은 감싸서 FAIL로 만든다.
+- **파일을 고치는 명령과 테스트를 같은 블록에서 돌리지 않는다**(Sprint 82 규칙). 저장소가
+  OneDrive 동기화 폴더 안이라, 방금 쓴 파일을 읽는 순간과 겹치면 일시적 파싱 실패가 난다
+  (이번에 1회 발생, 재현 안 됨 ― `compileall` 0 / 전수 ast 파싱 0실패로 확인).
+
+### Sprint 85 후반 추가분 (커버리지 재측정 후)
+
+```
+test_api_regression.py          +19  문서 서빙 방어(§34, #86) + 관심물건 실패 격리(§35, #87)
+test_document_status_sync.py    +15  현재 상태 조회 방어(§12) + READY 서빙 가능성(§11, #88)
+test_schema_hygiene.py          +6   init_db 실패는 조용하지 않다 (§12, #89)
+test_checkpoint_atomicity.py    +8   저장 실패는 크롤을 멈추지 않는다 (§4, #89)
+```
+
+최종 실측(2회 연속 동일):
+
+```
+파일 28개        24 PASS / 4 SKIPPED / 0 FAIL
+검사 총합        2,146 PASS / 0 FAIL
+전체 커버리지     79%
+```
+
+모듈별 커버리지 변화(전체 스위트 기준, 이번 Sprint):
+
+```
+api/v1/documents.py      95% -> 100%
+api/v1/favorites.py      94% -> 100%
+storage/checkpoint.py    91% -> 100%
+storage/database.py      89% ->  90%   남은 미커버는 query() 한 함수(운영 호출부 0곳)
+crawler/doc_paths.py            100%   (유지)
+```
+
+`crawler/doc_crawler.py`는 23%로 남는다 — 나머지는 selenium 드라이버를 요구하는 구간이다.
+이번에 그중 브라우저 비의존 부분(`wait_for_download`)을 100% 덮었고, **호출부의 None 처리**는
+실행 대신 AST 구조 검사로 고정했다(호출부는 드라이버 안에 있다).
+
+새로 추가한 측정 규칙 하나 더:
+
+- **변이 실행은 `-B`(바이트코드 미생성)로 한다.** 같은 파일을 길이가 같게 변이하면 `.pyc`가
+  재사용되어 **앞 변이의 결과가 다음 변이의 증거로 보고된다**(2026-08-13 실측).
+
+### Sprint 85 최종 실측
+
+```
+파일 28개        24 PASS / 4 SKIPPED / 0 FAIL
+검사 총합        2,186 PASS / 0 FAIL
+전체 커버리지     81%
+```
+
+이번 Sprint에 추가된 검사(파일별):
+
+```
+test_api_regression.py          +57  문서 서빙 방어(§34) / 관심물건 실패 격리(§35) /
+                                     결제·Webhook 실패·멱등 분기(§36) /
+                                     결제 생성 실패의 완전 롤백(§37)
+test_document_status_sync.py    +15  상태 조회 방어(§12) / READY 서빙 가능성(§11)
+test_doc_storage_atomicity.py   +10  wait_for_download(§8) + 호출부 None 처리(§9)
+test_race_conditions.py         +8   admin 409 결정적 검증(§14)
+test_schema_hygiene.py          +30  옛 스키마 보완(§10) / 레거시 플래그 가드(§11) /
+                                     init_db 실패(§12)
+test_checkpoint_atomicity.py    +8   저장 실패는 크롤을 멈추지 않는다(§4)
+test_search.py                  +12  프론트가 보내지만 무시되는 필터(§6)
+```
+
+**검사가 무엇을 통과했는지 확인하는 규칙**(이번에 두 번 걸렸다):
+
+- 통과했더라도 **의도한 분기에 도달했는지** 커버리지로 확인한다. Webhook 검사 두 개가
+  매핑표에 없는 `event_type` 때문에 더 앞의 분기에서 걸려 통과하고 있었다.
+- 방어 검사는 **가드가 없으면 실제로 나쁜 일이 일어나는 조건**으로 만든다. 경로 탈출은
+  존재하는 파일을 겨눠야 하고(없으면 404가 겹친다), 안정화 판정은 반환 시점의 크기를
+  봐야 한다(경로만 보면 1회/2회 규칙이 구별되지 않는다).
+
+---
+
+## 2026-08-13 Sprint 96 ― 변이 검증을 돌릴 때의 규율 (실제로 사고가 났다)
+
+이번 스프린트에서 **변이가 걸린 채로 제품 파일이 남았다.** `crawler/doc_crawler.py`의
+`while elapsed < timeout:`이 `while True:`인 상태로 작업 트리에 남아 있었고, 회귀 스위트가
+멈추는 것으로만 드러났다. 원인은 변이 실행기가 두 가지를 하지 않아서다.
+
+```
+하위 프로세스에 타임아웃이 없었다   -> 무한 루프 변이가 실행기를 같이 멈춘다
+원본 복구가 finally에 없었다        -> 실행기가 멈추면 복구가 영영 실행되지 않는다
+```
+
+### 앞으로 변이 스크립트는 이 형태를 지킨다
+
+```python
+raw = open(p, "rb").read()                     # 바이너리로 읽고
+bom = raw.startswith(b"ï»¿")           # BOM 유무를 기억한다
+src = raw.decode("utf-8-sig" if bom else "utf-8")
+
+def run():
+    try:
+        r = subprocess.run([sys.executable, TEST], capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return -9, ["<TIMEOUT>"]               # 정지도 결과로 다룬다
+    ...
+
+try:
+    for label, old, new in MUT:
+        write(src.replace(old, new, 1)); c, f = run(); write(src)
+finally:
+    write(src)                                 # 반드시 원본으로 되돌린다
+```
+
+BOM을 기억했다가 그대로 다시 쓰는 부분은 예전 사고(복구가 BOM을 새로 붙여
+`test_schema_hygiene.py`의 BOM 가드를 깨뜨렸다)에서 온 것이다. 두 사고를 합쳐서
+**"바이너리로 읽고, 타임아웃을 주고, finally로 되돌린다"**가 이 저장소의 규율이다.
+
+### 매 스프린트 끝에 확인하는 것
+
+```
+git diff --stat <변이 대상 파일>     변이가 남지 않았는가
+git diff --name-only 로 BOM 대조     BOM이 새로 붙거나 사라지지 않았는가
+```
+
+### 가짜 시계를 쓰는 테스트는 회차를 스스로 묶는다
+
+`wait_for_download()` 검사는 `time.sleep`을 가로채 실시간을 쓰지 않는다. 그러면 루프
+종료 조건을 없애는 변이가 **실패가 아니라 정지**로 나타난다. 가짜 sleep이 폴링 횟수를
+직접 세어 `timeout + 3`을 넘으면 예외를 던지게 했다 ― 같은 변이가 `[FAIL]` 한 줄이 된다.
+시간을 가로채는 테스트를 새로 쓸 때 같은 장치를 넣는다.
+
+### 프런트엔드 게이트는 두 갈래다
+
+```
+node --test "tests/**/*.test.mjs"        frontend-contract는 살아 있는 Next 서버가 필요하다
+node --test tests/format.test.mjs        서버 없이 도는 순수 단위 (13/13)
+```
+
+서버가 없을 때 `npm run test:frontend`가 실패하는 것은 **환경 조건이지 결함이 아니다**
+(`### dev 서버가 없을 때의 규약` 참고). 서버를 띄울 수 없는 상황에서는 순수 단위 쪽만
+돌리고 그 사실을 함께 남긴다. 또한 `node --test tests/`처럼 디렉터리를 그대로 넘기면
+`MODULE_NOT_FOUND`가 난다 ― 반드시 글롭을 쓴다.
+
+---
+
+## 2026-08-13 Sprint 98 ― 변이 검증이 **거짓말을 했다**: `.pyc` 캐시
+
+이번 세션에서 실제로 겪은 것 중 가장 위험한 함정이다. 변이 결과 자체가 틀릴 수 있다.
+
+### 무슨 일이 있었나
+
+`wait_for_download`의 "연속 2회" 검사가 **소스는 멀쩡한데 계속 실패**했다.
+파일을 다시 읽어도, `git diff`를 봐도 변이는 남아 있지 않았다. 그런데 실행하면 틀렸다.
+
+```
+crawler/doc_crawler.py            소스: if stable_count >= 2:   (정상)
+crawler/__pycache__/doc_crawler.*.pyc  실행된 것: >= 0          (변이)
+```
+
+### 왜 Python이 캐시를 버리지 않았나
+
+`.pyc` 헤더는 소스의 **(mtime, size)** 만 기록한다. 그런데
+
+```
+"if stable_count >= 2:"   와   "if stable_count >= 0:"   는 바이트 길이가 같다
+```
+
+변이를 쓰고 → import(=pyc 생성) → 원본을 복구하는 일이 **같은 초 안에** 일어나면
+mtime도 같아진다. 크기도 같고 mtime도 같으니 Python은 **낡은 바이트코드를 그대로 쓴다.**
+이 저장소의 변이는 대부분 `>= 2` -> `>= 0`, `<=` -> `<`, `True` -> `False`처럼
+**길이가 같은 치환**이라 이 조건에 정확히 들어맞는다.
+
+### 어느 방향으로도 거짓말한다
+
+```
+변이가 살아남은 것처럼 보인다   실행된 것은 원본 바이트코드였다   -> 없는 구멍을 "구멍 없음"으로 오인
+원본이 실패하는 것처럼 보인다   실행된 것은 변이 바이트코드였다   -> 멀쩡한 코드를 고치려 든다
+```
+
+이번엔 두 번째로 나타나서 알아챘다. **첫 번째로 나타났다면 조용히 틀린 결론을 남겼을 것이다.**
+
+### 규율 ― 변이 실행기는 반드시 이렇게 한다
+
+```python
+def write(t):
+    open(target, "wb").write(...)
+    purge(target)                      # __pycache__/<모듈>.*.pyc 삭제
+
+subprocess.run([sys.executable, "-B", test],       # -B: 새 pyc를 쓰지 않는다
+               env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+               timeout=300)
+```
+
+`-B`만으로는 **부족하다** ― 쓰지 않을 뿐 **이미 있는 것은 그대로 쓴다.**
+지우는 것과 쓰지 않는 것을 **둘 다** 해야 한다.
+
+Sprint 96에서 정리한 규율(하위 프로세스 타임아웃 + `finally` 복구 + BOM 보존)에
+**캐시 무효화**를 더한다. 재사용 가능한 실행기를 이 형태로 만들어 두고, 결론을 문서에
+적기 전에 그것으로 한 번 더 돌린다.
+
+### 이번에 다시 돌린 결과 (전부 캐시 안전판에서 재확인)
+
+```
+wait_for_download   8종 중 7종 검출 (.crdownload 제외는 증명된 중복 - 결론 유지)
+search_presets      3종 전부 검출
+admin LEFT JOIN     1종에서 검사 5개 검출
+payments 연결       2종 전부 검출
+```
+
+결론은 모두 그대로였다. 다만 **그것을 확인하기 전까지는 알 수 없었다**는 것이 요점이다.

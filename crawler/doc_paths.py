@@ -45,8 +45,40 @@ _PRIMARY_EXT = {"spec": "pdf", "status": "json", "appraisal": "pdf"}
 
 
 def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bool:
-    ext = _PRIMARY_EXT.get(doc_type, "pdf")
-    path = os.path.join(get_doc_dir(court_code, case_no, item_no), doc_type + "." + ext)
+    """이 문서가 "수집 완료"로 인정할 수 있는 상태인지.
+
+    `doc_type`은 대소문자를 가리지 않는다. 이 저장소는 문서 종류를 **대문자**로 다루는 쪽이
+    훨씬 많은데(`document_status.doc_type`, `api/v1/documents.py:DOC_TYPE_FILES`,
+    아래 `CANONICAL_DOC_FILENAME`) 이 함수만 소문자 키를 쓰고 있었다.
+
+    ★ 예전 구현은 `_PRIMARY_EXT.get(doc_type, "pdf")`였다. 대문자를 넘기면 사전에 없으니
+    **조용히 "pdf"로 떨어져 틀린 답**을 냈다. 그리고 그 틀림이 종류마다 달랐다:
+
+        doc_exists(..., "SPEC")       -> "SPEC.pdf"  Windows는 대소문자를 구분하지 않아
+                                        spec.pdf에 우연히 맞는다 (정답)
+        doc_exists(..., "APPRAISAL")  -> 위와 같은 이유로 우연히 정답
+        doc_exists(..., "STATUS")     -> "STATUS.pdf" — status의 기준 파일은 **json**인데
+                                        기본값 pdf로 떨어져 **항상 False** (오답)
+
+    2/3이 우연히 맞는 것이 가장 나쁘다 — 잘못된 호출이 대부분의 경우 정상으로 보이다가
+    STATUS에서만 조용히 틀린다. 그 오답의 방향도 나쁘다: "완료됐는데 미완료로 보임"이라
+    이미 수집된 문서를 영구히 재수집 대상으로 남긴다(이 파일이 BUGS #22/#50/#65에서
+    반복해 경고해 온 바로 그 함정의 반대 방향).
+
+    또한 예전 구현은 파일명을 **호출자가 준 대소문자 그대로** 만들었다. 대소문자를 구분하는
+    파일시스템에서는 SPEC/APPRAISAL조차 False가 된다. 이제 항상 소문자 파일명을 쓴다.
+
+    모르는 `doc_type`은 조용히 pdf로 넘기지 않고 예외를 던진다 — 바로 아래
+    `canonical_doc_path()`가 이미 취하고 있는 태도와 같다(알 수 없는 종류에 그럴듯한
+    답을 지어내지 않는다).
+    """
+    key = (doc_type or "").lower()
+    if key not in _PRIMARY_EXT:
+        raise ValueError(
+            "알 수 없는 doc_type: %r (가능한 값: %s)"
+            % (doc_type, ", ".join(sorted(_PRIMARY_EXT)))
+        )
+    path = os.path.join(get_doc_dir(court_code, case_no, item_no), key + "." + _PRIMARY_EXT[key])
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 

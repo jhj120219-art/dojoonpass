@@ -224,7 +224,7 @@ def search(
             payload = decode_supabase_jwt(credentials.credentials)
             user_id = payload.get("sub")
         except JWTError:
-            logger.debug("search: 토큰 검증 실패 — 비로그인으로 처리")
+            logger.debug("search: 토큰 검증 실패 ― 비로그인으로 처리")
             user_id = None
 
     conn = get_connection()

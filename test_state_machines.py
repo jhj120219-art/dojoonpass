@@ -144,6 +144,28 @@ def test_subscription_transitions_forbidden():
         check_raises("assert raises for %s -> %s" % (cur, tgt),
                      lambda c=cur, t=tgt: assert_subscription_transition(c, t))
 
+    # ── 아는 상태가 아니면 거부한다 (2026-08-13 Sprint 99, 커버리지가 지목) ──
+    #
+    # `assert_subscription_transition()`에는 관문이 **둘** 있다.
+    #
+    #     if target not in {s.value for s in SubscriptionStatus}:  # (A) 아는 상태인가
+    #     if not can_transition_subscription(current, target):     # (B) 허용된 전이인가
+    #
+    # 위 목록은 전부 (B)에서 걸리므로 **(A)는 한 번도 실행된 적이 없었다.** 둘은 막는
+    # 것이 다르다 ― (B)는 "아는 상태끼리 잘못된 순서", (A)는 **오타나 새 상태값처럼
+    # 우리가 모르는 문자열**이다.
+    #
+    # (A)가 없으면 그런 값은 `SUBSCRIPTION_TRANSITIONS.get(current, set())`에서
+    # 조용히 False가 되어 결국 같은 예외가 나긴 한다. 그래서 지금은 동작이 같다.
+    # 그럼에도 검사를 두는 이유: 전이표에 `"*"` 같은 와일드카드나 기본 허용이 한 줄
+    # 들어오는 순간 (A)만이 유일한 방어가 된다. 그 줄은 **모르는 상태를 열어 주는
+    # 형태로** 들어오기 마련이다.
+    for unknown in ("ACTIVE_", "활성", "active", "", "DELETED"):
+        check("모르는 상태값은 거부한다: %r" % (unknown,),
+              can_transition_subscription(S.ACTIVE, unknown), False)
+        check_raises("모르는 상태값에 예외: %r" % (unknown,),
+                     lambda t=unknown: assert_subscription_transition(S.ACTIVE.value, t))
+
 
 # ---------------------------------------------------------------------------
 # 3. 유예 기간(GRACE_PERIOD) 계산 — docs/BUGS.md #16과 같은 축의 회귀

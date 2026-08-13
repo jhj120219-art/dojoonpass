@@ -11,7 +11,7 @@
 - 데이터 저장소: **SQLite (`auction.db`)** — PostgreSQL/Supabase 아님
 - Router가 SQL을 직접 실행하는 구조 (별도 Service 레이어 없음)
 - 실제 구현 파일: `api_server.py`, `api/v1/search.py`, `api/v1/item.py`
-- DB 커넥션 모듈 `storage/database.py`는 `.gitignore`(`storage/` 전체) 규칙 때문에 **git 이력에는** 없지만, 실제 작업 디렉터리에는 파일이 존재하며 읽을 수 있다(2026-08-06 재확인, `docs/CLAUDE.md` 정정 사항과 동일). "미확인 상태"였던 이전 서술은 stale했음 — 아래 검색 인덱스/성능 전략 절의 "미확인" 서술도 실제로는 파일을 열어 확인 가능하다는 전제로 다시 봐야 한다.
+- DB 커넥션 모듈 `storage/database.py`는 **git이 정상적으로 추적한다** (2026-08-13 Sprint 75 실측 정정). 예전에는 `.gitignore`의 `storage/` 한 줄 때문에 git 이력에서 빠져 있었으나, 2026-08-11 Sprint 51에 규칙이 정밀화되어 `storage/*.py`와 `storage/migrations/*.sql`는 추적 대상이다(총 23개 파일). "미확인 상태"였던 이전 서술은 stale했음 — 아래 검색 인덱스/성능 전략 절의 "미확인" 서술도 실제로는 파일을 열어 확인 가능하다는 전제로 다시 봐야 한다.
 
 인증(Supabase Auth)과 경매 데이터(SQLite)는 분리된 구조다.
 
@@ -187,7 +187,7 @@ GET /api/v1/stats
 
 ## 알려진 문제점
 
-- ~~`storage/database.py`가 저장소에 없음~~ → 2026-08-06 정정. git 이력에는 없지만(`.gitignore`) 작업 디렉터리에는 실재하며 읽을 수 있음. `row_factory=sqlite3.Row` 등 실제 커넥션 옵션은 `docs/backend.md` 참고
+- ~~`storage/database.py`가 저장소에 없음~~ → 2026-08-13 Sprint 75 재정정. Sprint 51의 `.gitignore` 정밀화 이후 **git이 추적한다.** 작업 디렉터리에도 실재한다. `row_factory=sqlite3.Row` 등 실제 커넥션 옵션은 `docs/backend.md` 참고
 - 설계 문서(v1.0~v2.1)와 실제 구현 코드 간 불일치:
   - 페이지네이션: 설계는 cursor / 실제는 offset (여전히 유효, PM 결정으로 offset 유지)
   - ~~`status` 필터, `sort_by`: 설계만 있고 미구현~~ → 2026-08-06 재확인 결과 둘 다 구현되어 있음

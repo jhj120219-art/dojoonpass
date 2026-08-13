@@ -28,14 +28,20 @@ ADJACENT_SIDO_PAIRS = {
 # 가격 오차 허용 범위 (원)
 PRICE_TOLERANCE = 1000
 
-def extract_sido(text: str) -> str:
-    if not text:
-        return ""
-    for sido, variants in SIDO_MAP.items():
-        for v in variants:
-            if v in text:
-                return sido
-    return ""
+# extract_sido는 normalizer의 것을 그대로 쓴다 (2026-08-13 Sprint 78).
+#
+# 예전에는 이 파일에 **바이트 단위로 동일한 복사본**이 따로 있었다. 위 SIDO_MAP 주석이
+# "한쪽만 남기고 재사용한다"며 데이터(SIDO_PATTERNS)는 이미 합쳐 뒀는데, **그 데이터를
+# 해석하는 함수는 합쳐지지 않은 채 남아 있었다.**
+#
+# 같은 판정을 하는 함수가 두 벌이면 한쪽만 고쳐질 수 있다. 실제로 Sprint 78에
+# normalizer 쪽 판정 규칙을 고쳤을 때(가장 앞선 표기가 이기도록), 이 복사본을 그대로
+# 뒀다면 **크롤 데이터는 제주로 저장되는데 검증은 세종으로 판정**하는 상태가 됐을 것이다.
+# 그 불일치는 address_mismatch 오탐으로 나타나 화면에 "검증실패"로 뜬다.
+#
+# 재노출(re-export)이라 `from validator.validation_engine import extract_sido`를 쓰던
+# 기존 호출부는 그대로 동작한다.
+from normalizer.normalizer import extract_sido  # noqa: E402  (재노출)
 
 def parse_price(price_str: str) -> int:
     if not price_str or price_str == "-":

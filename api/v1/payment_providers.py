@@ -49,29 +49,52 @@ class WebhookEvent:
 
 
 class PaymentProvider:
+    # 미구현 메서드는 **반드시 사유가 담긴** NotImplementedError를 던진다 (2026-08-13 Sprint 78).
+    #
+    # 예전에는 전부 `raise NotImplementedError`(메시지 없음)였다. 그 예외는 조용히 사라지지
+    # 않고 사용자·운영자에게 그대로 노출되는데, 메시지가 비어 있어 **원인이 통째로 빠졌다.**
+    #
+    #     api/v1/payments.py:refund_payment()  except NotImplementedError as e:
+    #         log_payment_event(..., error_message=str(e))   -> payment_logs.error_message = ""
+    #         raise RefundError(..., f"환불 처리에 실패했습니다: {e}")  -> "...실패했습니다: "
+    #
+    # 실측(Sprint 78 신규 검사): `PAYMENT_PROVIDER=kginicis`로 환불을 시도하면 원장에
+    # `status=FAILED, error_message=''`가 남는다. 실패한 사실은 추적되지만 **왜 실패했는지는
+    # 어디에도 없다.** 이 저장소가 진단에 대해 반복해서 지킨 원칙("조용히 넘기면 원인을
+    # 추적할 수 없으므로 반드시 남긴다")이 이 경로에서만 빠져 있었다.
+    #
+    # 어느 provider의 어느 단계인지까지 담는다 — provider를 교체하는 전환기에는 "무엇이 아직
+    # 준비되지 않았는가"가 바로 그 두 정보다. TossProvider/PortOneProvider가 이미 같은 방식으로
+    # 사유를 담고 있었으므로(폐기 안내), 기본 구현을 그 수준에 맞춘 것이다.
+    def _not_implemented(self, method: str) -> NotImplementedError:
+        return NotImplementedError(
+            "%s.%s()는 아직 구현되지 않았습니다 (PG 실연동 대기 중)"
+            % (type(self).__name__, method)
+        )
+
     def charge(self, payment_type: str, amount: int, metadata: Optional[str]) -> ChargeResult:
-        raise NotImplementedError
+        raise self._not_implemented("charge")
 
     def create_order(self, payment_type: str, amount: int, metadata: Optional[str]) -> OrderResult:
         """주문 생성 — 실제 PG에서는 클라이언트가 결제창을 열 때 쓸 order_id를 발급받는 단계."""
-        raise NotImplementedError
+        raise self._not_implemented("create_order")
 
     def confirm_payment(self, order_id: str, pg_transaction_id: str, amount: int) -> ChargeResult:
         """결제 승인 — 사용자가 PG 결제창에서 결제를 마친 뒤, 서버가 최종 승인을 확정하는 단계."""
-        raise NotImplementedError
+        raise self._not_implemented("confirm_payment")
 
     def cancel_payment(self, pg_transaction_id: str, reason: Optional[str] = None) -> ChargeResult:
         """결제 취소/환불."""
-        raise NotImplementedError
+        raise self._not_implemented("cancel_payment")
 
     def verify_payment(self, pg_transaction_id: str) -> ChargeResult:
         """결제 검증 — 클라이언트가 준 값을 그대로 믿지 않고, 서버가 PG API로 실제 승인 여부를
         독립적으로 재확인하는 단계(실연동 시 보안상 반드시 필요)."""
-        raise NotImplementedError
+        raise self._not_implemented("verify_payment")
 
     def handle_webhook(self, payload: dict[str, Any]) -> WebhookEvent:
         """PG가 보내는 Webhook payload를 처리해 내부 이벤트로 정규화한다(서명 검증 포함, 실연동 시)."""
-        raise NotImplementedError
+        raise self._not_implemented("handle_webhook")
 
     def verify_webhook_signature(self, raw_body: bytes, headers: dict[str, str]) -> bool:
         """Webhook 요청이 정말 이 PG에서 온 것인지 검증한다.
@@ -158,7 +181,7 @@ class MockProvider(PaymentProvider):
         """
         secret = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
         if not secret:
-            logger.warning("PAYMENT_WEBHOOK_SECRET 미설정 — Webhook 서명 검증을 통과시키지 않습니다")
+            logger.warning("PAYMENT_WEBHOOK_SECRET 미설정 ― Webhook 서명 검증을 통과시키지 않습니다")
             return False
         # 헤더 이름은 대소문자를 가리지 않는다(HTTP 표준).
         provided = ""
@@ -219,6 +242,17 @@ _PROVIDERS = {
 # 폐기 예정 PG 후보. get_payment_provider()가 선택 사실을 경고로 남긴다 — 운영 .env에
 # 남아있는 옛 값을 조용히 지나치지 않도록.
 _DEPRECATED_PROVIDERS = ("toss", "portone")
+
+# provider 이름의 허용값 (2026-08-13 Sprint 78).
+#
+# `_PROVIDERS`가 이 저장소에서 provider 이름의 단일 출처다 — webhook 수신 경로가
+# `get_payment_provider_by_name()`으로 이 맵에 대고 검증하므로, `payment_webhooks.provider`에
+# 저장될 수 있는 값의 집합이 곧 이 맵의 키다. 조회 쪽(Admin 목록 필터)이 같은 집합을 봐야
+# "오타"와 "그 PG의 노티가 없다"를 구분할 수 있다.
+#
+# 목록을 손으로 다시 적지 않고 맵에서 도출한다 — `api/v1/admin.py`가 Enum에서 허용값을
+# 도출하기로 정한 것과 같은 이유다(손으로 적으면 provider가 늘 때 조용히 어긋난다).
+VALID_PROVIDER_NAMES = tuple(_PROVIDERS)
 
 
 def get_payment_provider_by_name(name: str) -> PaymentProvider:

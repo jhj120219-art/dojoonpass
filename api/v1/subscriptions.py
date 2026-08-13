@@ -227,6 +227,36 @@ def renew(conn, subscription_id: int, period_days: int,
 
     연장 기준점: 아직 만료 전이면 **기존 만료 시각에서** 이어 붙이고(사용자가 손해 보지
     않도록), 이미 지났으면 **지금부터** 센다(과거 시점에서 더하면 갱신하자마자 또 만료된다).
+
+    ## 동시 갱신 방어 (2026-08-13 Sprint 78)
+
+    이 함수는 read -> compute -> write이고, 예전에는 write가 `WHERE id=?`뿐이었다. 그래서
+    두 갱신이 겹치면 **뒤엣것이 앞엣것의 연장을 통째로 덮어썼다.** 결정적으로 재현했다
+    (SELECT와 UPDATE 사이에 다른 커넥션의 갱신을 끼워 넣는 방식, journal_mode=delete/wal
+    양쪽 동일):
+
+        기존 만료 2026-06-25, 30일 갱신 2건(=결제 2건)
+          기대: 60일 연장   실제: **30일**   -> 사용자가 산 기간 한 주기를 잃는다
+
+    같은 모듈의 `change_status()`는 이미 "조건부 UPDATE + rowcount 확인"으로 이 부류를
+    막고 있었다(registry.py §19 / payments.py 환불과 같은 패턴). 돈을 받고 기간을 늘리는
+    쪽에만 그 가드가 없었다.
+
+    **`BEGIN IMMEDIATE`를 쓰지 않는 이유**: 이 함수는 `change_status()`와 트랜잭션 계약이
+    다르다 — 호출부가 트랜잭션을 소유한다(테스트/호출부가 `BEGIN` 안에서 부른다). 여기서
+    새 트랜잭션을 시작하면 "cannot start a transaction within a transaction"으로 기존
+    계약이 깨진다. 그래서 낙관적 잠금(읽은 값을 UPDATE의 WHERE에 다시 거는 방식)만 쓴다 —
+    잠금 모드와 무관하게 동작하고, 계약을 바꾸지 않는다.
+
+    충돌을 감지하면 조용히 덮어쓰는 대신 `ConcurrentStatusChange`를 던진다. 호출부는
+    **다시 읽어 다시 계산**해야 한다(재시도하면 두 주기가 정확히 누적된다). 갱신은 돈이
+    걸린 조작이라 "성공했다고 응답했지만 기간이 늘지 않은" 상태를 만들면 안 된다.
+
+    **던질 때 롤백하지 않는다** — `change_status()`와 다른 점이다. 그쪽은 트랜잭션을
+    소유하므로 스스로 되돌려야 하지만, 여기서 롤백하면 같은 트랜잭션에 담긴 호출부의 다른
+    작업(결제 기록 등)까지 함께 지운다. 대신 호출부가 **재시도 전에 롤백해야 한다** —
+    실패한 UPDATE가 열어 둔 쓰기 트랜잭션을 닫지 않으면 다음 쓰기가 `database is locked`로
+    막힌다(`test_subscription_policy.py` §11이 이 계약을 고정한다).
     """
     now = at or datetime.now()
     row = conn.execute("SELECT * FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
@@ -244,7 +274,7 @@ def renew(conn, subscription_id: int, period_days: int,
             # 갱신하자마자 또 만료된다) 조용히 넘어가면 안 된다 — 사용자가 남은 기간을
             # 잃는 쪽이므로 반드시 드러나야 한다 (2026-08-11 Sprint 56).
             logger.warning(
-                "구독 %s의 만료 시각을 해석할 수 없습니다 (expires_at=%r) — "
+                "구독 %s의 만료 시각을 해석할 수 없습니다 (expires_at=%r) ― "
                 "기존 잔여 기간을 이어 붙이지 못하고 지금부터 다시 셉니다",
                 subscription_id, row["expires_at"]
             )
@@ -253,10 +283,22 @@ def renew(conn, subscription_id: int, period_days: int,
     if row["status"] != SubscriptionStatus.ACTIVE:
         assert_subscription_transition(row["status"], SubscriptionStatus.ACTIVE)
 
-    conn.execute(
-        "UPDATE subscriptions SET status=?, expires_at=?, updated_at=? WHERE id=?",
-        (SubscriptionStatus.ACTIVE.value, new_expires, now.isoformat(), subscription_id),
+    # 읽었던 값(status/expires_at)을 WHERE에 다시 건다. 그 사이 다른 갱신이나 상태 변경이
+    # 먼저 반영됐다면 rowcount==0이 되어 이 UPDATE는 아무 행도 건드리지 않는다.
+    # `expires_at`은 NULL일 수 있으므로(무기한 구독) `=` 대신 `IS`로 비교해야 한다 —
+    # `NULL = NULL`은 SQL에서 참이 아니라 NULL이라, `=`를 쓰면 무기한 구독의 갱신이
+    # **항상** 충돌로 오판된다.
+    cursor = conn.execute(
+        "UPDATE subscriptions SET status=?, expires_at=?, updated_at=?"
+        " WHERE id=? AND status=? AND expires_at IS ?",
+        (SubscriptionStatus.ACTIVE.value, new_expires, now.isoformat(),
+         subscription_id, row["status"], row["expires_at"]),
     )
+    if cursor.rowcount == 0:
+        raise ConcurrentStatusChange(
+            "다른 요청이 먼저 구독을 갱신/변경했습니다"
+            f" (기대한 현재 상태: {row['status']}, 만료: {row['expires_at']})"
+        )
     logger.info("구독 갱신: id=%s expires %s -> %s (by=%s)",
                 subscription_id, row["expires_at"], new_expires, actor)
     updated = conn.execute("SELECT * FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()

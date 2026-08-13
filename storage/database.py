@@ -348,6 +348,7 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
     """
     conn = get_connection()
     added = 0
+    refreshed = 0
     skipped_expired = 0
     try:
         now = datetime.now().isoformat()
@@ -371,9 +372,35 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                 """, (court_code, case_no, item_no, doc_type, priority, auction_date, now))
                 if cur.rowcount > 0:
                     added += 1
+                elif auction_date:
+                    # 이미 있는 행 — 기일이 바뀌었으면 최신 값으로 맞춘다 (2026-08-13 Sprint 74).
+                    #
+                    # 유찰 후 재매각은 한국 경매에서 일상이고, 그때 같은
+                    # (법원,사건,물건)에 새 매각기일이 잡힌다. 그런데 위 INSERT는
+                    # OR IGNORE라 **기존 행을 통째로 건드리지 않아** 큐는 옛 기일을 계속 들고 있었다.
+                    #
+                    # 그 결과가 나쁘다. doc_worker의 2차 방어선은 큐에 저장된 auction_date를 보고
+                    # `auction_date < today`면 SKIPPED_EXPIRED로 끝낸다. 즉 **기일이 미래로 다시
+                    # 잡힌 살아 있는 사건이, 남아 있던 옛 날짜 때문에 수집 대상에서 빠졌다.**
+                    # refresh_queue_priority()도 같은 stale 값으로 우선순위를 계산해 함께 틀렸다.
+                    # (2026-08-13 실측: 큐와 실제 기일이 다른 18행, 그중 9행은 기일이 미래였다)
+                    #
+                    # ★ status는 바꾸지 않는다. done/failed/SKIPPED_EXPIRED를 되살려 다시 수집할
+                    #   것인지는 재수집 정책이라 제품 판단이다(docs/roadmap.md 결정 대기).
+                    #   여기서 고치는 것은 큐가 자기 필드에 **사실과 다른 값**을 들고 있는 것뿐이다.
+                    #   그것만으로 pending 행의 오판은 사라진다.
+                    upd = conn.execute("""
+                        UPDATE document_queue
+                           SET auction_date = ?, priority = ?
+                         WHERE court_code = ? AND case_no = ? AND item_no = ? AND doc_type = ?
+                           AND IFNULL(auction_date, '') <> ?
+                    """, (auction_date, priority, court_code, case_no, item_no, doc_type,
+                          auction_date))
+                    refreshed += upd.rowcount
         conn.commit()
-        logger.info("document_queue 적재: %d건 (기일경과로 사전제외: %d건)", added, skipped_expired)
-        return {"added": added, "skipped_expired": skipped_expired}
+        logger.info("document_queue 적재: %d건 (기일 갱신: %d건, 기일경과로 사전제외: %d건)",
+                    added, refreshed, skipped_expired)
+        return {"added": added, "refreshed": refreshed, "skipped_expired": skipped_expired}
     finally:
         conn.close()
 
@@ -422,9 +449,36 @@ def reset_stale_queue() -> None:
       해당하지 않으므로 자동으로 재시도 대상에서 제외된다. 다만 이는 "현재 시점
       기준 검색 불가"의 기록일 뿐 "영구 재수집 불가"를 의미하지 않으므로(PM 확정
       사항), 필요 시 별도 운영 스크립트로 수동 재시도(pending 복귀)는 가능하다.
+
+    ## 화면 상태를 함께 되돌린다 (2026-08-13 Sprint 78, BUGS #73)
+
+    `mark_queue_failed()`는 "재시도가 소진된 **최종** 실패만 화면에 반영한다 — 중간
+    재시도까지 FAILED로 바꾸면 다음 시도에서 성공할 문서가 잠깐 '실패'로 보였다가
+    돌아온다"는 규칙으로 `document_status='FAILED'`를 쓴다. 그런데 이 함수가 그 행을
+    `pending` + `retry_count=0`(완전히 새 시도)으로 되돌리면서 **화면 상태는 FAILED로
+    남겨두었다.** 실측:
+
+        복구 전  queue=failed   document_status=FAILED
+        복구 후  queue=pending  document_status=FAILED   <- 재시도 대기인데 "수집실패"
+
+    같은 모듈의 #50 규약("화면이 읽는 것은 document_status다 — 같은 트랜잭션에서 함께
+    갱신해야 두 기록이 갈라지지 않는다")을 이 경로만 지키지 않고 있었다. 새 정책을
+    정하는 것이 아니라 위 두 규칙을 그대로 적용한다.
+
+    **`FAILED`인 행만 되돌린다.** `in_progress` 회수분이나 이전에 수집에 성공했던
+    문서(READY)까지 COLLECTING으로 바꾸면, **파일이 실제로 있는 문서를 "수집중"으로
+    가려** 사용자가 볼 수 있는 것을 못 보게 된다(정반대 방향의 결함).
     """
     conn = get_connection()
     try:
+        # 되돌릴 대상을 **먼저** 식별한다 — UPDATE 뒤에는 어느 행이 failed였는지 알 수 없다.
+        recovered = conn.execute("""
+            SELECT court_code, case_no, item_no, doc_type FROM document_queue
+            WHERE status='failed'
+              AND last_attempt_at IS NOT NULL
+              AND datetime(last_attempt_at) < datetime('now', '-1 day')
+        """).fetchall()
+
         conn.execute("""
             UPDATE document_queue
             SET status='pending', retry_count=0
@@ -439,7 +493,34 @@ def reset_stale_queue() -> None:
               AND last_attempt_at IS NOT NULL
               AND datetime(last_attempt_at) < datetime('now', '-10 minutes')
         """)
+
+        # 큐 변경과 **같은 트랜잭션**에서 화면 상태를 맞춘다(#50).
+        #
+        # ★ 화면 동기화 실패가 **큐 복구를 되돌리면 안 된다.** 이 함수의 본 작업은
+        # "재시도할 행을 pending으로 회수하는 것"이고, 화면 상태는 그것에 딸린 반영이다.
+        # 예외를 그대로 올리면 커밋 전에 빠져나가 회수 UPDATE까지 사라지고, doc_worker는
+        # 아무것도 회수되지 않은 채 시작한다 — 고치려던 것보다 나쁜 결과다.
+        # (`_set_document_status()`가 대상 행이 없을 때 예외 대신 경고 + False를 돌려주는
+        #  것과 같은 판단이다. 실제로 `document_status`/`auction_item`이 없는 축소 스키마에서
+        #  이 경로가 통째로 죽는 것을 기존 테스트가 잡아냈다 — Sprint 78.)
+        restored = 0
+        for row in recovered:
+            try:
+                if _current_document_status(conn, row["court_code"], row["case_no"],
+                                            row["item_no"], row["doc_type"]) != "FAILED":
+                    continue
+                if _set_document_status(conn, row["court_code"], row["case_no"],
+                                        row["item_no"], row["doc_type"], "COLLECTING"):
+                    restored += 1
+            except Exception as exc:  # noqa: BLE001 - 화면 반영 실패로 큐 회수를 잃지 않는다
+                logger.warning(
+                    "재시도 복구 중 화면 상태 갱신 실패 (법원=%s, 사건=%s, 물건=%s, 문서=%s): %s",
+                    row["court_code"], row["case_no"], row["item_no"], row["doc_type"], exc)
+
         conn.commit()
+        if recovered or restored:
+            logger.info("document_queue 재시도 복구: %d건 pending 복귀, 화면 상태 %d건 "
+                        "FAILED -> COLLECTING", len(recovered), restored)
     finally:
         conn.close()
 
@@ -476,6 +557,45 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
 QUEUE_TO_DOC_STATUS_TYPE = {"spec": "SPEC", "status": "STATUS", "appraisal": "APPRAISAL"}
 
 
+def _document_status_item_id(conn, court_code: str, case_no: str, item_no: str):
+    """큐 키(법원,사건,물건) -> `document_status.item_id`. 없으면 None.
+
+    2026-08-13 Sprint 78에 `_set_document_status()`에서 이 조회만 떼어냈다 — 읽기 쪽
+    (`_current_document_status`)이 **같은 JOIN 경로**를 써야 하기 때문이다. 조회를 두 벌
+    두면 한쪽만 고쳐졌을 때 "쓰기는 찾는데 읽기는 못 찾는" 어긋남이 생긴다.
+    """
+    row = conn.execute(
+        """
+        SELECT ai.id FROM auction_item ai
+        JOIN auction_case ac ON ac.id = ai.case_id
+        WHERE ac.court_code = ? AND ai.case_no = ? AND ai.item_no = ?
+        """,
+        (court_code, case_no, item_no),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _current_document_status(conn, court_code: str, case_no: str, item_no: str,
+                             doc_type: str):
+    """현재 화면 상태 문자열. 대상이 없거나 아직 기록이 없으면 None.
+
+    "지금 FAILED인 행만 되돌린다"처럼 **조건부**로 상태를 바꿀 때 쓴다
+    (`reset_stale_queue()` — 이미 READY인 문서를 COLLECTING으로 덮으면 실제로 볼 수 있는
+    문서를 가린다).
+    """
+    ds_type = QUEUE_TO_DOC_STATUS_TYPE.get(doc_type)
+    if not ds_type:
+        return None
+    item_id = _document_status_item_id(conn, court_code, case_no, item_no)
+    if item_id is None:
+        return None
+    row = conn.execute(
+        "SELECT status FROM document_status WHERE item_id=? AND doc_type=?",
+        (item_id, ds_type),
+    ).fetchone()
+    return row["status"] if row else None
+
+
 def _set_document_status(conn, court_code: str, case_no: str, item_no: str,
                          doc_type: str, status: str) -> bool:
     """`document_status`를 갱신한다. 갱신했으면 True.
@@ -502,15 +622,9 @@ def _set_document_status(conn, court_code: str, case_no: str, item_no: str,
         return False
 
     # 큐는 (court_code, case_no, item_no)로, document_status는 auction_item.id로 식별한다.
-    row = conn.execute(
-        """
-        SELECT ai.id FROM auction_item ai
-        JOIN auction_case ac ON ac.id = ai.case_id
-        WHERE ac.court_code = ? AND ai.case_no = ? AND ai.item_no = ?
-        """,
-        (court_code, case_no, item_no),
-    ).fetchone()
-    if not row:
+    # 조회는 `_document_status_item_id()` 하나가 담당한다(읽기 쪽과 같은 경로 — Sprint 78).
+    item_id = _document_status_item_id(conn, court_code, case_no, item_no)
+    if item_id is None:
         # 큐에는 있는데 auction_item에 없는 경우. 조용히 넘기면 왜 상태가 안 변하는지
         # 추적할 수 없으므로 반드시 남긴다.
         logger.warning("document_status 갱신 대상 없음 (법원=%s, 사건=%s, 물건=%s)",
@@ -522,7 +636,7 @@ def _set_document_status(conn, court_code: str, case_no: str, item_no: str,
         INSERT OR REPLACE INTO document_status (item_id, doc_type, status, updated_at)
         VALUES (?, ?, ?, ?)
         """,
-        (row["id"], ds_type, status, datetime.now().isoformat()),
+        (item_id, ds_type, status, datetime.now().isoformat()),
     )
     return True
 

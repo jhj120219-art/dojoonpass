@@ -80,7 +80,7 @@ def _get_jwk(kid: str):
             except Exception as exc:
                 # 네트워크/파싱 실패는 인증 실패로만 이어지게 하고 서버를 죽이지 않는다.
                 # 비밀값이 로그에 남지 않도록 예외 타입만 남긴다.
-                logger.warning("JWKS 조회 실패(%s) — 기존 캐시로 검증 시도", type(exc).__name__)
+                logger.warning("JWKS 조회 실패(%s) ― 기존 캐시로 검증 시도", type(exc).__name__)
         return _jwks_keys.get(kid)
 
 

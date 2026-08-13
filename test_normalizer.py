@@ -13,7 +13,10 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from normalizer.normalizer import normalize_address, extract_sido
+from normalizer.normalizer import (
+    normalize_address, extract_sido,
+    normalize_price, normalize_date, normalize_case_no,
+)
 
 
 CASES = [
@@ -86,6 +89,286 @@ CASES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 크롤 문자열 -> DB 값 변환 (2026-08-13 Sprint 75 신설)
+#
+# `normalize_price` / `normalize_date` / `normalize_case_no`는 **크롤한 원문을 DB에 들어갈
+# 값으로 바꾸는 마지막 관문**인데 검사가 0건이었다. 이 파일은 주소만 보고 있었다.
+#
+# 여기서 중요한 것은 "정상 입력이 잘 변환되는가"보다 **깨진 입력이 어떻게 되는가**다.
+# 법원 사이트 응답이 바뀌거나 잘리면 그대로 이 함수들로 들어온다.
+#
+# 현재 동작을 실측해 그대로 고정한다(규칙을 새로 정하지 않는다). 그중 둘은
+# **잠재 위험이므로 명시적으로 못박아 둔다**:
+#
+#   (1) normalize_date는 파싱하지 못한 값을 **원문 그대로 통과**시킨다.
+#       `2026-8-19`(한 자리 월)처럼 형식이 다른 값이 그대로 DB에 들어가면, 이 저장소가
+#       날짜를 **문자열로 비교**하기 때문에 정렬·D7 필터·우선순위가 조용히 어긋난다
+#       ('2026-8-19' > '2026-09-01' 이 참이 된다).
+#   (2) normalize_price는 숫자를 못 찾으면 **0**을 돌려준다. 크롤이 깨진 것과
+#       "실제로 0원"이 구분되지 않는다.
+#
+# 실측(2026-08-13): 실제 데이터에는 두 경우 모두 **0건**이다
+# (auction_item/auction/document_queue의 auction_date 형식 위반 0건, 가격 0원 0건).
+# 즉 지금 피해는 없고, 이 검사는 그 전제가 깨지는 순간을 잡기 위한 것이다.
+# ---------------------------------------------------------------------------
+PRICE_CASES = [
+    # (입력, 기대값, 설명)
+    ("1,234,000원", 1234000, "콤마와 단위를 제거한다"),
+    ("1,234,000", 1234000, "콤마만 있는 형태"),
+    ("500000000원(100%)", 500000000, "괄호 이후는 버린다(최저가율 표기)"),
+    ("감정가 500,000,000 (70%)", 500000000, "앞에 라벨이 붙어도 숫자만 취한다"),
+    ("  12,000  ", 12000, "앞뒤 공백"),
+    ("0", 0, "실제 0원"),
+    ("-", 0, "미표기(-)는 0"),
+    ("", 0, "빈 문자열은 0"),
+    (None, 0, "None도 0 (크롤 누락 시 예외를 내지 않는다)"),
+    ("abc", 0, "숫자가 없으면 0 -- 깨진 입력과 실제 0원이 구분되지 않는다(잠재 위험)"),
+    ("(1,000)", 0, "여는 괄호로 시작하면 앞부분이 비어 0"),
+]
+
+DATE_CASES = [
+    ("2026-08-19", "2026-08-19", "이미 정규 형식"),
+    ("2026.08.19", "2026-08-19", "점 구분자"),
+    ("2026/08/19", "2026-08-19", "슬래시 구분자"),
+    ("2026-08-19 10:00", "2026-08-19", "시각이 붙어도 날짜만"),
+    ("매각기일 2026.08.19(수)", "2026-08-19", "라벨과 요일이 붙어도 추출한다"),
+    ("-", "", "미표기(-)는 빈 문자열"),
+    ("", "", "빈 문자열"),
+    (None, "", "None도 빈 문자열 (예외를 내지 않는다)"),
+    # 아래 두 개가 잠재 위험이다 -- 파싱 실패인데 원문이 그대로 남는다.
+    ("2026-8-19", "2026-8-19", "한 자리 월은 정규화되지 않고 원문 통과(잠재 위험)"),
+    ("20260819", "20260819", "구분자가 없으면 원문 통과(잠재 위험)"),
+    ("abc", "abc", "날짜가 아니어도 원문 통과(잠재 위험)"),
+]
+
+
+def run_value_normalizers():
+    failures = []
+    print()
+    print("--- normalize_price ---")
+    for raw, expected, desc in PRICE_CASES:
+        got = normalize_price(raw)
+        ok = got == expected
+        print("[%s] %-46s %r -> %r" % ("PASS" if ok else "FAIL", desc, raw, got))
+        if not ok:
+            failures.append("normalize_price(%r)" % (raw,))
+            print("     expected %r" % (expected,))
+
+    print()
+    print("--- normalize_date ---")
+    for raw, expected, desc in DATE_CASES:
+        got = normalize_date(raw)
+        ok = got == expected
+        print("[%s] %-46s %r -> %r" % ("PASS" if ok else "FAIL", desc, raw, got))
+        if not ok:
+            failures.append("normalize_date(%r)" % (raw,))
+            print("     expected %r" % (expected,))
+
+    # 정규 형식으로 나온 값은 **문자열 비교로 정렬 가능**해야 한다.
+    # 이 저장소는 날짜를 문자열로 비교한다(D7 필터, 우선순위, doc_worker의 기일 판정).
+    ordered = [normalize_date(d) for d in ("2026.01.05", "2026.02.01", "2026.10.01", "2026.12.31")]
+    ok = ordered == sorted(ordered)
+    print("[%s] 정규화된 날짜는 문자열 정렬이 시간순과 같다: %r" % ("PASS" if ok else "FAIL", ordered))
+    if not ok:
+        failures.append("date string ordering")
+
+    # 반대로 정규화되지 못한 값이 섞이면 정렬이 깨진다 -- 위험을 사실로 못박아 둔다.
+    broken = normalize_date("2026-8-19")
+    ok = broken > "2026-09-01"
+    print("[%s] 미정규화 값은 문자열 비교를 깨뜨린다(%r > '2026-09-01' 이 참): %r"
+          % ("PASS" if ok else "FAIL", broken, ok))
+    if not ok:
+        failures.append("unnormalized date ordering hazard")
+
+    print()
+    print("--- normalize_case_no ---")
+    for raw, expected in (("  2024타경1234 ", "2024타경1234"),
+                          ("2024타경1234", "2024타경1234"),
+                          ("", "")):
+        got = normalize_case_no(raw)
+        ok = got == expected
+        print("[%s] %r -> %r" % ("PASS" if ok else "FAIL", raw, got))
+        if not ok:
+            failures.append("normalize_case_no(%r)" % (raw,))
+
+    # None은 예외가 난다. price/date와 달리 방어가 없다 -- 현재 동작을 명시적으로 고정한다.
+    # (실측: auction/auction_item의 case_no 빈 값 0건이라 지금 도달하지 않는다)
+    raised = False
+    try:
+        normalize_case_no(None)
+    except AttributeError:
+        raised = True
+    print("[%s] None은 AttributeError (price/date와 달리 방어가 없다 -- 현재 동작)"
+          % ("PASS" if raised else "FAIL"))
+    if not raised:
+        failures.append("normalize_case_no(None) 동작 변경")
+
+    return failures
+
+
+
+def run_batch_isolation():
+    """`normalize_batch()`의 행 단위 실패 격리 (2026-08-13 Sprint 78 신설).
+
+    커버리지로 찾은 미검증 경로다(`normalizer/normalizer.py` 144-150).
+    `upsert_batch()`와 **같은 계약**이다 — 매일 06:00 크롤러가 법원 60곳에서 모은 수백 건을
+    한 번에 정규화하는데, 그중 한 건이 기형이면 나머지가 함께 사라지면 안 된다(FR-101).
+
+    격리가 사라지면 피해가 크다: 정규화가 파이프라인의 **첫 단계**라, 여기서 배치가 죽으면
+    `upsert_batch`/`enqueue_documents`가 아예 호출되지 않아 **그날 수집이 통째로 0건**이 된다.
+    (실제로 mvp_scraper는 `rows`가 비면 "적재를 건너뜁니다" 경고만 남기고 성공으로 끝낸다.)
+    """
+    from normalizer.normalizer import normalize_batch
+    from models.auction_item import AuctionItem
+
+    failures = []
+
+    def good(case_no):
+        return AuctionItem(
+            case_no=case_no, item_no="1", address="서울특별시 강남구 역삼동 736-1",
+            property_type="아파트", appraisal_price="100,000,000",
+            minimum_bid_price="80,000,000", auction_date="2026.09.01",
+            status="유찰", court_code="서울중앙지방법원", court_name="서울중앙지방법원",
+            crawl_date="2026-08-13",
+        )
+
+    # 기형 행: address가 None이면 normalize_address 안에서 예외가 난다.
+    broken = good("BROKEN")
+    broken.address = None
+
+    # 격리가 사라지면 이 호출이 그대로 던진다 -> 크래시로 중단되면 남은 검사가 실행되지
+    # 않는다(변이 시험에서 확인). 예외를 FAIL로 바꿔 원인과 범위를 함께 보게 한다.
+    try:
+        rows = normalize_batch([good("A"), broken, good("B")])
+    except Exception as exc:
+        print("[FAIL] normalize_batch: 기형 행이 배치 전체를 죽였다 -> %r" % (exc,))
+        failures.append("normalize_batch 행 단위 격리")
+        rows = []
+    ok = len(rows) == 2
+    print("[%s] normalize_batch: 기형 행 하나가 배치를 죽이지 않는다 (정상 %d/2건)"
+          % ("PASS" if ok else "FAIL", len(rows)))
+    if not ok:
+        failures.append("normalize_batch 행 단위 격리")
+
+    got = [r["case_no"] for r in rows]
+    ok = got == ["A", "B"]
+    print("[%s] normalize_batch: 앞뒤 정상 행이 순서대로 살아남는다 (%r)"
+          % ("PASS" if ok else "FAIL", got))
+    if not ok:
+        failures.append("normalize_batch 정상 행 보존")
+
+    ok = all(r["case_no"] != "BROKEN" for r in rows)
+    print("[%s] normalize_batch: 기형 행은 결과에 섞이지 않는다" % ("PASS" if ok else "FAIL"))
+    if not ok:
+        failures.append("normalize_batch 기형 행 제외")
+
+    # 전부 기형이면 빈 리스트 — 예외로 죽지 않는다(호출부가 "수집 0건"으로 판단해 경고를 남긴다).
+    b2 = good("B2"); b2.address = None
+    try:
+        rows = normalize_batch([broken, b2])
+        ok = rows == []
+        print("[%s] normalize_batch: 전부 기형이면 빈 리스트(예외 아님)" % ("PASS" if ok else "FAIL"))
+        if not ok:
+            failures.append("normalize_batch 전량 실패 처리")
+    except Exception as exc:
+        print("[FAIL] normalize_batch: 전부 기형일 때 예외가 올라왔다 -> %r" % (exc,))
+        failures.append("normalize_batch 전량 실패 처리")
+
+    # 빈 입력도 안전해야 한다(크롤이 0건을 돌려준 날).
+    ok = normalize_batch([]) == []
+    print("[%s] normalize_batch: 빈 입력은 빈 결과" % ("PASS" if ok else "FAIL"))
+    if not ok:
+        failures.append("normalize_batch 빈 입력")
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# 지역 분류: 가장 앞에 나오는 표기가 이긴다 (2026-08-13 Sprint 78 신설)
+#
+# 예전 `extract_sido()`는 SIDO_PATTERNS를 **딕셔너리 선언 순서**로 훑어 처음 발견된 것을
+# 돌려줬다. 즉 판정이 문자열 안의 위치가 아니라 사전의 줄 순서로 정해졌다.
+# 주소는 시도로 시작하는데도 뒤쪽에 다른 지역명이 섞이면 그쪽이 이겼다.
+#
+# 실측(auction_item 1,876건) 결과 4건이 잘못 분류돼 있었고, 원인이 전부 다르다.
+#
+#     경기도 시흥시 서울대학로 59-21              -> 서울   도로명 (실재하는 도로다)
+#     경상남도 양산시 물금읍 부산대학로 150         -> 부산   도로명 (실재하는 도로다)
+#     인천광역시 계양구 ... (효성동, 뉴서울아파트)   -> 서울   건물명
+#     제주특별자치도 제주시 ... 주식회사 뉴세종하우징 -> 세종   공유자(법인) 이름
+#
+# 마지막 건이 결함의 성격을 가장 잘 보여준다. "제주특별자치도"가 **0번 위치**에 있는데
+# **539번 위치**의 "세종"에게 졌다. 오직 사전에서 세종이 제주보다 위라는 이유였다.
+#
+# `sido`는 검색의 1차 필터다. 잘못 분류된 물건은 제 지역에서 검색되지 않고 남의 지역을
+# 오염시킨다. 도로명 사례는 실재하는 이름이라 **반드시 재발한다**.
+#
+# 수정 후 전수 재계산: 1,876건 중 **정확히 이 4건만** 바뀌었다(나머지 무변동).
+# ---------------------------------------------------------------------------
+SIDO_POSITION_CASES = [
+    # (설명, 입력, 기대 시도)
+    ("도로명에 다른 지역명(서울대학로)", "경기도 시흥시 서울대학로 59-21 1층189호", "경기"),
+    ("도로명에 다른 지역명(부산대학로)", "경상남도 양산시 물금읍 부산대학로 150 3층304호", "경남"),
+    ("건물명에 다른 지역명(뉴서울아파트)",
+     "사용본거지 : 인천광역시 계양구 새벌로 88 303동 106호 (효성동, 뉴서울아파트)", "인천"),
+    ("공유자 이름에 다른 지역명(뉴세종하우징)",
+     "제주특별자치도 제주시 구좌읍 세화리 산29 [토지 임야 93124㎡ "
+     "130번 주식회사 뉴세종하우징 지분]", "제주"),
+    # 정상 주소는 그대로여야 한다.
+    ("정식 명칭 접두어", "서울특별시 강남구 역삼동 736-1", "서울"),
+    ("도 단위 접두어", "충청남도 논산시 은진면 시묘리 499-1", "충남"),
+    ("특별자치도", "전북특별자치도 군산시 사정동 401-1", "전북"),
+    # 지역명이 앞에 오지 않는 입력(사용자 검색어 등)은 기존처럼 동작해야 한다.
+    ("축약형 검색어", "서울 강남구", "서울"),
+    ("지역명 없음", "강남구 아파트", ""),
+    ("빈 입력", "", ""),
+]
+
+
+def run_sido_position():
+    failures = []
+    print()
+    print("--- extract_sido: 가장 앞선 표기가 이긴다 ---")
+    for desc, text, expected in SIDO_POSITION_CASES:
+        got = extract_sido(text)
+        ok = got == expected
+        print("[%s] %-38s -> %r" % ("PASS" if ok else "FAIL", desc, got))
+        if not ok:
+            failures.append(desc)
+            print("     입력: %s" % text[:70])
+            print("     expected %r" % (expected,))
+
+    # 위치가 같으면 더 긴(구체적인) 표기를 택한다.
+    ok = extract_sido("서울특별시") == "서울"
+    print("[%s] 같은 위치면 더 긴 표기 우선" % ("PASS" if ok else "FAIL"))
+    if not ok:
+        failures.append("longest variant at same position")
+
+    # 순서가 뒤집혀도 결과가 같아야 한다 - 판정이 사전 순서에 의존하지 않는다는 증거다.
+    # (예전 구현은 이 검사에서 반드시 실패한다)
+    import normalizer.normalizer as nm
+    original = nm.SIDO_PATTERNS
+    try:
+        nm.SIDO_PATTERNS = dict(reversed(list(original.items())))
+        reversed_result = extract_sido("경기도 시흥시 서울대학로 59-21")
+    finally:
+        nm.SIDO_PATTERNS = original
+    ok = reversed_result == "경기"
+    print("[%s] 사전 순서를 뒤집어도 결과가 같다: %r" % ("PASS" if ok else "FAIL", reversed_result))
+    if not ok:
+        failures.append("dict-order independence")
+
+    # validator가 같은 함수를 쓴다 - 판정이 두 벌이면 한쪽만 고쳐질 수 있다.
+    from validator.validation_engine import extract_sido as validator_extract_sido
+    ok = validator_extract_sido is extract_sido
+    print("[%s] validator가 같은 함수를 재사용한다(중복 판정 없음)" % ("PASS" if ok else "FAIL"))
+    if not ok:
+        failures.append("validator uses its own copy")
+
+    return failures
+
+
 def run():
     failures = []
 
@@ -128,11 +411,15 @@ def run():
     if not ok:
         failures.append("extract_sido 단독 동작")
 
+    failures += run_value_normalizers()
+    failures += run_sido_position()
+    failures += run_batch_isolation()
+
     print()
     if failures:
         print(f"{len(failures)}건 실패: {failures}")
         return 1
-    print(f"전체 {len(CASES) + 3}건 통과")
+    print(f"전체 {len(CASES) + 3 + len(PRICE_CASES) + len(DATE_CASES) + 6 + len(SIDO_POSITION_CASES) + 3}건 통과")
     return 0
 
 

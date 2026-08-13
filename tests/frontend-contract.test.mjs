@@ -4,8 +4,17 @@
 // docs/FRONTEND_MASTER_SPEC.md가 "절대 변경 금지"로 못박은 계약을 고정한다.
 // Sprint 44에서 손으로 확인했던 흐름이 다음에 조용히 깨지는 것을 막는 것이 목적이다.
 //
-// 실행:  npm run test:frontend        (dev 또는 start 서버가 떠 있어야 함)
-//        BASE_URL=http://localhost:3000 npm run test:frontend
+// 실행:  npm run test:frontend        (Next 서버 + FastAPI 백엔드가 **둘 다** 떠 있어야 함)
+//        BASE_URL=http://localhost:3000 API_BASE_URL=http://localhost:8000 npm run test:frontend
+//
+//   1) python -m uvicorn api_server:app --host 127.0.0.1 --port 8000
+//   2) npm run dev      (또는 npm run build && npm run start)
+//   3) npm run test:frontend
+//
+// 백엔드가 빠지면 검색 결과가 0건이 되고, 결과 데이터를 단언하는 검사들이 줄줄이 실패한다.
+// 예전에는 그 상황이 "비로그인 결과 카드에 즐겨찾기 버튼이 없습니다"처럼 **원인과 무관한
+// 문구**로 보고돼, 백엔드가 안 떠 있다는 사실을 알아채는 데 시간이 걸렸다(2026-08-13
+// Sprint 72). 아래 before() 훅이 두 서버를 각각 확인하고 무엇이 빠졌는지 지목한다.
 //
 // 설계 원칙
 // 1. **새 라이브러리를 설치하지 않는다** — Node 내장 러너(node:test) + 전역 fetch만 쓴다.
@@ -24,6 +33,10 @@ import assert from 'node:assert/strict'
 
 const BASE = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
 
+// 프런트(서버 컴포넌트)가 직접 호출하는 FastAPI 주소. 기본값은 .env.local의
+// NEXT_PUBLIC_API_BASE_URL과 같다 — node --test는 .env를 읽지 않으므로 여기서 기본값을 둔다.
+const API_BASE = (process.env.API_BASE_URL ?? 'http://localhost:8000').replace(/\/$/, '')
+
 // redirect: 'manual' — 3xx를 따라가지 않고 그대로 관찰해야 게이트 동작을 검증할 수 있다.
 async function get(path) {
   return fetch(`${BASE}${path}`, { redirect: 'manual', headers: { 'accept-language': 'ko' } })
@@ -41,11 +54,45 @@ before(async () => {
     res = await get('/')
   } catch (err) {
     assert.fail(
-      `서버(${BASE})에 연결할 수 없습니다. 먼저 "npm run dev" 또는 "npm run start"로 띄운 뒤 실행하세요.\n원인: ${err.message}`
+      `Next 서버(${BASE})에 연결할 수 없습니다. 먼저 "npm run dev" 또는 "npm run start"로 띄운 뒤 실행하세요.\n원인: ${err.message}`
     )
   }
   assert.equal(res.status, 200, `첫 화면이 200이 아닙니다 (${res.status})`)
   homeHtml = await res.text()
+
+  // ── 백엔드 사전 점검 ────────────────────────────────────────────────
+  // 이 스위트의 상당수는 "200이면 통과"가 아니라 **실제 결과 데이터**를 단언한다
+  // (Sprint 49에서 의도적으로 그렇게 바꿨다 — 정렬 버튼을 눌러도 순서가 그대로였던
+  // BUGS #29/#30이 200 검사만으로는 전부 통과했기 때문). 그래서 백엔드가 없으면
+  // 결과가 0건이 되고 그 검사들이 원인과 무관한 문구로 실패한다.
+  //
+  // 여기서 한 번 확인해 **무엇이 빠졌는지** 지목한다. 건너뛰지 않고 실패시키는 이유는,
+  // 백엔드 없이 통과한 결과를 "게이트 통과"로 오해하면 안 되기 때문이다.
+  let apiRes
+  try {
+    apiRes = await fetch(`${API_BASE}/api/v1/search?size=1`, { cache: 'no-store' })
+  } catch (err) {
+    assert.fail(
+      `FastAPI 백엔드(${API_BASE})에 연결할 수 없습니다.\n` +
+        `  python -m uvicorn api_server:app --host 127.0.0.1 --port 8000\n` +
+        `으로 띄운 뒤 다시 실행하세요. (다른 주소면 API_BASE_URL 환경변수로 지정)\n` +
+        `원인: ${err.message}`
+    )
+  }
+  assert.equal(
+    apiRes.status,
+    200,
+    `백엔드 검색 API가 200이 아닙니다 (${apiRes.status}) — ${API_BASE}/api/v1/search`
+  )
+
+  // 물건이 0건이면 결과 데이터를 보는 검사들이 "기능이 깨진 것"처럼 실패한다.
+  // 데이터 부족과 기능 결함을 구분해 준다(설계 원칙 3 — 건수 자체는 단언하지 않는다).
+  const payload = await apiRes.json()
+  assert.ok(
+    typeof payload?.total === 'number' && payload.total > 0,
+    `백엔드에 검색 가능한 물건이 0건입니다 (total=${payload?.total}). ` +
+      `크롤 데이터가 비었거나 전부 만료됐습니다 — 결과 데이터를 단언하는 검사는 이 상태에서 의미가 없습니다.`
+  )
 })
 
 describe('첫 화면 = 검색 화면 (MASTER_SPEC §4)', () => {
@@ -158,16 +205,43 @@ describe('상세는 로그인 필수 + redirect에 query string 보존 (MASTER_S
 })
 
 describe('로그인 후 원래 URL 복귀 구조 (MASTER_SPEC §3.4)', () => {
-  test('로그인 화면이 redirect 값을 폼에 그대로 싣는다', async () => {
+  // ★ 이 자리에는 원래 "서버가 내려준 HTML에서 name="redirect" hidden input을 정규식으로
+  //   찾는" 검사가 있었다. **원리상 통과할 수 없는 검사였다** (2026-08-13 Sprint 98).
+  //
+  //   `/login`은 `'use client'` + `<Suspense fallback={null}>`이라 서버가 내려주는 HTML은
+  //   빈 껍데기이고(빌드 출력에서도 `○ /login` = static), hidden input은 `useSearchParams()`가
+  //   도는 **하이드레이션 이후**에 생긴다. 이 파일은 fetch로 받은 HTML 문자열만 보므로
+  //   그 값을 볼 수 없다.
+  //
+  //   왜 아무도 몰랐나 — 이 파일의 검사는 Next/FastAPI가 **둘 다 떠 있어야** 도는데,
+  //   서버 없이 실행하면 `before()`가 실패해 전부 취소된다. 그래서 이 실패는 "서버가 없다"에
+  //   묻혀 한 번도 드러나지 않았다. 서버를 띄우고 돌려 보고서야 106개 중 유일한 실패로 나왔다.
+  //
+  //   실제 브라우저에서 하이드레이션 후를 확인한 결과 **제품은 정상**이다 —
+  //   `input[name=redirect]`가 type=hidden으로 존재하고 값이 원래 URL과 정확히 일치했다.
+  //   따라서 검사를 **없애지 않고 관측 가능한 곳으로 옮겼다**:
+  //   폼이 값을 싣는지는 `tests/source-contract.test.mjs`의
+  //   "로그인 화면이 redirect 값을 폼에 hidden input으로 싣는다"가 고정한다.
+  //
+  //   여기서는 HTTP로 **실제로 확인할 수 있는 것**만 남긴다: 로그인 화면이 redirect를 달고도
+  //   정상 응답하고, 그 값을 잃어버리거나 외부로 튕기지 않는다는 것.
+  test('로그인 화면은 redirect를 달고도 정상 응답하고 값을 잃지 않는다', async () => {
     const target = '/properties/84?ids=84,85,86&i=1'
-    const { res, body } = await getText(`/login?redirect=${encodeURIComponent(target)}`)
-    assert.equal(res.status, 200)
+    const path = `/login?redirect=${encodeURIComponent(target)}`
+    const res = await get(path)
+    assert.equal(res.status, 200, '로그인 화면이 200이 아닙니다')
 
-    const m = body.match(/name="redirect"\s+value="([^"]*)"/)
-    assert.ok(m, '로그인 폼에 redirect hidden input이 없습니다')
-    // HTML 이스케이프(&amp;)를 되돌려 원본과 비교한다.
-    const carried = m[1].replace(/&amp;/g, '&')
-    assert.equal(carried, target, '로그인 폼이 원래 URL을 그대로 싣지 않습니다')
+    // 서버가 리다이렉트로 값을 깎아먹지 않는지 확인한다(3xx면 location에 값이 남아야 한다).
+    const loc = res.headers.get('location')
+    if (loc) {
+      const to = new URL(loc, BASE)
+      assert.equal(to.origin, new URL(BASE).origin, '로그인 화면이 외부로 리다이렉트했습니다')
+      assert.equal(
+        to.searchParams.get('redirect'),
+        target,
+        '리다이렉트 과정에서 redirect 값이 유실됐습니다'
+      )
+    }
   })
 
   // 실제 로그인 제출(=비밀번호 입력)은 하지 않으므로 sanitizeRedirectPath()가 값을

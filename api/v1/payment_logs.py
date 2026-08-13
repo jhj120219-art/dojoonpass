@@ -171,7 +171,7 @@ def record_webhook(
             "SELECT id FROM payment_webhooks WHERE event_id=?", (event_id,)
         ).fetchone()
         if existing:
-            logger.info("중복 Webhook 수신 — 무시합니다 (event_id=%s)", event_id)
+            logger.info("중복 Webhook 수신 ― 무시합니다 (event_id=%s)", event_id)
             return existing["id"], True
 
     webhook_id = conn.execute(

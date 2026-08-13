@@ -223,7 +223,7 @@ def test_parsing_gap_is_measurable():
         # "미파싱"이라고 부르지 않는다 — 2026-08-12 Sprint 62 실측 결과 SPEC의 차이분은
         # 파싱 실패가 아니라 표에 `조사된 임차내역없음`이라고 적힌 **임차인 없는 물건**이었다.
         # 정상 동작을 결함처럼 보이게 하는 표현이라 "결과 행 없음"으로 바꾼다.
-        print("    SPEC   READY %d / 파싱결과 있음 %d (결과 행 없음 %d — 임차인 없음 포함)"
+        print("    SPEC   READY %d / 파싱결과 있음 %d (결과 행 없음 %d ― 임차인 없음 포함)"
               % (spec_ready, spec_parsed, spec_ready - spec_parsed))
         print("    STATUS READY %d / 파싱결과 있음 %d (결과 행 없음 %d)"
               % (status_ready, status_parsed, status_ready - status_parsed))
@@ -372,7 +372,7 @@ def test_property_type_matches_content():
 
 def run():
     if not os.path.exists(DB):
-        print("[SKIPPED] auction.db 없음 (fresh clone) — 파이프라인 정합 검사 생략")
+        print("[SKIPPED] auction.db 없음 (fresh clone) ― 파이프라인 정합 검사 생략")
         return 0
 
     test_path_rule_matches_api()

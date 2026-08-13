@@ -156,7 +156,7 @@ def step_4_login_gate_preserves_return_url(item_id):
     path = "/properties/%d?ids=%d&i=0" % (item_id, item_id)
     res = frontend_get(path)
     if res is None:
-        print("[SKIPPED] dev 서버(%s) 미기동 — 프런트 게이트 단계를 건너뛴다" % FRONTEND)
+        print("[SKIPPED] dev 서버(%s) 미기동 ― 프런트 게이트 단계를 건너뛴다" % FRONTEND)
         skipped.append("프런트 로그인 게이트 (dev 서버 없음)")
         return
     code = getattr(res, "status", None) or res.getcode()
@@ -309,8 +309,10 @@ def cleanup():
         pay_ids = [str(r[0]) for r in conn.execute(
             "SELECT id FROM payments WHERE user_id=?", (USER,))]
         total = 0
+        # subscriptions가 payments **앞**이어야 한다 ― `subscriptions.payment_id`가
+        # 생기면서 구독이 결제의 자식이 됐다 (2026-08-13 Sprint 96, BUGS #94).
         for t in ("registry_credit_logs", "registry_requests", "registry_usage",
-                  "payment_logs", "payments", "subscriptions", "favorites",
+                  "payment_logs", "subscriptions", "payments", "favorites",
                   "recent_items", "search_presets", "registry_credits"):
             total += conn.execute("DELETE FROM %s WHERE user_id=?" % t, (USER,)).rowcount
         if pay_ids:

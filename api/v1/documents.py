@@ -57,7 +57,23 @@ def get_document(item_id: int, doc_type: str):
     if os.path.commonpath([real_document_root, real_file_path]) != real_document_root:
         raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
 
-    if not os.path.exists(real_file_path):
+    # ★ "있다"의 기준을 **크롤러와 같게** 맞춘다 (2026-08-13 Sprint 98).
+    #
+    #   예전에는 `os.path.exists()`만 봤다. 그래서 **0바이트 파일이 200으로 나갔다.**
+    #   프런트는 뷰어를 열기 전에 HEAD로 존재만 확인하고(`properties/[id]/page.tsx:215`
+    #   — `res.ok`만 본다) 200이면 iframe을 띄우므로, 사용자는 **아무 설명 없는 빈 화면**을
+    #   본다. "문서가 없다"는 안내조차 못 받는다.
+    #
+    #   쓰는 쪽은 이미 크기를 본다 — `crawler/doc_paths.doc_exists()`는
+    #   `exists() and getsize() > 0`이라야 "수집됨"으로 친다. 읽는 쪽만 기준이 느슨해서
+    #   **크롤러는 "아직 없음"이라 재수집 대상으로 보는 파일을 API는 "있음"이라고 답하는**
+    #   비대칭이 있었다. 두 정의를 하나로 맞춘다.
+    #
+    #   `test_document_status_sync.py`는 이미 이 상태를 "뷰어가 200을 주지만 사용자에게는
+    #   빈 문서"라고 적어 두고 **데이터에만** 그 조건을 강제하고 있었다(현재 실 DB 0건).
+    #   엔드포인트 자체에도 같은 기준을 둬서, 0바이트 파일이 생기더라도 거짓 성공이 되지 않게 한다.
+    #   Sprint 95가 admin의 쓰기 검사를 download의 읽기 검사와 맞춘 것과 같은 정렬이다.
+    if not os.path.isfile(real_file_path) or os.path.getsize(real_file_path) == 0:
         raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
 
     return FileResponse(

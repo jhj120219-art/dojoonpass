@@ -193,7 +193,7 @@ def _parse(value: str) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         logger.warning(
-            "구독 만료 시각을 해석할 수 없습니다 (expires_at=%r) — 만료 판정을 보류합니다. "
+            "구독 만료 시각을 해석할 수 없습니다 (expires_at=%r) ― 만료 판정을 보류합니다. "
             "이 구독은 만료되지 않으므로 데이터 점검이 필요합니다", value
         )
         return None

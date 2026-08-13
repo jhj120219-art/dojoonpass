@@ -142,6 +142,81 @@ def test_corrupted_file_does_not_crash_get():
     check("get() on corrupted file returns None (treated as no checkpoint)", result, None)
 
 
+def test_write_failure_does_not_stop_the_crawl():
+    """저장 실패가 **크롤을 멈추지 않는가** (2026-08-13 Sprint 85 신설).
+
+    커버리지가 지목한 두 곳(`save()`/`clear()`의 `except Exception` -> 로그)이었다. 이 두
+    분기는 의도된 설계다 ― 체크포인트는 "다음 실행이 이어받기 위한 편의"이고, 그 저장이
+    실패했다고 **이미 성공한 크롤을 중단시키면 손해가 더 크다**(60개 법원 순차 루프가
+    디스크 일시 오류로 통째로 멈춘다). 그래서 예외를 삼키고 로그만 남긴다.
+
+    다만 삼키는 코드는 위험하다 ― 조용해지면 "왜 이어받기가 안 되는지" 알 수 없다. 그래서
+    (1) 예외가 밖으로 나가지 않고 (2) ERROR 로그가 남고 (3) 기존 파일이 망가지지 않는지를
+    함께 고정한다. 특히 (3)이 핵심이다: 실패한 저장이 기존 내용을 반쯤 덮어쓰면 다른 법원의
+    진행 상황까지 사라진다(이 파일 상단이 설명하는 바로 그 사고).
+    """
+    import logging
+    import storage.checkpoint as cp_mod
+
+    print("\n--- 4. 저장 실패는 크롤을 멈추지 않는다 (Sprint 85) ---")
+    path = os.path.join(QA_DIR, "qa-writefail-" + uuid.uuid4().hex[:8] + ".json")
+    cm = CheckpointManager(path=path)
+    cm.save("COURT_KEEP", "2026TA0001", 3, 30)
+    before = open(path, encoding="utf-8").read()
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.ERROR)
+    logger = logging.getLogger(cp_mod.__name__)
+    logger.addHandler(handler)
+
+    real_write = CheckpointManager._write_atomic
+
+    def boom(self, data):
+        raise OSError("디스크 쓰기 실패(주입)")
+
+    CheckpointManager._write_atomic = boom
+    try:
+        raised = None
+        try:
+            cm.save("COURT_NEW", "2026TA9999", 1, 10)
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        check("save 실패가 호출자에게 전파되지 않는다", raised, None)
+        check_true("save 실패에 ERROR 로그가 남는다",
+                   any("save failed" in r.getMessage() for r in records),
+                   [r.getMessage() for r in records])
+
+        records.clear()
+        raised = None
+        try:
+            cm.clear("COURT_KEEP")
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        check("clear 실패도 전파되지 않는다", raised, None)
+        check_true("clear 실패에 ERROR 로그가 남는다",
+                   any("clear failed" in r.getMessage() for r in records),
+                   [r.getMessage() for r in records])
+    finally:
+        CheckpointManager._write_atomic = real_write
+        logger.removeHandler(handler)
+
+    # 실패한 쓰기가 기존 파일을 건드리지 않았는가 ― 이어받기 자산을 잃지 않는 것이 요점이다.
+    check("실패한 저장이 기존 파일을 바꾸지 않는다", open(path, encoding="utf-8").read(), before)
+    check("다른 법원의 진행 상황이 그대로 남는다",
+          CheckpointManager(path=path).get("COURT_KEEP")["last_case_no"], "2026TA0001")
+    check_true("실패 후 .tmp 잔재가 남지 않는다", not os.path.exists(path + ".tmp"))
+
+    # 복구 후에는 정상 동작해야 한다(주입이 영구 영향을 남기지 않았는지 확인).
+    cm.save("COURT_NEW", "2026TA9999", 1, 10)
+    check("주입 해제 후 정상 저장된다", cm.get("COURT_NEW")["last_case_no"], "2026TA9999")
+    os.remove(path)
+
+
 def cleanup():
     print("\n--- cleanup (qa checkpoint file only) ---")
     for p in (QA_PATH, QA_PATH + ".tmp"):
@@ -158,6 +233,7 @@ def run():
         test_save_get_clear_roundtrip()
         test_atomic_write_survives_simulated_crash()
         test_corrupted_file_does_not_crash_get()
+        test_write_failure_does_not_stop_the_crawl()
     finally:
         cleanup()
 

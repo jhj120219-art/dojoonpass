@@ -253,10 +253,28 @@ def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_cur
 def get_registry_requests(user_id: str = Depends(get_current_user)):
     conn = get_connection()
     try:
+        # ★ LEFT JOIN이어야 한다 (2026-08-13 Sprint 98).
+        #
+        #   `auction_item` 행이 사라진 신청은 INNER JOIN에서 **목록에서 통째로 사라진다.**
+        #   그런데 그 신청은 **멀쩡히 쓸 수 있는 상태다** — 다운로드 경로
+        #   (`download_registry()`)는 JOIN을 하지 않으므로, 실제 파일만 있으면 200으로
+        #   문서를 그대로 내려준다. 즉 "받을 수는 있는데 화면에는 존재하지 않는" 신청이다.
+        #
+        #   프런트가 request_id를 얻는 유일한 경로가 이 목록이라(`mypage/page.tsx:146`,
+        #   `properties/[id]/page.tsx:257`) 사용자는 **자기가 돈을 내고 발급받은 문서에
+        #   도달할 방법이 없다.** 관리자 목록은 Sprint 97에서 LEFT JOIN으로 고쳐 보이는데
+        #   정작 소유자에게만 안 보인다 — Sprint 95(admin이 파일 존재를 확인하지 않아
+        #   "완료인데 못 받는" 상태를 만든 것)와 방향만 반대인 같은 부류다.
+        #
+        #   임시 복사본에서 실측(Sprint 98): 물건 행 삭제 후
+        #   사용자 목록 0건 / 사용자 상세 404 / 관리자 목록 1건 / 다운로드 200.
+        #
+        #   `case_no`/`full_address`는 None으로 내려간다 — 프런트는 이미 두 필드를
+        #   `string | null`로 선언하고 `|| '-'`로 그리므로 계약 변경이 아니다.
         rows = conn.execute("""
             SELECT rr.*, ai.full_address, ai.case_no
             FROM registry_requests rr
-            JOIN auction_item ai ON rr.item_id = ai.id
+            LEFT JOIN auction_item ai ON rr.item_id = ai.id
             WHERE rr.user_id = ?
             ORDER BY rr.requested_at DESC, rr.id DESC
         """, (user_id,)).fetchall()
@@ -277,10 +295,13 @@ def get_registry_requests(user_id: str = Depends(get_current_user)):
 def get_registry_request(request_id: int, user_id: str = Depends(get_current_user)):
     conn = get_connection()
     try:
+        # LEFT JOIN 이유는 위 목록(`get_registry_requests()`)과 같다 (Sprint 98).
+        # 여기서 INNER JOIN을 남겨두면 목록에는 보이는 신청이 상세에서만 404가 되어,
+        # 사용자가 카드를 눌렀을 때 "없는 신청"이라는 거짓말을 보게 된다.
         row = conn.execute("""
             SELECT rr.*, ai.full_address, ai.case_no
             FROM registry_requests rr
-            JOIN auction_item ai ON rr.item_id = ai.id
+            LEFT JOIN auction_item ai ON rr.item_id = ai.id
             WHERE rr.id=? AND rr.user_id=?
         """, (request_id, user_id)).fetchone()
         if not row:

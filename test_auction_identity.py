@@ -164,9 +164,135 @@ def test_cross_court_upsert_safety():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _check_true(name, cond, detail=""):
+    print("[%s] %s%s" % ("PASS" if cond else "FAIL", name, ("" if cond else " -- " + str(detail))))
+    if not cond:
+        failures.append(name)
+
+
+def test_upsert_partial_failure_isolation():
+    """행 하나가 깨져도 배치 전체가 죽지 않는가 (2026-08-13 Sprint 78 신설).
+
+    커버리지로 찾은 미검증 경로다 — `upsert_batch()`의 행 단위 예외 처리
+    (`storage/database.py` 245-247)와 전체 실패 롤백(254-257)이 한 번도 실행되지 않았다.
+    §2는 정상 경로(insert/update/법원 격리)만 본다.
+
+    왜 중요한가 — 이 함수는 **매일 06:00 크롤러의 유일한 DB 쓰기 경로**다(mvp_scraper.py).
+    법원 60곳에서 모은 수백 행을 한 번에 넣는데, 그중 한 행이 기형이면(가격 필드에 숫자가
+    아닌 값이 오는 것은 크롤링에서 드문 일이 아니다) **나머지 전부가 함께 사라지면 안 된다.**
+    이 저장소의 FR-101("1개 실패는 전체 실패로 이어지지 않는다")이 이 경로에도 적용된다.
+
+    실제 auction.db는 절대 쓰지 않는다 — §2와 같은 스크래치 사본 방식.
+    """
+    print("\n--- 3. upsert_batch() partial failure isolation (scratch copy only) ---")
+    real_path = dbmod.DB_PATH
+    tmp_dir = tempfile.mkdtemp(prefix="kokchal_qa_upsert_")
+    tmp_db = os.path.join(tmp_dir, "scratch.db")
+    shutil.copy2(real_path, tmp_db)
+    dbmod.DB_PATH = tmp_db
+    try:
+        case = "QA-UPSERT-ISOLATION"
+
+        def row(item_no, price="1000", court="QA법원C"):
+            return {"court_code": court, "court_name": court, "case_no": case,
+                    "item_no": item_no, "full_address": "addr-" + item_no,
+                    "appraisal_price": price, "minimum_bid_price": "500"}
+
+        # 가운데 행의 가격이 숫자가 아니다 -> int() 변환에서 ValueError.
+        # 앞뒤 행은 정상이므로 저장돼야 한다.
+        #
+        # ★ 예외를 잡아 FAIL로 바꾼다. 격리가 사라지면 이 호출이 그대로 던지는데, 그러면
+        # 스위트가 **크래시로 중단**돼 남은 검사가 실행되지 않는다(변이 시험에서 확인).
+        # 실패는 깔끔한 FAIL이어야 원인과 범위를 함께 볼 수 있다
+        # (`test_api_regression.py::_safe_out`이 같은 이유로 존재한다).
+        try:
+            result = dbmod.upsert_batch([row("1"), row("2", price="가격미정"), row("3")])
+        except Exception as exc:  # noqa: BLE001
+            _check_true("깨진 행이 배치 전체를 죽이지 않는다(행 단위 격리)", False,
+                        "예외가 그대로 올라왔다: %r" % (exc,))
+            result = {"inserted": 0, "updated": 0, "failed": 0}
+        else:
+            _check_true("깨진 행이 배치 전체를 죽이지 않는다(행 단위 격리)", True)
+
+        check("깨진 행은 failed로 계수된다", result["failed"], 1)
+        check("정상 행은 그대로 저장된다", result["inserted"], 2)
+        _check_true("합계가 입력 행 수와 같다(조용히 사라지는 행이 없다)",
+                    result["inserted"] + result["updated"] + result["failed"] == 3, result)
+
+        conn = dbmod.get_connection()
+        try:
+            saved = {r["item_no"] for r in conn.execute(
+                "SELECT item_no FROM auction WHERE case_no=?", (case,)).fetchall()}
+            check("깨진 행 앞의 정상 행이 커밋됐다", "1" in saved, True)
+            check("깨진 행 뒤의 정상 행도 커밋됐다", "3" in saved, True)
+            check("깨진 행은 저장되지 않았다", "2" in saved, False)
+        finally:
+            conn.close()
+
+        # 재실행: 정상 행은 UPDATE로, 깨진 행은 여전히 failed로 간다(누적 오염 없음).
+        again = dbmod.upsert_batch([row("1", price="2000"), row("2", price="가격미정")])
+        check("재실행 시 정상 행은 update", again["updated"], 1)
+        check("재실행 시 깨진 행은 여전히 failed", again["failed"], 1)
+        conn = dbmod.get_connection()
+        try:
+            price = conn.execute(
+                "SELECT appraisal_price FROM auction WHERE case_no=? AND item_no='1'",
+                (case,)).fetchone()["appraisal_price"]
+            check("update가 실제로 값을 바꿨다", price, 2000)
+            check("깨진 행이 뒤늦게 생기지도 않았다", conn.execute(
+                "SELECT COUNT(*) FROM auction WHERE case_no=? AND item_no='2'",
+                (case,)).fetchone()[0], 0)
+        finally:
+            conn.close()
+
+        # 빈 배치: 크롤이 0건을 돌려준 날에도 예외 없이 0을 보고해야 한다
+        # (mvp_scraper는 rows가 비면 enqueue를 건너뛰지만 upsert 자체는 호출될 수 있다).
+        check("빈 배치는 0/0/0", dbmod.upsert_batch([]),
+              {"inserted": 0, "updated": 0, "failed": 0})
+
+        # 필수 키가 아예 없는 행 — 크롤러 파싱이 실패했을 때의 모습이다.
+        # 지금 구현은 빈 문자열 기본값으로 저장한다(예외가 아니다). 그 동작을 고정한다:
+        # 조용히 죽지 않는다는 것이 계약이고, 빈 키 행을 어떻게 다룰지는 크롤러 정책이다.
+        empty = dbmod.upsert_batch([{}])
+        _check_true("키 없는 행도 배치를 죽이지 않는다",
+                    empty["inserted"] + empty["updated"] + empty["failed"] == 1, empty)
+        conn = dbmod.get_connection()
+        try:
+            conn.execute("DELETE FROM auction WHERE case_no=? OR case_no=''", (case,))
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_get_stats_contract():
+    """`get_stats()` — 크롤러가 매 실행 끝에 로그로 남기는 요약(미검증 경로였다).
+
+    이 값이 틀리면 운영자가 "오늘 몇 건 들어왔나"를 잘못 읽는다. 실제 DB를 읽기만 한다.
+    """
+    print("\n--- 4. get_stats() contract (read-only) ---")
+    stats = dbmod.get_stats()
+    _check_true("dict를 돌려준다", isinstance(stats, dict), type(stats))
+    total = dbmod.get_connection()
+    try:
+        actual = total.execute("SELECT COUNT(*) FROM auction").fetchone()[0]
+    finally:
+        total.close()
+    # 키 이름은 구현이 정한다 — 총건수를 담은 키가 실제 건수와 맞는지만 본다.
+    matching = [k for k, v in stats.items() if v == actual]
+    _check_true("총 건수와 일치하는 항목이 있다(집계가 실제 DB를 반영한다)",
+                bool(matching) or actual == 0, "stats=%r actual=%d" % (stats, actual))
+    _check_true("음수 값이 없다", all(
+        (v >= 0) for v in stats.values() if isinstance(v, (int, float))), stats)
+
+
 def run():
     test_real_db_integrity_invariants()
     test_cross_court_upsert_safety()
+    test_upsert_partial_failure_isolation()
+    test_get_stats_contract()
 
     print("\n" + "=" * 55)
     if failures:

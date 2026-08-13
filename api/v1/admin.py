@@ -10,7 +10,10 @@ from api.auth import success
 # Admin은 실패를 전부 HTTPException(FastAPI 표준 detail)으로 반환한다 —
 # 기존 클라이언트가 status_code로 분기하고 있어 envelope로 바꾸면 Breaking Change다.
 # 따라서 여기서는 ErrorCode를 쓰지 않고, 상태/감사 관련 Enum만 가져온다.
-from api.constants import AuditAction, AuditTargetType, RegistryRequestStatus
+from api.constants import (
+    AuditAction, AuditTargetType, RegistryRequestStatus,
+    PaymentStatus, PaymentType, SubscriptionStatus,
+)
 from api.v1.audit import record_audit, get_audit_logs
 
 logger = logging.getLogger(__name__)
@@ -19,6 +22,40 @@ router = APIRouter()
 
 # 값은 기존과 동일하다 — api/constants.py로 정의 위치만 모았다(오타·누락 방지).
 VALID_STATUSES = tuple(s.value for s in RegistryRequestStatus)
+
+
+# 목록 필터의 허용값 (2026-08-13 Sprint 74)
+# ---------------------------------------------------------------------------
+# 잘못된 필터 값을 어떻게 다루는지가 엔드포인트마다 **세 갈래로 갈려 있었다**(실측).
+#
+#     registry-requests?status=오타          400  허용값 안내
+#     payments/webhooks?processing_status=오타 400  허용값 안내
+#     payments?status=오타                   200  빈 목록      <- 오타인지 데이터가 없는지 모른다
+#     subscriptions?status=오타              200  빈 목록      <-
+#     audit-logs?target_type=오타            200  빈 목록      <-
+#
+# 뒤 세 개가 문제다. 운영자가 필터 값을 잘못 적으면 "결과 없음"으로 보이므로,
+# **오타와 "정말 그 상태인 건이 없다"를 구분할 수 없다.** 잘못된 조건으로 조회해 놓고
+# "이 상태의 결제는 한 건도 없다"고 판단하게 되는 자리다.
+# (프런트에서 BUGS #31이 "빈 결과"와 "페이지 범위 초과"를 뭉개지 않도록 고친 것과 같은 부류)
+#
+# 새 규칙을 만든 것이 아니라 **이 파일이 이미 쓰고 있는 방식**을 나머지에 맞춘 것이다.
+# 허용값은 전부 api/constants.py의 Enum에서 도출한다 — 목록을 손으로 적어 두면
+# Enum이 늘어날 때 조용히 어긋난다.
+def _validate_filter(name: str, value, allowed) -> None:
+    """목록 필터 값 검증. 값이 없으면(None/빈 문자열) 필터를 걸지 않으므로 통과."""
+    if value and value not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="허용되지 않는 %s입니다: %s (허용값: %s)" % (name, value, ", ".join(allowed)),
+        )
+
+
+VALID_PAYMENT_STATUSES = tuple(s.value for s in PaymentStatus)
+VALID_PAYMENT_TYPES = tuple(t.value for t in PaymentType)
+VALID_SUBSCRIPTION_STATUSES = tuple(s.value for s in SubscriptionStatus)
+VALID_AUDIT_TARGET_TYPES = tuple(t.value for t in AuditTargetType)
+VALID_AUDIT_ACTIONS = tuple(a.value for a in AuditAction)
 
 # 관리자가 직접 바꿀 수 있는 전이만 허용한다. PAYMENT_REQUIRED는 결제 성공 시
 # api/v1/payments.py가 자동으로 PENDING으로 옮기므로 관리자 전이 대상이 아니다.
@@ -87,6 +124,49 @@ def require_super_admin(x_admin_key: Optional[str] = Header(None, alias="X-Admin
     return _require_role(x_admin_key, ROLE_SUPER_ADMIN)
 
 
+def _require_existing_registry_document(doc_url: str) -> None:
+    """COMPLETED로 넘기기 전에 `doc_url`이 **실제로 존재하는 파일**인지 확인한다.
+
+    2026-08-13 Sprint 95 신설 (docs/BUGS.md #93).
+
+    예전에는 `doc_url`이 **비어 있지 않은지만** 봤다. 그래서 운영자가 파일명을 오타내도
+    전이가 성공했고, 그 결과가 사용자에게 그대로 거짓말로 나갔다(실측 재현).
+
+        Admin PATCH status=COMPLETED, doc_url="does-not-exist.pdf"   -> 200 성공
+        DB                       status=COMPLETED                    -> 저장됨
+        사용자 상세 화면            "발급 완료"                        -> 보인다
+        사용자 다운로드             404 "문서 파일을 찾을 수 없습니다"    -> 받을 수 없다
+
+    `docs/BUGS.md` #50/#65와 같은 부류다 {"완료"로 표시되는데 실제로는 못 쓰는 파일}.
+    다만 그쪽은 크롤러가 재시도로 스스로 회복하는 반면, 이 경로는 **자가 복구가 없다** —
+    운영자가 알아채기 전까지 그 사용자는 계속 404를 받는다.
+
+    검사 방식은 다운로드 경로(`api/v1/registry.py:download_registry()`)와 **똑같이** 맞춘다.
+    두 곳이 다른 기준을 쓰면 "등록은 됐는데 못 받는" 상태가 다시 생긴다.
+    덤으로 경로 탐색을 **쓰기 시점에** 막는다 — 예전에는 읽기 시점에만 막고 있었다.
+    """
+    from api.v1.registry import REGISTRY_DOCUMENT_ROOT
+
+    real_root = os.path.realpath(REGISTRY_DOCUMENT_ROOT)
+    real_path = os.path.realpath(os.path.join(REGISTRY_DOCUMENT_ROOT, doc_url))
+    try:
+        inside = os.path.commonpath([real_root, real_path]) == real_root
+    except ValueError:
+        # 다른 드라이브 등 commonpath가 비교할 수 없는 경로. 바깥으로 본다.
+        inside = False
+    if not inside:
+        raise HTTPException(
+            status_code=400,
+            detail=f"doc_url이 등기부 문서 디렉터리 밖을 가리킵니다: {doc_url}",
+        )
+    if not os.path.isfile(real_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"해당 문서 파일이 없습니다: {doc_url} "
+                   f"(registry_documents/ 아래에 먼저 파일을 두고 연결하세요)",
+        )
+
+
 class StatusUpdateRequest(BaseModel):
     status: str
     reason: Optional[str] = None  # status=FAILED일 때 필수
@@ -94,6 +174,12 @@ class StatusUpdateRequest(BaseModel):
 
 
 def row_to_admin_registry_request(row) -> dict:
+    """등기부 신청 행 -> Admin 응답.
+
+    `case_no` / `full_address`는 `auction_item`에서 LEFT JOIN으로 붙는다.
+    물건 행이 사라진 신청이면 **None으로 온다** ― 그래도 신청 자체는 보여야 한다
+    (2026-08-13 Sprint 97). 아래 목록/상세 쿼리의 LEFT JOIN 주석 참고.
+    """
     return {
         "id": row["id"],
         "user_id": row["user_id"],
@@ -141,10 +227,25 @@ def list_registry_requests(
             params.append(f"%{case_no}%")
 
         where = " AND ".join(conditions)
+        # ★ LEFT JOIN이어야 한다 (2026-08-13 Sprint 97).
+        #
+        #   INNER JOIN이던 시절, `auction_item` 행이 사라진 신청은 **관리자 목록에서
+        #   통째로 사라졌다.** total까지 같이 줄어서 "무언가 빠졌다"는 신호조차 없었다.
+        #   반면 사용자 쪽 목록(`registry.py:161`)은 JOIN을 하지 않으므로 **그 신청을
+        #   계속 보여준다.** 사용자는 "처리 중"을 보는데 관리자는 존재 자체를 모른다 ―
+        #   돈을 낸 신청이 영영 처리되지 않는다.
+        #
+        #   임시 복사본에서 실측: 사용자 목록 1건 / 관리자 목록 0건 / LEFT JOIN 1건.
+        #
+        #   **[현재 노출 범위]** 지금 프로덕션 코드에는 `auction_item`을 지우는 경로가
+        #   없고 런타임 커넥션은 FK를 켠다. 실 DB의 고아 신청도 0건으로 확인했다.
+        #   다만 011~013처럼 **테이블을 재작성하는 마이그레이션은 FK를 끄고 돌며**,
+        #   그때 UNIQUE 정리로 빠지는 행이 생기면 이 상태가 만들어진다.
+        #   대비 비용은 JOIN 한 단어이고, 놓쳤을 때의 대가는 조용한 영구 방치다.
         total = conn.execute(
             f"""
             SELECT COUNT(*) FROM registry_requests rr
-            JOIN auction_item ai ON rr.item_id = ai.id
+            LEFT JOIN auction_item ai ON rr.item_id = ai.id
             WHERE {where}
             """,
             params,
@@ -155,7 +256,7 @@ def list_registry_requests(
             f"""
             SELECT rr.*, ai.case_no, ai.full_address
             FROM registry_requests rr
-            JOIN auction_item ai ON rr.item_id = ai.id
+            LEFT JOIN auction_item ai ON rr.item_id = ai.id
             WHERE {where}
             -- requested_at만으로 정렬하면 동률 행의 순서가 쿼리마다 달라질 수 있어,
             -- offset 페이지네이션에서 같은 행이 두 페이지에 나오거나 아예 빠질 수 있다.
@@ -188,6 +289,8 @@ def update_registry_request_status(
         raise HTTPException(status_code=400, detail="FAILED 처리에는 reason이 필요합니다")
     if req.status == "COMPLETED" and not req.doc_url:
         raise HTTPException(status_code=400, detail="COMPLETED 처리에는 doc_url이 필요합니다")
+    if req.status == "COMPLETED":
+        _require_existing_registry_document(req.doc_url)
 
     conn = get_connection()
     try:
@@ -266,7 +369,7 @@ def update_registry_request_status(
             """
             SELECT rr.*, ai.case_no, ai.full_address
             FROM registry_requests rr
-            JOIN auction_item ai ON rr.item_id = ai.id
+            LEFT JOIN auction_item ai ON rr.item_id = ai.id
             WHERE rr.id=?
             """,
             (request_id,),
@@ -491,6 +594,9 @@ def admin_list_payments(
     admin_role: str = Depends(require_admin),
 ):
     """결제 목록(읽기 전용). 사용자용 `GET /payments`와 달리 전체 사용자를 대상으로 한다."""
+    _validate_filter("status", status, VALID_PAYMENT_STATUSES)
+    _validate_filter("payment_type", payment_type, VALID_PAYMENT_TYPES)
+
     conn = get_connection()
     try:
         conditions, params = ["1=1"], []
@@ -560,6 +666,7 @@ def admin_list_webhooks(
     운영자가 "가능/불가"만 보고 오판하지 않도록 **왜 안 되는지**까지 돌려준다.
     """
     from api.v1.payment_logs import row_to_webhook, VALID_WEBHOOK_STATUSES
+    from api.v1.payment_providers import VALID_PROVIDER_NAMES
 
     if processing_status and processing_status not in VALID_WEBHOOK_STATUSES:
         raise HTTPException(
@@ -567,6 +674,22 @@ def admin_list_webhooks(
             detail=f"허용되지 않는 processing_status입니다: {processing_status} "
                    f"(허용값: {', '.join(VALID_WEBHOOK_STATUSES)})",
         )
+    # 2026-08-13 Sprint 78 — Sprint 74가 정리한 규약의 **누락 인스턴스**였다.
+    # 바로 위 `processing_status`는 검증되는데 같은 함수의 `provider`는 그대로 SQL 등호로
+    # 들어가, 오타를 주면 400이 아니라 200 + 빈 목록이 나왔다(실측).
+    #
+    #     GET /admin/payments/webhooks?provider=BOGUS  ->  200 {"data": []}
+    #
+    # 운영자는 "그 PG의 노티가 한 건도 없다"고 읽는다. 값의 허용 집합은 이미 존재한다 —
+    # webhook 수신 경로가 `get_payment_provider_by_name()`으로 같은 맵에 검증하므로
+    # 저장될 수 있는 값이 곧 그 맵의 키다(`VALID_PROVIDER_NAMES`).
+    #
+    # 수신 경로와 **같은 정규화**를 먼저 적용한다(`.strip().lower()`). 그쪽이 소문자로
+    # 정규화해 저장하므로 `provider=Mock`은 저장된 값과 절대 일치하지 않는다 — 정규화하지
+    # 않으면 "시스템이 받아주는 이름인데 조회에서는 거부되는" 비대칭이 생긴다.
+    if provider:
+        provider = provider.strip().lower()
+    _validate_filter("provider", provider, VALID_PROVIDER_NAMES)
 
     conn = get_connection()
     try:
@@ -769,6 +892,8 @@ def admin_list_subscriptions(
     """
     from api.v1.subscriptions import sync_expired_status, row_to_subscription
 
+    _validate_filter("status", status, VALID_SUBSCRIPTION_STATUSES)
+
     conn = get_connection()
     try:
         # 읽기 경로다 — 호출부에 트랜잭션이 없으므로 여기서 확정해야 변경이 남는다.
@@ -871,6 +996,9 @@ def admin_audit_logs(
     admin_role: str = Depends(require_admin),
 ):
     """Admin 작업 이력 조회 (CTO 승인 5번)."""
+    _validate_filter("target_type", target_type, VALID_AUDIT_TARGET_TYPES)
+    _validate_filter("action", action, VALID_AUDIT_ACTIONS)
+
     conn = get_connection()
     try:
         total, items = get_audit_logs(

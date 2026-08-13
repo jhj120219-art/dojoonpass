@@ -50,7 +50,7 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
                 payload = decode_supabase_jwt(credentials.credentials)
                 user_id = payload.get("sub")
             except JWTError:
-                logger.debug("item 상세: 토큰 검증 실패 — 비로그인으로 처리")
+                logger.debug("item 상세: 토큰 검증 실패 ― 비로그인으로 처리")
                 user_id = None
             if user_id:
                 try:

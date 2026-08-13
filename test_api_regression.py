@@ -24,6 +24,7 @@ import os
 import json
 import uuid
 import secrets
+import sqlite3
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -230,6 +231,70 @@ def test_search():
     closed = client.get("/api/v1/search?include_closed=true").json()["total"]
     check_true("include_closed >= default", closed >= base, "%d < %d" % (closed, base))
 
+    # ── D7 경계: **오늘이 매각기일인 물건은 보여야 한다** (2026-08-13 Sprint 79) ──
+    #
+    # 위 검사는 "include_closed를 켜면 건수가 같거나 는다"만 본다. 그래서 기본 필터가
+    # `auction_date >= today`에서 `> today`로 바뀌어도 **그대로 통과한다.**
+    #
+    # 그 한 글자가 바뀌면 **매각 당일 아침에 그 물건이 검색에서 사라진다.** 사용자가 가장
+    # 절실하게 찾는 시점에 사라지는 셈이라, 경계를 데이터로 못박아 둔다.
+    # (실측 2026-08-13 기준 오늘이 기일인 물건이 0건이라 기존 데이터로는 확인할 수 없다 —
+    #  그래서 어제/오늘/내일 픽스처를 직접 만든다.)
+    d7_case = "QA-D7-%d" % int(datetime.now().timestamp())
+    conn = get_connection()
+    made_ids = []
+    try:
+        try:
+            case_id = conn.execute(
+                "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                ("서울중앙지방법원", d7_case)).lastrowid
+            for label, offset in (("yesterday", -1), ("today", 0), ("tomorrow", 1)):
+                d = (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+                made_ids.append(conn.execute(
+                    "INSERT INTO auction_item"
+                    " (case_id, case_no, item_no, court_name, auction_date, full_address,"
+                    "  appraisal_price, minimum_bid_price)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (case_id, d7_case, label, "서울중앙지방법원", d,
+                     "서울특별시 강남구 역삼동 1", 100000000, 70000000)).lastrowid)
+            conn.commit()
+
+            def d7_dates(qs):
+                r = client.get("/api/v1/search?size=50&case_no=%s&%s" % (d7_case, qs))
+                return sorted(i["auction_date"] for i in r.json()["items"])
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            default_dates = d7_dates("")
+            check("D7 기본: 오늘과 내일만 보인다", default_dates, [today_str, tomorrow_str])
+            check_true("D7 기본: 오늘이 기일인 물건이 포함된다", today_str in default_dates,
+                       default_dates)
+            check_true("D7 기본: 어제 기일인 물건은 빠진다", yesterday_str not in default_dates,
+                       default_dates)
+
+            all_dates = d7_dates("include_closed=true")
+            check("include_closed=true면 셋 다 보인다", all_dates,
+                  [yesterday_str, today_str, tomorrow_str])
+
+            # auction_date_from을 명시하면 D7 기본값을 적용하지 않는다(기존 계약).
+            explicit = d7_dates("auction_date_from=%s" % yesterday_str)
+            check("auction_date_from 명시는 기본 필터를 대체한다", explicit,
+                  [yesterday_str, today_str, tomorrow_str])
+        finally:
+            if made_ids:
+                conn.execute("DELETE FROM auction_item WHERE id IN (%s)"
+                             % ",".join("?" * len(made_ids)), made_ids)
+            conn.execute("DELETE FROM auction_case WHERE case_no=?", (d7_case,))
+            conn.commit()
+    finally:
+        conn.close()
+
+    # 픽스처가 남지 않았는지 확인한다(남으면 다음 실행의 건수 검사를 오염시킨다).
+    leftover = client.get("/api/v1/search?include_closed=true&case_no=%s" % d7_case).json()["total"]
+    check("D7 픽스처가 정리됐다", leftover, 0)
+
     # SQL Injection 시도가 파라미터 바인딩으로 무해하게 처리되는지
     r = client.get("/api/v1/search?sido=' OR 1=1--")
     check("injection attempt safe", r.status_code, 200)
@@ -243,6 +308,178 @@ def test_search():
 
 # ---------------------------------------------------------------------------
 # 2-B. 물건종류 어휘 별칭 (docs/BUGS.md #33, 2026-08-11 Sprint 51 신규)
+# ---------------------------------------------------------------------------
+# 2-C. address_detail 의도 분기 (2026-08-13 Sprint 90 신규)
+#
+# `address_detail`은 검색 화면의 **주소 상세** 입력이다. 사용자가 무엇을 적었는지를
+# `intent.analyzer`가 해석하고, `api/v1/search.py:build_address_condition()`이 그에 맞는
+# SQL 조건을 만든다. 그런데 이 파라미터는 **API 레벨 검사가 0건**이었다
+# (커버리지가 LOT_NUMBER 분기와 MIXED의 sido 가지를 미커버로 지목했다).
+#
+# 의도별로 조건이 완전히 다르다.
+#
+#     "서울"                -> SIDO          sido = ?
+#     "강남구"               -> SIGUNGU       sigungu LIKE ?
+#     "역삼동"               -> DONG          dong LIKE ?
+#     "609-10"             -> LOT_NUMBER    lot_number = ?        <- 미커버였다
+#     "서울 강남구 역삼동"      -> FULL_ADDRESS  세 조건 AND
+#     "서울 아파트"           -> MIXED         sido + 잔여어         <- sido 가지가 미커버였다
+#
+# 200만 보고 통과시키지 않는다. **반환된 행이 실제로 그 조건에 맞는지**까지 본다
+# (Sprint 49가 정렬/페이지에서 세운 원칙과 같다 - 조건이 통째로 무시돼도 200은 나온다).
+#
+# 기대 건수는 단언하지 않는다. DB에서 실제 물건 하나를 뽑아 그 값으로 검색하므로
+# 데이터가 바뀌어도 유효하다.
+# ---------------------------------------------------------------------------
+def test_address_detail_intents():
+    print("\n--- 2-C. address_detail 의도 분기 (Sprint 90) ---")
+    conn = get_connection()
+    try:
+        sample = conn.execute(
+            "SELECT id, sido, sigungu, dong, lot_number FROM auction_item"
+            " WHERE sido != '' AND sigungu != '' AND dong != '' AND lot_number != ''"
+            " LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not sample:
+        print("[SKIP] 주소 4요소가 모두 있는 물건이 없다")
+        return
+
+    sido, sigungu = sample["sido"], sample["sigungu"]
+    dong, lot = sample["dong"], sample["lot_number"]
+
+    def search(detail, **extra):
+        params = {"size": 100, "include_closed": "true", "address_detail": detail}
+        params.update(extra)
+        r = client.get("/api/v1/search", params=params)
+        check("address_detail=%r 는 200" % detail, r.status_code, 200)
+        return r.json()
+
+    # (1) SIDO — 반환된 모든 행의 sido가 정확히 일치해야 한다(LIKE가 아니라 =).
+    body = search(sido)
+    check_true("SIDO: 결과가 있다", body["total"] > 0, body["total"])
+    off = [i["sido"] for i in body["items"] if i["sido"] != sido]
+    check("SIDO: 다른 시도가 섞이지 않는다", off, [])
+
+    # (2) SIGUNGU — LIKE라 부분 일치를 허용하지만 그 값을 포함해야 한다.
+    body = search(sigungu)
+    check_true("SIGUNGU: 결과가 있다", body["total"] > 0, body["total"])
+    off = [i["sigungu"] for i in body["items"] if sigungu not in (i["sigungu"] or "")]
+    check("SIGUNGU: 조건과 무관한 시군구가 없다", off, [])
+
+    # (3) DONG
+    body = search(dong)
+    check_true("DONG: 결과가 있다", body["total"] > 0, body["total"])
+    off = [i["dong"] for i in body["items"] if dong not in (i["dong"] or "")]
+    check("DONG: 조건과 무관한 동이 없다", off, [])
+
+    # (4) ★ LOT_NUMBER — 지번은 **정확히 일치**해야 한다(LIKE가 아니다).
+    #
+    # 검사가 실제로 구분력을 가지려면 **다른 지번의 부분문자열인 지번**을 써야 한다.
+    # 처음엔 임의의 지번을 썼는데, 그 값이 다른 어떤 지번에도 포함되지 않아
+    # `=`를 LIKE로 바꾸는 변이가 **그대로 통과했다**(결과가 같았다).
+    # 이제 상위 문자열이 존재하는 지번을 DB에서 직접 골라, LIKE가 되면
+    # "19"가 "342-19"·"619-2"까지 끌어오는 것이 드러나게 한다.
+    conn = get_connection()
+    try:
+        distinguishing = conn.execute(
+            "SELECT a.id, a.lot_number FROM auction_item a"
+            " WHERE a.lot_number != '' AND EXISTS ("
+            "   SELECT 1 FROM auction_item b"
+            "   WHERE b.lot_number != a.lot_number"
+            "     AND b.lot_number LIKE '%' || a.lot_number || '%')"
+            " LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    # 지번을 바꾸면 "그 물건이 결과에 있는가"의 기준 id도 함께 바꿔야 한다.
+    lot_sample_id = sample["id"]
+    if distinguishing:
+        lot = distinguishing["lot_number"]
+        lot_sample_id = distinguishing["id"]
+    else:
+        print("[NOTE] 부분문자열 관계인 지번이 없어 LIKE/= 구분력이 약하다")
+
+    body = search(lot)
+    check_true("LOT_NUMBER: 결과가 있다", body["total"] > 0, body["total"])
+    # 검색 응답 항목에는 lot_number가 없다(row_to_item이 내려주지 않는다).
+    # 반환된 id를 DB로 되짚어 확인한다 — 직렬화가 아니라 **SQL 필터 자체**를 보는 셈이라
+    # 오히려 더 강한 검사다.
+    ids = [i["id"] for i in body["items"]]
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, lot_number FROM auction_item WHERE id IN (%s)"
+            % ",".join("?" * len(ids)), ids).fetchall() if ids else []
+    finally:
+        conn.close()
+    off = [(r["id"], r["lot_number"]) for r in rows if r["lot_number"] != lot]
+    check("LOT_NUMBER: 지번이 정확히 일치한다", off, [])
+    check_true("LOT_NUMBER: 그 지번의 물건이 결과에 있다",
+               any(i["id"] == lot_sample_id for i in body["items"]),
+               [i["id"] for i in body["items"]][:5])
+
+    # (5) FULL_ADDRESS — 세 조건이 AND로 걸린다.
+    body = search("%s %s %s" % (sido, sigungu, dong))
+    check_true("FULL_ADDRESS: 결과가 있다", body["total"] > 0, body["total"])
+    bad = [i["id"] for i in body["items"]
+           if i["sido"] != sido or sigungu not in (i["sigungu"] or "")
+           or dong not in (i["dong"] or "")]
+    check("FULL_ADDRESS: 세 조건이 모두 적용된다", bad, [])
+    # 좁은 조건이 넓은 조건보다 결과가 많을 수는 없다.
+    sido_total = search(sido)["total"]
+    check_true("FULL_ADDRESS는 SIDO보다 넓지 않다", body["total"] <= sido_total,
+               "%d > %d" % (body["total"], sido_total))
+
+    # (6) ★ MIXED — 지역어 + 잔여어. sido 가지가 실제로 걸리는지 본다.
+    mixed = search("%s 아파트" % sido)
+    off = [i["sido"] for i in mixed["items"] if i["sido"] != sido]
+    check("MIXED: sido 조건이 적용된다", off, [])
+    check_true("MIXED는 SIDO보다 넓지 않다", mixed["total"] <= sido_total,
+               "%d > %d" % (mixed["total"], sido_total))
+
+    # MIXED는 세 요소가 각각 독립적으로 붙는다. sido만 검증하면 나머지 두 가지가
+    # 통째로 빠져도 드러나지 않는다 — "시군구 + 동" 조합으로 나머지 가지도 확인한다.
+    mixed2 = search("%s %s" % (sigungu, dong))
+    bad2 = [i["id"] for i in mixed2["items"]
+            if sigungu not in (i["sigungu"] or "") or dong not in (i["dong"] or "")]
+    check("MIXED: 시군구와 동 조건이 함께 적용된다", bad2, [])
+    check_true("MIXED(시군구+동)는 시군구 단독보다 넓지 않다",
+               mixed2["total"] <= search(sigungu)["total"],
+               "%d > %d" % (mixed2["total"], search(sigungu)["total"]))
+
+    # (6-B) 검색도 선택적 인증이다 — 토큰이 잘못돼도 200이고 비로그인으로 처리된다.
+    #
+    # item.py와 같은 분기인데(Sprint 88), 검색 쪽은 **BUGS #27이 살았던 자리**다:
+    # ES256 전환 후 HS256만 검증하던 시절 로그인 사용자의 하트가 전부 빈 하트로 내려갔다.
+    # 그때는 예외가 아니라 **조용한 오답**이었으므로, 200만 보지 말고 is_favorited까지 본다.
+    bad_tok = {"Authorization": "Bearer not-a-jwt"}
+    leaked = None
+    r_badtok = None
+    try:
+        r_badtok = client.get("/api/v1/search",
+                              params={"size": 5, "include_closed": "true"}, headers=bad_tok)
+    except Exception as exc:
+        leaked = exc
+    check_true("검색: 잘못된 토큰에 예외가 새어 나오지 않는다", leaked is None,
+               "선택적 인증의 except JWTError가 사라졌는가? 검색이 통째로 500이 된다: %r"
+               % (leaked,))
+    if r_badtok is not None:
+        check("검색: 잘못된 토큰이어도 200", r_badtok.status_code, 200)
+        hearts = {i["is_favorited"] for i in r_badtok.json()["items"]}
+        check("검색: 잘못된 토큰이면 하트가 켜지지 않는다", hearts - {False}, set())
+
+    # (7) 해석할 수 없는 입력은 결과를 0으로 만들되 오류가 아니다.
+    unknown = search("존재하지않는지역명입니다")
+    check("UNKNOWN 입력도 200이고 오류가 아니다", unknown["total"], 0)
+
+    # (8) 빈 문자열은 조건을 걸지 않는다(전체와 같아야 한다).
+    all_total = client.get("/api/v1/search",
+                           params={"size": 1, "include_closed": "true"}).json()["total"]
+    check("빈 address_detail은 조건을 걸지 않는다", search("")["total"], all_total)
+
+
 # ---------------------------------------------------------------------------
 def test_property_type_aliases():
     """
@@ -366,20 +603,30 @@ def test_detail_and_documents():
     check("detail not found", client.get("/api/v1/item/99999999").status_code, 404)
 
     # 문서: 지원하지 않는 타입은 400, 지원 타입은 200/404(파일 유무에 따라)
-    check("document bad type", client.get("/api/v1/item/%d/documents/INVALID" % item_id).status_code, 400)
-    get_status = client.get("/api/v1/item/%d/documents/SPEC" % item_id).status_code
-    check_true("document known type", get_status in (200, 404))
+    #
+    # 2026-08-13 Sprint 85: 상태코드를 직접 꺼내지 않고 감싼다. TestClient는 서버 예외를
+    # 그대로 올리므로, 엔드포인트가 500이 되는 결함이 생기면 이 줄에서 **스위트 전체가
+    # 크래시**했다(변이 테스트로 확인: doc_type 검사를 없앤 변이가 FAIL 0건 + 크래시로
+    # 끝나 집계에서 사라졌다). 예외를 None으로 바꿔 기대값과 어긋나게 만든다.
+    def doc_status(item, doc_type, method="GET"):
+        try:
+            return client.request(method, "/api/v1/item/%s/documents/%s" % (item, doc_type)).status_code
+        except Exception as exc:  # noqa: BLE001
+            print("      (서버 예외: %r)" % (exc,))
+            return None
+
+    check("document bad type", doc_status(item_id, "INVALID"), 400)
+    get_status = doc_status(item_id, "SPEC")
+    check_true("document known type", get_status in (200, 404), get_status)
 
     # HEAD 프로브 — properties/[id]/page.tsx가 문서 뷰어를 열기 전에 실제로 호출하는
     # 엔드포인트다(docCheckKey). GET/HEAD를 별도 라우트로 분리한 이유(OpenAPI Duplicate
     # Operation ID 회피, docs/CHANGELOG.md Sprint 26)가 유지되는지, 응답 상태코드가 GET과
     # 항상 같은지 여기서 처음으로 자동 검증한다(이전까지 이 라우트는 테스트 0건이었다).
-    head_status = client.head("/api/v1/item/%d/documents/SPEC" % item_id).status_code
+    head_status = doc_status(item_id, "SPEC", method="HEAD")
     check("HEAD status matches GET status", head_status, get_status)
-    check("HEAD on bad doc type -> 400",
-          client.head("/api/v1/item/%d/documents/INVALID" % item_id).status_code, 400)
-    check("HEAD on nonexistent item -> 404",
-          client.head("/api/v1/item/99999999/documents/SPEC").status_code, 404)
+    check("HEAD on bad doc type -> 400", doc_status(item_id, "INVALID", method="HEAD"), 400)
+    check("HEAD on nonexistent item -> 404", doc_status(99999999, "SPEC", method="HEAD"), 404)
 
     # 실제 성공 경로 — 위 "document known type" 검사는 200/404 둘 다 통과로 처리해
     # 어느 쪽이 맞는지, 200일 때 실제로 올바른 파일이 내려오는지는 확인한 적이 없었다
@@ -566,6 +813,146 @@ def test_recent_items():
     rows = [i for i in client.get("/api/v1/recent-items", headers=h).json()["data"] if i["id"] == item_id]
     check("no duplicate recent row", len(rows), 1)
 
+    # --- 2026-08-13 Sprint 88: 토큰이 잘못돼도 상세는 비로그인으로 보인다 ---
+    #
+    # 커버리지가 지목했다: `api/v1/item.py`의 `except JWTError: user_id = None`(52-54행)이
+    # 미커버였다. 상세 조회는 **선택적 인증**이다 — 토큰이 있으면 최근조회를 기록하고,
+    # 없거나 잘못됐으면 비로그인으로 그냥 보여준다.
+    #
+    # 이 분기가 없으면 **토큰이 만료된 사용자가 물건 상세를 열 때 오류를 본다.**
+    # 세션 만료는 정상적인 일상이고, 그때 화면이 깨지면 안 된다.
+    # (401도 아니다 — 비로그인도 볼 수 있는 화면인데 401을 주면 로그인 강요가 된다)
+    detail_id = pick_item_ids(1)[0]
+    for label, token in (("깨진 토큰", "not-a-jwt"),
+                         ("빈 문자열", ""),
+                         ("서명이 틀린 토큰",
+                          auth_headers("qa-reg-x")["Authorization"][7:] + "tampered")):
+        # except JWTError가 사라지면 예외가 그대로 올라와 **스위트가 크래시**한다.
+        # 그 형태로 끝나면 원인이 안 보이므로 붙잡아 깔끔한 FAIL로 바꾼다.
+        r_bad = None
+        leaked = None
+        try:
+            r_bad = client.get("/api/v1/item/%d" % detail_id,
+                               headers={"Authorization": "Bearer " + token})
+        except Exception as exc:
+            leaked = exc
+        check_true("%s에 예외가 새어 나오지 않는다" % label, leaked is None,
+                   "선택적 인증의 except JWTError가 사라졌는가? "
+                   "세션 만료만으로 상세 화면이 깨진다: %r" % (leaked,))
+        if r_bad is None:
+            continue
+        check("%s이어도 상세는 200" % label, r_bad.status_code, 200)
+        check("%s이어도 본문은 정상" % label, r_bad.json()["id"], detail_id)
+
+    # 토큰이 없을 때와 같은 결과여야 한다(잘못된 토큰 = 비로그인 취급).
+    anon = client.get("/api/v1/item/%d" % detail_id).json()
+    broken = client.get("/api/v1/item/%d" % detail_id,
+                        headers={"Authorization": "Bearer not-a-jwt"}).json()
+    # 전체 dict를 check()로 비교하면 실패 시 본문 두 개가 통째로 찍혀 읽을 수 없다.
+    # 같은지 여부는 그대로 단언하되, **다른 키만** 골라 보여준다.
+    diff_keys = sorted(k for k in set(anon) | set(broken) if anon.get(k) != broken.get(k))
+    check_true("잘못된 토큰의 응답이 비로그인과 같다", not diff_keys,
+               "다른 키: %s" % diff_keys)
+    # 개인화 필드가 켜지지 않았는지 직접 확인한다(위 비교가 통과해도 명시적으로 못박는다).
+    check("잘못된 토큰에 is_favorited가 켜지지 않는다", broken.get("is_favorited"), False)
+
+    # 그리고 잘못된 토큰으로는 최근조회가 기록되지 않아야 한다 —
+    # 기록됐다면 그 user_id는 검증되지 않은 값이다.
+    conn = get_connection()
+    try:
+        before_rows = conn.execute("SELECT COUNT(*) FROM recent_items").fetchone()[0]
+    finally:
+        conn.close()
+    client.get("/api/v1/item/%d" % detail_id,
+               headers={"Authorization": "Bearer not-a-jwt"})
+    conn = get_connection()
+    try:
+        after_rows = conn.execute("SELECT COUNT(*) FROM recent_items").fetchone()[0]
+    finally:
+        conn.close()
+    check("잘못된 토큰은 최근조회를 남기지 않는다", after_rows, before_rows)
+
+    # --- 2026-08-13 Sprint 80: 기록 실패가 상세 조회를 막으면 안 된다 ---
+    #
+    # `api/v1/item.py`는 record_view()를 try/except로 감싸고 실패해도 계속 진행한다.
+    #
+    #     try:
+    #         record_view(conn, user_id, item_id)
+    #     except Exception:
+    #         logger.warning("최근조회 기록 실패 ...", exc_info=True)
+    #
+    # 의도는 분명하다 — **부가 기능(최근조회)의 실패가 본 기능(물건 상세)을 무너뜨리면
+    # 안 된다.** 그런데 그 계약이 검증된 적이 없었다. except를 지우거나 raise로 바꾸면
+    # DB 잠금 한 번에 **상세 화면 전체가 500**이 되는데, 기존 검사는 전부 정상 경로만 탄다.
+    #
+    # 반대쪽도 함께 고정한다 — 조용히 삼키기만 하고 아무 흔적도 안 남기면 원인 추적이
+    # 불가능해진다. 그래서 경고 로그가 실제로 남는지까지 본다.
+    import logging as _logging
+    import api.v1.item as item_mod
+
+    fail_item_id = pick_item_ids(1)[0]
+    fail_user = "qa-reg-recordview-" + uuid.uuid4().hex[:6]
+    original_record_view = item_mod.record_view
+    captured = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    def _boom(conn, user_id, item_id):
+        # 실제로 일어날 법한 실패를 흉내 낸다 — DB 잠금이 대표적이다.
+        # (이 파일은 sqlite3을 import하지 않으므로 지역 import로 정확한 예외 타입을 쓴다)
+        import sqlite3 as _sqlite3
+        raise _sqlite3.OperationalError("database is locked (주입된 실패)")
+
+    handler = _Capture()
+    item_logger = _logging.getLogger("api.v1.item")
+    item_logger.addHandler(handler)
+    item_mod.record_view = _boom
+    r_fail = None
+    propagated = None
+    try:
+        # 예외가 그대로 새어 나오면 TestClient가 **그것을 다시 던진다** — 500 응답이 아니라
+        # 스위트가 통째로 죽는다. 그 형태로 끝나면 원인이 안 보이므로 여기서 붙잡아
+        # 깔끔한 FAIL로 바꾼다. 가드는 실패할 때 무엇이 잘못됐는지 말해야 한다.
+        try:
+            r_fail = client.get("/api/v1/item/%d" % fail_item_id, headers=auth_headers(fail_user))
+        except Exception as exc:
+            propagated = exc
+    finally:
+        item_mod.record_view = original_record_view
+        item_logger.removeHandler(handler)
+
+    check_true("기록 실패가 상세 조회 밖으로 새어 나오지 않는다", propagated is None,
+               "record_view의 예외가 그대로 전파됐다(try/except가 사라졌는가?): %r" % (propagated,))
+    if r_fail is not None:
+        check("최근조회 기록이 실패해도 상세는 200", r_fail.status_code, 200)
+        # item 상세는 envelope를 쓰지 않는다(search/item 예외 — docs/CLAUDE.md).
+        check("실패해도 상세 본문은 정상", r_fail.json()["id"], fail_item_id)
+    check_true("기록 실패가 경고 로그로 남는다",
+               any("최근조회" in m for m in captured),
+               "조용히 삼키면 원인 추적이 불가능하다: %r" % captured)
+
+    conn = get_connection()
+    try:
+        left = conn.execute("SELECT COUNT(*) FROM recent_items WHERE user_id=?",
+                            (fail_user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("실패했으므로 최근조회 행은 생기지 않는다", left, 0)
+
+    # 주입을 되돌린 뒤에는 다시 정상 기록되어야 한다(패치가 남지 않았는지 확인).
+    client.get("/api/v1/item/%d" % fail_item_id, headers=auth_headers(fail_user))
+    conn = get_connection()
+    try:
+        after = conn.execute("SELECT COUNT(*) FROM recent_items WHERE user_id=?",
+                             (fail_user,)).fetchone()[0]
+        conn.execute("DELETE FROM recent_items WHERE user_id=?", (fail_user,))
+        conn.commit()
+    finally:
+        conn.close()
+    check("주입 해제 후에는 정상 기록된다", after, 1)
+
     # --- 2026-08-12 Sprint 61: 아래 3개는 그동안 검사가 0건이던 영역이다 ---
     # (1) 최근 조회는 개인화 데이터다 — 다른 사용자에게 새어나가면 안 된다.
     other_user = "qa-reg-recent-other-" + uuid.uuid4().hex[:6]
@@ -668,6 +1055,57 @@ def test_search_presets():
     check("preset name trimmed by server", r.json()["data"]["name"], "trimmed")
     client.delete("/api/v1/search-presets/%d" % r.json()["data"]["id"], headers=h)
 
+    # ── 손상된 conditions 한 행이 목록 전체를 죽이면 안 된다 ──────────────────
+    #   (2026-08-13 Sprint 96, BUGS #95)
+    #
+    # 고치기 전 실측: 정상 3건 + 손상 1건 -> **GET 전체가 500**. 멀쩡한 검색조건까지
+    # 통째로 사라졌다. 그리고 사용자는 **스스로 빠져나올 수 없었다** ― 지우려면
+    # preset_id가 필요한데, id를 알 수 있는 유일한 경로가 죽은 그 목록이다.
+    #
+    # 손상 행은 정상 API로는 만들 수 없다(POST는 항상 유효한 JSON을 쓴다). 그래서
+    # DB에 직접 넣는다 ― 레거시 행·수동 복구·부분 쓰기로 생길 수 있는 상태이고,
+    # Sprint 95에서 "COMPLETED인데 파일 없음"을 레거시 상태 방어로 남긴 것과 같은 판단이다.
+    conn = get_connection()
+    try:
+        broken_user = TEST_USER + "-broken-preset"
+        bh = auth_headers(broken_user)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO search_presets (user_id, name, conditions, created_at) VALUES (?,?,?,?)",
+            (broken_user, "정상", json.dumps({"sido": "서울"}), now))
+        conn.execute(
+            "INSERT INTO search_presets (user_id, name, conditions, created_at) VALUES (?,?,?,?)",
+            (broken_user, "손상", "{not valid json", now))
+        # 객체가 아닌 유효 JSON도 같은 취급이어야 한다(리스트/문자열 -> conditions[key]가 깨진다)
+        conn.execute(
+            "INSERT INTO search_presets (user_id, name, conditions, created_at) VALUES (?,?,?,?)",
+            (broken_user, "객체아님", "[1, 2, 3]", now))
+        conn.commit()
+
+        # TestClient는 서버 예외를 그대로 다시 던지므로, 가드가 사라지면 이 호출이
+        # **테스트를 크래시**시킨다(FAIL 0건에 exit=1). 그러면 무엇이 깨졌는지 알 수 없다.
+        # 잡아서 진단으로 바꾼다 ― 이 저장소에서 반복해 겪은 형태다.
+        try:
+            r = client.get("/api/v1/search-presets", headers=bh)
+            status = r.status_code
+        except Exception as exc:
+            r, status = None, "예외: %r" % (exc,)
+        check("손상 행이 있어도 목록은 200 (BUGS #95)", status, 200)
+        got = {p["name"]: p["conditions"] for p in r.json()["data"]} if r is not None else {}
+        check("멀쩡한 검색조건이 살아남는다", got.get("정상"), {"sido": "서울"})
+        check("손상 행은 빈 조건으로 대체된다", got.get("손상"), {})
+        check("객체가 아닌 JSON도 빈 조건으로", got.get("객체아님"), {})
+        # ★ 핵심: 목록에 보여야 지울 수 있다. 숨기면 영원히 남고 한도만 잡아먹는다.
+        broken_id = next((p["id"] for p in (r.json()["data"] if r is not None else [])
+                          if p["name"] == "손상"), None)
+        check("손상 행을 사용자가 지울 수 있다",
+              client.delete("/api/v1/search-presets/%d" % broken_id, headers=bh).status_code
+              if broken_id is not None else "목록에서 찾을 수 없다", 200)
+    finally:
+        conn.execute("DELETE FROM search_presets WHERE user_id=?", (TEST_USER + "-broken-preset",))
+        conn.commit()
+        conn.close()
+
     # 사용자당 저장 개수 상한 — 한도까지 채운 뒤 한 건 더 시도하면 거부되어야 한다.
     conn = get_connection()
     try:
@@ -726,6 +1164,27 @@ def test_payment_and_subscription():
     sub = body["data"]["subscription"]
     days = (datetime.fromisoformat(sub["expires_at"]) - datetime.fromisoformat(sub["started_at"])).days
     check("monthly period ~30d", days, 30)
+
+    # ── 결제 <-> 구독을 잇는 열쇠 (2026-08-13 Sprint 96, BUGS #94) ────────────
+    #
+    # 구독 결제를 전액 환불해도 구독은 ACTIVE로 남는다 ― 돈은 돌려주고 서비스는 계속
+    # 준다(#93 "돈 받고 물건 안 준다"의 거울상). 고치려 해도 **대상을 특정할 수
+    # 없었다**: `subscriptions`에 `payment_id`가 없고 `payments`에도 구독 id가 없어서,
+    # 두 행을 맞출 방법이 `(user_id, 금액, 시각)` 어림짐작뿐이었다.
+    # (`registry_requests`는 진작부터 `payment_id`를 갖고 있다 ― 여기만 끊겨 있었다.)
+    #
+    # ★ 환불 시 구독을 **어떻게** 할지는 정책 결정 대기라 여기서 정하지 않는다.
+    #   그래서 이 검사는 "환불하면 해지된다"를 요구하지 않는다 ― 지금 동작을 정상으로
+    #   굳히지도 않는다(Sprint 95에서 겪은 함정: 결함을 굳힌 검사가 수정을 가로막았다).
+    #   고정하는 것은 **어떤 정책을 고르든 반드시 있어야 하는 식별자**뿐이다.
+    conn = get_connection()
+    try:
+        linked = conn.execute(
+            "SELECT payment_id FROM subscriptions WHERE id=?", (sub["id"],)
+        ).fetchone()["payment_id"]
+    finally:
+        conn.close()
+    check("구독이 자신을 산 결제를 가리킨다(BUGS #94)", linked, body["data"]["payment"]["id"])
 
     # 연 결제(PRO) — 할인가 198,000원이 적용되어야 한다. TEST_USER는 여기서 처음이자
     # 유일하게 구독한다(하위 테스트가 PRO 한도 10회를 전제).
@@ -944,8 +1403,51 @@ def test_registry():
     other_h = auth_headers("qa-reg-other-" + uuid.uuid4().hex[:6])
     check("other user cannot read request",
           client.get("/api/v1/registry-requests/%d" % req_id, headers=other_h).status_code, 404)
+
+    # ── 본인 신청 상세 조회의 응답 계약 (2026-08-13 Sprint 93) ──────────────────
+    #
+    # 커버리지가 지목했다: `get_registry_request()`의 `return success(...)`가 미커버였다.
+    # **404(타인 접근)만 검증되고 200(본인 조회)은 한 번도 실행된 적이 없었다.**
+    #
+    # 즉 이 엔드포인트가 실제로 무엇을 돌려주는지 아무도 확인하지 않았다. 응답에서 키가
+    # 하나 빠지거나 이름이 바뀌어도 검사는 전부 통과한다 — 프런트가 읽는 값인데도 그렇다.
+    own = client.get("/api/v1/registry-requests/%d" % req_id, headers=h)
+    check("본인 신청 상세는 200", own.status_code, 200)
+    own_data = own.json()["data"]
+    check("상세가 요청한 신청을 돌려준다", own_data["id"], req_id)
+    # 필드 집합을 고정한다 — 늘어나는 것은 허용(추가 필드는 하위호환), 사라지면 실패한다.
+    for key in ("id", "item_id", "case_no", "full_address",
+                "status", "reason", "requested_at", "completed_at"):
+        check_true("상세 응답에 %s가 있다" % key, key in own_data, sorted(own_data))
+    # 목록과 상세가 같은 신청에 대해 같은 상태를 말해야 한다(두 경로가 갈라지면 안 된다).
+    listed = client.get("/api/v1/registry-requests", headers=h).json()["data"]
+    mine = [x for x in listed if x["id"] == req_id]
+    check_true("목록에도 같은 신청이 있다", len(mine) == 1, [x["id"] for x in listed][:5])
+    if mine:
+        check("목록과 상세의 상태가 일치한다", mine[0]["status"], own_data["status"])
     check("other user cannot download",
           client.get("/api/v1/registry-requests/%d/download" % req_id, headers=other_h).status_code, 404)
+
+    # ── 다운로드의 인증 경계 (2026-08-13 Sprint 93) ────────────────────────────
+    #
+    # §8의 보호 라우트 검사는 **기본 경로만** 훑는다(`/api/v1/registry-requests`).
+    # 다운로드는 그 하위 경로라 목록에 걸리지 않아, "토큰 없이 파일을 받을 수 있는가"가
+    # 검증된 적이 없었다. 파일을 내려주는 엔드포인트라 가장 먼저 막혀야 하는 자리다.
+    dl_path = "/api/v1/registry-requests/%d/download" % req_id
+    check("토큰 없이 다운로드하면 401", client.get(dl_path).status_code, 401)
+    check("잘못된 토큰으로 다운로드하면 401",
+          client.get(dl_path, headers={"Authorization": "Bearer not-a-real-token"}).status_code,
+          401)
+    # 스킴이 없는 Authorization 헤더도 401이다(403이 아니다) — HTTPBearer가 스킴 불일치를
+    # 인증 실패로 다룬다. 세 경우(없음/잘못된 토큰/스킴 없음)가 **같은 401**로 수렴하는 것이
+    # 맞다: 어느 쪽이든 "인증되지 않았다"이고, 구분해서 알려주면 탐색 단서가 된다.
+    check("Bearer 스킴이 없는 헤더도 401",
+          client.get(dl_path, headers={"Authorization": "raw-token"}).status_code, 401)
+    # 없는 신청은 소유자 토큰이어도 404다(존재 여부를 노출하지 않는다).
+    check("없는 신청 다운로드는 404",
+          client.get("/api/v1/registry-requests/999999999/download", headers=h).status_code, 404)
+    check("음수 request_id도 404",
+          client.get("/api/v1/registry-requests/-1/download", headers=h).status_code, 404)
 
     # 미완료 상태 다운로드는 거짓 성공 없이 실패 메시지를 반환.
     # ★ success=False만 보면 안 된다 (2026-08-11 Sprint 56): 상태 검사를 통째로 없애는
@@ -1001,6 +1503,42 @@ def test_registry():
             conn.close()
         traversal = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
         check("path traversal blocked -> 404", traversal.status_code, 404)
+
+        # COMPLETED인데 doc_url이 비어 있는 방어 경로 (2026-08-13 Sprint 92).
+        #
+        # 코드 주석이 "정상 경로로는 발생하지 않지만 방어적으로 처리한다"고 적어 둔 분기이고,
+        # 실제로 커버리지 0이었다. admin.py가 COMPLETED 전이에 doc_url을 필수로 받으므로
+        # API를 통해서는 만들 수 없지만, **직접 DB를 만진 복구 작업이나 과거 데이터**로는
+        # 생길 수 있다. 그때 500이나 경로 오류가 아니라 **읽을 수 있는 실패**여야 한다.
+        conn = get_connection()
+        try:
+            conn.execute(
+                "UPDATE registry_requests SET status='COMPLETED', doc_url=NULL WHERE id=?",
+                (req_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        # 가드가 없으면 os.path.join(root, None)이 TypeError를 내고 그대로 새어 나온다
+        # (500조차 아니라 예외 전파). 그 형태로 끝나면 원인이 안 보이므로 붙잡아
+        # 깔끔한 FAIL로 바꾼다 — 이 가드가 막는 것이 정확히 그 사고다.
+        no_doc = None
+        leaked_dl = None
+        try:
+            no_doc = client.get("/api/v1/registry-requests/%d/download" % req_id, headers=h)
+        except Exception as exc:
+            leaked_dl = exc
+        check_true("doc_url이 비어도 예외가 새어 나오지 않는다", leaked_dl is None,
+                   "doc_url 가드가 사라졌는가? os.path.join(root, None)이 터진다: %r"
+                   % (leaked_dl,))
+        if no_doc is not None:
+            check("doc_url이 비면 200 + 실패 응답(500이 아니다)", no_doc.status_code, 200)
+            check("doc_url이 비면 REGISTRY_DOCUMENT_NOT_FOUND",
+                  no_doc.json().get("error"), "REGISTRY_DOCUMENT_NOT_FOUND")
+            # 상태 게이트가 아니라 **문서 가드**가 막았는지까지 본다 —
+            # 위 "어느 가드가 막았는지 고정해야 제거가 검출된다"는 교훈과 같은 이유다.
+            check_true("상태 게이트가 아니라 문서 가드가 막았다",
+                       no_doc.json().get("error") != "REGISTRY_NOT_COMPLETED",
+                       no_doc.json())
     finally:
         _os.remove(real_path)
         conn = get_connection()
@@ -1146,6 +1684,91 @@ def test_admin():
     check("admin invalid status filter",
           client.get("/api/v1/admin/registry-requests?status=BOGUS", headers=ah).status_code, 400)
 
+    # ── 물건 행이 사라진 신청도 관리자에게 보여야 한다 (2026-08-13 Sprint 97) ──
+    #
+    # 관리자 목록은 `auction_item`을 JOIN해 사건번호/주소를 붙인다. 이것이 INNER JOIN이면
+    # **물건 행이 없는 신청은 목록에서 통째로 사라지고 total도 함께 줄어든다** ―
+    # 빠졌다는 신호조차 남지 않는다. 반면 사용자 쪽 목록(`registry.py:161`)은 JOIN을
+    # 하지 않아 **그 신청을 계속 보여준다.**
+    #
+    #     사용자 화면   "처리 중"
+    #     관리자 화면   존재하지 않음   -> 돈 낸 신청이 영영 처리되지 않는다
+    #
+    # 정상 API로는 만들 수 없는 상태다(FK가 막는다). 011~013처럼 테이블을 재작성하는
+    # 마이그레이션이 FK를 끄고 도는 동안 생길 수 있어, 그 상태를 직접 재현한다.
+    # 실 DB에 흔적을 남기지 않도록 물건과 사건을 이 검사가 직접 만들고 지운다.
+    conn = get_connection()
+    orphan_user = TEST_USER + "-orphan-item"
+    orphan_case = "9999타경콕찰97"
+    try:
+        now = datetime.now().isoformat()
+        case_id = conn.execute(
+            "INSERT INTO auction_case (case_no, court_name, created_at) VALUES (?,?,?)",
+            (orphan_case, "QA법원", now)).lastrowid
+        item_id = conn.execute(
+            "INSERT INTO auction_item (case_id, case_no, item_no, full_address, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (case_id, orphan_case, "1", "서울특별시 강남구 QA로 1", now)).lastrowid
+        req_id = conn.execute(
+            "INSERT INTO registry_requests (user_id,item_id,status,requested_at) VALUES (?,?,?,?)",
+            (orphan_user, item_id, "PENDING", now)).lastrowid
+        conn.commit()
+
+        r = client.get("/api/v1/admin/registry-requests?user_id=%s" % orphan_user, headers=ah)
+        check("물건이 있을 때 관리자 목록에 보인다", r.json()["data"]["total"], 1)
+
+        # 물건 행만 지운다 — FK를 끈 커넥션이라야 가능하다(마이그레이션이 도는 방식).
+        mig = get_connection(enforce_foreign_keys=False)
+        try:
+            mig.execute("DELETE FROM auction_item WHERE id=?", (item_id,))
+            mig.commit()
+        finally:
+            mig.close()
+
+        r = client.get("/api/v1/admin/registry-requests?user_id=%s" % orphan_user, headers=ah)
+        check("물건이 사라져도 관리자 목록에 남는다", r.json()["data"]["total"], 1)
+        got = r.json()["data"]["items"]
+        check("신청 id가 그대로다", [x["id"] for x in got], [req_id])
+        # 사건번호/주소는 붙일 곳이 없으니 None ― 값을 지어내지 않는다.
+        # ★ 목록이 비면 got[0]이 IndexError로 **테스트를 크래시**시킨다. 그러면 위의
+        #   FAIL 두 줄까지 묻히고 정리(finally)만 남는다. 회귀는 크래시가 아니라
+        #   읽을 수 있는 실패여야 한다 ― 빈 dict로 대신해 검사로 드러낸다.
+        #   빈 dict를 그냥 쓰면 `.get()`이 None을 돌려줘 **기대값 None과 우연히 같아진다**
+        #   ― 목록이 사라졌는데 검사가 통과하는 최악의 형태다. 없을 때는 다른 값이 나오게 한다.
+        first = got[0] if got else {}
+        check("사라진 물건의 사건번호는 None", first.get("case_no", "목록에 행이 없다"), None)
+        check("사라진 물건의 주소는 None", first.get("full_address", "목록에 행이 없다"), None)
+        # ★ 보이기만 해서는 부족하다. 관리자가 **처리할 수 있어야** 한다.
+        #   전이 뒤 상세를 다시 읽는 쿼리도 같은 JOIN을 쓴다 ― INNER JOIN이면 그 SELECT가
+        #   빈 결과를 주고 응답 조립에서 터진다. TestClient가 그 예외를 되던지므로
+        #   감싸지 않으면 여기서 테스트가 크래시한다(앞선 FAIL들이 묻힌다).
+        try:
+            patched = client.patch("/api/v1/admin/registry-requests/%d" % req_id,
+                                   json={"status": "PROCESSING"}, headers=ah).status_code
+        except Exception as exc:
+            patched = "예외: %r" % (exc,)
+        check("사라진 물건의 신청도 상태를 바꿀 수 있다", patched, 200)
+    finally:
+        mig = get_connection(enforce_foreign_keys=False)
+        try:
+            # PATCH가 감사 로그를 남긴다 — 신청 행을 지우기 전에 그 id로 함께 지운다
+            # (남기면 `no dangling audit rows left` 가드가 다음 실행에서 잡는다).
+            for (rid_,) in mig.execute(
+                    "SELECT id FROM registry_requests WHERE user_id=?", (orphan_user,)).fetchall():
+                mig.execute("DELETE FROM audit_logs WHERE target_type='REGISTRY_REQUEST' "
+                            "AND target_id=?", (str(rid_),))
+            mig.execute("DELETE FROM registry_requests WHERE user_id=?", (orphan_user,))
+            mig.execute("DELETE FROM auction_item WHERE case_id IN "
+                        "(SELECT id FROM auction_case WHERE case_no=?)", (orphan_case,))
+            mig.execute("DELETE FROM auction_case WHERE case_no=?", (orphan_case,))
+            mig.commit()
+        finally:
+            mig.close()
+        conn.close()
+    left = client.get("/api/v1/admin/registry-requests?user_id=%s" % orphan_user,
+                      headers=ah).json()["data"]["total"]
+    check("고아 픽스처가 정리됐다", left, 0)
+
     # 내 테스트 유저의 PENDING 건으로 상태 전이 규칙 검증
     r = client.get("/api/v1/admin/registry-requests?status=PENDING&user_id=%s" % TEST_USER, headers=ah)
     items = r.json()["data"]["items"]
@@ -1170,25 +1793,110 @@ def test_admin():
           client.patch("/api/v1/admin/registry-requests/%d" % rid,
                        json={"status": "COMPLETED"}, headers=ah).status_code, 400)
 
-    # PROCESSING -> COMPLETED (doc_url 포함)
-    r = client.patch("/api/v1/admin/registry-requests/%d" % rid,
-                     json={"status": "COMPLETED", "doc_url": "qa-regression-not-a-real-file.pdf"}, headers=ah)
-    check("PROCESSING->COMPLETED ok", r.json()["data"]["status"], "COMPLETED")
-    check_true("completed_at recorded", r.json()["data"]["completed_at"] is not None)
-
-    # 종결 상태에서 추가 전이 금지
-    check("COMPLETED->FAILED rejected",
+    # ── COMPLETED 전이는 **실제 파일이 있어야** 성립한다 (2026-08-13 Sprint 95, BUGS #93) ──
+    #
+    # 예전에는 doc_url이 비어 있지 않기만 하면 통과했다. 그래서 운영자가 파일명을 오타내도
+    # 전이가 성공했고, 사용자 화면에는 "발급 완료"가 뜨는데 다운로드는 404였다(실측 재현).
+    # 크롤러 쪽 BUGS #50/#65와 같은 부류인데, **이쪽은 자가 복구가 없다** —
+    # 운영자가 알아채기 전까지 그 사용자는 계속 404를 받는다.
+    #
+    # 이 검사가 없던 시절 이 블록은 `doc_url="qa-regression-not-a-real-file.pdf"`로
+    # **성공을 기대**하고 있었다. 즉 테스트가 결함을 정상으로 굳혀 두고 있었다.
+    check("없는 파일로 COMPLETED 전이는 400",
           client.patch("/api/v1/admin/registry-requests/%d" % rid,
-                       json={"status": "FAILED", "reason": "x"}, headers=ah).status_code, 400)
+                       json={"status": "COMPLETED",
+                             "doc_url": "qa-regression-not-a-real-file.pdf"},
+                       headers=ah).status_code, 400)
+    check("경로 탐색 doc_url도 400(쓰기 시점 차단)",
+          client.patch("/api/v1/admin/registry-requests/%d" % rid,
+                       json={"status": "COMPLETED", "doc_url": "../../../etc/passwd"},
+                       headers=ah).status_code, 400)
+    # ★ **실재하는** 바깥 파일로도 막혀야 한다.
+    #
+    # 위 `../../../etc/passwd`는 이 환경에 없는 파일이라 "파일 없음" 검사에도 걸린다.
+    # 즉 그것만으로는 **경로 탐색 검사가 살아 있는지 알 수 없다**(변이 시험에서 실제로
+    # 통과했다). `registry_documents/`의 부모는 저장소 루트이고 거기에는 `auction.db`가
+    # 실재한다 — 경로 검사가 없으면 운영자가 그것을 연결할 수 있고, 그러면 사용자가
+    # **DB 파일 전체를 내려받는다.**
+    check("실재하는 바깥 파일(../auction.db)도 400",
+          client.patch("/api/v1/admin/registry-requests/%d" % rid,
+                       json={"status": "COMPLETED", "doc_url": "../auction.db"},
+                       headers=ah).status_code, 400)
+    # ★ **비교조차 할 수 없는 경로**도 막혀야 한다 (2026-08-13 Sprint 99, 커버리지가 지목).
+    #
+    #   포함 검사는 `os.path.commonpath([root, path]) == root`인데, 이 함수는 두 경로가
+    #   **다른 드라이브에 있으면 답을 내는 대신 ValueError를 던진다.**
+    #
+    #       commonpath(["C:\\...\\registry_documents", "D:\\x.pdf"])
+    #           -> ValueError: Paths don't have the same drive
+    #
+    #   `doc_url`이 절대 경로면 `os.path.join(root, doc_url)`이 root를 통째로 버리므로
+    #   그런 경로가 실제로 들어온다(UNC `//server/share/...`도 같다).
+    #
+    #   그 예외를 잡지 않으면 500이 되고, 잡되 `inside = True`로 처리하면 **드라이브만
+    #   바꾸면 어떤 파일이든 연결되는 우회로**가 된다. 지금은 `inside = False`로
+    #   fail-closed다 ― 그 선택을 여기서 고정한다. 이 분기는 지금까지 한 번도 실행된 적이
+    #   없었다(커버리지 미도달).
+    #   ★ 400이라는 것만 봐서는 **어느 가드가 막았는지 알 수 없다.** 이 경로들은 존재하지도
+    #     않으므로 뒤따르는 "파일 없음" 검사에도 걸린다 ― `../../../etc/passwd`에서 이미
+    #     한 번 속았던 그 자리다. 다른 드라이브에 실재하는 파일을 만들어 구분하는 방법은
+    #     저장소 밖에 파일을 쓰는 일이라 하지 않는다. 대신 **응답 메시지**로 가른다:
+    #     두 가드는 서로 다른 문장을 돌려준다.
+    for outside in ("D:/x.pdf", "//server/share/x.pdf", "Z:/nope.pdf"):
+        r_out = client.patch("/api/v1/admin/registry-requests/%d" % rid,
+                             json={"status": "COMPLETED", "doc_url": outside}, headers=ah)
+        check("비교 불가 경로도 400: %s" % outside, r_out.status_code, 400)
+        check_true("막은 것은 경로 검사다(파일 없음이 아니라): %s" % outside,
+                   "디렉터리 밖" in str(r_out.json().get("detail", "")),
+                   r_out.json())
+    # 거부됐으면 상태가 그대로여야 한다 — 막았는데 값이 바뀌면 의미가 없다.
+    # 목록의 첫 항목이 아니라 **그 신청**을 직접 본다 — TEST_USER에게는 다른 신청도 있다.
+    _items = client.get("/api/v1/admin/registry-requests?user_id=%s&size=200" % TEST_USER,
+                        headers=ah).json()["data"]["items"]
+    _mine = [x for x in _items if x["id"] == rid]
+    check_true("그 신청을 목록에서 찾을 수 있다", len(_mine) == 1, [x["id"] for x in _items][:5])
+    check("거부된 COMPLETED 전이 후에도 PROCESSING", _mine[0]["status"], "PROCESSING")
 
-    check("admin 404 for unknown id",
-          client.patch("/api/v1/admin/registry-requests/99999999",
-                       json={"status": "PROCESSING"}, headers=ah).status_code, 404)
+    # PROCESSING -> COMPLETED (실제 파일을 두고 연결한다 — 문서가 안내하는 운영 순서)
+    from api.v1.registry import REGISTRY_DOCUMENT_ROOT as _REG_ROOT
+    os.makedirs(_REG_ROOT, exist_ok=True)
+    real_doc_name = "qa-regression-%s.pdf" % uuid.uuid4().hex[:8]
+    real_doc_path = os.path.join(_REG_ROOT, real_doc_name)
+    with open(real_doc_path, "wb") as _fh:
+        _fh.write(b"%PDF-1.4 qa registry fixture")
+    # 아래 검사 중 하나라도 실패하면 파일이 registry_documents/에 남는다(실제로 남았다).
+    # 남은 픽스처는 다음 실행의 "파일 없음" 전제를 오염시키므로 try/finally로 반드시 지운다.
+    try:
+        r = client.patch("/api/v1/admin/registry-requests/%d" % rid,
+                         json={"status": "COMPLETED", "doc_url": real_doc_name}, headers=ah)
+        check("PROCESSING->COMPLETED ok", r.json()["data"]["status"], "COMPLETED")
+        check_true("completed_at recorded", r.json()["data"]["completed_at"] is not None)
 
-    # COMPLETED이지만 실제 파일이 없으면 거짓 성공을 반환하지 않아야 한다
-    r = client.get("/api/v1/registry-requests/%d/download" % rid, headers=auth_headers())
-    check_true("missing file not a false success",
-               r.status_code == 404 or r.json().get("success") is False)
+        # 종결 상태에서 추가 전이 금지
+        check("COMPLETED->FAILED rejected",
+              client.patch("/api/v1/admin/registry-requests/%d" % rid,
+                           json={"status": "FAILED", "reason": "x"}, headers=ah).status_code, 400)
+
+        check("admin 404 for unknown id",
+              client.patch("/api/v1/admin/registry-requests/99999999",
+                           json={"status": "PROCESSING"}, headers=ah).status_code, 404)
+
+        # 정상 경로: 실제 파일이 연결됐으니 사용자는 받을 수 있어야 한다.
+        ok_dl = client.get("/api/v1/registry-requests/%d/download" % rid, headers=auth_headers())
+        check("연결된 문서는 실제로 받아진다", ok_dl.status_code, 200)
+
+        # 레거시 상태 방어: **API로는 더 이상 만들 수 없지만**(위 400 검사) 과거 데이터나
+        # 수동 복구로 "COMPLETED인데 파일 없음"이 남아 있을 수 있다. 그때도 거짓 성공을
+        # 돌려주면 안 된다 — 읽기 쪽 방어는 그대로 살아 있어야 한다.
+        os.remove(real_doc_path)
+        r = client.get("/api/v1/registry-requests/%d/download" % rid, headers=auth_headers())
+        check_true("파일이 사라지면 거짓 성공을 주지 않는다",
+                   r.status_code == 404 or r.json().get("success") is False,
+                   (r.status_code, r.text[:60]))
+
+    finally:
+        if os.path.exists(real_doc_path):
+            os.remove(real_doc_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1223,8 +1931,35 @@ def test_payment_providers():
             try:
                 call(provider)
                 check_true("kginicis %s not implemented" % name, False, "실패하지 않고 값을 반환함")
-            except NotImplementedError:
+            except NotImplementedError as exc:
                 check_true("kginicis %s not implemented" % name, True)
+                # 2026-08-13 Sprint 78 (BUGS #80): 예외가 **나는 것**만으로는 부족하다.
+                # 예전에는 인자 없는 `raise NotImplementedError`라 str(e)가 빈 문자열이었고,
+                # 그 값이 payment_logs.error_message와 사용자 응답에 그대로 실려
+                # "왜 실패했는지"가 통째로 사라졌다. 사유가 실제로 담기는지까지 본다.
+                message = str(exc)
+                check_true("kginicis %s 실패 사유가 비어 있지 않다" % name, bool(message.strip()),
+                           "빈 메시지는 로그와 응답에서 원인을 지운다")
+                # provider를 식별할 수 있어야 한다. `charge`만은 자체 메시지를 갖고 있어
+                # ("KG이니시스 실연동 미구현 (계약/API Key 발급 대기)") 클래스명 대신 브랜드명이
+                # 들어간다 — 둘 중 하나면 운영자가 어느 PG인지 안다.
+                check_true("kginicis %s 사유로 provider를 식별할 수 있다" % name,
+                           "KGInicis" in message or "KG이니시스" in message, message)
+
+        # 기본 구현의 계약: **어느 provider의 어느 단계**인지 담는다(BUGS #80).
+        # 하위 클래스가 자체 메시지로 덮어쓸 수 있으므로, 기본 구현 자체를 직접 확인한다.
+        class _BareProvider(pp.PaymentProvider):
+            pass
+
+        bare = _BareProvider()
+        for name, call in calls:
+            try:
+                call(bare)
+                check_true("기본 구현 %s는 실패한다" % name, False, "값을 반환함")
+            except NotImplementedError as exc:
+                msg = str(exc)
+                check_true("기본 구현 %s 사유에 클래스와 단계가 담긴다" % name,
+                           "_BareProvider" in msg and name in msg, msg)
 
         # 폐기 예정 후보도 여전히 선택은 되지만(하위호환) 호출 시 실패해야 한다
         for legacy in ("toss", "portone"):
@@ -1250,6 +1985,77 @@ def test_payment_providers():
 
     # MockProvider가 여전히 기본 경로임을 확인(실제 결제 흐름은 8~10번에서 검증됨)
     check("restored default is mock", type(pp.get_payment_provider()).__name__, "MockProvider")
+
+    # ── verify_webhook_signature: provider별 fail-closed (2026-08-13 Sprint 76) ──
+    #
+    # 위 6개 생명주기 메서드는 검증돼 있었지만 **7번째이자 유일한 보안 메서드**는
+    # provider별로 확인된 적이 없었다.
+    #
+    # `POST /payments/webhook/{provider_name}`은 **사용자 인증이 없는 공개 경로**다.
+    # provider를 URL 이름으로 고르고 그 provider의 `verify_webhook_signature()` 하나로
+    # 신뢰 여부를 정한다. 어느 provider든 이 메서드가 True로 기울면 **누구나 "결제 완료"를
+    # 위조**할 수 있다. 그래서 기본 구현이 `return False`(fail-closed)인데,
+    # 그 기본값이 실제로 유지되는지는 아무도 확인하지 않고 있었다.
+    #
+    # 특히 KGInicisProvider는 실연동 전 자리 구현이라 이 메서드를 **오버라이드하지 않는다**.
+    # 누군가 기본 구현을 True로 바꾸거나, 새 provider를 추가하면서 이 메서드를 잊고
+    # 기본값을 낙관적으로 만들면 방어가 통째로 사라진다.
+    forged_headers = {"X-Webhook-Signature": "a" * 64, "Content-Type": "application/json"}
+    forged_body = b'{"event":"PAID","pg_transaction_id":"forged"}'
+
+    saved_secret = os.environ.get("PAYMENT_WEBHOOK_SECRET")
+    try:
+        # (1) 시크릿이 아예 없으면 어떤 provider도 통과시키면 안 된다.
+        os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+        for name in pp._PROVIDERS:
+            provider = pp.get_payment_provider_by_name(name)
+            check("%s: 시크릿 없으면 서명 검증 실패" % name,
+                  provider.verify_webhook_signature(forged_body, forged_headers), False)
+
+        # (2) 시크릿이 있어도, 서명을 구현하지 않은 provider는 여전히 거절해야 한다.
+        os.environ["PAYMENT_WEBHOOK_SECRET"] = "sprint76-probe-secret"
+        for name in pp._PROVIDERS:
+            provider = pp.get_payment_provider_by_name(name)
+            implements = type(provider).verify_webhook_signature is not \
+                pp.PaymentProvider.verify_webhook_signature
+            got = provider.verify_webhook_signature(forged_body, forged_headers)
+            if implements:
+                # 구현한 provider(mock)는 **틀린 서명**을 거절해야 한다.
+                check("%s: 위조 서명 거절" % name, got, False)
+            else:
+                # 미구현 provider는 기본 fail-closed를 그대로 물려받아야 한다.
+                check("%s: 미구현이므로 항상 거절(fail-closed)" % name, got, False)
+
+        # (3) 기본 구현 자체가 False여야 한다 - 이 한 줄이 모든 미구현 provider의 방어선이다.
+        check("PaymentProvider 기본 구현은 False",
+              pp.PaymentProvider().verify_webhook_signature(forged_body, forged_headers), False)
+
+        # (4) 올바른 서명은 통과해야 한다(방어가 정상 경로까지 막으면 안 된다).
+        import hmac as _hmac, hashlib as _hashlib
+        good = _hmac.new(b"sprint76-probe-secret", forged_body, _hashlib.sha256).hexdigest()
+        mock = pp.get_payment_provider_by_name("mock")
+        check("mock: 올바른 서명은 통과",
+              mock.verify_webhook_signature(forged_body, {"X-Webhook-Signature": good}), True)
+        # 헤더 이름 대소문자는 가리지 않는다(HTTP 표준).
+        check("mock: 헤더 이름 대소문자 무관",
+              mock.verify_webhook_signature(forged_body, {"x-webhook-signature": good}), True)
+        # 서명이 없으면 거절.
+        check("mock: 서명 헤더 없으면 거절",
+              mock.verify_webhook_signature(forged_body, {}), False)
+        # 바디가 1바이트만 달라도 거절(원문 전체에 대한 서명임을 확인).
+        check("mock: 바디가 바뀌면 거절",
+              mock.verify_webhook_signature(forged_body + b" ", {"X-Webhook-Signature": good}),
+              False)
+
+        # (5) 엔드포인트 수준: 서명을 구현하지 않은 provider로 들어온 Webhook은 401이어야 한다.
+        r_forged = client.post("/api/v1/payments/webhook/kginicis",
+                               content=forged_body, headers=forged_headers)
+        check("kginicis webhook은 401(미검증 거절)", r_forged.status_code, 401)
+    finally:
+        if saved_secret is None:
+            os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+        else:
+            os.environ["PAYMENT_WEBHOOK_SECRET"] = saved_secret
 
 
 # ---------------------------------------------------------------------------
@@ -1757,6 +2563,103 @@ def test_payment_logs():
     check("non-sensitive kept", masked["nested"]["ok"], "keep")
     check("amount kept", masked["amount"], 1000)
 
+    # ── 리스트 안쪽까지 마스킹되는가 (2026-08-13 Sprint 89) ────────────────────
+    #
+    # 커버리지가 지목했다: `mask_sensitive()`의 **리스트 분기**(70행)가 미커버였다.
+    # 위 검사는 dict 중첩만 본다.
+    #
+    # PG Webhook payload는 배열을 흔히 포함한다(`{"items":[{...}]}`, 승인 내역 목록 등).
+    # 리스트 재귀가 끊기면 **배열 안의 카드번호가 평문 그대로** `payment_webhooks.raw_payload`에
+    # 저장되고, 그 로그는 운영자가 폭넓게 열람한다. dict만 막고 리스트를 놓치면
+    # 마스킹이 있다는 사실 자체가 오히려 위험하다(안전하다고 믿게 되므로).
+    in_list = mask_sensitive({"items": [{"card_no": "4111111111111111", "name": "홍길동"}]})
+    check("리스트 안 dict의 민감 키도 마스킹", in_list["items"][0]["card_no"], REDACTED)
+    check("리스트 안 비민감 값은 보존", in_list["items"][0]["name"], "홍길동")
+
+    top_list = mask_sensitive([{"cvc": "123"}, {"ok": "x"}])
+    check("최상위가 리스트여도 마스킹", top_list[0]["cvc"], REDACTED)
+    check("최상위 리스트의 비민감 값 보존", top_list[1]["ok"], "x")
+
+    nested_list = mask_sensitive({"a": [[{"password": "p"}]]})
+    check("중첩 리스트도 끝까지 내려간다", nested_list["a"][0][0]["password"], REDACTED)
+
+    # 키 표기 변형 — PG마다 표기가 다르다(card-no / CARD_NO).
+    check("하이픈 키도 마스킹", mask_sensitive({"card-no": "1111"})["card-no"], REDACTED)
+    check("대문자 키도 마스킹", mask_sensitive({"CARD_NO": "1111"})["CARD_NO"], REDACTED)
+
+    # 스칼라는 그대로 통과한다(문자열을 dict처럼 다루지 않는다).
+    check("스칼라는 그대로", mask_sensitive("그냥 문자열"), "그냥 문자열")
+
+    # ★ 원본을 바꾸지 않는다 — docstring이 약속한 것이고, 바꾸면 호출부가 PG로 되돌려보내는
+    #   payload까지 오염된다(마스킹된 값으로 재처리하면 서명이 깨진다).
+    original = {"card_no": "4111", "items": [{"cvc": "999"}]}
+    mask_sensitive(original)
+    check("원본 dict가 변형되지 않는다", original["card_no"], "4111")
+    check("원본 리스트 안쪽도 변형되지 않는다", original["items"][0]["cvc"], "999")
+
+    # _dump: audit._dump과 같은 세 갈래(None / 문자열 / 그 외)
+    from api.v1.payment_logs import _dump as _pl_dump
+    check("_dump(None)은 None", _pl_dump(None), None)
+    check("_dump(str)은 그대로(이중 인코딩 없음)", _pl_dump("이미 문자열"), "이미 문자열")
+    check_true("_dump(dict)은 마스킹된 JSON",
+               REDACTED in _pl_dump({"card_no": "4111"}), _pl_dump({"card_no": "4111"}))
+    check_true("_dump(dict)은 한글을 이스케이프하지 않는다",
+               "한글" in _pl_dump({"한글": "값"}), _pl_dump({"한글": "값"}))
+
+    # ── 알 수 없는 enum 값은 조용히 저장되지 않는다 ────────────────────────────
+    #
+    # `log_payment_event` / `mark_webhook_processed`의 ValueError 분기(103·105·194행)도
+    # 미커버였다. 이 값들은 나중에 재처리 가능 여부를 판정하는 근거가 되므로,
+    # 모르는 값이 DB에 들어가면 `webhook_reprocess_block_reason()`이 오판한다.
+    from api.v1.payment_logs import log_payment_event as _log_event
+    conn_v = get_connection()
+    try:
+        # ★ status 케이스의 event_type은 **반드시 유효한 값**이어야 한다.
+        #   처음엔 "PAYMENT_CONFIRMED"를 썼는데 그것이 VALID_EVENT_TYPES에 없어서
+        #   앞선 event_type 가드에서 걸렸다 — 검사는 통과했지만 **의도한 분기를 타지
+        #   않았다**(커버리지가 그 줄을 미커버로 남겨 드러났다).
+        #   "ValueError가 났다"만 보면 이런 가짜 통과를 구분할 수 없다.
+        for label, kwargs in (
+            ("알 수 없는 event_type",
+             dict(event_type="NOT_A_TYPE", status="SUCCESS")),
+            ("알 수 없는 log status",
+             dict(event_type="CONFIRM", status="NOT_A_STATUS")),
+        ):
+            raised = False
+            try:
+                _log_event(conn_v, payment_id=None, provider="mock", **kwargs)
+            except ValueError:
+                raised = True
+            check("%s는 ValueError" % label, raised, True)
+
+        raised = False
+        try:
+            mark_webhook_processed(conn_v, 1, "NOT_A_WEBHOOK_STATUS")
+        except ValueError:
+            raised = True
+        check("알 수 없는 webhook 상태는 ValueError", raised, True)
+    finally:
+        conn_v.rollback()
+        conn_v.close()
+
+    # ── 재처리 차단 사유: 나머지 두 갈래 (235·237행) ──────────────────────────
+    from api.v1.payment_logs import (
+        webhook_reprocess_block_reason as _block_reason, WEBHOOK_FAILED,
+    )
+
+    def fake_row(status, verified=1):
+        return {"signature_verified": verified, "processing_status": status}
+
+    failed_reason = _block_reason(fake_row(WEBHOOK_FAILED))
+    check_true("FAILED는 재처리를 막는다", failed_reason is not None, failed_reason)
+    check_true("FAILED 사유가 재전송을 안내한다", "재전송" in (failed_reason or ""), failed_reason)
+
+    unknown_reason = _block_reason(fake_row("SOME_FUTURE_STATUS"))
+    check_true("모르는 상태도 막는다(기본 허용이 아니다)",
+               unknown_reason is not None, unknown_reason)
+    check_true("모르는 상태 사유에 그 값이 적힌다",
+               "SOME_FUTURE_STATUS" in (unknown_reason or ""), unknown_reason)
+
     # Webhook 멱등성 — 같은 event_id 재수신은 새 행을 만들지 않는다
     conn = get_connection()
     try:
@@ -2051,6 +2954,211 @@ def test_subscription_lifecycle():
 # ---------------------------------------------------------------------------
 # 26. audit_logs / registry_credit_logs (CTO 승인 4·5번)
 # ---------------------------------------------------------------------------
+# 31-B. Admin 목록 필터와 키 미설정 가드 (2026-08-13 Sprint 91 신규)
+#
+# 커버리지가 지목했다. `api/v1/admin.py`의 미커버 26행 중 상당수가
+# **한 번도 걸어보지 않은 목록 필터**였다.
+#
+#     /admin/registry-requests?item_id= / ?case_no=
+#     /admin/payments?user_id= / ?payment_type=
+#     /admin/payments/webhooks?payment_id=
+#
+# Sprint 74가 "잘못된 필터 **값**"을 다뤘다면, 이번은 **필터가 실제로 걸리는가**다.
+# 둘은 다른 문제다 - 값 검증을 통과해도 조건이 SQL에 안 붙으면 **전체가 그대로 나온다**.
+# 200이고 목록도 그럴듯해서 운영자는 필터가 먹었다고 믿는다.
+#
+# 그리고 `_require_role()`의 첫 가드(104행)도 미커버였다 - 두 키가 모두 없으면 500이다.
+# 여기서 통과시키면 **키 없이 관리자 API가 열린다.**
+# ---------------------------------------------------------------------------
+def test_admin_list_filters():
+    print("\n--- 31-B. Admin 목록 필터 / 키 미설정 가드 (Sprint 91) ---")
+    ah = {"X-Admin-Key": TEST_ADMIN_KEY}
+
+    # (1) ★ 두 키가 모두 없으면 Admin API 자체가 500이다(fail-closed).
+    #     401/403이 아니라 500인 것도 의도다 - 키를 안 준 것이 아니라 **서버가 설정되지
+    #     않은 것**이므로, 사용자 탓처럼 보이는 응답을 주면 원인을 못 찾는다.
+    saved_admin = os.environ.get("ADMIN_API_KEY")
+    saved_super = os.environ.get("SUPER_ADMIN_API_KEY")
+    try:
+        os.environ.pop("ADMIN_API_KEY", None)
+        os.environ.pop("SUPER_ADMIN_API_KEY", None)
+        r_nokey = client.get("/api/v1/admin/users", headers=ah)
+        check("관리자 키가 모두 없으면 500", r_nokey.status_code, 500)
+        # 키 값이 응답에 새면 안 된다.
+        check_true("500 응답에 키 값이 실리지 않는다",
+                   TEST_ADMIN_KEY not in r_nokey.text, r_nokey.text[:80])
+    finally:
+        if saved_admin is not None:
+            os.environ["ADMIN_API_KEY"] = saved_admin
+        if saved_super is not None:
+            os.environ["SUPER_ADMIN_API_KEY"] = saved_super
+    check("키를 되돌리면 다시 200",
+          client.get("/api/v1/admin/users", headers=ah).status_code, 200)
+
+    # (2) 필터 픽스처 - 두 사용자 x 두 결제유형으로 구분 가능한 데이터를 만든다.
+    #     한 종류만 있으면 "필터가 무시돼도 결과가 같아" 검사가 구분력을 잃는다.
+    tag = uuid.uuid4().hex[:8]
+    user_a = "qa-reg-flt-a-" + tag
+    user_b = "qa-reg-flt-b-" + tag
+    conn = get_connection()
+    made = []
+    try:
+        ts = datetime.now().isoformat()
+        for uid, ptype in ((user_a, "SUBSCRIPTION"), (user_a, "OVERAGE_USAGE"),
+                           (user_b, "SUBSCRIPTION")):
+            made.append(conn.execute(
+                "INSERT INTO payments (user_id, payment_type, amount, status,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                (uid, ptype, 12900, "PAID", ts, ts)).lastrowid)
+        conn.commit()
+
+        def ids(qs):
+            r = client.get("/api/v1/admin/payments?size=200&" + qs, headers=ah)
+            check("%s 는 200" % qs, r.status_code, 200)
+            return {i["id"] for i in r.json()["data"]}
+
+        # user_id 필터: A의 것만 나와야 한다.
+        a_ids = ids("user_id=" + user_a)
+        check("user_id 필터: A의 결제 2건", a_ids & set(made), {made[0], made[1]})
+        check_true("user_id 필터: B의 결제가 섞이지 않는다", made[2] not in a_ids, sorted(a_ids)[:5])
+
+        # payment_type 필터: 같은 사용자 안에서도 갈라져야 한다.
+        overage = ids("user_id=%s&payment_type=OVERAGE_USAGE" % user_a)
+        check("payment_type 필터: 초과결제 1건만", overage & set(made), {made[1]})
+        check_true("payment_type 필터: 구독 결제가 섞이지 않는다",
+                   made[0] not in overage, sorted(overage)[:5])
+
+        # 두 필터를 함께 걸면 교집합이다(하나만 먹으면 이 검사가 실패한다).
+        none_expected = ids("user_id=%s&payment_type=OVERAGE_USAGE" % user_b)
+        check("두 필터의 교집합이 비어 있다", none_expected & set(made), set())
+
+        # (3) webhook payment_id 필터
+        wh_ids = []
+        for pid in (made[0], made[1]):
+            wh_ids.append(conn.execute(
+                "INSERT INTO payment_webhooks (provider, event_type, event_id,"
+                " payment_id, signature_verified, processing_status, raw_payload, received_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                ("mock", "PAYMENT_CONFIRMED", "qa-wh-flt-%s-%d" % (tag, pid),
+                 pid, 1, "RECEIVED", "{}", ts)).lastrowid)
+        conn.commit()
+
+        r = client.get("/api/v1/admin/payments/webhooks?size=200&payment_id=%d" % made[0],
+                       headers=ah)
+        check("webhook payment_id 필터는 200", r.status_code, 200)
+        got = {w["id"] for w in r.json()["data"]}
+        check("webhook payment_id 필터: 해당 건만", got & set(wh_ids), {wh_ids[0]})
+        check_true("webhook payment_id 필터: 다른 결제의 webhook이 섞이지 않는다",
+                   wh_ids[1] not in got, sorted(got)[:5])
+    finally:
+        conn.execute("DELETE FROM payment_webhooks WHERE event_id LIKE ?",
+                     ("qa-wh-flt-%s-%%" % tag,))
+        conn.execute("DELETE FROM payments WHERE user_id IN (?,?)", (user_a, user_b))
+        conn.commit()
+        conn.close()
+
+    # 픽스처가 남지 않았는지 확인한다.
+    left = client.get("/api/v1/admin/payments?size=1&user_id=" + user_a,
+                      headers=ah).json()["meta"]["total"]
+    check("필터 픽스처가 정리됐다", left, 0)
+
+    # (4) registry-requests의 item_id / case_no 필터도 미커버였다.
+    #     case_no는 LIKE(부분 일치)이고 item_id는 정확 일치다 — 둘의 성격이 다르다.
+    reg_user = "qa-reg-flt-r-" + tag
+    conn = get_connection()
+    reg_ids = []
+    try:
+        two = conn.execute(
+            "SELECT id, case_no FROM auction_item WHERE case_no != '' LIMIT 2").fetchall()
+        if len(two) < 2:
+            print("[SKIP] 서로 다른 물건 2건이 없어 registry 필터 검사를 생략한다")
+        else:
+            ts = datetime.now().isoformat()
+            for it in two:
+                reg_ids.append(conn.execute(
+                    "INSERT INTO registry_requests (user_id, item_id, status, requested_at)"
+                    " VALUES (?,?,?,?)", (reg_user, it["id"], "PENDING", ts)).lastrowid)
+            conn.commit()
+
+            def reg_ids_for(qs):
+                r = client.get("/api/v1/admin/registry-requests?size=200&" + qs, headers=ah)
+                check("registry %s 는 200" % qs, r.status_code, 200)
+                # 이 엔드포인트만 data가 리스트가 아니라 {total,page,size,items} dict다
+                # (다른 admin 목록은 data=list + meta.total). 기존 계약이라 그대로 따른다.
+                return {x["id"] for x in r.json()["data"]["items"]}
+
+            only_first = reg_ids_for("user_id=%s&item_id=%d" % (reg_user, two[0]["id"]))
+            check("item_id 필터: 해당 물건의 신청만", only_first & set(reg_ids), {reg_ids[0]})
+            check_true("item_id 필터: 다른 물건의 신청이 섞이지 않는다",
+                       reg_ids[1] not in only_first, sorted(only_first)[:5])
+
+            # case_no는 부분 일치 — 전체 사건번호로 걸면 그 건이 나와야 한다.
+            by_case = reg_ids_for("user_id=%s&case_no=%s" % (reg_user, two[0]["case_no"]))
+            check_true("case_no 필터: 해당 사건의 신청이 나온다",
+                       reg_ids[0] in by_case, sorted(by_case)[:5])
+
+            # 존재하지 않는 사건번호는 빈 결과(오류가 아니라).
+            check("case_no 필터: 없는 사건은 빈 결과",
+                  reg_ids_for("user_id=%s&case_no=NOPE-%s" % (reg_user, tag)) & set(reg_ids),
+                  set())
+
+            # (5) 상태 변경의 허용값 가드 — 목록 필터와 달리 **본문** 검증이다.
+            r_bad = client.patch("/api/v1/admin/registry-requests/%d" % reg_ids[0],
+                                 json={"status": "NOT_A_STATUS"},
+                                 headers={"X-Admin-Key": TEST_SUPER_ADMIN_KEY})
+            check("허용되지 않는 상태 값은 400", r_bad.status_code, 400)
+            check_true("400 메시지가 그 값을 알려준다",
+                       "NOT_A_STATUS" in r_bad.text, r_bad.text[:80])
+            # 거부됐으면 DB도 그대로여야 한다.
+            still = conn.execute("SELECT status FROM registry_requests WHERE id=?",
+                                 (reg_ids[0],)).fetchone()["status"]
+            check("거부된 상태 변경은 DB를 바꾸지 않는다", still, "PENDING")
+
+            # 관리자가 직접 바꿀 수 없는 값(실재하는 상태지만 자동 전이 전용)도 막힌다.
+            # PAYMENT_REQUIRED는 결제 성공 시 payments.py가 자동으로 PENDING으로 옮긴다.
+            for forbidden in ("PENDING", "PAYMENT_REQUIRED"):
+                r_forbid = client.patch("/api/v1/admin/registry-requests/%d" % reg_ids[0],
+                                        json={"status": forbidden},
+                                        headers={"X-Admin-Key": TEST_SUPER_ADMIN_KEY})
+                check("관리자가 직접 바꿀 수 없는 값(%s)은 400" % forbidden,
+                      r_forbid.status_code, 400)
+                after = conn.execute("SELECT status FROM registry_requests WHERE id=?",
+                                     (reg_ids[0],)).fetchone()["status"]
+                check("%s 시도 후에도 상태 불변" % forbidden, after, "PENDING")
+
+            # ── 상태값 가드가 전이 검사와 어떻게 다른가 (2026-08-13 Sprint 91) ──────
+            #
+            # 변이 시험에서 알게 된 것: `if req.status not in ("PROCESSING","COMPLETED",
+            # "FAILED")` 가드를 제거해도 **위 검사들이 전부 통과했다.** ALLOWED_TRANSITIONS가
+            #
+            #     PENDING    -> {FAILED, PROCESSING}
+            #     PROCESSING -> {COMPLETED, FAILED}
+            #
+            # 뿐이라, 그 가드가 막는 값은 하류 전이 검사도 전부 막기 때문이다.
+            #
+            # 두 검사가 갈라지는 지점은 **순서**다. 가드는 DB 조회 **이전**에 돌고
+            # 전이 검사는 조회 **이후**에 돈다. 그래서 없는 신청 + 잘못된 상태값이면
+            #
+            #     가드 있음 -> 400 (상태값이 잘못됐다)
+            #     가드 없음 -> 404 (신청이 없다)
+            #
+            # 가 된다. 운영자가 상태값을 오타냈을 때 "신청이 없다"고 답하면 엉뚱한 곳을
+            # 찾게 되므로, 이 순서가 곧 진단 품질이다.
+            r_order = client.patch("/api/v1/admin/registry-requests/999999999",
+                                   json={"status": "NOT_A_STATUS"},
+                                   headers={"X-Admin-Key": TEST_SUPER_ADMIN_KEY})
+            check("없는 신청이어도 상태값 오류가 먼저다(404가 아니라 400)",
+                  r_order.status_code, 400)
+            check_true("그 400이 상태값을 지목한다",
+                       "NOT_A_STATUS" in r_order.text, r_order.text[:80])
+    finally:
+        if reg_ids:
+            conn.execute("DELETE FROM registry_requests WHERE user_id=?", (reg_user,))
+            conn.commit()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 def test_audit_and_credit_logs():
     print("\n--- 26. audit / credit logs ---")
     sh = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
@@ -2072,6 +3180,56 @@ def test_audit_and_credit_logs():
         check_true("audit log has %s" % key, key in entry)
     check("audit actor is SUPER_ADMIN", entry["admin_id"], "SUPER_ADMIN")
     check_true("audit meta has total", "total" in (r.json()["meta"] or {}))
+
+    # ── _dump()의 두 분기와 admin_id 필터 (2026-08-13 Sprint 87) ──────────────
+    #
+    # 커버리지가 지목했다: `api/v1/audit.py`의 `_dump()`가 **None으로도 문자열로도
+    # 호출된 적이 없었고**, `get_audit_logs(admin_id=...)` 필터도 미검증이었다.
+    # 지금까지는 dict만 들어와 json.dumps 경로만 돌았다.
+    #
+    # 세 가지 모두 조용히 틀릴 수 있는 자리다.
+    #
+    #   _dump(None) 이 "null" 문자열을 돌려주면  생성 이벤트의 before가 **값이 있는 것처럼**
+    #                                          보인다(NULL과 문자열 "null"은 다르다)
+    #   _dump(str) 이 다시 json.dumps하면        문자열이 이중 인코딩돼 화면에 따옴표가 남는다
+    #   admin_id 필터가 빗나가면                 "이 관리자가 무엇을 했는가"를 못 찾는다
+    #
+    # 감사 로그는 사후 추적의 유일한 근거라 표기 하나가 틀리면 판단이 틀어진다.
+    from api.v1.audit import _dump, record_audit, get_audit_logs
+
+    check("_dump(None)은 None (문자열 'null'이 아니다)", _dump(None), None)
+    check("_dump(str)은 그대로 통과(이중 인코딩 없음)", _dump("이미 문자열"), "이미 문자열")
+    check("_dump(dict)은 JSON 문자열", _dump({"a": 1}), '{"a": 1}')
+    check_true("_dump(dict)은 한글을 이스케이프하지 않는다",
+               "서울" in _dump({"court": "서울"}), _dump({"court": "서울"}))
+
+    # DB 레벨: before=None으로 기록하면 컬럼이 NULL이어야 한다(문자열 "null"이 아니라).
+    conn = get_connection()
+    try:
+        actor = "qa-reg-audit-actor-" + uuid.uuid4().hex[:6]
+        target = "qa-audit-target-" + uuid.uuid4().hex[:6]
+        record_audit(conn, admin_id=actor, action="SOFT_DELETE",
+                     target_type="USER", target_id=target,
+                     before=None, after="문자열 그대로")
+        conn.commit()
+        row = conn.execute(
+            "SELECT before, after FROM audit_logs WHERE target_id=?", (target,)).fetchone()
+        check("before=None은 컬럼 NULL", row["before"], None)
+        check("after=문자열은 그대로 저장", row["after"], "문자열 그대로")
+
+        # admin_id 필터가 실제로 걸리는가 — 다른 행위자의 기록이 섞이면 안 된다.
+        total, items = get_audit_logs(conn, admin_id=actor, limit=50, offset=0)
+        check("admin_id 필터가 그 행위자만 돌려준다", total, 1)
+        check_true("돌려준 행이 그 행위자다",
+                   items and items[0]["admin_id"] == actor, items)
+        # 존재하지 않는 행위자는 빈 결과(에러가 아니라).
+        empty_total, empty_items = get_audit_logs(
+            conn, admin_id="qa-nobody-" + uuid.uuid4().hex[:6], limit=50, offset=0)
+        check("없는 행위자는 빈 결과", (empty_total, empty_items), (0, []))
+    finally:
+        conn.execute("DELETE FROM audit_logs WHERE target_id=?", (target,))
+        conn.commit()
+        conn.close()
 
     # credit 변동 추적 로그
     r = client.get("/api/v1/admin/registry/credit-logs/%s" % user, headers=ah)
@@ -2216,6 +3374,60 @@ def test_admin_rest_structure():
         # 권한 게이트가 걸려 있는지
         check("%s requires admin" % path, client.get(path).status_code, 403)
 
+    # ── 목록 필터의 잘못된 값 (2026-08-13 Sprint 74) ──────────────────────────
+    # Admin 16개 엔드포인트를 경계 상태로 전수 스윕하다 발견했다. 잘못된 필터 값을
+    # 다루는 방식이 **세 갈래로 갈려 있었다.**
+    #
+    #     registry-requests?status=오타            400  허용값 안내
+    #     payments/webhooks?processing_status=오타  400  허용값 안내
+    #     payments?status=오타                     200  빈 목록   <- 오타를 결과 없음으로 오인
+    #     subscriptions?status=오타                200  빈 목록   <-
+    #     audit-logs?target_type=오타              200  빈 목록   <-
+    #
+    # 운영자가 필터를 잘못 적으면 "이 상태인 건이 한 건도 없다"로 읽힌다. 조회 결과를
+    # 근거로 판단하는 자리라 조용한 오답이 그대로 운영 판단이 된다.
+    # (프런트에서 BUGS #31이 "빈 결과"와 "페이지 범위 초과"를 갈라 놓은 것과 같은 부류)
+    #
+    # 새 정책이 아니라 이 파일이 이미 검증하고 있던 두 엔드포인트의 방식에 나머지를 맞춘 것이다.
+    for path, param in (
+        ("/api/v1/admin/payments", "status"),
+        ("/api/v1/admin/payments", "payment_type"),
+        ("/api/v1/admin/subscriptions", "status"),
+        ("/api/v1/admin/audit-logs", "target_type"),
+        ("/api/v1/admin/audit-logs", "action"),
+        ("/api/v1/admin/registry-requests", "status"),
+        ("/api/v1/admin/payments/webhooks", "processing_status"),
+    ):
+        bad = client.get("%s?%s=NOT_A_REAL_VALUE" % (path, param), headers=ah)
+        check("%s?%s 오타는 400" % (path, param), bad.status_code, 400)
+        detail = str(bad.json().get("detail", ""))
+        check_true("%s?%s 400 메시지가 허용값을 알려준다" % (path, param),
+                   "허용값" in detail or "허용되지 않는" in detail,
+                   "메시지=%r ― 무엇이 잘못됐는지 알 수 없으면 400의 의미가 없다" % detail[:80])
+
+    # 빈 값/미지정은 필터를 걸지 않는 것이므로 그대로 통과해야 한다(기존 동작 유지).
+    for path, param in (("/api/v1/admin/payments", "status"),
+                        ("/api/v1/admin/subscriptions", "status"),
+                        ("/api/v1/admin/audit-logs", "target_type")):
+        check("%s?%s= (빈 값)은 200" % (path, param),
+              client.get("%s?%s=" % (path, param), headers=ah).status_code, 200)
+
+    # 허용값은 Enum에서 도출돼야 한다 — 손으로 적어 두면 Enum이 늘 때 조용히 어긋난다.
+    from api.v1 import admin as admin_mod
+    from api.constants import PaymentStatus, SubscriptionStatus, AuditTargetType
+    check("payments status 허용값이 Enum과 일치",
+          set(admin_mod.VALID_PAYMENT_STATUSES), {s.value for s in PaymentStatus})
+    check("subscriptions status 허용값이 Enum과 일치",
+          set(admin_mod.VALID_SUBSCRIPTION_STATUSES), {s.value for s in SubscriptionStatus})
+    check("audit target_type 허용값이 Enum과 일치",
+          set(admin_mod.VALID_AUDIT_TARGET_TYPES), {t.value for t in AuditTargetType})
+
+    # 정상 값은 여전히 통과해야 한다(검증이 정상 경로까지 막으면 안 된다).
+    check("정상 status 값은 통과",
+          client.get("/api/v1/admin/payments?status=PAID", headers=ah).status_code, 200)
+    check("정상 구독 status 값은 통과",
+          client.get("/api/v1/admin/subscriptions?status=ACTIVE", headers=ah).status_code, 200)
+
     # 구독 상태 변경은 SUPER_ADMIN 전용 + 전이 규칙 적용
     conn = get_connection()
     try:
@@ -2244,6 +3456,78 @@ def test_admin_rest_structure():
     check("unknown subscription 404",
           client.patch("/api/v1/admin/subscriptions/99999999",
                        json={"status": "PAUSED"}, headers=sh).status_code, 404)
+
+    # ── 감사 로그의 원자성: **실패한 조작은 흔적을 남기지 않는다** (2026-08-13 Sprint 75) ──
+    #
+    # `api/v1/audit.py:record_audit()`의 계약은 "commit은 호출부 책임이다 — 업무 트랜잭션과
+    # 함께 커밋되어야 하므로"다. 지금까지의 검사는 **성공했을 때 로그가 남는가**만 봤다.
+    # 계약의 나머지 절반(실패하면 남지 않는가)은 검증된 적이 없었다.
+    #
+    # 이 방향이 더 위험하다. 실패한 조작이 감사 로그에만 남으면 **하지도 않은 특권 조작이
+    # 기록으로 존재**하게 되고, 반대로 성공한 조작이 안 남으면 추적이 끊긴다. 감사 로그는
+    # "누가 무엇을 바꿨는가"를 사후에 판단하는 유일한 근거라 어느 쪽도 허용되지 않는다.
+    #
+    # admin.py의 5개 호출부는 전부 `record_audit(...)` 다음에 같은 커넥션으로 `conn.commit()`을
+    # 부르고, 실패 경로에서는 `conn.rollback()`으로 되돌린다(정적 확인 완료). 여기서는 그
+    # 결과를 **실제 응답과 DB로** 확인한다.
+    def audit_count(target_type, target_id):
+        c = get_connection()
+        try:
+            return c.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE target_type=? AND target_id=?",
+                (target_type, str(target_id))).fetchone()[0]
+        finally:
+            c.close()
+
+    before_cnt = audit_count("SUBSCRIPTION", sub_id)
+    # 규칙에 없는 전이(PAUSED -> GRACE_PERIOD)는 400이어야 하고, 감사 로그도 남으면 안 된다.
+    rejected = client.patch("/api/v1/admin/subscriptions/%d" % sub_id,
+                            json={"status": "GRACE_PERIOD", "reason": "should not be audited"},
+                            headers=sh)
+    check("거부된 전이는 400", rejected.status_code, 400)
+    check("거부된 전이는 감사 로그를 남기지 않는다",
+          audit_count("SUBSCRIPTION", sub_id), before_cnt)
+
+    # 없는 대상에 대한 조작도 마찬가지다.
+    ghost_before = audit_count("SUBSCRIPTION", 99999999)
+    client.patch("/api/v1/admin/subscriptions/99999999",
+                 json={"status": "PAUSED", "reason": "ghost"}, headers=sh)
+    check("없는 구독 조작은 감사 로그를 남기지 않는다",
+          audit_count("SUBSCRIPTION", 99999999), ghost_before)
+
+    # 권한 부족(ADMIN이 SUPER_ADMIN 작업 시도)도 흔적을 남기면 안 된다 —
+    # 시도 자체는 admin.py가 WARNING 로그로 남기지만 audit_logs는 "실제로 바뀐 것"만 담는다.
+    forbidden_before = audit_count("SUBSCRIPTION", sub_id)
+    check("권한 부족은 403",
+          client.patch("/api/v1/admin/subscriptions/%d" % sub_id,
+                       json={"status": "CANCELLED"}, headers=ah).status_code, 403)
+    check("권한 부족 시도는 감사 로그를 남기지 않는다",
+          audit_count("SUBSCRIPTION", sub_id), forbidden_before)
+
+    # 반대 방향도 함께 고정한다 — 성공한 조작은 반드시 남아야 한다(둘이 짝이어야 계약이 성립).
+    ok_before = audit_count("SUBSCRIPTION", sub_id)
+    check("정상 전이는 200",
+          client.patch("/api/v1/admin/subscriptions/%d" % sub_id,
+                       json={"status": "ACTIVE", "reason": "resume"}, headers=sh).status_code, 200)
+    check("성공한 조작은 감사 로그를 남긴다",
+          audit_count("SUBSCRIPTION", sub_id), ok_before + 1)
+
+    # 호출부 구조 자체도 고정한다 — record_audit 뒤에 commit이 오지 않으면
+    # "업무는 커밋됐는데 감사만 빠지는" 상태가 생긴다(정적으로만 잡을 수 있는 형태다).
+    admin_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "api", "v1", "admin.py"), encoding="utf-8-sig").read()
+    unpaired = []
+    for idx in range(len(admin_src)):
+        pos = admin_src.find("record_audit(", idx)
+        if pos == -1:
+            break
+        idx = pos + 1
+        tail = admin_src[pos:pos + 1500]
+        commit_at = tail.find("conn.commit()")
+        return_at = tail.find("return ")
+        if commit_at == -1 or (return_at != -1 and return_at < commit_at):
+            unpaired.append(admin_src[:pos].count("\n") + 1)
+    check("record_audit 뒤에는 반드시 commit이 온다(줄번호)", unpaired, [])
 
     # ACTIVE -> CANCELLED / ACTIVE -> EXPIRED — 둘 다 CANCELLED/EXPIRED 종결 분기를 타며
     # 즉시 만료 시각을 지금으로 당긴다. 각각 별도 구독으로 실제 엔드포인트를 통해 확인한다
@@ -2552,6 +3836,122 @@ def test_refund():
     r = client.post("/api/v1/admin/payments/%d/refund" % pid,
                     json={"reason": "실패 결제 환불 시도"}, headers=sh)
     check("FAILED 결제는 환불 불가(400)", r.status_code, 400)
+
+    # --- 실연동 전 provider로 환불 시도: DB만 REFUNDED가 되면 안 된다 (Sprint 78) ---
+    #
+    # 커버리지로 찾은 미검증 경로다(`api/v1/payments.py` 539-549). 이 분기의 주석이 위험을
+    # 정확히 적어 두었다 — "PG에서 실제로 환불되지 않았는데 DB만 REFUNDED가 되는 것이 최악의
+    # 결과다." KG이니시스 Provider는 계약 전이라 전 메서드가 NotImplementedError이고,
+    # `PAYMENT_PROVIDER`를 바꾸는 순간(운영자의 .env 한 줄) 이 경로가 실제로 열린다.
+    #
+    # **실제 PG를 부르지 않는다** — kginicis Provider는 호출 즉시 NotImplementedError를
+    # 던지도록 되어 있어(자리만 잡아둔 상태) 외부 통신이 발생하지 않는다.
+    # 환경변수는 이 프로세스에서만 바꾸고 반드시 되돌린다.
+    user = TEST_USER + "-refund-unimpl"
+    pid, amount = _make_paid_payment(user)
+    # 시도 **전** 상태를 기록해 둔다. 어떤 값이 "결제 완료"인지는 provider가 정하므로
+    # (Mock은 레거시 SUCCESS, 실연동은 PAID — api/constants.py:is_paid가 둘 다 인정한다)
+    # 특정 값을 기대하지 않고 **변하지 않았다**만 본다.
+    conn = get_connection()
+    try:
+        status_before = conn.execute(
+            "SELECT status FROM payments WHERE id=?", (pid,)).fetchone()["status"]
+    finally:
+        conn.close()
+
+    saved_provider = os.environ.get("PAYMENT_PROVIDER")
+    os.environ["PAYMENT_PROVIDER"] = "kginicis"
+    try:
+        r = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                        json={"reason": "미구현 provider 환불 시도"}, headers=sh)
+        check("실연동 전 provider 환불은 실패로 끝난다", r.status_code, 400)
+        # Admin은 실패를 envelope가 아니라 HTTPException(detail)로 돌려준다
+        # (api/v1/admin.py 상단 주석의 기존 결정). envelope의 error를 기대하면 안 된다.
+        detail_msg = r.json().get("detail", "")
+        check_true("실패 사유가 응답에 담긴다", "환불 처리에 실패" in str(detail_msg), r.json())
+        check_true("어느 provider의 어느 단계인지까지 담긴다",
+                   "KGInicisProvider" in str(detail_msg) and "cancel_payment" in str(detail_msg),
+                   detail_msg)
+    finally:
+        if saved_provider is None:
+            os.environ.pop("PAYMENT_PROVIDER", None)
+        else:
+            os.environ["PAYMENT_PROVIDER"] = saved_provider
+
+    # ★ 돈 안전 불변식: 상태가 바뀌지 않았어야 한다.
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT status FROM payments WHERE id=?", (pid,)).fetchone()
+    finally:
+        conn.close()
+    check("PG 환불 실패 시 결제 상태 불변(REFUNDED로 바뀌지 않는다)",
+          row["status"], status_before)
+    check_true("종결 상태로 넘어가지 않았다", row["status"] not in ("REFUNDED", "PARTIAL_REFUND"),
+               row["status"])
+
+    # ── refund_payment()의 소유권 인자 (2026-08-13 Sprint 94) ──────────────────
+    #
+    # Sprint 72가 **잠재 IDOR 함정**으로 기록한 자리다. `refund_payment(user_id=None)`은
+    # 기본값이 "소유권을 확인하지 않음"이고, 지금 유일한 호출부가 super-admin이라
+    # 현재 IDOR는 없다. 그래서 **소유권 분기 자체가 한 번도 실행된 적이 없었다**
+    # (커버리지 497-498 미커버).
+    #
+    # 위험은 나중이다. 누군가 사용자용 환불 경로를 만들면서 `user_id=`를 빠뜨리면
+    # **아무나 남의 결제를 환불할 수 있다.** 기본값이 안전하지 않은 쪽이라 더 그렇다.
+    # 그 분기가 실제로 동작하는지 지금 못박아 두면, 배선하는 사람이 믿고 쓸 수 있다.
+    from api.v1.payments import refund_payment, RefundError
+
+    owner = TEST_USER + "-refund-owner"
+    owned_pid, owned_amount = _make_paid_payment(owner)
+    conn = get_connection()
+    try:
+        # (1) 남의 결제를 user_id로 환불하려 하면 "찾을 수 없음"이다
+        #     (권한 오류가 아니라 404 — 존재 자체를 노출하지 않는다).
+        denied = None
+        try:
+            refund_payment(conn, owned_pid, None, "타인 환불 시도",
+                           actor="USER", user_id="qa-reg-not-the-owner")
+        except RefundError as exc:
+            denied = exc
+        check_true("타인 user_id로는 환불되지 않는다", denied is not None,
+                   "소유권 필터가 걸리지 않았다 - 남의 결제를 환불할 수 있다")
+        if denied is not None:
+            check("거부는 404(존재를 노출하지 않는다)", denied.http_status, 404)
+        conn.rollback()
+
+        # 상태가 바뀌지 않았어야 한다.
+        after_denied = conn.execute(
+            "SELECT status FROM payments WHERE id=?", (owned_pid,)).fetchone()["status"]
+        check_true("거부된 시도는 상태를 바꾸지 않는다",
+                   after_denied not in ("REFUNDED", "PARTIAL_REFUND"), after_denied)
+
+        # (2) 본인 user_id면 정상 환불된다 — 필터가 정상 경로까지 막으면 안 된다.
+        result = refund_payment(conn, owned_pid, None, "본인 환불",
+                                actor="USER", user_id=owner)
+        check("본인 user_id면 환불된다", result.payment_row["id"], owned_pid)
+        check("잔여 전액이 환불된다", result.refunded_amount, owned_amount)
+        conn.rollback()
+
+        # (3) user_id를 주지 않으면 소유권을 보지 않는다(현재 Admin 경로의 동작).
+        result2 = refund_payment(conn, owned_pid, None, "관리자 환불",
+                                 actor="ADMIN")
+        check("user_id 없이도 환불된다(Admin 경로)", result2.payment_row["id"], owned_pid)
+        conn.rollback()
+    finally:
+        conn.close()
+
+    detail = client.get("/api/v1/admin/payments/%d/logs" % pid, headers=ah).json()["data"]
+    cancels = [l for l in detail if l["event_type"] == "CANCEL"]
+    check("실패한 환불도 원장에 남는다(시도를 추적할 수 있다)", len(cancels), 1)
+    check("그 기록은 FAILED 상태다", cancels[0]["status"], "FAILED")
+    check_true("실패 사유가 기록된다", bool(cancels[0].get("error_message")), cancels[0])
+    # 누적 환불액은 성공한 CANCEL만 세야 한다 — 실패 기록이 잔액을 깎으면
+    # 나중에 진짜 환불을 할 때 "환불 가능 금액 초과"로 막힌다.
+    again = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                        json={"reason": "mock으로 되돌린 뒤 정상 환불"}, headers=sh)
+    check("provider를 되돌리면 전액 환불이 가능하다", again.status_code, 200)
+    check("실패 기록이 누적 환불액을 오염시키지 않았다",
+          again.json()["data"]["refunded_amount"], amount)
 
     # --- 원장(payment_logs)이 환불 궤적을 남기는가 ---
     user = TEST_USER + "-refund-log"
@@ -2989,6 +4389,55 @@ def test_webhook_ops():
         check("두 번째 재처리는 400", again.status_code, 400)
         check("결제 상태는 그대로", status_of(pid), "REFUNDED")
 
+        # --- 저장된 payload가 손상된 경우 (2026-08-13 Sprint 94) ------------------
+        #
+        # 커버리지가 지목했다: `reprocess_webhook()`의 payload 파싱 실패 분기가 미커버였다.
+        #
+        # `raw_payload`는 수신 당시 그대로 저장한 텍스트다. 디스크 문제나 과거 데이터,
+        # 수동 복구 과정에서 잘리거나 JSON이 아닌 값이 들어갈 수 있다. 그때 운영자가
+        # 재처리 버튼을 누르면 **500이 아니라 읽을 수 있는 400**이어야 한다.
+        # (500이면 운영자는 서버 장애로 오해하고 엉뚱한 곳을 본다)
+        conn = get_connection()
+        broken_ids = []
+        try:
+            ts = datetime.now().isoformat()
+            for label, payload in (("잘린 JSON", '{"event_id": "x", "amo'),
+                                   ("JSON이 아님", "not json at all"),
+                                   ("객체가 아닌 JSON", '[1, 2, 3]')):
+                broken_ids.append((label, conn.execute(
+                    "INSERT INTO payment_webhooks (provider, event_type, event_id,"
+                    " pg_transaction_id, signature_verified, processing_status,"
+                    " raw_payload, received_at) VALUES (?,?,?,?,?,?,?,?)",
+                    ("mock", "PAYMENT_CONFIRMED",
+                     "qa-wh-broken-%s-%d" % (uuid.uuid4().hex[:6], len(broken_ids)),
+                     future_tx, 1, "RECEIVED", payload, ts)).lastrowid))
+            conn.commit()
+        finally:
+            conn.close()
+
+        for label, bid in broken_ids:
+            r_broken = None
+            leaked_rp = None
+            try:
+                r_broken = client.post(
+                    "/api/v1/admin/payments/webhooks/%d/reprocess" % bid, headers=sh)
+            except Exception as exc:
+                leaked_rp = exc
+            check_true("%s: 예외가 새어 나오지 않는다" % label, leaked_rp is None,
+                       "payload 파싱 가드가 사라졌는가? json.loads가 그대로 터진다: %r"
+                       % (leaked_rp,))
+            if r_broken is not None:
+                check("%s: 500이 아니라 400" % label, r_broken.status_code, 400)
+                check_true("%s: 사유가 payload를 지목한다" % label,
+                           "payload" in r_broken.text, r_broken.text[:80])
+
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM payment_webhooks WHERE event_id LIKE 'qa-wh-broken-%'")
+            conn.commit()
+        finally:
+            conn.close()
+
         # --- 보안 경계: 서명 미검증 수신은 절대 재처리 불가 ---
         bad = _post_webhook({"event_id": "qa-wh-ops-unsigned", "event_type": "PAYMENT_CONFIRMED",
                              "pg_transaction_id": future_tx}, signed=False)
@@ -3047,6 +4496,37 @@ def test_webhook_ops():
         check_true("reprocessable_only는 가능한 것만", all(i["reprocessable"] for i in ro["data"]),
                    ro["data"][:2])
         check_true("필터 사실을 meta에 명시", ro["meta"]["reprocessable_only"] is True, ro["meta"])
+
+        # --- provider 필터 (2026-08-13 Sprint 78 신규) ---
+        # Sprint 74가 "잘못된 필터 값은 400으로 거부한다"로 규약을 통일했는데, 이 함수의
+        # `provider`만 빠져 있었다 — 바로 위 `processing_status`는 검증되고 `provider`는
+        # 그대로 SQL로 들어가 오타에 200 + 빈 목록을 돌려줬다(실측).
+        #
+        # 검사가 무력해지지 않도록 **이 시점에 provider='mock' 행이 실재하는 상태**에서 본다.
+        # 빈 테이블에서 검사하면 "필터가 동작한다"와 "아무것도 없다"를 구분할 수 없다.
+        mock_list = client.get("/api/v1/admin/payments/webhooks?provider=mock", headers=ah).json()
+        check_true("provider=mock 이 실제 행을 돌려준다(검사의 구분력 확보)",
+                   len(mock_list["data"]) > 0, mock_list["meta"])
+        check_true("provider 필터가 동작", all(i["provider"] == "mock" for i in mock_list["data"]),
+                   [i["provider"] for i in mock_list["data"][:3]])
+
+        check("오타 provider는 400으로 거부",
+              client.get("/api/v1/admin/payments/webhooks?provider=BOGUS",
+                         headers=ah).status_code, 400)
+
+        # 유효하지만 해당 행이 없는 값은 **200 + 빈 목록**이어야 한다 —
+        # "오타"와 "그 PG의 노티가 없다"가 이 두 응답으로 갈린다(고치기 전에는 둘 다 200이었다).
+        valid_empty = client.get("/api/v1/admin/payments/webhooks?provider=kginicis", headers=ah)
+        check("유효한 provider는 200", valid_empty.status_code, 200)
+        check("유효하지만 없는 provider는 빈 목록", valid_empty.json()["data"], [])
+
+        # 수신 경로는 provider 이름을 `.strip().lower()`로 정규화해 저장한다. 조회가 그
+        # 정규화를 하지 않으면 "시스템이 받아주는 이름인데 조회에서는 거부"되는 비대칭이 생긴다.
+        upper = client.get("/api/v1/admin/payments/webhooks?provider=MOCK", headers=ah)
+        check("대문자 provider도 수신 경로와 같게 정규화", upper.status_code, 200)
+        check_true("정규화 결과가 소문자 조회와 동일",
+                   len(upper.json()["data"]) == len(mock_list["data"]),
+                   (len(upper.json()["data"]), len(mock_list["data"])))
 
         # --- 감사 로그 ---
         audit = client.get("/api/v1/admin/audit-logs?target_type=PAYMENT", headers=ah).json()["data"]
@@ -3195,6 +4675,580 @@ def test_authz_coverage():
 
 
 # ---------------------------------------------------------------------------
+# 34. 문서 서빙의 방어 분기 (2026-08-13 Sprint 85 신설)
+#
+# 커버리지가 지목한 두 줄이다 ― `api/v1/documents.py` 48행(경로를 만들 수 없는 행은 404)과
+# 58행(계산된 경로가 DOCUMENT_ROOT를 벗어나면 차단). 둘 다 **방어 코드인데 검사가 없었다.**
+# 방어 코드에 검사가 없으면 리팩터링 때 조용히 사라지고, 사라진 사실은 사고로만 드러난다.
+#
+# 실제 DB에 조작된 행을 넣지 않는다 ― `court_name`에 `..`를 담은 행을 운영 테이블에 만드는
+# 것 자체가 위험하고, 정리에 실패하면 흔적이 남는다. 대신 커넥션만 메모리 DB로 갈아끼운다
+# (`test_race_conditions.py` §14가 쓴 방법과 같은 계열).
+# ---------------------------------------------------------------------------
+def test_document_serving_guards():
+    import shutil as _shutil
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+    import api.v1.documents as docs_mod
+
+    print("\n--- 34. 문서 서빙 방어 분기 (Sprint 85) ---")
+
+    def fetch(url, method="GET"):
+        """서버가 예외를 던지면 TestClient는 그것을 그대로 올린다 ― 그대로 두면 결함이
+        FAIL이 아니라 **크래시**로 나타나 집계에서 사라진다. 상태코드 자리에 None을 돌려
+        어떤 기대값과도 맞지 않게 만든다."""
+        try:
+            r = client.request(method, url)
+            return r.status_code, r.content
+        except Exception as exc:  # noqa: BLE001
+            return None, ("예외: %r" % (exc,)).encode("utf-8")
+
+    # 경로 탈출이 **실제로 파일을 새게 만드는** 조건을 만든다. os.path.join은 두 번째
+    # 인자가 절대경로면 앞을 버리므로, court_name에 절대경로가 들어오면 DOCUMENT_ROOT를
+    # 즉시 벗어난다. 여기에 진짜 파일을 두고, 가드가 없으면 그 내용이 응답에 실리는지 본다
+    # (파일이 없는 탈출 경로만 검사하면 "존재하지 않아서 404"와 구별되지 않는다).
+    leak_dir = _tempfile.mkdtemp(prefix="qa_leak_")
+    os.makedirs(os.path.join(leak_dir, "1"), exist_ok=True)
+    with open(os.path.join(leak_dir, "1", "spec.pdf"), "wb") as fh:
+        fh.write(b"%PDF-1.4 QA-SECRET-SHOULD-NOT-LEAK")
+
+    mem = _sqlite3.connect(":memory:", check_same_thread=False)
+    mem.row_factory = _sqlite3.Row
+    mem.execute("CREATE TABLE auction_item (id INTEGER PRIMARY KEY, court_name TEXT,"
+                " case_no TEXT, item_no TEXT)")
+    mem.executemany(
+        "INSERT INTO auction_item (id, court_name, case_no, item_no) VALUES (?,?,?,?)",
+        [
+            # 1) 경로를 만들 수 없는 행: court_name이 NULL. 예전에는 os.path.join이
+            #    TypeError로 터져 500이었다(48행 주석).
+            (9001, None, "2026타경1", "1"),
+            (9002, "서울중앙지방법원", None, "1"),
+            # 2) 경로 탈출 시도: 값 자체에 상위 디렉터리 이동이 들어 있다. 크롤 데이터가
+            #    오염되거나 누가 직접 DB를 건드린 경우에 해당한다.
+            (9003, "..", "..", "1"),
+            (9004, "서울중앙지방법원", "../../../../windows", "1"),
+            # 3) 정상 형태지만 파일이 없는 행 ― 404가 나야 하고, 그 이유는 탈출이 아니다.
+            (9005, "존재하지않는법원", "2026타경9999", "1"),
+            # 4) 절대경로 주입 ― 실제로 존재하는 파일을 가리킨다(가드가 없으면 유출된다).
+            (9006, leak_dir, ".", "1"),
+        ],
+    )
+    mem.commit()
+
+    class _NoCloseConn:
+        """엔드포인트는 finally에서 conn.close()를 부른다 ― 메모리 DB가 그때 사라지면
+        다음 호출이 빈 DB를 보게 된다. close만 무시하고 나머지는 그대로 위임한다."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def close(self):
+            pass
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_get_connection = docs_mod.get_connection
+    docs_mod.get_connection = lambda *a, **kw: _NoCloseConn(mem)
+    try:
+        # 잘못된 doc_type은 DB를 보기도 전에 400 ― 순서까지 고정한다(존재하지 않는 물건이어도
+        # 400이어야 한다. 404가 나오면 DB를 먼저 보고 있다는 뜻이다).
+        status, _ = fetch("/api/v1/item/9999999/documents/REGISTRY")
+        check("지원하지 않는 문서 종류는 400", status, 400)
+
+        status, _ = fetch("/api/v1/item/424242/documents/SPEC")
+        check("없는 물건은 404", status, 404)
+
+        for item_id, label in ((9001, "court_name이 NULL"), (9002, "case_no가 NULL")):
+            status, body = fetch("/api/v1/item/%d/documents/SPEC" % item_id)
+            # None이면 서버가 예외로 죽었다는 뜻이다 ― 그것도 이 검사가 잡아야 하는 결과다.
+            check("%s인 행은 404(500도 예외도 아니다)" % label, status, 404)
+
+        for item_id, label in ((9003, "법원명/사건번호가 '..'"),
+                               (9004, "사건번호에 상위 경로 이동"),
+                               (9006, "court_name에 절대경로 주입(실파일 존재)")):
+            status, body = fetch("/api/v1/item/%d/documents/SPEC" % item_id)
+            check("%s: 404로 차단" % label, status, 404)
+            # 파일 내용이 새어 나오지 않았는지 ― 본문에 PDF 시그니처가 없어야 한다.
+            check_true("%s: 응답에 파일 내용이 없다" % label,
+                       b"%PDF" not in body and b"QA-SECRET" not in body, body[:60])
+
+        status, _ = fetch("/api/v1/item/9005/documents/STATUS")
+        check("정상 형태 + 파일 없음도 404", status, 404)
+
+        # HEAD도 같은 방어를 지나야 한다(프론트가 뷰어를 열기 전에 HEAD로 확인한다).
+        status, _ = fetch("/api/v1/item/9006/documents/SPEC", method="HEAD")
+        check("HEAD도 경로 탈출을 차단한다", status, 404)
+        status, _ = fetch("/api/v1/item/9001/documents/SPEC", method="HEAD")
+        check("HEAD도 경로를 만들 수 없으면 404", status, 404)
+    finally:
+        docs_mod.get_connection = real_get_connection
+        mem.close()
+        _shutil.rmtree(leak_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 35. 관심물건 등록 실패를 "이미 등록됨"으로 오해하지 않는다 (2026-08-13 Sprint 85 신설)
+#
+# `api/v1/favorites.py` 57-59행(중복 위반이 **아닌** 예외는 감추지 않고 올린다)이 미커버였다.
+# 이 분기는 과거의 실제 결함을 고친 자리다 ― 예전에는 `except Exception`으로 전부 잡아
+# DB 잠금/디스크 오류까지 "이미 관심물건으로 등록되어 있습니다"로 안내했다. 그러면 사용자는
+# 등록됐다고 믿고 넘어가고, 운영자는 오류를 볼 수 없다.
+# ---------------------------------------------------------------------------
+def test_favorite_insert_failure_is_not_masked():
+    import api.v1.favorites as fav_mod
+
+    print("\n--- 35. 관심물건 등록 실패 격리 (Sprint 85) ---")
+    user = "qa-reg-favfail-" + uuid.uuid4().hex[:8]
+    item_id = pick_item_ids(1)[0]
+
+    real_get_connection = fav_mod.get_connection
+
+    class _FailingInsert:
+        """INSERT만 IntegrityError가 **아닌** 오류로 실패시킨다(디스크/잠금 오류를 흉내)."""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self.rolled_back = False
+
+        def execute(self, sql, *a, **kw):
+            if sql.lstrip().upper().startswith("INSERT INTO FAVORITES"):
+                raise sqlite3.OperationalError("database is locked (qa-injected)")
+            return self._conn.execute(sql, *a, **kw)
+
+        def rollback(self):
+            self.rolled_back = True
+            return self._conn.rollback()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    box = {}
+
+    def patched(*a, **kw):
+        box["conn"] = _FailingInsert(real_get_connection(*a, **kw))
+        return box["conn"]
+
+    fav_mod.get_connection = patched
+    try:
+        raised = None
+        try:
+            r = client.post("/api/v1/favorites", json={"item_id": item_id},
+                            headers=auth_headers(user))
+            status = r.status_code
+            body = r.text
+        except Exception as exc:  # TestClient는 서버 예외를 그대로 올린다
+            raised = exc
+            status = None
+            body = ""
+    finally:
+        fav_mod.get_connection = real_get_connection
+
+    # 어떤 형태로든 **성공으로 보이지 않아야** 하고, "이미 등록됨"으로 오해되지도 않아야 한다.
+    check_true("성공(200 + success)으로 응답하지 않는다", status != 200 or '"success": true' not in body,
+               (status, body[:120]))
+    check_true("'이미 등록' 안내로 감추지 않는다", "이미 관심물건" not in body, body[:120])
+    check_true("오류가 드러난다(예외 전파 또는 5xx)",
+               raised is not None or (status is not None and status >= 500), (raised, status))
+    check_true("실패 시 롤백한다", box.get("conn") is not None and box["conn"].rolled_back,
+               "rollback이 호출되지 않았다")
+
+    # 실제로 등록되지 않았는지 DB로 확인한다(응답만 보고 판단하지 않는다).
+    conn = get_connection()
+    try:
+        left = conn.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("실패한 등록은 남지 않는다", left, 0)
+
+    # 대조군: 같은 요청이 정상 경로에서는 성공한다(위 실패가 주입 때문임을 보인다).
+    r = client.post("/api/v1/favorites", json={"item_id": item_id}, headers=auth_headers(user))
+    check("대조군: 정상 경로에서는 200", r.status_code, 200)
+    client.delete("/api/v1/favorites/%d" % item_id, headers=auth_headers(user))
+
+
+# ---------------------------------------------------------------------------
+# 36. 결제·Webhook의 남은 실패 분기 (2026-08-13 Sprint 85 신설)
+#
+# 커버리지가 `api/v1/payments.py`에 남긴 미커버 중 **Mock Provider로 도달 가능한** 실패
+# 분기들이다(실연동은 계속 SKIP). 돈이 걸린 경로라 우선순위를 가장 높게 뒀다.
+#
+#   514행  환불 가능 잔액 0 -> 두 번째 환불 거절     (이중 환불 방어)
+#   557행  조건부 UPDATE rowcount=0 -> 409          (동시 환불 방어의 **실행** 경로)
+#   629행  Webhook payload 해석 불가 -> 400
+#   682행  pg_transaction_id 없음 -> skip
+#   693행  같은 상태 재통지 -> 멱등 skip
+#   761행  재처리: 알 수 없는 provider -> 400
+#   767행  재처리: 저장된 payload 해석 불가 -> 400
+# ---------------------------------------------------------------------------
+def test_payment_failure_branches():
+    print("\n--- 36. 결제/Webhook 남은 실패 분기 (Sprint 85) ---")
+    # 환불과 Webhook 재처리는 둘 다 SUPER_ADMIN 전용이다(§29/§31이 그 경계를 고정했다).
+    super_headers = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
+    saved_secret = os.environ.get("PAYMENT_WEBHOOK_SECRET")
+    os.environ["PAYMENT_WEBHOOK_SECRET"] = WEBHOOK_SECRET
+
+    # -- (1) 전액 환불 뒤 같은 요청이 또 오면 **멱등 성공**이다 (오류가 아니다) ----
+    #
+    # 처음에 이 검사를 "두 번째 환불은 거절된다"로 썼는데 200이 왔다. 제품이 아니라 **검사의
+    # 가정이 틀렸다** ― `refund_payment()`는 이미 REFUNDED인 결제에 다시 요청이 오면
+    # `already_refunded=True`, 환불액 0으로 돌려준다(등기부 `already_requested`, 구독
+    # `already_subscribed`와 같은 규약이다).
+    #
+    # 그래서 여기서 지켜야 할 것은 "거절"이 아니라 **원장이 두 번 계상되지 않는 것**이다.
+    # 멱등 성공이 원장에 환불을 한 번 더 적으면 총 환불액이 결제액의 2배가 되고, 그 뒤로는
+    # 정산이 영구히 어긋난다. 돈 관련 멱등에서 진짜 위험은 그쪽이다.
+    user = TEST_USER + "-refund-twice"
+    pid, amount = _make_paid_payment(user)
+    r1 = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                     json={"reason": "qa-full-refund"}, headers=super_headers)
+    check("전액 환불은 성공한다", r1.status_code, 200)
+    d1 = r1.json()["data"]
+    check("첫 환불액은 결제액 전액", d1["refunded_amount"], amount)
+    check("첫 환불 후 잔여는 0", d1["refundable_remaining"], 0)
+    check("첫 환불은 멱등 응답이 아니다", d1["already_refunded"], False)
+
+    r2 = client.post("/api/v1/admin/payments/%d/refund" % pid,
+                     json={"reason": "qa-second-refund"}, headers=super_headers)
+    check("같은 환불 재요청은 멱등 성공", r2.status_code, 200)
+    d2 = r2.json()["data"]
+    check("멱등 응답임을 표시한다", d2["already_refunded"], True)
+    check("두 번째 요청의 환불액은 0", d2["refunded_amount"], 0)
+    check("누적 환불액이 결제액을 넘지 않는다", d2["total_refunded"], amount)
+
+    conn = get_connection()
+    try:
+        ledger = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM payment_logs"
+            " WHERE payment_id=? AND event_type='CANCEL' AND status='SUCCESS'",
+            (pid,)).fetchone()[0]
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs"
+            " WHERE payment_id=? AND event_type='CANCEL' AND status='SUCCESS'",
+            (pid,)).fetchone()[0]
+        audits = conn.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE target_type='PAYMENT' AND target_id=?",
+            (str(pid),)).fetchone()[0]
+    finally:
+        conn.close()
+    check("원장의 환불 합계가 결제액 그대로다(2배가 아니다)", ledger, amount)
+    check("원장에 환불 성공 기록은 한 건뿐이다", rows, 1)
+    # 멱등 응답은 감사 로그도 남기지 않는다(admin.py가 already_refunded를 보고 건너뛴다).
+    check("멱등 재요청은 감사 로그를 늘리지 않는다", audits, 1)
+
+    # -- (2) 동시 환불 방어의 **1차 방어선**을 직접 확인한다 (BEGIN IMMEDIATE) -----
+    #
+    # 처음 의도는 admin 409 분기(payments.py 557행)를 §14처럼 결정적으로 태우는 것이었다.
+    # 그런데 커넥션을 감싸 `UPDATE payments` 직전에 다른 커넥션으로 끼어들려 하니 **끼어든
+    # 쪽이 쓰기를 하지 못했다**. 이유가 곧 답이다 - `refund_payment()`는 함수 진입 직후
+    # `BEGIN IMMEDIATE`로 쓰기 락을 선점한다. 그래서 같은 프로세스/같은 DB에서는 조회와
+    # UPDATE 사이에 다른 쓰기가 끼어들 수 없고, 557행의 rowcount 검사는 **락 뒤의 이중
+    # 방어**다(도달시키려면 락을 우회해야 하는데, 그건 제품 동작이 아니다).
+    #
+    # 그래서 검사의 방향을 바꿨다: 못 태우는 분기를 억지로 태우는 대신, **1차 방어선이
+    # 실제로 직렬화하는지**를 확인한다. 이것도 지금까지 소스 문자열 검사밖에 없었다
+    # (test_race_conditions.py §7). 끼어든 쓰기가 "database is locked"로 막히는 것이
+    # BEGIN IMMEDIATE가 살아 있다는 실행 증거다.
+    import api.v1.admin as admin_mod
+    import storage.database as dbmod
+
+    user2 = TEST_USER + "-refund-lock"
+    pid2, amount2 = _make_paid_payment(user2)
+    attempt = {}
+
+    def interloper():
+        # 타임아웃을 짧게 잡는다(기본 5초를 기다릴 이유가 없다).
+        c = sqlite3.connect(dbmod.DB_PATH, timeout=0.3)
+        try:
+            c.execute("UPDATE payments SET status='REFUNDED' WHERE id=?", (pid2,))
+            c.commit()
+            attempt["result"] = "wrote"
+        except sqlite3.OperationalError as exc:
+            attempt["result"] = "blocked"
+            attempt["error"] = str(exc)
+        finally:
+            c.close()
+
+    class _Interleave:
+        """`UPDATE payments SET status` 직전에 다른 커넥션의 쓰기를 시도한다.
+
+        속성 **대입**도 감싼 커넥션으로 넘겨야 한다 - `refund_payment()`가
+        `conn.isolation_level = None`을 설정하는데, 래퍼에만 붙으면 실제 커넥션의 트랜잭션
+        모드가 바뀌지 않아 BEGIN IMMEDIATE가 의도대로 동작하지 않는다(그러면 검사가
+        제품이 아니라 래퍼를 시험하게 된다).
+        """
+
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "fired", False)
+
+        def execute(self, sql, *a, **kw):
+            if not self.fired and sql.lstrip().upper().startswith("UPDATE PAYMENTS SET STATUS"):
+                object.__setattr__(self, "fired", True)
+                interloper()
+            return self._conn.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+    real_get_connection = admin_mod.get_connection
+    box = {}
+
+    def patched(*a, **kw):
+        box["w"] = _Interleave(real_get_connection(*a, **kw))
+        return box["w"]
+
+    admin_mod.get_connection = patched
+    try:
+        r = client.post("/api/v1/admin/payments/%d/refund" % pid2,
+                        json={"reason": "qa-lock-probe"}, headers=super_headers)
+    finally:
+        admin_mod.get_connection = real_get_connection
+
+    check("끼어들기 시도가 실제로 실행됐다", box.get("w").fired if box.get("w") else None, True)
+    check("끼어든 쓰기는 락에 막힌다(BEGIN IMMEDIATE가 살아 있다)",
+          attempt.get("result"), "blocked")
+    check_true("막힌 이유가 잠금이다", "locked" in attempt.get("error", ""), attempt)
+    check("락을 잡은 쪽의 환불은 정상 완료된다", r.status_code, 200)
+
+    conn = get_connection()
+    try:
+        st = conn.execute("SELECT status FROM payments WHERE id=?", (pid2,)).fetchone()["status"]
+        entries = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs WHERE payment_id=? AND event_type='CANCEL'"
+            " AND status='SUCCESS'", (pid2,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("최종 상태는 환불이다", st, "REFUNDED")
+    check("원장에 환불 기록은 정확히 한 건이다", entries, 1)
+
+    # ── (3) Webhook payload 해석 불가 ────────────────────────────────────────
+    bad_body = b"{this is not json"
+    r = client.post("/api/v1/payments/webhook/mock", content=bad_body,
+                    headers={"Content-Type": "application/json",
+                             "X-Webhook-Signature": _sign(bad_body)})
+    check("해석 불가 payload는 400", r.status_code, 400)
+
+    list_body = json.dumps([1, 2, 3]).encode("utf-8")
+    r = client.post("/api/v1/payments/webhook/mock", content=list_body,
+                    headers={"Content-Type": "application/json",
+                             "X-Webhook-Signature": _sign(list_body)})
+    check("객체가 아닌 payload도 400", r.status_code, 400)
+
+    conn = get_connection()
+    try:
+        stored = conn.execute(
+            "SELECT COUNT(*) FROM payment_webhooks WHERE raw_payload LIKE '%this is not json%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    check("해석 불가 요청은 행을 만들지 않는다", stored, 0)
+
+    # -- (4) 무시되는 노티 두 종류 / (5) 같은 상태 재통지의 멱등 ----------------
+    #
+    # 여기서 한 번 헛돌았다. 처음에 `event_type="payment.paid"`로 보냈는데 통과했지만,
+    # 그것은 **무시 이유가 달랐기 때문**이다 - Mock의 매핑표(WEBHOOK_EVENT_STATUS)에 없는
+    # 이름이라 status가 빈 문자열이 되어 더 앞의 분기에서 걸렸다. 검사하려던 분기
+    # (pg_transaction_id 없음 / 같은 상태)에는 **도달조차 못 했다.** 커버리지로 그 사실이
+    # 드러났다(해당 줄이 그대로 미커버였다). 실제 event_type을 쓰도록 고친다.
+    user3 = TEST_USER + "-wh-branches"
+    pid3, _ = _make_paid_payment(user3)
+
+    # (4-a) 매핑표에 없는 event_type - 상태를 바꾸지 않는다(Sprint 52에서 고친 결함:
+    #       예전엔 event_type과 무관하게 항상 SUCCESS로 바꿨다).
+    r = _post_webhook({"event_id": "qa-wh-unknown-" + uuid.uuid4().hex[:8],
+                       "event_type": "payment.paid",
+                       "pg_transaction_id": "qa-nonexistent-tx"})
+    check("모르는 event_type은 200(무시)", r.status_code, 200)
+    check_true("무시 사유가 응답에 담긴다", "reason" in json.dumps(r.json()), r.text[:160])
+
+    # (4-b) 아는 event_type인데 pg_transaction_id가 없다 - 어느 결제인지 특정할 수 없다.
+    r = _post_webhook({"event_id": "qa-wh-notx-" + uuid.uuid4().hex[:8],
+                       "event_type": "PAYMENT_CONFIRMED"})
+    check("pg_transaction_id 없는 노티는 200(무시)", r.status_code, 200)
+    check_true("사유가 pg_transaction_id 부재를 알린다",
+               "pg_transaction_id" in json.dumps(r.json(), ensure_ascii=False), r.text[:200])
+
+    # (5) 이미 REFUNDED인 결제에 PAYMENT_REFUNDED가 다시 온다(PG 재전송의 정상 결과).
+    #     같은 상태이므로 멱등하게 성공 처리하고 **원장을 늘리지 않아야** 한다 - 여기서
+    #     환불 기록이 하나 더 생기면 총 환불액이 결제액을 넘는다.
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT status, pg_transaction_id FROM payments WHERE id=?",
+                           (pid,)).fetchone()
+        before_entries = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs WHERE payment_id=? AND event_type='CANCEL'"
+            " AND status='SUCCESS'", (pid,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("대상 결제는 이미 REFUNDED다(검사 전제)", row["status"], "REFUNDED")
+
+    if row["pg_transaction_id"]:
+        r = _post_webhook({"event_id": "qa-wh-same-" + uuid.uuid4().hex[:8],
+                           "event_type": "PAYMENT_REFUNDED",
+                           "pg_transaction_id": row["pg_transaction_id"]})
+        check("같은 상태 재통지는 200", r.status_code, 200)
+        body = json.dumps(r.json(), ensure_ascii=False)
+        check_true("멱등 처리임을 사유로 알린다", "이미 동일한 상태" in body, body[:200])
+        conn = get_connection()
+        try:
+            after = conn.execute("SELECT status FROM payments WHERE id=?", (pid,)).fetchone()["status"]
+            after_entries = conn.execute(
+                "SELECT COUNT(*) FROM payment_logs WHERE payment_id=? AND event_type='CANCEL'"
+                " AND status='SUCCESS'", (pid,)).fetchone()[0]
+        finally:
+            conn.close()
+        check("같은 상태 재통지가 상태를 바꾸지 않는다", after, "REFUNDED")
+        check("같은 상태 재통지가 원장을 늘리지 않는다", after_entries, before_entries)
+    else:
+        check_true("pg_transaction_id가 없어 같은상태 재통지 검사를 생략", False,
+                   "Mock 결제에 pg_transaction_id가 없다 - 전제가 바뀌었으면 검사를 고쳐야 한다")
+
+    # ── (6)(7) 재처리: 알 수 없는 provider / 저장된 payload 해석 불가 ────────
+    conn = get_connection()
+    try:
+        now = datetime.now().isoformat()
+        bad_provider_id = conn.execute(
+            "INSERT INTO payment_webhooks (provider, event_id, event_type, raw_payload,"
+            " signature_verified, processing_status, received_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("qa-unknown-pg", "qa-wh-badpg-" + uuid.uuid4().hex[:8], "payment.paid",
+             '{"event_type": "payment.paid"}', 1, "RECEIVED", now),
+        ).lastrowid
+        bad_payload_id = conn.execute(
+            "INSERT INTO payment_webhooks (provider, event_id, event_type, raw_payload,"
+            " signature_verified, processing_status, received_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("mock", "qa-wh-badbody-" + uuid.uuid4().hex[:8], "payment.paid",
+             "{not json at all", 1, "RECEIVED", now),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.post("/api/v1/admin/payments/webhooks/%d/reprocess" % bad_provider_id, headers=super_headers)
+    check("알 수 없는 provider 재처리는 400", r.status_code, 400)
+    # 재처리 가능 상태는 RECEIVED/IGNORED뿐이다(payment_logs.py:REPROCESSABLE_STATUSES).
+    # 처음에 PENDING으로 행을 만들어 "재처리를 지원하지 않는 상태"에 먼저 걸렸다 ― 제품이
+    # 아니라 픽스처의 상태값이 틀렸다.
+    check_true("사유에 provider를 알려준다", "provider" in r.text, r.text[:160])
+
+    r = client.post("/api/v1/admin/payments/webhooks/%d/reprocess" % bad_payload_id, headers=super_headers)
+    check("저장된 payload 해석 불가 재처리는 400", r.status_code, 400)
+    check_true("사유가 payload 문제임을 알린다", "payload" in r.text, r.text[:160])
+
+    if saved_secret is None:
+        os.environ.pop("PAYMENT_WEBHOOK_SECRET", None)
+    else:
+        os.environ["PAYMENT_WEBHOOK_SECRET"] = saved_secret
+
+
+# ---------------------------------------------------------------------------
+# 37. 결제 생성이 중간에 실패하면 결제 행도 남지 않는다 (2026-08-13 Sprint 85 신설)
+#
+# `api/v1/payments.py` 420-422행(`except Exception: rollback; raise`)이 미커버였다.
+# 이 트랜잭션은 **결제 기록 -> 구독 생성 -> 등기부 신청 연결**을 한 묶음으로 처리한다.
+# 중간에서 실패했는데 앞 단계가 남으면 **돈은 받았는데 이용권이 없는** 상태가 된다 —
+# 사용자에게 가장 나쁜 형태의 절반 반영이다.
+#
+# 구독 INSERT만 실패시켜 그 격리를 확인한다. 실패 자체가 목적이 아니라 **결제 행이
+# 남지 않는 것**이 목적이다.
+# ---------------------------------------------------------------------------
+def test_payment_creation_rolls_back_completely():
+    import api.v1.payments as pay_mod
+
+    print("\n--- 37. 결제 생성 실패의 완전 롤백 (Sprint 85) ---")
+    user = TEST_USER + "-create-rollback"
+    real_get_connection = pay_mod.get_connection
+
+    class _FailSubscriptionInsert:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "rolled_back", False)
+
+        def execute(self, sql, *a, **kw):
+            if sql.lstrip().upper().startswith("INSERT INTO SUBSCRIPTIONS"):
+                raise sqlite3.OperationalError("disk I/O error (qa-injected)")
+            return self._conn.execute(sql, *a, **kw)
+
+        def rollback(self):
+            object.__setattr__(self, "rolled_back", True)
+            return self._conn.rollback()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+    box = {}
+
+    def patched(*a, **kw):
+        box["conn"] = _FailSubscriptionInsert(real_get_connection(*a, **kw))
+        return box["conn"]
+
+    pay_mod.get_connection = patched
+    try:
+        raised = None
+        status = None
+        body = ""
+        try:
+            r = client.post("/api/v1/payments",
+                            json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                                  "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                                  "billing_cycle": BILLING_MONTHLY},
+                            headers=auth_headers(user))
+            status, body = r.status_code, r.text
+        except Exception as exc:  # noqa: BLE001 - TestClient는 서버 예외를 그대로 올린다
+            raised = exc
+    finally:
+        pay_mod.get_connection = real_get_connection
+
+    check_true("실패가 성공으로 보이지 않는다", status != 200, (status, body[:120]))
+    check_true("오류가 드러난다(예외 전파 또는 5xx)",
+               raised is not None or (status is not None and status >= 500), (raised, status))
+    # 명시적 롤백까지 확인하는 이유: 커밋 없이 close()하면 sqlite가 암묵적으로 되돌리므로
+    # **데이터는 두 겹으로 안전하다**(실제로 rollback을 지운 변이에서도 결제 행은 남지 않았다).
+    # 그러나 커넥션을 재사용하는 구조로 바뀌는 순간 암묵적 롤백은 사라진다 — 명시적 롤백이
+    # 그 변화에 견디는 쪽이므로, 그것도 함께 못 박는다.
+    check_true("실패 시 롤백한다", box.get("conn") is not None and box["conn"].rolled_back,
+               "rollback이 호출되지 않았다")
+
+    conn = get_connection()
+    try:
+        payments_left = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (user,)).fetchone()[0]
+        subs_left = conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (user,)).fetchone()[0]
+        logs_left = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs WHERE user_id=?", (user,)).fetchone()[0]
+    finally:
+        conn.close()
+    # 핵심: 결제 행이 남으면 "돈은 받았는데 구독이 없는" 상태다.
+    check("실패한 결제 행이 남지 않는다", payments_left, 0)
+    check("구독도 만들어지지 않는다", subs_left, 0)
+    check("원장에도 성공 기록이 남지 않는다", logs_left, 0)
+
+    # 대조군: 주입을 풀면 같은 요청이 결제와 구독을 함께 만든다(위 실패가 주입 때문임을 보인다).
+    r = client.post("/api/v1/payments",
+                    json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                          "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                          "billing_cycle": BILLING_MONTHLY},
+                    headers=auth_headers(user))
+    check("대조군: 정상 경로는 200", r.status_code, 200)
+    conn = get_connection()
+    try:
+        pair = (conn.execute("SELECT COUNT(*) FROM payments WHERE user_id=?", (user,)).fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (user,)).fetchone()[0])
+    finally:
+        conn.close()
+    check("대조군: 결제와 구독이 함께 생긴다", pair, (1, 1))
+
+
+# ---------------------------------------------------------------------------
 # cleanup: 이 테스트가 만든 행만 정리한다(실제 사용자 데이터는 건드리지 않음)
 # ---------------------------------------------------------------------------
 def cleanup():
@@ -3229,8 +5283,13 @@ def cleanup():
             (like,))]
 
         # FK가 런타임에 강제되므로 자식 -> 부모 순서로 지운다.
+        #
+        # ★ subscriptions가 payments **앞**에 있어야 한다 (2026-08-13 Sprint 96).
+        #   `subscriptions.payment_id`가 생기면서 구독이 결제의 자식이 됐다(BUGS #94).
+        #   순서를 되돌리면 이 정리가 FOREIGN KEY constraint failed로 죽는다 ―
+        #   실제로 그렇게 죽는 것을 보고 고친 순서다.
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
-                      "payment_logs", "payments", "subscriptions", "favorites",
+                      "payment_logs", "subscriptions", "payments", "favorites",
                       "recent_items", "search_presets", "registry_credits"):
             cur = conn.execute("DELETE FROM %s WHERE user_id LIKE ?" % table, (like,))
             total += cur.rowcount
@@ -3305,6 +5364,7 @@ def run():
     try:
         test_health_and_stats()
         test_search()
+        test_address_detail_intents()
         test_property_type_aliases()
         test_detail_and_documents()
         test_authentication()
@@ -3329,6 +5389,7 @@ def run():
         test_foreign_key_enforcement()
         test_payment_state_machine()
         test_subscription_lifecycle()
+        test_admin_list_filters()
         test_audit_and_credit_logs()
         test_admin_rest_structure()
         test_soft_delete_columns()
@@ -3337,6 +5398,10 @@ def run():
         test_my_subscriptions()
         test_webhook_ops()
         test_authz_coverage()
+        test_document_serving_guards()
+        test_favorite_insert_failure_is_not_masked()
+        test_payment_failure_branches()
+        test_payment_creation_rolls_back_completely()
     finally:
         cleanup()
 

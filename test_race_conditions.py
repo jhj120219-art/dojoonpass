@@ -830,8 +830,10 @@ def cleanup():
             )
             total += cur.rowcount
 
+        # subscriptions가 payments **앞**이어야 한다 ― `subscriptions.payment_id`가
+        # 생기면서 구독이 결제의 자식이 됐다 (2026-08-13 Sprint 96, BUGS #94).
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
-                      "payment_logs", "payments", "subscriptions"):
+                      "payment_logs", "subscriptions", "payments"):
             for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION,
                          TEST_USER_ADMIN_TARGET, TEST_USER_REFUND, TEST_USER_SUB_STATUS):
                 cur = conn.execute("DELETE FROM %s WHERE user_id=?" % table, (user,))
@@ -855,6 +857,132 @@ def cleanup():
         conn.close()
 
 
+class _InterleavingConn:
+    """`UPDATE registry_requests` 직전에 콜백을 딱 한 번 실행하는 커넥션 래퍼.
+
+    SELECT와 조건부 UPDATE 사이의 창은 수 마이크로초라 실제 스레드로는 안정 재현이
+    불가능하다는 것이 2026-08-11 실측 결론이었다(시나리오 4 주석: 2스레드 3/4, 6스레드 1/5).
+    그래서 그 창을 **직접 벌린다** ― UPDATE를 대행하기 바로 전에 다른 커넥션으로 상태를
+    바꿔 놓으면 조건부 UPDATE는 rowcount=0을 볼 수밖에 없다. 확률이 개입하지 않는다.
+
+    구조 검사(`test_toctou_guard_is_structural()`)는 소스에 가드 문자열이 남아 있는지만
+    보므로, 가드가 실제로 **409를 내고 롤백하며 앞선 결과를 보존하는지**는 확인하지 못한다.
+    이 래퍼가 그 실행 경로를 결정적으로 밟는다.
+    """
+
+    def __init__(self, conn, on_update):
+        self._conn = conn
+        self._on_update = on_update
+        self.fired = False
+
+    def execute(self, sql, *a, **kw):
+        if not self.fired and sql.lstrip().upper().startswith("UPDATE REGISTRY_REQUESTS"):
+            self.fired = True
+            self._on_update()
+        return self._conn.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _new_processing_request():
+    conn = get_connection()
+    try:
+        item_id = conn.execute("SELECT id FROM auction_item LIMIT 1").fetchone()["id"]
+        req_id = conn.execute(
+            "INSERT INTO registry_requests (user_id,item_id,status,requested_at) VALUES (?,?,?,?)",
+            (TEST_USER_ADMIN_TARGET, item_id, "PROCESSING", datetime.now().isoformat()),
+        ).lastrowid
+        conn.commit()
+        return req_id
+    finally:
+        conn.close()
+
+
+def test_admin_registry_conflict_is_deterministic():
+    """409 분기를 **결정적으로** 실행시켜, 거부 응답과 데이터 보존을 함께 확인한다
+    (2026-08-13 Sprint 85 신설).
+
+    지금까지 이 분기의 근거는 (a) 확률적 스레드 재현과 (b) 소스 문자열 검사 두 개뿐이었다.
+    둘 다 "409를 실제로 돌려주는가 / 앞선 관리자의 결과가 살아남는가"는 검증하지 못한다.
+    끼어든 쪽이 COMPLETED(doc_url 포함)로 먼저 확정한 뒤, 진 쪽의 FAILED(reason 포함)가
+    어떻게 처리되는지 본다 ― 조용히 덮어쓰면 운영자는 발급된 등기부를 잃는다.
+    """
+    import api.v1.admin as admin_mod
+
+    print("\n--- 14. admin registry 409 분기 결정적 검증 (Sprint 85) ---")
+    admin_headers = {"X-Admin-Key": os.environ["ADMIN_API_KEY"]}
+    req_id = _new_processing_request()
+    INTERLOPER_URL = "https://example.com/qa-interloper.pdf"
+
+    def interloper():
+        # 다른 관리자 요청이 먼저 반영된 상황. 이 시점의 admin 커넥션은 SELECT만 했고
+        # sqlite3 모듈은 SELECT로 트랜잭션을 열지 않으므로 락 없이 끼어들 수 있다 ―
+        # 이것이 TOCTOU 창의 실제 모습이다.
+        c = get_connection()
+        try:
+            c.execute(
+                "UPDATE registry_requests SET status=?, completed_at=?, doc_url=? WHERE id=?",
+                ("COMPLETED", datetime.now().isoformat(), INTERLOPER_URL, req_id),
+            )
+            c.commit()
+        finally:
+            c.close()
+
+    real_get_connection = admin_mod.get_connection
+    box = {}
+
+    def patched(*a, **kw):
+        box["w"] = _InterleavingConn(real_get_connection(*a, **kw), interloper)
+        return box["w"]
+
+    admin_mod.get_connection = patched
+    try:
+        r = client.patch(
+            "/api/v1/admin/registry-requests/%s" % req_id,
+            json={"status": "FAILED", "reason": "qa-deterministic-loser"},
+            headers=admin_headers,
+        )
+    finally:
+        admin_mod.get_connection = real_get_connection
+
+    check("끼어든 UPDATE가 실제로 실행됐다(창이 벌어졌다)", box.get("w").fired if box else None, True)
+    check("진 쪽은 409로 거부된다", r.status_code, 409)
+    check_true("거부 사유가 기대했던 현재 상태를 알려준다",
+               "PROCESSING" in str(r.json().get("detail", "")))
+
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT status, doc_url, reason FROM registry_requests WHERE id=?", (req_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    check("먼저 반영된 상태가 그대로 남는다", row["status"], "COMPLETED")
+    check("먼저 발급된 doc_url이 덮이지 않는다", row["doc_url"], INTERLOPER_URL)
+    check("진 쪽의 reason이 섞여 들어가지 않는다", row["reason"], None)
+
+    # 대조군: 끼어들기가 없으면 **같은 요청이 성공한다**. 이게 없으면 위 409가 끼어들기
+    # 때문인지 요청 자체가 잘못됐기 때문인지 구별되지 않는다(검사가 공허해진다).
+    control_id = _new_processing_request()
+    r2 = client.patch(
+        "/api/v1/admin/registry-requests/%s" % control_id,
+        json={"status": "FAILED", "reason": "qa-deterministic-control"},
+        headers=admin_headers,
+    )
+    check("대조군(끼어들기 없음)은 같은 요청이 200", r2.status_code, 200)
+
+    conn = get_connection()
+    try:
+        row2 = conn.execute(
+            "SELECT status, reason FROM registry_requests WHERE id=?", (control_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    check("대조군은 요청대로 반영된다", (row2["status"], row2["reason"]),
+          ("FAILED", "qa-deterministic-control"))
+
+
 def run():
     try:
         test_registry_free_limit_race()
@@ -870,6 +998,7 @@ def run():
         test_registry_credit_adjust_race()
         test_search_preset_cap_race()
         test_search_preset_cap_guard_is_structural()
+        test_admin_registry_conflict_is_deterministic()
     finally:
         cleanup()
 

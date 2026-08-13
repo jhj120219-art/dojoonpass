@@ -1,10 +1,13 @@
 ﻿import json
+import logging
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import ErrorCode
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -73,10 +76,36 @@ def get_presets(user_id: str = Depends(get_current_user)):
         ).fetchall()
         items = []
         for row in rows:
+            # 저장된 JSON을 해석하지 못해도 **목록 전체를 죽이지 않는다**
+            # (2026-08-13 Sprint 96, BUGS #95).
+            #
+            # 고치기 전에는 손상된 행 하나가 이 반복문에서 예외를 던져 **500**이 됐고,
+            # 멀쩡한 나머지 검색조건까지 통째로 사라졌다. 실측: 정상 3건 + 손상 1건 -> 500.
+            #
+            # 더 나쁜 것은 **사용자가 스스로 빠져나올 수 없다**는 점이었다. 삭제하려면
+            # preset_id가 필요한데 id를 알 수 있는 유일한 경로가 바로 이 목록이다.
+            # 목록이 죽으면 지울 대상도 볼 수 없다 ― 막다른 길이다.
+            #
+            # 빈 dict로 되돌리는 이유(None이 아니라): 프론트가 `preset.conditions[key]`로
+            # 읽는다(SearchPresets.tsx:139). None이면 거기서 TypeError가 나서 화면이
+            # 같은 방식으로 죽는다. `{}`면 "조건 없는 검색"이 되어 무해하고, 무엇보다
+            # **그 행이 목록에 보이므로 지울 수 있다.**
+            #
+            # 저장된 데이터를 해석하는 다른 경로(payments.py:646/784)와 같은 규약이다.
+            try:
+                conditions = json.loads(row["conditions"])
+                if not isinstance(conditions, dict):
+                    raise ValueError("conditions가 객체가 아닙니다")
+            except (TypeError, ValueError):
+                logger.warning(
+                    "검색조건 %s(user=%s)의 conditions를 해석할 수 없다 - 빈 조건으로 대체한다",
+                    row["id"], user_id,
+                )
+                conditions = {}
             items.append({
                 "id": row["id"],
                 "name": row["name"],
-                "conditions": json.loads(row["conditions"]),
+                "conditions": conditions,
                 "created_at": row["created_at"],
             })
         return success(items)

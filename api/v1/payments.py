@@ -300,16 +300,32 @@ def create_payment_record(conn, user_id: str, payment_type: str, amount: int, pl
 
 
 def create_subscription(conn, user_id: str, plan: str, price: int, now: str,
-                        billing_cycle: str = BILLING_MONTHLY) -> int:
+                        billing_cycle: str = BILLING_MONTHLY,
+                        payment_id: int | None = None) -> int:
+    """구독 행을 만든다.
+
+    `payment_id`는 **이 구독을 산 결제**를 가리킨다 (2026-08-13 Sprint 96, BUGS #94).
+    이전에는 이 연결이 아예 없어서, 구독 결제를 환불해도 어느 구독이 그 돈으로
+    만들어졌는지 알 수 없었다 ― 맞춰 볼 방법이 `(user_id, 금액, 시각)` 어림짐작뿐이었다.
+    `registry_requests`는 진작부터 `payment_id`를 갖고 있었고, 여기만 끊겨 있었다.
+
+    ★ 환불 시 구독을 어떻게 할지(즉시 해지 / 주기 만료 / 일할)는 **정책 결정 대기**다.
+      이 인자는 그 결정을 앞지르지 않는다 ― 어떤 선택지를 고르든 먼저 있어야 하는
+      식별자일 뿐이다. docs/roadmap.md "결정 대기 ― 구독 결제를 환불하면" 참고.
+
+    None을 허용하는 이유: 이 칼럼이 생기기 전에 만들어진 구독은 결제를 특정할 수 없다.
+    가짜 값으로 채우면 "모르는 것"과 "없는 것"이 구분되지 않는다.
+    """
     started_at = now
     expires_at = (datetime.now() + timedelta(days=BILLING_PERIOD_DAYS[billing_cycle])).isoformat()
     subscription_id = conn.execute(
         """
         INSERT INTO subscriptions
-        (user_id, plan, price, status, started_at, expires_at, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?)
+        (user_id, plan, price, status, started_at, expires_at, created_at, updated_at, payment_id)
+        VALUES (?,?,?,?,?,?,?,?,?)
         """,
-        (user_id, plan, price, SubscriptionStatus.ACTIVE.value, started_at, expires_at, now, now),
+        (user_id, plan, price, SubscriptionStatus.ACTIVE.value, started_at, expires_at,
+         now, now, payment_id),
     ).lastrowid
     return subscription_id
 
@@ -393,7 +409,10 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
 
             subscription_row = None
             if req.payment_type == "SUBSCRIPTION":
-                subscription_id = create_subscription(conn, user_id, req.plan, req.amount, now, billing_cycle)
+                # payment_id를 함께 넘겨 결제 <-> 구독을 잇는다(BUGS #94).
+                # 같은 트랜잭션 안이라 두 행은 함께 커밋되거나 함께 사라진다.
+                subscription_id = create_subscription(conn, user_id, req.plan, req.amount, now,
+                                                      billing_cycle, payment_id=payment_id)
                 subscription_row = conn.execute(
                     "SELECT * FROM subscriptions WHERE id=?", (subscription_id,)
                 ).fetchone()
@@ -618,7 +637,7 @@ async def receive_payment_webhook(provider_name: str, request: Request):
     verified = provider.verify_webhook_signature(raw_body, headers)
     if not verified:
         logger.warning(
-            "Webhook 서명 검증 실패 — 저장하지 않고 거절 (provider=%s, bytes=%d, client=%s)",
+            "Webhook 서명 검증 실패 ― 저장하지 않고 거절 (provider=%s, bytes=%d, client=%s)",
             provider_name, len(raw_body), getattr(request.client, "host", "?"),
         )
         raise HTTPException(status_code=401, detail="Webhook 서명 검증에 실패했습니다")

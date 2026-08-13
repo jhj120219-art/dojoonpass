@@ -1,7 +1,7 @@
 # Error Code 표준 (도메인별)
 
 Status: Active
-Last Updated: 2026-08-09 (Sprint 40 — `api/constants.py:ErrorCode` 40개 전량과 1:1 대조 재확인, 불일치 0건)
+Last Updated: 2026-08-13 (Sprint 72 — 정의/문서/실제 방출 3자 실측. 정의 40 = 문서 40, 실제 방출 19 / 미방출 21)
 Owner: CTO
 
 정의 위치: `api/constants.py:ErrorCode` — **이 문서가 아니라 코드가 기준**이다.
@@ -117,10 +117,26 @@ Owner: CTO
 
 ---
 
-## 적용 현황 (2026-08-07)
+## 적용 현황 (2026-08-07 서술, 2026-08-13 Sprint 72 실측으로 재확인)
 
 **Error Code가 붙은 곳** — envelope(`{success, data, error, meta, message}`)를 쓰는 라우트:
 `payments` / `registry` / `favorites` / `search_presets`.
+
+Sprint 72에 코드를 기계적으로 훑어 아래 서술이 지금도 사실인지 확인했다. **사실이다.**
+
+```
+정의된 코드            40
+이 문서에 있는 코드      40   (1:1, 불일치 0)
+실제로 응답에 실리는 코드 19   payments 9 / search_presets 5 / registry 3 / favorites 2
+한 번도 방출되지 않는 코드 21   AUTH·ADMIN·SUBSCRIPTION 전체 + SEARCH 2 + REGISTRY 5 + ITEM/INTERNAL
+```
+
+즉 **"정의됐다"와 "응답에 실린다"는 다르다.** 21개는 아래 서술대로 `HTTPException`을 쓰는
+영역에 대응하는, 아직 배선되지 않은 코드다. 프런트(`src/lib/api.ts:ERROR_CODES`)가 분기에
+쓰는 3개는 전부 실제 방출되는 코드임도 함께 확인했다.
+
+이 경계는 `test_schema_hygiene.py` §5가 회귀로 고정한다 — 문서/정의 불일치, 방출 코드의
+증감, 프런트가 **방출되지 않는 코드로 분기하는 것**(죽은 분기)을 전부 잡는다.
 
 **아직 붙지 않은 곳** — `HTTPException`으로 실패를 반환하는 지점(FastAPI 표준 `{"detail": ...}`).
 `admin` 전체와 각 라우트의 404/400이 여기 해당한다. **의도적으로 두었다**: 기존 클라이언트가

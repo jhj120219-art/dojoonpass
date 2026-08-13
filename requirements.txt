@@ -29,7 +29,19 @@ fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
 python-dotenv==1.2.2
-requests==2.34.2
+
+# `requests`를 뺐다 (2026-08-13 Sprint 99).
+#
+# 위 머리말대로 이 목록은 "소스 .py의 import를 전수 파싱"해서 뽑았는데, 그 파싱이
+# **`.gitignore` 대상인 로컬 실험 스크립트까지 포함**하고 있었다(`step*.py` 65개).
+# `requests`를 import하는 저장소 소스는 그중 `step8_verify.py` **하나뿐**이고, 그 파일은
+# clone에 존재하지 않는다. 즉 이 줄은 저장소에 없는 파일 때문에 들어온 항목이었다.
+#
+# 빼도 설치 결과는 달라지지 않는다 — `webdriver-manager`가 `requests`를 의존하므로
+# 전이 의존성으로 그대로 설치된다(실측 확인).
+#
+# 같은 원인으로 `test_schema_hygiene.py`의 import 스캔도 이번에 git 기준으로 바꿨다.
+# 그 전에는 무시된 스크립트가 섞여 **새로 clone한 환경에서만 검사가 깨지는** 상태였다.
 
 # Supabase JWT 검증(ES256/HS256)에 쓰인다. `[cryptography]` extra가 없으면
 # ES256 검증이 런타임에 실패한다 — docs/BETA_RELEASE_CHECKLIST.local.md에도 적혀 있다.
