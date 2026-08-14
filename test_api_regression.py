@@ -300,6 +300,38 @@ def test_search():
     check("injection attempt safe", r.status_code, 200)
     check("injection returns no rows", r.json()["total"], 0)
 
+    # 나머지 문자열 파라미터도 같은지 (2026-08-14 신설).
+    #
+    # 위 `sido` 한 줄만으로는 부족하다. WHERE 조각을 만드는 파라미터는 여럿이고,
+    # 뚫리는 곳은 **검사하지 않은 쪽**이다. 페이로드가 값으로 취급되면 결과가 0건이어야 한다
+    # (기준 total 과 같아지면 조건이 "항상 참"이 됐다는 뜻이다).
+    #
+    # 조립 구조 자체는 `test_schema_hygiene.py` 의 SQL 텍스트 보간 검사가 지킨다.
+    # 여기서는 **실제 요청**으로 확인한다 ― 두 검사가 같은 것을 다른 방법으로 본다.
+    base_total = client.get("/api/v1/search?size=1").json()["total"]
+    for field in ("sigungu", "dong", "case_no", "court_name", "status", "address_detail"):
+        for payload in ("' OR '1'='1", "'; DROP TABLE auction_item; --", "%' OR 1=1 --"):
+            rr = client.get("/api/v1/search", params={field: payload, "size": 1})
+            check_true("injection %s 는 200" % field, rr.status_code == 200,
+                       "HTTP %s / %s" % (rr.status_code, payload))
+            if rr.status_code == 200:
+                check_true("injection %s 는 값으로 취급" % field, rr.json()["total"] == 0,
+                           "total=%s (기준 %s) payload=%r"
+                           % (rr.json()["total"], base_total, payload))
+
+    # 정렬은 값 바인딩이 불가능해 화이트리스트가 유일한 방어다 ― 밖이면 거부해야 한다.
+    # (조용히 기본값으로 넘어가면 "정렬이 먹지 않는다"는 버그로만 보이고 방어는 안 보인다.)
+    for bad in ("id; DROP TABLE auction_item", "auction_date; --", "(SELECT 1)"):
+        check("sort_by 화이트리스트 밖 거부",
+              client.get("/api/v1/search", params={"sort_by": bad}).status_code, 400)
+    for bad in ("asc; DROP TABLE x", "DESC--"):
+        check("sort_order 화이트리스트 밖 거부",
+              client.get("/api/v1/search", params={"sort_order": bad}).status_code, 400)
+
+    # 테이블이 살아 있는가 ― 위 시도 중 하나라도 성립했으면 여기서 드러난다.
+    check_true("인젝션 시도 후에도 auction_item 이 살아 있다",
+               client.get("/api/v1/search?size=1").status_code == 200)
+
     # regions
     r = client.get("/api/v1/search/regions?sido=서울")
     check("regions status", r.status_code, 200)
@@ -2297,6 +2329,60 @@ def test_response_envelope():
     body = client.get("/api/v1/search").json()
     check_true("search keeps flat shape", "items" in body and "success" not in body, sorted(body)[:4])
 
+    # ── 위 5개는 손으로 적은 목록이다. 전수로 넓힌다 (2026-08-14) ──────────────
+    #
+    # 인증이 필요한 GET 은 **21개**인데 위에서 검사하던 것은 5개뿐이었다.
+    # 빠져 있던 16개에는 관리자 목록 11개와 `/subscriptions/me` 가 전부 들어간다.
+    # 지금은 전부 봉투를 지키지만(2026-08-14 실측), 새 관리자 엔드포인트가
+    # 리스트를 그대로 돌려주면 프런트의 `result.data` 읽기가 깨진다 —
+    # 그리고 그 사실을 알려 줄 검사가 없었다.
+    #
+    # 라우트를 손으로 고르지 않고 앱에서 유도한다(Sprint 108과 같은 방식).
+    # 이 FastAPI 버전은 `include_router` 결과를 평탄화하지 않으므로 감싼 것을 풀어서 센다.
+    #
+    # ★ 판정 대상은 **HTTP 200 응답만**이다. 이 저장소에는 실패 응답이 두 형태 있고
+    #   둘 다 의도된 상태다 — `error_response()` 는 200 + 봉투, `HTTPException` 은
+    #   4xx + `detail`. 없는 id 를 넣어 404가 나온 것을 봉투 위반으로 세면 안 된다.
+    routes = set()
+    for r in api_server.app.routes:
+        if type(r).__name__ == "_IncludedRouter":
+            pre = r.include_context.prefix or ""
+            subs = [(pre + s.path, s) for s in r.original_router.routes]
+        else:
+            subs = [(getattr(r, "path", ""), r)]
+        for full, s in subs:
+            for m in (getattr(s, "methods", None) or set()):
+                if m == "GET":
+                    routes.add(full)
+
+    admin_h = {"X-Admin-Key": TEST_SUPER_ADMIN_KEY}
+    checked, violations = 0, []
+    for path in sorted(routes):
+        if path in ("/", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"):
+            continue
+        probe = path
+        for token, sample in _PATH_SAMPLE.items():
+            probe = probe.replace(token, sample)
+        if client.get(probe).status_code not in (401, 403):
+            continue          # 공개 라우트 — 봉투 계약 대상이 아니다
+        hdr = admin_h if "/admin/" in path else h
+        resp = client.get(probe, headers=hdr)
+        if resp.status_code != 200:
+            continue          # HTTPException 경로(detail 모양) — 위 주석 참고
+        checked += 1
+        try:
+            body = resp.json()
+        except ValueError:
+            violations.append("%s: JSON 아님" % path)
+            continue
+        if not isinstance(body, dict) or set(body) != ENVELOPE_KEYS:
+            violations.append("%s: %s" % (path, sorted(body) if isinstance(body, dict)
+                                          else type(body).__name__))
+
+    print("   인증 필요 GET 중 200 응답 %d개 대조" % checked)
+    check_true("봉투 계약 대상이 충분히 있다(검사가 공허하지 않다)", checked >= 12, checked)
+    check("봉투 모양을 벗어난 인증 GET 없음", violations, [])
+
 
 # ---------------------------------------------------------------------------
 # 18. CORS 설정 — 기본값은 전체 허용, 환경변수 지정 시 그 목록만 허용
@@ -2582,6 +2668,39 @@ def test_payment_logs():
 
     nested_list = mask_sensitive({"a": [[{"password": "p"}]]})
     check("중첩 리스트도 끝까지 내려간다", nested_list["a"][0][0]["password"], REDACTED)
+
+    # ── 감사 로그(audit_logs)도 같은 기준으로 마스킹하는가 (2026-08-14 신설) ────
+    #
+    # `payment_logs._dump()` 와 `audit._dump()` 는 **이름이 같고 하는 일도 같은데**
+    # 마스킹은 결제 로그 쪽만 하고 있었다. 감사 로그 payload 는 지금 손으로 고른
+    # 스칼라 dict 뿐이라 사고가 없었지만(호출부 5곳 전수 확인), `audit.py` 의 docstring
+    # 자체가 "전체 행을 통째로 넣으면 민감정보가 섞여 들어갈 여지가 커진다"고 경고한다 —
+    # 그건 **관례**일 뿐 강제되지 않았다.
+    #
+    # `audit_logs` 도 운영자가 폭넓게 열람하는 기록이다. 같은 성질의 기록에 서로 다른
+    # 기준이 적용되는 상태를 없앤다. 지금 payload 에는 민감 키가 없으므로 무영향이고,
+    # 앞으로 누가 행을 통째로 넘겼을 때만 효과가 있다.
+    import json as _json
+    from api.v1.audit import _dump as audit_dump
+
+    dumped = audit_dump({"status": "PAID", "card_no": "4111111111111111",
+                         "nested": {"access_token": "eyJ", "ok": "keep"}})
+    parsed = _json.loads(dumped)
+    check("감사 로그도 card_no를 마스킹한다", parsed["card_no"], REDACTED)
+    check("감사 로그도 중첩 토큰을 마스킹한다", parsed["nested"]["access_token"], REDACTED)
+    check("감사 로그의 비민감 값은 보존", parsed["nested"]["ok"], "keep")
+    check("감사 로그의 일반 필드도 보존", parsed["status"], "PAID")
+
+    # 현재 실제로 쓰이는 payload 모양에는 **영향이 없어야 한다**(no-op).
+    for sample in ({"status": "PENDING", "reason": None, "doc_url": "a.pdf"},
+                   {"status": "ACTIVE", "expires_at": "2026-09-01T00:00:00"}):
+        check("현재 감사 payload는 그대로 직렬화된다 %s" % sorted(sample),
+              _json.loads(audit_dump(sample)), sample)
+
+    # datetime 이 섞여도 감사 기록을 잃지 않아야 한다(default=str 유지).
+    from datetime import datetime as _dt
+    check_true("datetime이 섞여도 직렬화가 죽지 않는다",
+               "2026" in audit_dump({"when": _dt(2026, 8, 14)}))
 
     # 키 표기 변형 — PG마다 표기가 다르다(card-no / CARD_NO).
     check("하이픈 키도 마스킹", mask_sensitive({"card-no": "1111"})["card-no"], REDACTED)
@@ -3467,9 +3586,51 @@ def test_admin_rest_structure():
     # 기록으로 존재**하게 되고, 반대로 성공한 조작이 안 남으면 추적이 끊긴다. 감사 로그는
     # "누가 무엇을 바꿨는가"를 사후에 판단하는 유일한 근거라 어느 쪽도 허용되지 않는다.
     #
-    # admin.py의 5개 호출부는 전부 `record_audit(...)` 다음에 같은 커넥션으로 `conn.commit()`을
-    # 부르고, 실패 경로에서는 `conn.rollback()`으로 되돌린다(정적 확인 완료). 여기서는 그
-    # 결과를 **실제 응답과 DB로** 확인한다.
+    # ★ 2026-08-14 정정 — 위 문단은 원래 이렇게 적혀 있었다:
+    #
+    #     "admin.py의 5개 호출부는 전부 record_audit(...) 다음에 같은 커넥션으로
+    #      conn.commit()을 부르고, 실패 경로에서는 conn.rollback()으로 되돌린다
+    #      (정적 확인 완료)"
+    #
+    #   **5개 중 2개가 사실이 아니었다.** `update_registry_request_status` 와
+    #   `adjust_registry_credit` 는 본 작업을 먼저 커밋한 뒤에 record_audit 을 불렀다.
+    #   즉 감사 기록이 실패하면 **기록 없는 특권 조작이 영구히 남는** 상태였다.
+    #   실측 재현(record_audit 에 예외 주입, 수정 전):
+    #
+    #       registry_credits +1 / registry_credit_logs +1 / audit_logs +0
+    #
+    #   "정적 확인 완료"라고 적힌 주장이 틀렸던 것이라, 아래에 **구조 검사**를 넣어
+    #   같은 착오가 반복되지 않게 한다(주석이 아니라 코드가 확인하게 만든다).
+    #   수정 후에는 셋 다 0이 된다.
+    def audit_commit_order_violations():
+        """record_audit 앞에서 본 작업을 커밋하는 admin 엔드포인트를 찾는다."""
+        import ast as _ast
+        import re as _re
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "api", "v1", "admin.py")
+        with open(path, encoding="utf-8-sig") as _fh:
+            src = _fh.read()
+        lines = src.splitlines()
+        bad = []
+        for node in _ast.walk(_ast.parse(src, filename=path)):
+            if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            body = [l.split("#")[0]
+                    for l in lines[node.lineno - 1:(node.end_lineno or node.lineno)]]
+            audits = [i for i, l in enumerate(body) if "record_audit(" in l]
+            if not audits:
+                continue
+            commits = [i for i, l in enumerate(body)
+                       if _re.search(r"\bconn\.commit\(\)", l)]
+            if any(i < audits[0] for i in commits):
+                bad.append(node.name)
+        return sorted(bad)
+
+    check("본 작업을 감사보다 먼저 커밋하는 admin 엔드포인트 없음",
+          audit_commit_order_violations(), [])
+
+    # 여기서는 그 결과를 **실제 응답과 DB로** 확인한다.
     def audit_count(target_type, target_id):
         c = get_connection()
         try:
@@ -3711,15 +3872,55 @@ def test_soft_delete_columns():
 
     # 소프트 삭제를 배선할 때 **함께 고쳐야 하는 조회 지점**을 소스로 고정해 둔다.
     # (지금은 어느 곳에도 조건이 없어야 정상 — 하나라도 생기면 전환이 시작된 것이다)
-    fav_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "api", "v1", "favorites.py"), encoding="utf-8-sig").read()
-    pre_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "api", "v1", "search_presets.py"), encoding="utf-8-sig").read()
-    sea_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "api", "v1", "search.py"), encoding="utf-8-sig").read()
-    check("favorites.py에 deleted_at 조건이 아직 없다", "deleted_at" in fav_src, False)
-    check("search_presets.py에 deleted_at 조건이 아직 없다", "deleted_at" in pre_src, False)
-    check("search.py(하트 조회)에 deleted_at 조건이 아직 없다", "deleted_at" in sea_src, False)
+    #
+    # ★ 목록을 손으로 적지 않는다 (2026-08-14 정정).
+    #
+    #   원래 여기에는 favorites.py / search_presets.py / search.py **3개**가 박혀 있었다.
+    #   그런데 소프트 삭제 대상 테이블을 읽는 파일은 실제로 **5개**다 —
+    #   `item.py`(물건 상세의 하트)와 `admin.py`(사용자 목록 UNION, favorite_count)가
+    #   빠져 있었다. 이 목록의 용도가 "배선할 때 함께 고칠 곳"인데 **목록 자체가 불완전**하면,
+    #   그것을 믿고 전환한 사람은 상세 화면의 하트와 관리자 통계에서 지운 즐겨찾기를 계속 본다.
+    #
+    #   손으로 적은 목록은 코드가 늘면 어긋난다(Sprint 106의 "정적 확인 완료" 주석과 같은
+    #   실패 모양이다). 그래서 **코드에서 유도한다** — 그 테이블을 읽는 파일을 찾아서 검사한다.
+    #   새 라우터가 favorites를 읽기 시작하면 목록에 자동으로 들어온다.
+    import io
+    import re
+    import tokenize
+
+    api_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api")
+    # 테이블명이 그냥 등장하는 것으로는 부족하다 — `api/constants.py` 처럼 **설명 문자열**에
+    # 파일명이 적혀 있는 경우가 걸린다(실제로 걸렸다). 질의로 쓰는 것만 고른다.
+    soft_sql = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:favorites|search_presets)\b",
+                          re.IGNORECASE)
+    readers, wired = [], []
+    for dirpath, dirnames, filenames in os.walk(api_dir):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in sorted(filenames):
+            if not fn.endswith(".py"):
+                continue
+            full = os.path.join(dirpath, fn)
+            with open(full, "rb") as fh:
+                src = fh.read().decode("utf-8-sig")
+            # 주석/문자열을 걷어낸 **코드만** 본다 — 설명 주석에 컬럼명이 나왔다고
+            # "배선됐다"고 오판하지 않기 위해서다(앞선 스프린트에서 3번 겪은 실패 모양).
+            code = []
+            try:
+                for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                    if tok.type not in (tokenize.COMMENT,):
+                        code.append(tok.string)
+            except (tokenize.TokenError, IndentationError):
+                code = [src]
+            code = " ".join(code)
+            rel = os.path.relpath(full, os.path.dirname(api_dir)).replace("\\", "/")
+            if soft_sql.search(code):
+                readers.append(rel)
+                if "deleted_at" in code:
+                    wired.append(rel)
+
+    check_true("소프트 삭제 테이블을 읽는 파일을 실제로 찾았다", len(readers) >= 5, readers)
+    print("   대상 파일 %d개: %s" % (len(readers), ", ".join(readers)))
+    check("아직 어느 조회에도 deleted_at 조건이 없다", wired, [])
 
     conn = get_connection()
     try:
@@ -4635,6 +4836,56 @@ def test_authz_coverage():
                checked["user"] >= 10 and checked["admin"] >= 10, checked)
     print("   분류: %s" % checked)
 
+    # ★ 이 검사가 **조용히 좁아지지** 않게 한다 (2026-08-14 신설).
+    #
+    # 위 전수는 `app.openapi()` 로 라우트를 열거한다. 그런데 `include_in_schema=False` 인
+    # 라우트는 스펙에 **아예 나오지 않는다.** 즉 누가 보호 엔드포인트에 그 인자를 붙이면
+    # 이 검사는 실패하지 않고 **그 엔드포인트를 그냥 안 보게 된다.**
+    #
+    # 하필 그 인자를 붙이는 동기가 "내부용이라 문서에 안 띄우고 싶다"인 경우가 많다 ―
+    # 즉 **가장 민감한 것부터** 검사 밖으로 빠질 수 있다. 검사가 줄어드는데 초록불이면
+    # 줄어든 사실을 알 방법이 없다.
+    #
+    # 2026-08-14 실측: 구조상 42개 / 스펙 41개, 차이는 **문서 뷰어용 HEAD 하나**뿐이고
+    # 그 HEAD는 공개 경로이며 GET과 인가 결과가 같다(둘 다 404). 그 상태를 고정한다.
+    #
+    # (이 FastAPI 버전은 `include_router` 결과를 `app.routes` 에 평탄화하지 않고
+    #  `_IncludedRouter` 로 감싼다 ― 그냥 훑으면 라우트가 2개만 보여서 "전부 공개"라는
+    #  거짓 정상 판정이 나온다. 그래서 감싼 것을 풀어서 센다.)
+    structural = set()
+    for r in api_server.app.routes:
+        if type(r).__name__ == "_IncludedRouter":
+            sub_prefix = r.include_context.prefix or ""
+            subs = [(sub_prefix + s.path, s) for s in r.original_router.routes]
+        else:
+            subs = [(getattr(r, "path", ""), r)]
+        for full_path, s in subs:
+            for m in (getattr(s, "methods", None) or set()):
+                structural.add((m.upper(), full_path))
+    docs_paths = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+    structural = {(m, p) for m, p in structural
+                  if p not in docs_paths and m != "OPTIONS"}
+    spec_pairs = {(m.upper(), p) for p, ops in spec["paths"].items() for m in ops}
+    # 스펙 밖에 있어도 되는 것: 문서 뷰어가 존재만 확인하는 HEAD 하나.
+    ALLOWED_UNSPECED = {("HEAD", "/api/v1/item/{item_id}/documents/{doc_type}")}
+    unspeced = structural - spec_pairs - ALLOWED_UNSPECED
+    check_true("스펙에 없어 전수에서 빠지는 라우트 없음", not unspeced,
+               "이 라우트들은 위 인가 전수를 통과한 적이 없다: %s" % sorted(unspeced))
+    # 허용한 HEAD 가 사라지면 목록도 같이 줄여야 한다(죽은 예외가 남으면 검사가 헐거워진다).
+    check_true("허용한 스펙 밖 라우트가 실재한다",
+               ALLOWED_UNSPECED <= structural,
+               "코드에서 사라진 예외: %s" % sorted(ALLOWED_UNSPECED - structural))
+    # HEAD 는 GET 과 같은 인가를 받아야 한다 ― 다르면 HEAD 가 우회로가 된다.
+    for _, hp in sorted(ALLOWED_UNSPECED):
+        probe = hp
+        for token, sample in _PATH_SAMPLE.items():
+            probe = probe.replace(token, sample)
+        g = client.get(probe).status_code
+        h = client.request("HEAD", probe).status_code
+        check_true("HEAD 와 GET 의 인가 결과가 같다 (%s)" % hp,
+                   (g in (401, 403)) == (h in (401, 403)),
+                   "GET %s / HEAD %s" % (g, h))
+
     # 인증이 **body 검증보다 먼저** 동작하는지 — 그래야 스키마 정보가 익명에게 새지 않는다.
     # (POST에 빈 body를 보냈을 때 422가 아니라 401이어야 한다)
     check("POST 익명 요청은 body 검증 전에 401",
@@ -5360,6 +5611,135 @@ def cleanup():
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# 무료 등기부 크레딧: 부분 실패 시 차감이 되돌아오는가 (2026-08-14 신설)
+#
+# `create_registry_request()`의 무료 경로는 **한 트랜잭션에서 세 번 쓴다.**
+#
+#     1) registry_usage        INSERT   <- 무료 1회를 "썼다"고 기록 (한도 계산의 근거)
+#     2) registry_credit_logs  INSERT   <- 변동 추적 원장
+#     3) registry_requests     INSERT   <- 사용자가 보는 신청
+#
+# 3번이 실패했는데 1번이 남으면 **사용자는 무료 횟수를 잃고 신청은 없다.** 화면에는
+# "남은 횟수 9회"라고만 줄어들 뿐, 왜 줄었는지 볼 방법이 없다 — 가장 알아채기 어려운
+# 손실이다(돈으로 환산되는 자원이다).
+#
+# 코드는 `except Exception: conn.rollback(); raise`로 되돌리게 돼 있다. 그런데 그 경로가
+# **한 번도 실행된 적이 없었다** — 정적으로만 확인돼 있었다. 여기서 실제로 태운다.
+#
+# `test_payment_creation_rolls_back_completely()`(결제)와 같은 방식이고, 등기부는 그
+# 검사가 없었다.
+# ---------------------------------------------------------------------------
+def test_registry_free_credit_rolls_back_on_partial_failure():
+    print("\n--- 41. 무료 등기부 크레딧 부분 실패 롤백 (2026-08-14) ---")
+    import api.v1.registry as reg_mod
+
+    user = "qa-reg-rollback-" + uuid.uuid4().hex[:8]
+    h = auth_headers(user)
+    item_id = pick_item_ids(1)[0]
+
+    # 무료 경로를 타려면 구독이 있어야 한다(무료 한도가 플랜에서 나온다).
+    sub = client.post("/api/v1/payments",
+                      json={"payment_type": "SUBSCRIPTION", "plan": "PRO",
+                            "amount": resolve_plan_price("PRO", BILLING_MONTHLY),
+                            "billing_cycle": BILLING_MONTHLY}, headers=h)
+    check("전제: 구독 생성 성공", sub.json().get("success"), True)
+
+    def free_remaining():
+        r = client.get("/api/v1/registry-requests", headers=h)
+        return r.json()
+
+    def counts():
+        c = get_connection()
+        try:
+            return (
+                c.execute("SELECT COUNT(*) FROM registry_usage WHERE user_id=?",
+                          (user,)).fetchone()[0],
+                c.execute("SELECT COUNT(*) FROM registry_credit_logs WHERE user_id=?",
+                          (user,)).fetchone()[0],
+                c.execute("SELECT COUNT(*) FROM registry_requests WHERE user_id=?",
+                          (user,)).fetchone()[0],
+            )
+        finally:
+            c.close()
+
+    before = counts()
+    check("전제: 시작 시 아무 흔적이 없다", before, (0, 0, 0))
+
+    real_get_connection = reg_mod.get_connection
+
+    class _FailLastInsert:
+        """`registry_requests` INSERT만 실패시킨다 — 앞의 두 쓰기는 이미 끝난 상태다."""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self.rolled_back = False
+
+        def execute(self, sql, *a, **kw):
+            if "INSERT INTO REGISTRY_REQUESTS" in " ".join(sql.split()).upper():
+                raise sqlite3.OperationalError("disk I/O error (qa-injected)")
+            return self._conn.execute(sql, *a, **kw)
+
+        def rollback(self):
+            self.rolled_back = True
+            return self._conn.rollback()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    box = {}
+
+    def patched(*a, **kw):
+        box["conn"] = _FailLastInsert(real_get_connection(*a, **kw))
+        return box["conn"]
+
+    reg_mod.get_connection = patched
+    try:
+        raised = None
+        status, body = None, ""
+        try:
+            r = client.post("/api/v1/registry-requests", json={"item_id": item_id}, headers=h)
+            status, body = r.status_code, r.text
+        except Exception as exc:  # TestClient는 서버 예외를 그대로 올린다
+            raised = exc
+    finally:
+        reg_mod.get_connection = real_get_connection
+
+    check_true("성공(200 + success)으로 응답하지 않는다",
+               status != 200 or '"success": true' not in body, (status, body[:120]))
+    check_true("오류가 드러난다(예외 전파 또는 5xx)",
+               raised is not None or (status is not None and status >= 500), (raised, status))
+    check_true("실패 시 롤백한다", box.get("conn") is not None and box["conn"].rolled_back,
+               "rollback이 호출되지 않았다")
+
+    # ★ 핵심: 응답이 아니라 **DB**로 확인한다. 세 테이블 전부 시작 상태여야 한다.
+    after = counts()
+    check("registry_usage에 차감 흔적이 남지 않는다", after[0], 0)
+    check("registry_credit_logs에 흔적이 남지 않는다", after[1], 0)
+    check("registry_requests도 만들어지지 않는다", after[2], 0)
+    check("세 테이블 모두 시작 상태로 돌아온다", after, before)
+
+    # 그리고 사용자가 실제로 무료 횟수를 잃지 않았는지 — 다시 신청하면 정상 성공해야 한다.
+    ok = client.post("/api/v1/registry-requests", json={"item_id": item_id}, headers=h)
+    ok_body = ok.json()
+    check("롤백 후 정상 신청이 성공한다", ok_body.get("success"), True)
+    check_true("무료 횟수를 잃지 않았다(첫 신청이 여전히 무료)",
+               ok_body.get("data", {}).get("is_free") is True, ok_body.get("data"))
+
+    # 정리 — 이 테스트가 만든 행만 지운다(자식 -> 부모 순서).
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM registry_credit_logs WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM registry_requests WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM registry_usage WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM payment_logs WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM subscriptions WHERE user_id=?", (user,))
+        conn.execute("DELETE FROM payments WHERE user_id=?", (user,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def run():
     try:
         test_health_and_stats()
@@ -5402,6 +5782,7 @@ def run():
         test_favorite_insert_failure_is_not_masked()
         test_payment_failure_branches()
         test_payment_creation_rolls_back_completely()
+        test_registry_free_credit_rolls_back_on_partial_failure()
     finally:
         cleanup()
 

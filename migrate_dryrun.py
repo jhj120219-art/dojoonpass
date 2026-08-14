@@ -23,11 +23,25 @@ def dryrun():
     rows = conn.execute("SELECT * FROM auction").fetchall()
 
     # auction_case 중복 제거
+    #
+    # ★ 키는 (court_code, case_no) 다 — `migrate_execute.py:45` 와 같아야 한다 (2026-08-14).
+    #
+    #   예전에는 `case_no` 단독이었다. 법원마다 사건번호를 독립 채번하므로 서로 다른 법원의
+    #   같은 사건번호가 **한 건으로 합쳐져** 예고 건수가 실제보다 적게 나왔다.
+    #
+    #       2026-08-14 실측
+    #         dryrun 방식 (case_no 만)     1,381건
+    #         execute 방식 (court+case_no) 1,384건   <- 실제 auction_case 행 수와 같다
+    #
+    #   미리보기 도구가 **실행 결과와 다른 숫자**를 말하면, 실행 뒤 그 차이를 보고
+    #   "execute 가 뭔가 잘못했다"고 오판하게 된다. 이 저장소에는 법원이 다른 같은
+    #   사건번호가 3개 있다(2024타경34089 / 2024타경3700 / 2024타경4973).
     case_map = {}
     for row in rows:
         case_no = row["case_no"]
-        if case_no not in case_map:
-            case_map[case_no] = {
+        key = (row["court_code"], case_no)
+        if key not in case_map:
+            case_map[key] = {
                 "case_no": case_no,
                 "court_name": row["court_name"],
                 "case_type": None,

@@ -277,6 +277,186 @@ def test_batch_scripts_create_logs_before_redirecting():
                        mkdir_at < redirect_at,
                        "mkdir=%d줄, 첫 리다이렉트=%d줄" % (mkdir_at + 1, redirect_at + 1))
 
+        # ── 배치가 부르는 스크립트가 실재하는가 (2026-08-14 추가) ────────────
+        #
+        # `test_crawl_exit_code.py` §8은 **알려진 후보 목록**의 파일 존재와 input() 부재를
+        # 본다. 그러나 배치가 **무엇을 부르는지**는 보지 않는다. 그래서 배치를 고쳐
+        # 존재하지 않는 스크립트를 부르게 만들면 아무 검사도 걸리지 않는다 —
+        # 그 경우 Task Scheduler는 매일 조용히 실패한다(파일이 없으면 cmd는 계속 진행한다).
+        #
+        # 이 검사도 REM을 건너뛴 본문만 본다(위와 같은 이유 — 주석에 예시가 들어 있다).
+        body = "\n".join(l for l in lines
+                         if not (l.strip().upper().startswith("REM") or l.strip().startswith("::")))
+        called = sorted(set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*\.py)", body)))
+        check_true("%s: 부르는 파이썬 스크립트를 찾았다" % name, len(called) > 0, called)
+        missing = [s for s in called if not os.path.exists(os.path.join(REPO_ROOT, s))]
+        check("%s: 부르는 스크립트가 모두 실재한다" % name, missing, [])
+        print("      %s -> %s" % (name, ", ".join(called)))
+
+
+# ---------------------------------------------------------------------------
+# 6. "safe to re-run"이 **실제 부트스트랩에서** 사실인가 (2026-08-14 신설)
+#
+# `docs/CLAUDE.md`는 부트스트랩이 "safe to re-run"이라고 안내한다. 그런데 그 주장을
+# 검증하는 것은 `test_schema_hygiene.py` §7뿐이고, 거기서 쓰는 것은 **합성 마이그레이션**
+# (`CREATE TABLE IF NOT EXISTS qa_a ...`)이다. 즉 러너의 skip 분기는 검증됐지만
+# **실제 19개 파일로 두 번 돌렸을 때 안전한가는 확인된 적이 없었다.**
+#
+# 이게 공허한 걱정이 아닌 이유: 마이그레이션 019는 이렇게 생겼다.
+#
+#     ALTER TABLE subscriptions ADD COLUMN payment_id INTEGER REFERENCES payments(id);
+#
+# `ALTER TABLE ADD COLUMN`은 **그 자체로는 멱등이 아니다** — 두 번 실행하면
+# "duplicate column name"으로 죽는다. 안전한 이유는 오직 `migration_history` 기반
+# skip 하나뿐이다. 그 방어가 실제 파일에서 동작하는지 여기서 직접 확인한다.
+#
+# 스키마 비교는 테이블 이름만 보지 않는다 — **컬럼 목록과 인덱스까지** 본다.
+# 이름만 같고 컬럼이 늘어나는 종류의 비멱등성이 정확히 019 같은 경우다.
+# ---------------------------------------------------------------------------
+def _full_schema(db_path):
+    """테이블/인덱스 이름 + 테이블별 컬럼 목록. 재실행 전후를 비교할 지문."""
+    c = sqlite3.connect(db_path)
+    try:
+        tables = sorted(r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        indexes = sorted(r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"))
+        cols = {t: [r[1] for r in c.execute("PRAGMA table_info(%s)" % t)] for t in tables}
+        return {"tables": tables, "indexes": indexes, "columns": cols}
+    finally:
+        c.close()
+
+
+def test_bootstrap_is_idempotent():
+    print("\n--- 6. 부트스트랩을 두 번 돌려도 안전한가 (CLAUDE.md 'safe to re-run') ---")
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as v41
+
+    tmp = tempfile.mkdtemp(prefix="qa_boot_idem_")
+    db = os.path.join(tmp, "fresh.db")
+    saved = dbmod.DB_PATH
+    dbmod.DB_PATH = db
+    try:
+        # 1회차
+        dbmod.init_db()
+        v41.migrate()
+        _load_runner().run()
+        first_schema = _full_schema(db)
+        first_applied = _applied(db)
+
+        # 2회차 — 같은 3단계를 그대로 다시 돌린다
+        crashed = None
+        try:
+            dbmod.init_db()
+            v41.migrate()
+            _load_runner().run()
+        except SystemExit as exc:
+            crashed = "SystemExit: %s" % exc
+        except Exception as exc:  # noqa: BLE001
+            crashed = "%s: %s" % (type(exc).__name__, exc)
+
+        check_true("두 번째 실행이 예외 없이 끝난다", crashed is None, crashed)
+        if crashed:
+            return
+
+        second_schema = _full_schema(db)
+        second_applied = _applied(db)
+
+        # 목록을 통째로 찍으면 로그가 수십 줄로 불어나 진짜 실패가 묻힌다 —
+        # **차이만** 보고한다(같으면 빈 목록이라 한 줄로 끝난다).
+        def diff(label, a, b):
+            check("재실행 후 %s에 사라진 것" % label, sorted(set(a) - set(b)), [])
+            check("재실행 후 %s에 새로 생긴 것" % label, sorted(set(b) - set(a)), [])
+
+        check("재실행이 마이그레이션을 중복 기록하지 않는다",
+              len(second_applied), len(first_applied))
+        diff("마이그레이션 기록", first_applied, second_applied)
+        diff("테이블", first_schema["tables"], second_schema["tables"])
+        diff("인덱스", first_schema["indexes"], second_schema["indexes"])
+
+        # ★ 019 같은 ADD COLUMN이 두 번 먹으면 여기서 잡힌다.
+        drifted = {t: (first_schema["columns"][t], second_schema["columns"][t])
+                   for t in first_schema["columns"]
+                   if first_schema["columns"][t] != second_schema["columns"].get(t)}
+        check("재실행 후 컬럼 구성이 같다(ADD COLUMN 중복 없음)", drifted, {})
+        # 출력 리터럴에는 U+2014(—) 대신 U+2015(―)를 쓴다 — cp949 콘솔에서 깨진다
+        # (`test_console_encoding.py`가 강제한다).
+        print("   테이블 %d개 / 인덱스 %d개 / 마이그레이션 %d개 ― 2회 실행 후 동일"
+              % (len(second_schema["tables"]), len(second_schema["indexes"]),
+                 len(second_applied)))
+    finally:
+        dbmod.DB_PATH = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 5. `docs/CLAUDE.md`가 부트스트랩에 대해 말하는 것이 사실인가 (2026-08-14 신설)
+#
+# CLAUDE.md는 새 개발자와 새 세션이 **가장 먼저 읽는 색인**이다. 여기가 틀리면 그
+# 아래 모든 판단이 틀어진다. 그런데 이 문서는 이미 여러 번 낡았고, 그때마다 본문에
+# "정정" 문단이 덧붙는 방식으로만 고쳐졌다 — 즉 **드리프트를 잡아 주는 장치가 없다.**
+#
+# 2026-08-14에 실제로 두 건이 낡아 있었다.
+#
+#   "No `requirements.txt` exists"        -> 2026-08-11 Sprint 54에 신설돼 추적 중이었다
+#   "applies numbered SQL files 001~018"  -> 019가 이미 있고 적용까지 돼 있었다
+#
+# 둘 다 사람이 눈으로 봐야만 발견된다. 그래서 **문서가 주장하는 사실을 코드로 대조한다.**
+# 문장 표현이 아니라 "숫자/파일 존재" 같은 확인 가능한 주장만 검사한다 —
+# 산문까지 고정하면 문서를 손볼 때마다 검사가 깨져서 오히려 신뢰를 잃는다.
+# ---------------------------------------------------------------------------
+def test_claude_md_bootstrap_claims_are_true():
+    print("\n--- 5. docs/CLAUDE.md의 부트스트랩 서술이 사실인가 ---")
+    import re
+
+    doc_path = os.path.join(REPO_ROOT, "docs", "CLAUDE.md")
+    if not os.path.exists(doc_path):
+        print("[SKIP] docs/CLAUDE.md 없음")
+        return
+    doc = open(doc_path, encoding="utf-8-sig").read()
+
+    mig_dir = os.path.join(REPO_ROOT, "storage", "migrations")
+    numbers = sorted(int(m.group(1)) for f in os.listdir(mig_dir)
+                     for m in [re.match(r"^(\d{3})_.*\.sql$", f)] if m)
+    check_true("마이그레이션 파일을 찾았다", bool(numbers), numbers)
+
+    # (1) "001~NNN" 범위 주장이 실제 파일 번호와 맞는가
+    ranges = re.findall(r"(\d{3})\s*~\s*(\d{3})", doc)
+    check_true("CLAUDE.md에 마이그레이션 범위 서술이 있다", bool(ranges), ranges)
+    for lo, hi in ranges:
+        check("CLAUDE.md가 말하는 마이그레이션 시작 번호", int(lo), numbers[0])
+        check("CLAUDE.md가 말하는 마이그레이션 끝 번호", int(hi), numbers[-1])
+
+    # (2) 번호가 비어 있지 않은가 (문서 범위가 맞아도 중간이 빠지면 안내가 거짓이 된다)
+    check("마이그레이션 번호에 빠진 구간 없음",
+          sorted(set(range(numbers[0], numbers[-1] + 1)) - set(numbers)), [])
+
+    # (3) 존재/부재를 단정하는 서술이 실제와 맞는가
+    #     ("No `requirements.txt` exists"가 정확히 이 부류로 틀려 있었다)
+    #
+    # ★ 함정: 이 문서의 관례는 낡은 문장을 지우는 대신 **그대로 인용하고 "정정"을 붙이는**
+    #   것이다. 그래서 단순 문자열 검색은 *고쳐 놓은 문서*를 위반으로 잡는다 —
+    #   이 검사를 처음 붙였을 때 실제로 그렇게 실패했다(같은 날 만든
+    #   `test_pipeline_integrity.py` §9 스캐너가 자기 설명 주석을 잡은 것과 같은 부류다).
+    #   그래서 **주변에 정정 표시가 있으면 살아 있는 주장이 아니라 인용으로 본다.**
+    req = os.path.join(REPO_ROOT, "requirements.txt")
+    if os.path.exists(req):
+        CORRECTION = ("정정", "stale", "이전 버전", "예전", "더 이상")
+        live_claims = []
+        for m in re.finditer(r"No\s+`?requirements\.txt`?\s+exists", doc, re.I):
+            around = doc[max(0, m.start() - 300):m.end() + 300]
+            if not any(k in around for k in CORRECTION):
+                live_claims.append(doc[max(0, m.start() - 60):m.end() + 60])
+        check("requirements.txt가 있는데 '없다'고 단정한 자리 없음", live_claims, [])
+
+    # (4) 부트스트랩 명령이 가리키는 파일이 실제로 있는가
+    for rel in ("storage/migrate_v4_1.py", "storage/migrations/run_migrations.py",
+                "storage/database.py", "api_server.py", "doc_worker.py",
+                "mvp_scraper.py", "migrate_execute.py", "refresh_priority.py"):
+        if rel in doc or rel.replace("/", "\\") in doc:
+            check_true("CLAUDE.md가 언급한 %s 가 실재한다" % rel,
+                       os.path.exists(os.path.join(REPO_ROOT, *rel.split("/"))), rel)
+
 
 def run():
     print("=" * 60)
@@ -287,6 +467,8 @@ def run():
     test_full_bootstrap_from_scratch()
     test_bootstrap_matches_live_schema()
     test_batch_scripts_create_logs_before_redirecting()
+    test_claude_md_bootstrap_claims_are_true()
+    test_bootstrap_is_idempotent()
 
     print("\n" + "=" * 60)
     if failures:

@@ -164,6 +164,187 @@ def test_cross_court_upsert_safety():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_cross_court_migrate_safety():
+    """§2의 나머지 절반 — **동기화 경로**도 법원을 구분하는가 (2026-08-14 신설).
+
+    §2는 크롤러의 쓰기 경로(`upsert_batch`)가 법원을 구분하는지 본다. 그런데 데이터가
+    화면에 닿으려면 `migrate_execute.py`를 한 번 더 지나야 하고, **그쪽은 검사가 없었다.**
+
+    실제로 거기 구멍이 있었다. 2026-08-07에 "auction_item 조회/갱신에 법원 구분이 없다"를
+    고쳐 `(case_id, item_no)` 로 바꿨는데(migrate_execute.py 주석), 60줄 아래
+    `document_status` 조회는 `WHERE case_no=? AND item_no=?` 그대로 남아 있었다.
+    같은 수정의 나머지 절반이 빠진 것이다.
+
+    증상(2026-08-14 사본 재현): 법원이 다른 같은 (사건, 물건) 두 개를 만들면
+
+        수집 완료한 쪽 : document_status 행이 **아예 생기지 않는다**
+                         -> 받아 둔 문서를 사용자가 못 본다
+        자체 검증      : document_status 건수 불일치
+
+    실 DB에는 법원이 다른 같은 사건번호가 **3개** 있다(2024타경34089 / 2024타경3700 /
+    2024타경4973). 지금은 물건번호가 마침 달라 무사할 뿐이다.
+
+    실제 auction.db는 쓰지 않는다 — 임시 사본에서만 돌린다.
+    """
+    print("\n--- 5. cross-court migrate_execute safety (scratch copy only) ---")
+    import sqlite3
+    import migrate_execute
+
+    real_path = dbmod.DB_PATH
+    tmp_dir = tempfile.mkdtemp(prefix="kokchal_mig_")
+    tmp_db = os.path.join(tmp_dir, "scratch.db")
+    shutil.copy2(real_path, tmp_db)
+    dbmod.DB_PATH = tmp_db
+    try:
+        CASE, ITEM = "QA-MIGRATE-COURT", "1"
+        # 같은 (사건, 물건)을 두 법원에 만든다. 한쪽만 문서를 수집한 상태로 둔다.
+        dbmod.upsert_batch([
+            {"court_code": "QA법원A", "court_name": "QA법원A", "case_no": CASE,
+             "item_no": ITEM, "full_address": "A"},
+            {"court_code": "QA법원B", "court_name": "QA법원B", "case_no": CASE,
+             "item_no": ITEM, "full_address": "B"},
+        ])
+        # `has_*_pdf` 는 크롤 수집 결과라 `upsert_batch()` 의 입력이 아니다
+        # (doc_worker 가 따로 쓴다). 그래서 여기서 직접 세운다 —
+        # 처음에 upsert 입력에 넣었다가 전제 검사에 걸렸다.
+        conn = dbmod.get_connection()
+        try:
+            conn.execute("UPDATE auction SET has_spec_pdf=1"
+                         " WHERE case_no=? AND court_code='QA법원A'", (CASE,))
+            conn.commit()
+            seeded = conn.execute(
+                "SELECT court_code, has_spec_pdf FROM auction WHERE case_no=?"
+                " ORDER BY court_code", (CASE,)).fetchall()
+        finally:
+            conn.close()
+        # 전제가 깨지면 아래 판정은 의미가 없다.
+        check("전제: 두 법원 행이 만들어졌다", len(seeded), 2)
+        check("전제: 한쪽만 수집 완료", [r["has_spec_pdf"] for r in seeded], [1, 0])
+
+        ok = migrate_execute.execute()
+        _check_true("migrate_execute 가 검증을 통과한다", ok,
+                    "자체 건수 검증이 실패하면 문서 상태가 유실된 것이다")
+
+        c = sqlite3.connect(tmp_db)
+        c.row_factory = sqlite3.Row
+        try:
+            got = {r["court_code"]: r["st"] for r in c.execute("""
+                SELECT ac.court_code,
+                       (SELECT status FROM document_status
+                         WHERE item_id = ai.id AND doc_type='SPEC') AS st
+                FROM auction_item ai JOIN auction_case ac ON ac.id = ai.case_id
+                WHERE ai.case_no=? AND ai.item_no=?""", (CASE, ITEM))}
+        finally:
+            c.close()
+
+        # 핵심: 두 법원이 **각자의** 문서 상태를 갖는다.
+        check("수집한 법원은 READY", got.get("QA법원A"), "READY")
+        check("수집하지 않은 법원은 COLLECTING", got.get("QA법원B"), "COLLECTING")
+        _check_true("두 법원 모두 document_status 행을 갖는다(유실 없음)",
+                    None not in (got.get("QA법원A"), got.get("QA법원B")), got)
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_migrate_exit_code_contract():
+    """검증이 실패하면 **종료코드로도** 실패여야 한다 (2026-08-14 신설).
+
+    예전에는 `[FAIL] document_status 불일치: ...` 를 찍고도 `sys.exit(0)` 이었다.
+    그래서 `run_daily.bat` 의 `if errorlevel 1` 에 걸리지 않고, **자기 검증이 실패했다고
+    적혀 있는 그 로그 파일에** `[SUCCESS]` 마커가 함께 찍혔다.
+
+    이 저장소가 Sprint 13/54/99에서 `.bat` 계층에 대해 없앤 "실패 은폐"와 같은 모양이고,
+    이번에는 파이썬 쪽에 남아 있었다.
+    """
+    print("\n--- 6. migrate_execute 종료코드 계약 ---")
+    import sqlite3
+    import migrate_execute
+
+    real_path = dbmod.DB_PATH
+    tmp_dir = tempfile.mkdtemp(prefix="kokchal_exit_")
+    tmp_db = os.path.join(tmp_dir, "scratch.db")
+    shutil.copy2(real_path, tmp_db)
+    dbmod.DB_PATH = tmp_db
+    try:
+        _check_true("정상 상태에서는 True(성공)를 돌려준다", migrate_execute.execute() is True)
+
+        # 건수 검증을 깨뜨린다 — migrate 는 stray 행을 지우지 않으므로 그대로 남는다.
+        c = sqlite3.connect(tmp_db)
+        try:
+            c.execute("INSERT INTO document_status (item_id, doc_type, status, updated_at)"
+                      " VALUES (999999, 'SPEC', 'READY', '2026-01-01')")
+            c.commit()
+        finally:
+            c.close()
+
+        _check_true("검증이 깨지면 False(실패)를 돌려준다",
+                    migrate_execute.execute() is False,
+                    "True를 돌려주면 run_daily.bat이 [SUCCESS]를 남긴다")
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # 호출부도 함께 고정한다 — 반환값을 만들어 놓고 __main__ 이 무시하면 의미가 없다.
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "migrate_execute.py"), encoding="utf-8-sig").read()
+    main_block = src[src.index('if __name__ == "__main__":'):]
+    _check_true("__main__ 이 execute() 의 반환값을 종료코드로 쓴다",
+                "execute()" in main_block and "sys.exit(0)" not in main_block,
+                main_block.strip()[:160])
+
+
+def test_dryrun_predicts_what_execute_does():
+    """미리보기가 **실행 결과와 같은 숫자**를 말하는가 (2026-08-14 신설).
+
+    `migrate_dryrun.py` 는 `migrate_execute.py` 를 돌리기 전에 무엇이 만들어질지 보여준다.
+    그런데 `auction_case` 중복 제거 키가 **`case_no` 단독**이었다 —
+    execute 는 `(court_code, case_no)` 를 쓴다.
+
+        2026-08-14 실측
+          dryrun  (case_no 만)      1,381건
+          execute (court+case_no)   1,384건   <- 실제 auction_case 행 수
+
+    미리보기가 실행 결과와 다른 숫자를 말하면, 실행 뒤 그 차이를 보고
+    "execute 가 뭔가 잘못했다"고 오판한다. 두 키가 같은지 **출력으로** 확인한다
+    (소스를 대조하면 형태만 같고 동작이 달라도 통과할 수 있다).
+
+    읽기 전용이다 — dryrun 은 아무것도 쓰지 않는다.
+    """
+    print("\n--- 7. dryrun 예고 == execute 결과 ---")
+    import io
+    import re
+    import contextlib
+    import migrate_dryrun
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        migrate_dryrun.dryrun()
+    out = buf.getvalue()
+
+    m = re.search(r"auction_case\s*예정\s*:\s*([\d,]+)", out)
+    _check_true("dryrun 출력에서 auction_case 예정 건수를 읽었다", bool(m), out[:200])
+    if not m:
+        return
+    predicted = int(m.group(1).replace(",", ""))
+
+    conn = dbmod.get_connection()
+    try:
+        # execute 와 같은 키로 센다 — 이것이 실제로 만들어질 auction_case 수다.
+        truth = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT court_code, case_no FROM auction)"
+        ).fetchone()[0]
+        actual = conn.execute("SELECT COUNT(*) FROM auction_case").fetchone()[0]
+    finally:
+        conn.close()
+
+    print("    예고 %d / (court,case) 고유 %d / 실제 auction_case %d"
+          % (predicted, truth, actual))
+    check("dryrun 예고가 (court_code, case_no) 기준과 같다", predicted, truth)
+    # 실제 테이블과도 같아야 한다 — 셋이 어긋나면 어느 쪽이 틀렸는지부터 봐야 한다.
+    check("실제 auction_case 행 수와도 같다", actual, truth)
+
+
 def _check_true(name, cond, detail=""):
     print("[%s] %s%s" % ("PASS" if cond else "FAIL", name, ("" if cond else " -- " + str(detail))))
     if not cond:
@@ -293,6 +474,9 @@ def run():
     test_cross_court_upsert_safety()
     test_upsert_partial_failure_isolation()
     test_get_stats_contract()
+    test_cross_court_migrate_safety()
+    test_migrate_exit_code_contract()
+    test_dryrun_predicts_what_execute_does()
 
     print("\n" + "=" * 55)
     if failures:

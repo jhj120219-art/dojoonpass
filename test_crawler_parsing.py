@@ -275,11 +275,145 @@ def test_parse_gamjung():
                item.validation_reasons)
 
 
+# ---------------------------------------------------------------------------
+# 5. collect_list_items(): 법원 목록 -> 크롤 작업 목록 (2026-08-14 신설)
+#
+# 위 네 함수와 같은 부류(브라우저 없이 검증 가능한 조립 로직)인데 **혼자 빠져 있었다.**
+# 그런데 이 함수가 파이프라인에서 차지하는 자리가 가장 앞이다.
+#
+#     collect_list_items()  ->  crawl_court()가 이 목록을 그대로 돌면서 상세를 수집한다
+#
+# 즉 **여기서 빠진 물건은 그날 아예 수집되지 않는다.** 그리고 빠져도 아무 신호가 없다 —
+# 예외도 로그도 없이 목록이 짧아질 뿐이다(`docs/BUGS.md`가 반복해서 잡아 온 조용한 누락).
+#
+# 이 검사도 §2~4와 같은 경계를 지킨다: **XPath가 실제 법원 DOM과 맞는지는 검증하지
+# 않는다.** 가짜 드라이버는 XPath를 해석하지 않는다. 검증 대상은 "DOM에서 값을 꺼낸
+# 뒤의 조립 규칙"뿐이다.
+# ---------------------------------------------------------------------------
+class FakeAnchor:
+    """`cells[3].find_element(...)`가 돌려주는 <a>. onclick만 있으면 된다."""
+
+    def __init__(self, onclick):
+        self._onclick = onclick
+
+    def get_attribute(self, name):
+        return self._onclick if name == "onclick" else None
+
+
+class FakeCell(FakeElement):
+    """td 하나. 안에 moveDtlPage 링크가 있을 수 있다."""
+
+    def __init__(self, text="", anchor=None):
+        super().__init__(text=text)
+        self._anchor = anchor
+
+    def find_element(self, by, value):
+        if self._anchor is None:
+            raise RuntimeError("no such element")
+        return self._anchor
+
+
+def list_row(texts, onclick=None):
+    """목록 한 행. `onclick`을 주면 4번째 칸(주소)에 상세 링크가 달린다."""
+    cells = []
+    for i, t in enumerate(texts):
+        anchor = FakeAnchor(onclick) if (i == 3 and onclick) else None
+        cells.append(FakeCell(t, anchor))
+    return FakeElement(tds=cells)
+
+
+def item_row(case_no="2024타경100", obj="1", addr="서울특별시 강남구 역삼동 1",
+             appraisal="100,000,000", date="2026.09.01", onclick="moveDtlPage(0)"):
+    # base_crawler는 texts[1]=사건번호, [2]=물건번호, [3]=주소, [6]=감정가, [7]=기일을 본다.
+    return list_row(["", case_no, obj, addr, "", "", appraisal, date], onclick=onclick)
+
+
+def status_row(text="유찰 2회"):
+    return list_row(["", "", "", text, "", "", "", ""])
+
+
+def test_collect_list_items():
+    print("\n--- 5. collect_list_items(): 목록 -> 작업 목록 ---")
+    from crawler.base_crawler import collect_list_items
+
+    # (1) 기본: 물건 행 + 상태 행 한 쌍
+    got = collect_list_items(FakeDriver([item_row(), status_row("유찰 2회")]), 10)
+    check("한 쌍에서 1건을 만든다", len(got), 1)
+    check("사건번호", got[0]["case_no"], "2024타경100")
+    check("물건번호", got[0]["obj_no"], "1")
+    check("주소", got[0]["addr"], "서울특별시 강남구 역삼동 1")
+    check("감정가", got[0]["appraisal"], "100,000,000")
+    check("매각기일", got[0]["date"], "2026.09.01")
+    check("상태는 다음 행에서 가져온다", got[0]["status"], "유찰 2회")
+    check("onclick에서 dtl_idx를 뽑는다", got[0]["dtl_idx"], 0)
+
+    # (2) dtl_idx는 숫자를 그대로 읽는다 — 여기가 어긋나면 **다른 물건을 수집한다**
+    got = collect_list_items(FakeDriver([item_row(onclick="moveDtlPage(7)"), status_row()]), 10)
+    check("moveDtlPage(7) -> 7", got[0]["dtl_idx"], 7)
+
+    # (3) 링크가 없으면 dtl_idx는 None. crawl_court()가 이 값을 보고 건너뛴다
+    #     (`if item_info["dtl_idx"] is None: continue`) — 즉 **수집되지 않는다.**
+    got = collect_list_items(FakeDriver([item_row(onclick=None), status_row()]), 10)
+    check("상세 링크가 없으면 dtl_idx는 None", got[0]["dtl_idx"], None)
+
+    # (4) 사건번호가 없는 행은 물건 행이 아니다
+    got = collect_list_items(FakeDriver([list_row(["", "머리글", "", "", "", "", "", ""])]), 10)
+    check("사건번호 없는 행은 건너뛴다", got, [])
+
+    # (5) 칸이 8개 미만이면 목록 행이 아니다
+    got = collect_list_items(FakeDriver([list_row(["", "2024타경1", "1", "주소"])]), 10)
+    check("칸이 모자란 행은 건너뛴다", got, [])
+
+    # (6) 한 물건에 사건번호가 여러 개면 ' / '로 잇는다(실데이터에 425건 존재)
+    got = collect_list_items(
+        FakeDriver([item_row(case_no="2024타경1 외 2024타경2"), status_row()]), 10)
+    check("복수 사건번호를 ' / '로 잇는다", got[0]["case_no"], "2024타경1 / 2024타경2")
+
+    # (7) 상태 문구가 없으면 '-'. 지어내지 않는다
+    got = collect_list_items(FakeDriver([item_row(), list_row(["", "", "", "비고", "", "", "", ""])]), 10)
+    check("상태를 못 찾으면 '-'", got[0]["status"], "-")
+
+    # (8) 기일 형식(YYYY.MM.DD)이 아니면 '-'
+    got = collect_list_items(FakeDriver([item_row(date="미정"), status_row()]), 10)
+    check("기일 형식이 아니면 '-'", got[0]["date"], "-")
+
+    # (9) max_items를 넘지 않는다 — crawl_court()가 MAX_ITEMS로 상한을 건다
+    rows = []
+    for i in range(5):
+        rows += [item_row(case_no="2024타경%d" % i, onclick="moveDtlPage(%d)" % i), status_row()]
+    got = collect_list_items(FakeDriver(rows), 3)
+    check("max_items 상한을 지킨다", len(got), 3)
+    check("앞에서부터 채운다", [g["case_no"] for g in got],
+          ["2024타경0", "2024타경1", "2024타경2"])
+
+    # (10) ★ 이 함수의 핵심 전제를 명시적으로 고정한다.
+    #
+    #      물건 행을 하나 찾으면 **그 다음 행을 상태 행으로 소비하고 i를 2 늘린다.**
+    #      즉 "한 물건 = 두 행"을 전제한다. 만약 실제 페이지가 한 행짜리 물건을 준다면
+    #      **바로 다음 물건이 상태 행으로 먹혀 통째로 사라진다.**
+    #
+    #      지금 이것이 결함인지 아닌지는 실제 법원 DOM을 봐야 알 수 있고, 이 저장소는
+    #      회귀에서 실크롤을 돌리지 않는다. 그래서 **고치지 않고 전제를 드러내 둔다** —
+    #      누가 이 규칙을 바꾸면 이 검사가 먼저 실패해서 "무엇을 바꾸는지" 알게 된다.
+    rows = [item_row(case_no="2024타경1", onclick="moveDtlPage(0)"),
+            item_row(case_no="2024타경2", onclick="moveDtlPage(1)")]
+    got = collect_list_items(FakeDriver(rows), 10)
+    check_true("연속한 물건 행 2개는 1건으로 줄어든다(한 물건=두 행 전제)",
+               len(got) == 1 and got[0]["case_no"] == "2024타경1",
+               [g["case_no"] for g in got])
+    check("먹힌 행의 상태는 '-'로 남는다(사건번호는 상태 문구가 아니므로)",
+          got[0]["status"], "-")
+
+    # (11) 빈 표
+    check("행이 없으면 빈 목록", collect_list_items(FakeDriver([]), 10), [])
+
+
 def run():
     test_clean()
     test_parse_basic_info()
     test_parse_section_table()
     test_parse_gamjung()
+    test_collect_list_items()
 
     print("\n" + "=" * 55)
     if failures:

@@ -348,6 +348,50 @@ describe('검색 파라미터 계약: 프런트가 보내는 것과 백엔드가
     )
   })
 
+  // 2026-08-14 신설. 위 두 검사는 **프런트 ↔ 백엔드**를 본다.
+  // 빠져 있던 것은 **프런트 안쪽의 두 목록**이다.
+  //
+  //     buildSearchQuery()   URL 에 실어 보낼 파라미터를 만든다
+  //     FILTER_PARAM_KEYS    "검색조건 저장"이 URL 에서 뽑아 저장할 키 목록
+  //
+  // 둘이 어긋나면 조용히 틀린다. 새 필터를 `buildSearchQuery()` 에만 추가하면
+  // 검색은 정상 동작하는데 **저장된 검색조건에서는 그 필터가 빠진다.**
+  // 사용자는 저장한 조건을 다시 불러왔을 때 **다른 결과**를 보게 되고,
+  // 오류도 빈 화면도 아니라 알아챌 방법이 없다.
+  //
+  // 반대 방향도 막는다 — `FILTER_PARAM_KEYS` 에만 남은 키는 죽은 항목이고,
+  // 그것이 쌓이면 목록이 실제 필터 집합을 더 이상 설명하지 못한다.
+  //
+  // 두 목록은 같은 파일(`SearchForm.tsx`)에 있지만 **따로 관리된다** —
+  // `SearchPresets.tsx` 가 import 해 쓰는 쪽은 `FILTER_PARAM_KEYS` 뿐이다.
+  // 2026-08-14 실측: 양쪽 24개, 차이 0.
+  test('저장되는 검색조건 키가 실제로 보내는 파라미터와 같다', async () => {
+    const form = await read('src/app/search/SearchForm.tsx')
+
+    const listMatch = form.match(/FILTER_PARAM_KEYS\s*=\s*\[([\s\S]*?)\]\s*as const/)
+    assert.ok(listMatch, 'FILTER_PARAM_KEYS 선언을 찾지 못했습니다')
+    const saved = new Set([...listMatch[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]))
+
+    const body = form.slice(form.indexOf('function buildSearchQuery'))
+    const build = body.slice(0, body.indexOf('function handleSearch'))
+    const sent = new Set([...build.matchAll(/\bquery\.([a-z_]+)\s*=/g)].map((m) => m[1]))
+
+    // 추출이 실패하면 두 집합이 비어 "차이 없음"으로 통과한다 — 공허한 검사 방지.
+    assert.ok(saved.size > 10, `FILTER_PARAM_KEYS 추출 실패 (${saved.size}개)`)
+    assert.ok(sent.size > 10, `buildSearchQuery 키 추출 실패 (${sent.size}개)`)
+
+    const lost = [...sent].filter((k) => !saved.has(k)).sort()
+    assert.deepEqual(
+      lost, [],
+      `보내지만 저장되지 않는 검색 파라미터입니다 — 저장한 조건을 다시 불러오면 이 필터가 빠집니다: ${lost.join(', ')}`
+    )
+    const dead = [...saved].filter((k) => !sent.has(k)).sort()
+    assert.deepEqual(
+      dead, [],
+      `FILTER_PARAM_KEYS 에만 남아 있는 키입니다(더 이상 보내지 않음) — 목록에서 빼십시오: ${dead.join(', ')}`
+    )
+  })
+
   test('미지원 파라미터는 TODO로 표시돼 있다', async () => {
     const form = await read('src/app/search/SearchForm.tsx')
     const lines = form.split('\n')

@@ -318,6 +318,28 @@ def get_stats() -> Dict:
 
 # ===== 02:00 PDF 수집 대기열(document_queue) =====
 
+# 시각 비교의 기준. **로컬 시각이다** — 이 저장소가 시각을 그렇게 쓰기 때문이다.
+#
+# `last_attempt_at` / `enqueued_at` / `updated_at`은 전부 파이썬이
+# `datetime.now().isoformat()`으로 남긴 **로컬 시각**이다. 그런데 SQLite의
+# `datetime('now')`는 **UTC**다. 두 값을 그대로 비교하면 시차만큼 조용히 어긋난다.
+#
+# 한국(UTC+9)에서 실측한 결과가 이렇다 (2026-08-14):
+#
+#     저장값        2026-08-14T09:53:43   (로컬)
+#     datetime('now') 2026-08-14 00:53:43 (UTC)
+#
+# 저장값이 9시간 "미래"로 보이므로 `datetime(last_attempt_at) <= datetime('now','-30 minutes')`는
+# **실제로 9시간 30분이 지나야** 참이 된다. 즉 `RETRY_INTERVAL_MINUTES = 30`은 30분이 아니라
+# 9시간 30분이었고, `reset_stale_queue()`의 "in_progress 10분" 회수도 9시간 10분이었다.
+# doc_worker는 02:00~04:00 두 시간만 도는데 재시도 간격이 9시간 반이면 **한 번 실패한 문서는
+# 그날 밤 안에 다시 시도될 수 없고**, 죽은 Worker가 남긴 in_progress 행도 그 밤에는 회수되지
+# 않는다. 두 방어 장치가 설계대로 동작한 적이 없었다.
+#
+# 저장 형식을 UTC로 바꾸면 이미 쌓인 행 전부와 어긋나므로, **비교 쪽을 로컬로 맞춘다.**
+_NOW_LOCAL = "datetime('now', 'localtime')"
+
+
 def calc_priority(auction_date: str) -> int:
     if not auction_date:
         return 3
@@ -445,10 +467,12 @@ def reset_stale_queue() -> None:
     02:00 Worker 시작 시 호출.
     - 하루 지난 failed 건은 재시도 가능하도록 pending으로 되돌림
     - in_progress 상태로 10분 넘게 멈춰있는 건(비정상 종료 추정)도 회수
-    - status='SKIPPED_EXPIRED'는 이 함수가 건드리는 대상(failed, in_progress)에
-      해당하지 않으므로 자동으로 재시도 대상에서 제외된다. 다만 이는 "현재 시점
-      기준 검색 불가"의 기록일 뿐 "영구 재수집 불가"를 의미하지 않으므로(PM 확정
-      사항), 필요 시 별도 운영 스크립트로 수동 재시도(pending 복귀)는 가능하다.
+    - status='SKIPPED_EXPIRED' / 'SKIPPED_UNSUPPORTED'는 이 함수가 건드리는 대상
+      (failed, in_progress)에 해당하지 않으므로 자동으로 재시도 대상에서 제외된다.
+      다만 이는 "현재 시점 기준 수집 불가"의 기록일 뿐 "영구 재수집 불가"를 의미하지
+      않으므로(PM 확정 사항), 필요 시 별도 운영 스크립트로 수동 재시도(pending 복귀)는
+      가능하다. **자동 부활은 일부러 하지 않는다** — 성공할 수 없는 항목이 매일 되살아나
+      영원히 재시도하던 것이 `mark_queue_unsupported()`가 해결한 문제다.
 
     ## 화면 상태를 함께 되돌린다 (2026-08-13 Sprint 78, BUGS #73)
 
@@ -476,7 +500,7 @@ def reset_stale_queue() -> None:
             SELECT court_code, case_no, item_no, doc_type FROM document_queue
             WHERE status='failed'
               AND last_attempt_at IS NOT NULL
-              AND datetime(last_attempt_at) < datetime('now', '-1 day')
+              AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-1 day')
         """).fetchall()
 
         conn.execute("""
@@ -484,14 +508,14 @@ def reset_stale_queue() -> None:
             SET status='pending', retry_count=0
             WHERE status='failed'
               AND last_attempt_at IS NOT NULL
-              AND datetime(last_attempt_at) < datetime('now', '-1 day')
+              AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-1 day')
         """)
         conn.execute("""
             UPDATE document_queue
             SET status='pending'
             WHERE status='in_progress'
               AND last_attempt_at IS NOT NULL
-              AND datetime(last_attempt_at) < datetime('now', '-10 minutes')
+              AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-10 minutes')
         """)
 
         # 큐 변경과 **같은 트랜잭션**에서 화면 상태를 맞춘다(#50).
@@ -533,6 +557,29 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
     - retry_count는 증가시키지 않음 (실패가 아니라 "애초에 대상이 아님"이므로)
     - status를 'SKIPPED_EXPIRED'로 기록
     - 종료 사유를 로그로 남김 (사유 추적용)
+
+    ## `document_status`를 **일부러** 건드리지 않는다 (제품 판단 대기)
+
+    같은 모듈의 다른 종결 함수는 전부 화면 상태를 함께 쓴다 — `mark_queue_done`은 READY,
+    `mark_queue_failed`와 `mark_queue_unsupported`는 FAILED. **이 함수만 큐만 닫는다.**
+    그래서 화면(`document_status`)은 `COLLECTING`("수집중")에 남는다.
+
+    이것은 누락이 아니라 Sprint 73이 검토하고 **보류한** 상태다:
+    `document_status` enum에 "대상 아님"이 없어 FAILED로 쓰면 실패가 아닌 것을 실패로
+    표기하게 되고, 새 상태를 만드는 것은 상태머신·화면 문구 결정이라 제품 판단이다.
+    자세한 근거·측정값·함께 고쳐야 할 지점은
+    `test_document_status_sync.py` §6이 들고 있고, 그 검사가 현재 동작을 고정한다
+    (배선하는 순간 실패하도록).
+
+    ★ 2026-08-14 추가 측정 — 이 상태로 남는 문서는 §6이 센 183건보다 훨씬 많다.
+      원인이 **둘**이기 때문이다.
+
+        (a) 큐가 SKIPPED_EXPIRED로 종결됨 (이 함수)          183건
+        (b) 기일 경과로 **애초에 큐에 넣지 않음**            2,145건
+            (`enqueue_documents()`의 1차 방어선. 716물건 x 3종,
+             큐 행 자체가 없어 어떤 종결 함수도 지나지 않는다)
+
+      (b)는 이 함수를 고쳐도 남는다. 정책을 정할 때 두 경로를 함께 봐야 한다.
     """
     conn = get_connection()
     try:
@@ -542,10 +589,77 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
             SET status='SKIPPED_EXPIRED', last_attempt_at=?
             WHERE id=?
         """, (now, queue_id))
+
         conn.commit()
         logger.info(
             "[%s-%s] %s SKIPPED_EXPIRED 처리 (사유: auction_date=%s 경과, 법원=%s)",
             case_no, item_no, doc_type, auction_date, court_code
+        )
+    finally:
+        conn.close()
+
+
+def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no: str,
+                            doc_type: str) -> None:
+    """수집 버튼 id가 아예 없는(= 지금 구조로는 성공할 수 없는) 항목의 종결 처리.
+
+    2026-08-14 신설. `doc_worker.py`는 큐에서 집은 항목마다
+    `get_doc_button_id(doc_type, item_no)`를 부르고, None이면 브라우저를 열지 않는다.
+    None이 되는 경우는 **둘 다 영구적**이다 — 현황조사서의 item_no != '1'
+    (DOM으로 확인된 버튼 id가 없다), 그리고 알 수 없는 doc_type.
+
+    ## 왜 `mark_queue_failed()`로는 안 되는가 (실측 재현)
+
+    예전에는 이 경로도 `mark_queue_failed()`를 불렀다. 그런데 실패는 **재시도 대상**이고,
+    `reset_stale_queue()`는 하루 지난 failed를 pending + retry_count=0으로 되살린다.
+    성공할 수 없는 항목이 그 고리에 들어가면 **영원히 빠져나오지 못한다**:
+
+        1일차  pending  retry=1   화면 COLLECTING
+        2일차  pending  retry=2   화면 COLLECTING
+        3일차  failed   retry=3   화면 FAILED      <- 재시도 소진
+        4일차  (reset_stale_queue가 되살린다)
+        5일차  pending  retry=1   화면 COLLECTING  <- 처음으로 되돌아간다
+        ...  16일 동안 12회 시도. 성공 가능성은 0.
+
+    두 가지가 나쁘다. (a) 절대 성공하지 못할 항목이 매일 claim 슬롯을 먹는다.
+    (b) **화면 상태가 4일 주기로 "수집실패" <-> "수집중"을 오간다** — 사용자는 같은
+    문서가 며칠마다 상태를 바꾸는 것을 보는데, 실제로는 아무것도 달라지지 않았다.
+
+    ## 그래서 `SKIPPED_EXPIRED`와 같은 계열로 끝낸다
+
+    "실패"가 아니라 **"애초에 대상이 아님"**이다. `mark_queue_skipped_expired()`와 같은
+    모양을 따른다 — retry_count를 소모하지 않고, `reset_stale_queue()`가 건드리는
+    대상(failed, in_progress)에서 벗어나므로 자동으로 재시도 고리에서 빠진다.
+
+    `SKIPPED_EXPIRED`와 마찬가지로 이것도 "현재 구조 기준"의 기록일 뿐 영구 불가를
+    뜻하지 않는다. 현황조사서의 다른 item_no 버튼 id가 DOM 분석으로 밝혀지면, 그때
+    별도 운영 스크립트로 pending 복귀시키면 된다(자동 부활은 일부러 하지 않는다 —
+    그것이 바로 위 무한 고리였다).
+
+    ## 화면 상태는 FAILED로 **한 번만** 쓴다
+
+    Sprint 75가 이미 정한 것을 그대로 유지한다 — "큐에서 빼면 document_status가
+    COLLECTING(수집중)에 영원히 머문다(BUGS #69와 같은 상태). 빠르게 실패로 남기는 쪽이
+    더 정직하다." 달라지는 것은 **시점과 안정성**뿐이다: 3일 뒤가 아니라 즉시,
+    그리고 다시 뒤집히지 않는다.
+    """
+    conn = get_connection()
+    try:
+        now = datetime.now().isoformat()
+        conn.execute("""
+            UPDATE document_queue
+            SET status='SKIPPED_UNSUPPORTED', last_attempt_at=?
+            WHERE id=?
+        """, (now, queue_id))
+
+        # 화면이 읽는 것은 document_status다 — 같은 트랜잭션에서 함께 갱신한다 (BUGS #50).
+        _set_document_status(conn, court_code, case_no, item_no, doc_type, "FAILED")
+
+        conn.commit()
+        logger.warning(
+            "[%s-%s] %s SKIPPED_UNSUPPORTED 처리 (사유: 수집 버튼 id 없음, 법원=%s) "
+            "― 재시도해도 성공할 수 없으므로 큐에서 종결한다",
+            case_no, item_no, doc_type, court_code
         )
     finally:
         conn.close()
@@ -656,7 +770,7 @@ def claim_next_queue_item() -> Optional[Dict]:
             WHERE status='pending'
               AND (
                     last_attempt_at IS NULL
-                    OR datetime(last_attempt_at) <= datetime('now', '-""" + str(RETRY_INTERVAL_MINUTES) + """ minutes')
+                    OR datetime(last_attempt_at) <= datetime(""" + _NOW_LOCAL + """, '-""" + str(RETRY_INTERVAL_MINUTES) + """ minutes')
               )
             ORDER BY priority ASC, auction_date ASC
             LIMIT 1

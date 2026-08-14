@@ -680,7 +680,65 @@ def test_renew_concurrent_guard():
         seed.close()
 
 
+# ---------------------------------------------------------------------------
+# 두 곳의 `row_to_subscription()` 이 같은 기본 필드를 낸다 (2026-08-14 신설)
+#
+# 같은 이름의 직렬화 함수가 **두 라이브 API 파일에 각각** 정의돼 있다.
+#
+#     api/v1/payments.py:row_to_subscription()       기본 9필드
+#     api/v1/subscriptions.py:row_to_subscription()  같은 9필드 + 파생 3필드
+#
+# 후자의 docstring 이 약속한다 —
+#   "기존 payments.py:row_to_subscription과 필드가 동일하고, 상태 해석에 필요한
+#    파생 필드만 추가한다(기존 필드는 하나도 바꾸지 않는다)"
+#
+# 그런데 **그 약속을 강제하는 것이 없다.** 한쪽에만 필드를 추가하거나 이름을 바꾸면
+# 같은 구독이 **어느 엔드포인트로 받았느냐에 따라 다르게 보인다.**
+# 프런트는 두 응답을 같은 타입으로 다루므로(`src/app/mypage` / `properties/[id]`),
+# 그 차이는 화면에서 `undefined` 로 나타난다.
+#
+# 이 저장소는 같은 부류를 이미 한 번 겪었다 — `api/v1/admin.py` 의
+# `_require_existing_registry_document()` 도 "다운로드 경로와 똑같이 맞춘다"고
+# 적어 두고 실제로는 어긋나 있었다(Sprint 104). 약속은 검사로 고정해야 남는다.
+# ---------------------------------------------------------------------------
+def test_row_to_subscription_shapes_agree():
+    print("\n--- row_to_subscription: 두 구현의 기본 필드 일치 ---")
+    import api.v1.payments as pay_mod
+    import api.v1.subscriptions as sub_mod
+
+    # 실제 컬럼 이름으로 만든 가짜 행 하나로 두 함수를 모두 태운다.
+    row = {
+        "id": 1, "user_id": "qa-shape", "plan": "BASIC", "price": 12900,
+        "status": "ACTIVE",
+        "started_at": "2026-08-01T00:00:00",
+        "expires_at": "2026-09-01T00:00:00",
+        "created_at": "2026-08-01T00:00:00",
+        "updated_at": "2026-08-01T00:00:00",
+    }
+
+    a = pay_mod.row_to_subscription(row)
+    b = sub_mod.row_to_subscription(row)
+
+    base = set(a)
+    derived = set(b) - base
+    check_true("payments 쪽이 필드를 낸다", len(base) > 0, sorted(base))
+    check("subscriptions 는 payments 의 모든 필드를 포함한다", sorted(base - set(b)), [])
+    # 값도 같아야 한다 — 이름만 같고 값이 달라지면 더 나쁘다.
+    differing = sorted(k for k in base if a[k] != b[k])
+    check("공통 필드의 값이 같다", differing, [])
+    print("    공통 %d필드 / subscriptions 전용 파생 %d필드: %s"
+          % (len(base), len(derived), sorted(derived)))
+
+    # 파생 필드는 **subscriptions 쪽에만** 있어야 한다(payments 가 상태 해석을 흉내내기
+    # 시작하면 두 곳에서 만료 판정이 갈린다 — resolve_expected_status 가 단일 기준이다).
+    check_true("파생 필드가 실제로 추가돼 있다", len(derived) > 0, sorted(derived))
+    for k in ("effective_status", "is_entitled", "grace_period_end"):
+        check_true("subscriptions 가 %s 를 낸다" % k, k in b, sorted(b))
+        check_true("payments 는 %s 를 내지 않는다(판정은 한 곳에서)" % k, k not in a, sorted(a))
+
+
 def run():
+    test_row_to_subscription_shapes_agree()
     test_plan_prices()
     test_registry_limits()
     test_invalid_combinations()

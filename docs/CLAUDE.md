@@ -71,7 +71,14 @@ python api_server.py
 # serves on 127.0.0.1:8000 (localhost-only), Swagger UI at /docs
 ```
 2026-08-06 정정: `api_server.py`의 `if __name__ == "__main__":` 블록이 `uvicorn.run(..., host="127.0.0.1", ...)`으로 하드코딩되어 있음(`git log -p -- api_server.py` 확인 결과 커밋 `bfefbf7`(인증 도입 시점)에서 `0.0.0.0` → `127.0.0.1`로 이미 변경됨). `uvicorn api_server:app --reload` CLI 실행도 `--host` 미지정 시 uvicorn 자체 기본값이 `127.0.0.1`이라 결과는 동일. 이전 버전 문서의 "0.0.0.0:8000"은 stale — 자세한 내용은 `docs/backend.md` 참고.
-No `requirements.txt` exists — dependencies are inferred from imports (`fastapi`, `uvicorn`, `python-dotenv`, `python-jose`, `selenium`, `webdriver-manager`, `pandas`). Get explicit approval before installing anything (project rule above).
+2026-08-14 정정: **`requirements.txt`는 존재한다** — 2026-08-11 Sprint 54에 신설됐고 git이 추적한다. 이전 버전의 "No `requirements.txt` exists — dependencies are inferred from imports"는 stale이었다(그 서술을 믿고 import에서 의존성을 역추론하면 안 된다). 11개 패키지가 **전부 `==`로 고정**돼 있고, 2026-08-14 감사에서 선언 버전과 설치 버전이 11/11 일치하며 전부 import되는 것을 확인했다.
+
+```bash
+pip install -r requirements.txt
+python -c "import selenium, pandas, pdfplumber, webdriver_manager; print('OK')"
+```
+
+`httpx`만은 **어떤 소스도 직접 import하지 않아** 안 쓰는 것처럼 보이지만 지우면 안 된다 — `fastapi.testclient.TestClient`가 내부에서 쓰므로 없으면 TestClient 기반 회귀가 통째로 실행되지 않는다(자세한 사유와 `httpx2` 전환 예고는 `requirements.txt`의 주석 참고). 새 패키지 설치는 여전히 승인 영역이다(위 프로젝트 규칙).
 
 ### Daily crawl pipeline (`run_daily.bat`, Task Scheduler job `LawAuctionDailyCrawl`)
 ```bash
@@ -83,7 +90,7 @@ Separately: `doc_worker.py` (~02:00, via `run_doc_worker.bat`) drains `document_
 ### DB schema setup (once, against a fresh `auction.db`, in order)
 ```bash
 python storage/migrate_v4_1.py                 # creates auction_case, auction_item, document_status, doc_raw, parsed_document, tenant_rights, rights_summary, rights_analysis_history
-python -m storage.migrations.run_migrations     # applies numbered SQL files 001~018 (favorites, recent_items, search_presets, subscriptions, registry_usage, payments, registry_requests, indexes, payment_logs, registry_credits, audit/credit logs + soft-delete columns, document_collect_failures, document_queue UNIQUE+item_no); tracked in `migration_history`, safe to re-run. Running it as a script (`python storage/migrations/run_migrations.py`) also works as of 2026-08-11 — before that only the `-m` form did.
+python -m storage.migrations.run_migrations     # applies numbered SQL files 001~019 (favorites, recent_items, search_presets, subscriptions, registry_usage, payments, registry_requests, indexes, payment_logs, registry_credits, audit/credit logs + soft-delete columns, document_collect_failures, document_queue UNIQUE+item_no, subscriptions.payment_id); tracked in `migration_history`, safe to re-run. Running it as a script (`python storage/migrations/run_migrations.py`) also works as of 2026-08-11 — before that only the `-m` form did.
 ```
 (2026-08-11 Sprint 53: `storage/migrate_doc_collect.py`는 Migration 017로 대체되어 제거됐다 — 부트스트랩은 위 두 명령만으로 완결된다.)
 

@@ -30,10 +30,26 @@ DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
 # 인자명을 court_name으로 바꾸지 않은 이유: DB 컬럼명이 `court_code`라서 여기만 바꾸면
 # 호출부(item["court_code"])와 어긋나 혼란이 옮겨갈 뿐이다. 컬럼명 변경은 스키마 변경이라
 # 승인이 필요하다.
-def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
+def _doc_dir_path(court_code: str, case_no: str, item_no: str = "1") -> str:
+    """경로만 계산한다. **디스크를 건드리지 않는다.**
+
+    2026-08-14 분리. 경로 규칙은 여기 한 곳에만 두고, `get_doc_dir()`은 여기에
+    디렉터리 생성을 얹는다 — 규칙이 두 벌이 되면 "쓰는 곳과 읽는 곳이 다른 경로를
+    보는" 이 저장소의 단골 결함이 된다.
+    """
     safe_case_no = case_no.replace("/", "_").strip()
     safe_item_no = (item_no or "1").replace("/", "_").strip()
-    path = os.path.join(DOCUMENT_ROOT, court_code, safe_case_no, safe_item_no)
+    return os.path.join(DOCUMENT_ROOT, court_code, safe_case_no, safe_item_no)
+
+
+def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
+    """문서 디렉터리 경로. **없으면 만든다.**
+
+    쓰기 직전에 부르는 용도다(`doc_crawler`의 spec/status/appraisal 저장 4곳,
+    `collect_documents`의 최종 경로). 조회만 할 때는 `_doc_dir_path()`를 쓴다 —
+    아래 `doc_exists()`가 그렇게 한다.
+    """
+    path = _doc_dir_path(court_code, case_no, item_no)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -78,7 +94,18 @@ def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bo
             "알 수 없는 doc_type: %r (가능한 값: %s)"
             % (doc_type, ", ".join(sorted(_PRIMARY_EXT)))
         )
-    path = os.path.join(get_doc_dir(court_code, case_no, item_no), key + "." + _PRIMARY_EXT[key])
+    # ★ `get_doc_dir()` 이 아니라 `_doc_dir_path()` 를 쓴다 (2026-08-14).
+    #
+    #   이 함수는 **조회**다. 그런데 예전에는 `get_doc_dir()` 을 불렀고, 그 함수는
+    #   `os.makedirs()` 를 한다. 즉 **"이 문서 있어요?" 라고 묻기만 해도 디스크에
+    #   빈 디렉터리가 생겼다.** 실측 재현: 없는 물건 하나를 조회하면 3단계 디렉터리
+    #   (법원/사건/물건번호)가 생기고, 물어볼 때마다 쌓인다.
+    #
+    #   그 쓰레기가 실제로 남아 있다 — `documents/` 아래 **대응 물건이 없는 빈 디렉터리
+    #   5개**가 그렇게 만들어진 것들이다(`A/B/1` 처럼 테스트가 물어본 흔적도 있다).
+    #   조회는 조회만 해야 한다. 만드는 것은 쓰기 직전에 `get_doc_dir()` 이 한다.
+    path = os.path.join(_doc_dir_path(court_code, case_no, item_no),
+                        key + "." + _PRIMARY_EXT[key])
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 

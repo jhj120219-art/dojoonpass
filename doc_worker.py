@@ -10,6 +10,7 @@ from config.settings import get_doc_button_id, DOC_WORKER_END_TIME
 from storage.database import (
     init_db, reset_stale_queue, claim_next_queue_item,
     mark_queue_done, mark_queue_failed, mark_queue_skipped_expired,
+    mark_queue_unsupported,
 )
 from crawler.doc_crawler import (
     collect_document, build_download_driver, restart_download_driver,
@@ -78,10 +79,18 @@ def main() -> int:
 
             btn_id = get_doc_button_id(doc_type, item_no)
 
+            # 3차 방어선: 수집 버튼 id가 없으면 브라우저를 열지 않는다.
+            #
+            # 이것은 **재시도로 해결되지 않는다** — 버튼 id가 없는 이유는 둘 다 영구적이다
+            # (현황조사서의 item_no != '1', 알 수 없는 doc_type). 그런데 예전에는
+            # `mark_queue_failed()`를 불렀고, `reset_stale_queue()`가 하루 지난 failed를
+            # 되살리기 때문에 **성공할 수 없는 항목이 4일 주기로 영원히 재시도됐다**
+            # (실측: 16일에 12회 시도, 화면 상태는 FAILED <-> COLLECTING을 계속 오감).
+            # 기일 경과와 같은 계열의 종결 처리로 바꿔 그 고리를 끊는다.
             if not btn_id:
-                logger.error("[%s-%s] %s 버튼 id 미지원(추가 DOM 분석 필요). 실패 처리",
+                logger.error("[%s-%s] %s 버튼 id 미지원(추가 DOM 분석 필요). 수집 대상에서 종결",
                              case_no, item_no, doc_type)
-                mark_queue_failed(item["id"], item["retry_count"])
+                mark_queue_unsupported(item["id"], court_code, case_no, item_no, doc_type)
                 continue
 
             processed += 1

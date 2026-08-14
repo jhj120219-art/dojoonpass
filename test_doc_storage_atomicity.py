@@ -63,6 +63,37 @@ def test_get_doc_dir_and_doc_exists():
 
     check("no spec.pdf yet -> doc_exists False", doc_exists(QA_COURT, QA_CASE, QA_ITEM, "spec"), False)
 
+    # ── 조회는 디스크를 건드리지 않는다 (2026-08-14 신설) ────────────────────
+    #
+    # `doc_exists()`는 **조회**인데 예전에는 `get_doc_dir()`을 불렀고, 그 함수는
+    # `os.makedirs()`를 한다. 즉 "이 문서 있어요?"라고 묻기만 해도 디스크에 빈 디렉터리가
+    # 생겼다. 실측: 없는 물건 하나를 조회하면 3단계 디렉터리가 생기고, 물어볼 때마다 쌓인다.
+    #
+    # 그 쓰레기가 실제로 남아 있었다 — `documents/` 아래 **대응 물건이 없는 빈 디렉터리
+    # 5개**(`A/B/1` 같은 테스트 흔적 포함)가 그렇게 만들어진 것이다.
+    #
+    # 여기서 고정하는 것: **조회는 아무것도 만들지 않는다.** 만드는 것은 쓰기 직전에
+    # `get_doc_dir()`이 한다(위 첫 줄이 그것을 검사한다 — 둘 다 지켜야 한다).
+    import tempfile as _tempfile
+    import crawler.doc_paths as _dp
+
+    _probe_root = _tempfile.mkdtemp(prefix="qa_noside_")
+    _real_root = _dp.DOCUMENT_ROOT
+    _dp.DOCUMENT_ROOT = _probe_root
+    try:
+        before = sum(len(d) for _, d, _ in os.walk(_probe_root))
+        r = _dp.doc_exists("QA조회법원", "2099타경0", "1", "spec")
+        after = sum(len(d) for _, d, _ in os.walk(_probe_root))
+        check("조회 결과는 False(파일이 없다)", r, False)
+        check("doc_exists 는 디렉터리를 만들지 않는다", after, before)
+
+        # 대조군: 쓰기용 헬퍼는 여전히 만들어야 한다(크롤러가 이것에 의존한다).
+        made = _dp.get_doc_dir("QA쓰기법원", "2099타경1", "1")
+        check_true("get_doc_dir 은 여전히 디렉터리를 만든다", os.path.isdir(made), made)
+    finally:
+        _dp.DOCUMENT_ROOT = _real_root
+        shutil.rmtree(_probe_root, ignore_errors=True)
+
     spec_path = os.path.join(path, "spec.pdf")
     with open(spec_path, "wb") as f:
         f.write(b"%PDF-1.4 fake content")
@@ -287,13 +318,28 @@ def test_collect_documents_saves_where_viewer_serves():
     check("뷰어 파일명과 canonical 정의가 일치한다", CANONICAL_DOC_FILENAME, viewer)
 
     # canonical 경로가 실제로 뷰어 루트(documents/) 아래에 만들어지는가
-    p = canonical_doc_path("서울중앙지방법원", "2024타경126346", "1", "SPEC")
-    check_true("canonical 경로가 documents/ 아래에 있다",
-               os.path.commonpath([os.path.abspath(p), os.path.abspath(DOCUMENT_ROOT)])
-               == os.path.abspath(DOCUMENT_ROOT), p)
-    check("canonical 파일명이 spec.pdf", os.path.basename(p), "spec.pdf")
-    check("STATUS는 status.html",
-          os.path.basename(canonical_doc_path("A", "B", "1", "STATUS")), "status.html")
+    # ★ `canonical_doc_path()` 는 쓰기 대상 경로라 **디렉터리를 만든다.**
+    #   그래서 이 검사를 실 DOCUMENT_ROOT 에 대고 돌리면 저장소의 `documents/` 아래에
+    #   쓰레기가 남는다 — 실제로 `documents/A/B/1` 이 이 줄 때문에 생겨 있었다
+    #   (2026-08-14 실측: 최상위에 법원이 아닌 `A` 디렉터리가 존재).
+    #   경로 규칙만 보는 검사이므로 임시 루트에서 돌린다.
+    import tempfile as _tf
+    import crawler.doc_paths as _dpm
+
+    _probe = _tf.mkdtemp(prefix="qa_canon_")
+    _saved_root = _dpm.DOCUMENT_ROOT
+    _dpm.DOCUMENT_ROOT = _probe
+    try:
+        p = canonical_doc_path("서울중앙지방법원", "2024타경126346", "1", "SPEC")
+        check_true("canonical 경로가 DOCUMENT_ROOT 아래에 있다",
+                   os.path.commonpath([os.path.abspath(p), os.path.abspath(_probe)])
+                   == os.path.abspath(_probe), p)
+        check("canonical 파일명이 spec.pdf", os.path.basename(p), "spec.pdf")
+        check("STATUS는 status.html",
+              os.path.basename(canonical_doc_path("A", "B", "1", "STATUS")), "status.html")
+    finally:
+        _dpm.DOCUMENT_ROOT = _saved_root
+        shutil.rmtree(_probe, ignore_errors=True)
 
     # STATUS는 PDF 다운로드 대상이 아니다 ― 시도하면 매번 FAILED가 찍힌다
     check("PDF 다운로드 대상에 STATUS가 없다", "STATUS" in PDF_DOWNLOADABLE_DOC_TYPES, False)

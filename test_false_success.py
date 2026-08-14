@@ -106,15 +106,18 @@ def test_registry_orphan_visibility():
 
         raw = sqlite3.connect(test_db)
         item_id = raw.execute(
+            # 시각은 로컬로 넣는다 — 이 저장소의 모든 운영 코드가
+            # `datetime.now().isoformat()`(로컬)로 쓰므로, 픽스처만 UTC면 같은 컬럼에
+            # 9시간 어긋난 값이 섞인다.
             "INSERT INTO auction_item (case_no, item_no, court_name, full_address, created_at)"
-            " VALUES (?,?,?,?,datetime('now'))",
+            " VALUES (?,?,?,?,datetime('now','localtime'))",
             ("2026타경-qa-orphan", "1", "서울중앙지방법원", "서울시 QA구 고아동 1-1"),
         ).lastrowid
         doc_name = "qa-false-success-%s.pdf" % uuid.uuid4().hex[:8]
         req_id = raw.execute(
             "INSERT INTO registry_requests"
             " (user_id, item_id, status, doc_url, requested_at, completed_at)"
-            " VALUES (?,?,?,?,datetime('now'),datetime('now'))",
+            " VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))",
             (user, item_id, "COMPLETED", doc_name),
         ).lastrowid
         raw.commit()
@@ -253,6 +256,177 @@ def test_zero_byte_document_is_not_served():
         shutil.rmtree(os.path.join(docs_mod.DOCUMENT_ROOT, "QA법원"), ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 3. 유료 등기부 문서도 0바이트를 "있다"로 치지 않는다 (2026-08-14 신설)
+#
+# §2는 **무료 법원문서**(`api/v1/documents.py`)만 덮고 있었다. 같은 저장소의 다른 파일
+# 서빙 경로인 `api/v1/registry.py`(유료 등기부)에는 그 방어가 없었고, 실측으로 재현됐다.
+#
+#     0바이트 등기부 파일  ->  HTTP 200 / 0 bytes
+#
+# **돈이 걸린 쪽이 더 느슨했다.** 사용자는 등기부 발급 비용을 내고 빈 파일을 받는다.
+# 게다가 `os.path.exists()`는 디렉터리에도 True라, 그 경우 FileResponse가 터져 500이 된다.
+#
+# 기준은 이 저장소가 이미 합의해 둔 것 하나뿐이어야 한다 —
+# `crawler/doc_paths.py:doc_exists()` = `exists() and getsize() > 0`.
+#
+# 저장소 전체 검색 결과 파일을 서빙하는 자리는 이 둘뿐이다(FileResponse 2곳).
+# 이제 둘 다 같은 정의를 쓴다.
+# ---------------------------------------------------------------------------
+def test_zero_byte_registry_document_is_not_served():
+    print("\n--- 3. 0바이트 유료 등기부 서빙 (2026-08-14) ---")
+
+    # jwt / SUPABASE_JWT_SECRET 은 환경변수 주입 뒤에 import 해야 한다(§1과 동일한 순서).
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    import api_server
+    import api.v1.registry as reg_mod
+    from api.auth import SUPABASE_JWT_SECRET
+
+    client = TestClient(api_server.app)
+    user = "qa-zero-reg-" + uuid.uuid4().hex[:8]
+    headers = {"Authorization": "Bearer " + jwt.encode(
+        {"sub": user, "aud": "authenticated"}, SUPABASE_JWT_SECRET, algorithm="HS256")}
+
+    mem = sqlite3.connect(":memory:", check_same_thread=False)
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE registry_requests (id INTEGER PRIMARY KEY, user_id TEXT,"
+                " item_id INTEGER, status TEXT, doc_url TEXT)")
+    empty_name = "qa-zero-%s.pdf" % uuid.uuid4().hex[:8]
+    full_name = "qa-full-%s.pdf" % uuid.uuid4().hex[:8]
+    mem.executemany(
+        "INSERT INTO registry_requests (id,user_id,item_id,status,doc_url) VALUES (?,?,?,?,?)",
+        [(9201, user, 1, "COMPLETED", empty_name),
+         (9202, user, 1, "COMPLETED", full_name)])
+    mem.commit()
+
+    class _NoCloseConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def close(self):
+            pass
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    os.makedirs(reg_mod.REGISTRY_DOCUMENT_ROOT, exist_ok=True)
+    p_empty = os.path.join(reg_mod.REGISTRY_DOCUMENT_ROOT, empty_name)
+    p_full = os.path.join(reg_mod.REGISTRY_DOCUMENT_ROOT, full_name)
+    with open(p_empty, "wb") as fh:
+        fh.write(b"")
+    with open(p_full, "wb") as fh:
+        fh.write(b"%PDF-1.4 qa registry")
+
+    real_get_connection = reg_mod.get_connection
+    reg_mod.get_connection = lambda *a, **kw: _NoCloseConn(mem)
+    try:
+        # 대조군이 200이어야 이 검사가 의미를 갖는다(둘 다 404면 경로가 틀린 것이다).
+        r = client.get("/api/v1/registry-requests/9202/download", headers=headers)
+        check("대조군: 내용이 있는 등기부는 200", r.status_code, 200)
+        check_true("대조군: 실제 내용이 실려 온다", r.content.startswith(b"%PDF"), r.content[:20])
+
+        r0 = client.get("/api/v1/registry-requests/9201/download", headers=headers)
+        check("0바이트 등기부는 404(빈 200이 아니다)", r0.status_code, 404)
+        check_true("빈 본문을 200으로 주지 않는다", not (r0.status_code == 200 and not r0.content),
+                   (r0.status_code, len(r0.content)))
+    finally:
+        reg_mod.get_connection = real_get_connection
+        mem.close()
+        for p in (p_empty, p_full):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# 4. 파일을 서빙하는 모든 경로가 **같은 "있다" 정의**를 쓴다 (2026-08-14 신설)
+#
+# §2/§3은 각 엔드포인트의 동작을 고정한다. 이 검사는 **새 서빙 경로가 생겼을 때**를 막는다.
+# 세 번째 FileResponse가 추가되면서 크기 검사를 빠뜨리면 같은 결함이 또 생긴다 —
+# 실제로 registry.py가 documents.py보다 뒤늦게 그 상태였다.
+# ---------------------------------------------------------------------------
+def test_all_file_serving_paths_check_size():
+    print("\n--- 4. 모든 파일 서빙 경로가 크기를 검사하는가 ---")
+    import glob
+    import re
+
+    serving = []
+    for path in sorted(glob.glob(os.path.join(REPO_ROOT, "api", "**", "*.py"), recursive=True)):
+        src = open(path, encoding="utf-8-sig").read()
+        # 주석이 아니라 실제 호출만 센다.
+        code = "\n".join(l.split("#")[0] for l in src.splitlines())
+        if re.search(r"\bFileResponse\s*\(", code):
+            serving.append((os.path.relpath(path, REPO_ROOT), code))
+
+    check_true("파일을 서빙하는 경로를 찾았다", len(serving) >= 2, [s[0] for s in serving])
+    missing = [rel for rel, code in serving if "getsize" not in code]
+    check("모든 서빙 경로가 0바이트를 거른다", missing, [])
+    print("    서빙 경로: %s" % ", ".join(rel for rel, _ in serving))
+
+    # `exists()`만으로 서빙을 판단하면 디렉터리도 통과한다 — isfile 을 쓰는지도 본다.
+    no_isfile = [rel for rel, code in serving if "isfile" not in code]
+    check("모든 서빙 경로가 isfile로 판단한다(디렉터리 통과 방지)", no_isfile, [])
+
+    # ── 쓰는 쪽과 읽는 쪽이 같은 정의를 쓰는가 ────────────────────────────
+    #
+    # `api/v1/admin.py:_require_existing_registry_document()`의 docstring은
+    # "검사 방식은 다운로드 경로와 **똑같이** 맞춘다"고 약속한다. 그런데 그 약속을
+    # **강제하는 것이 아무것도 없었고**, 실제로 어긋났다(둘 다 0바이트를 통과시켰다).
+    #
+    # 더 위험한 것은 한쪽만 고칠 때다. 다운로드만 조이면 admin은 COMPLETED를 허용하는데
+    # 사용자는 404를 받는다 — Sprint 95가 없앤 "등록은 됐는데 못 받는" 상태가 되돌아온다.
+    # (이 검사는 그 사고를 실제로 겪고 나서 붙였다.)
+    admin_src = open(os.path.join(REPO_ROOT, "api", "v1", "admin.py"),
+                     encoding="utf-8-sig").read()
+    admin_code = "\n".join(l.split("#")[0] for l in admin_src.splitlines())
+    idx = admin_code.find("def _require_existing_registry_document")
+    check_true("admin의 등기부 문서 검사 함수를 찾았다", idx >= 0, idx)
+    if idx >= 0:
+        # 함수 본문만 잘라 본다(다음 최상위 def 까지).
+        rest = admin_code[idx:]
+        nxt = rest.find("\ndef ", 1)
+        body = rest[:nxt if nxt > 0 else len(rest)]
+        check_true("admin도 0바이트를 거부한다(다운로드와 같은 정의)",
+                   "getsize" in body,
+                   "admin이 0바이트를 통과시키면 COMPLETED인데 다운로드는 404가 된다")
+        check_true("admin도 isfile로 판단한다", "isfile" in body, body[-200:])
+
+    # ── "문서가 있다"를 판단하는 **모든** 자리가 같은 정의를 쓰는가 ──────────
+    #
+    # 서빙(읽기)과 admin(쓰기) 말고도 판정하는 곳이 하나 더 있다 —
+    # `repair_document_status.py:document_exists()`가 디스크를 보고 `document_status`를
+    # READY로 바꾼다. 즉 **화면 상태를 정하는 쓰기 경로**다.
+    #
+    # 여기가 느슨하면(0바이트를 "있다"로 보면) 그 함수 자신의 주석이 예고한 상태가 된다:
+    # **화면은 "수집완료", 실제 다운로드는 404.** 이 스크립트의 목적이 바로 그 불일치를
+    # 없애는 것이므로 기준이 다르면 목적과 반대로 동작한다.
+    #
+    # 기준은 하나뿐이어야 한다 — `crawler/doc_paths.py:doc_exists()`.
+    DECIDERS = [
+        (os.path.join("crawler", "doc_paths.py"), "doc_exists"),
+        ("repair_document_status.py", "document_exists"),
+    ]
+    for rel, fname in DECIDERS:
+        path = os.path.join(REPO_ROOT, rel)
+        if not os.path.exists(path):
+            check_true("%s 가 존재한다" % rel, False, path)
+            continue
+        src = open(path, encoding="utf-8-sig").read()
+        code = "\n".join(l.split("#")[0] for l in src.splitlines())
+        i = code.find("def %s" % fname)
+        check_true("%s:%s 를 찾았다" % (rel, fname), i >= 0, i)
+        if i < 0:
+            continue
+        rest = code[i:]
+        nxt = rest.find("\ndef ", 1)
+        body = rest[:nxt if nxt > 0 else len(rest)]
+        check_true("%s:%s 가 0바이트를 '없음'으로 본다" % (rel, fname),
+                   "getsize" in body,
+                   "이 자리가 느슨하면 화면은 '수집완료'인데 다운로드는 404가 된다")
+
+
 def run():
     print("=" * 60)
     print("false success 회귀 테스트 (Sprint 98)")
@@ -260,6 +434,8 @@ def run():
 
     test_registry_orphan_visibility()
     test_zero_byte_document_is_not_served()
+    test_zero_byte_registry_document_is_not_served()
+    test_all_file_serving_paths_check_size()
 
     print("\n" + "=" * 60)
     if failures:

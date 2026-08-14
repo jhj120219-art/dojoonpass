@@ -422,7 +422,11 @@ def test_worker_failure_then_retry_converges():
         # 간격이 지난 것으로 만들고 재시도
         conn = env.conn()
         try:
-            conn.execute("UPDATE document_queue SET last_attempt_at=datetime('now','-%d minutes')"
+            # 'localtime' 필수 — 운영 코드가 `last_attempt_at`을 로컬 시각으로 쓰고
+            # claim도 로컬로 비교한다. UTC로 밀면 한국 기준 9시간 이상을 미는 셈이 되어
+            # "간격 +5분"이라는 이 검사의 경계 의미가 사라진다.
+            conn.execute("UPDATE document_queue SET"
+                         " last_attempt_at=datetime('now','localtime','-%d minutes')"
                          " WHERE id=?" % (env.dbmod.RETRY_INTERVAL_MINUTES + 5), (qid,))
             conn.commit()
         finally:

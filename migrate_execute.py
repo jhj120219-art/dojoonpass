@@ -155,9 +155,35 @@ def execute():
         logger.info("document_status 마이그레이션 시작...")
         ds_count = 0
         for row in rows:
+            # ★ 조회에 법원이 들어가야 한다 (2026-08-14).
+            #
+            # 위 auction_item UPSERT는 2026-08-07에 `(case_id, item_no)` 로 고쳤는데
+            # **이 조회만 옛 형태(`case_no` + `item_no`)로 남아 있었다.** 같은 수정의
+            # 나머지 절반이다.
+            #
+            # 법원마다 사건번호를 독립 채번하므로 서로 다른 법원이 같은 (case_no, item_no)
+            # 를 쓰면 이 조회는 **둘 중 아무 행이나** 돌려준다. 그러면 두 물건의 문서
+            # 상태가 한 item_id 로 몰리고, `INSERT OR IGNORE` 라 나중 것이 조용히 버려진다.
+            #
+            # 사본 재현(2026-08-14): 부산 물건2(수집완료) + 수원 물건2(미수집) 를 만들자
+            #
+            #     부산 item : document_status 행이 **아예 없음**  <- 수집한 문서를 못 본다
+            #     수원 item : COLLECTING (자기 값)
+            #     자체 검증 : document_status 5628 != 5631
+            #
+            # 실 DB에는 법원이 다른 같은 사건번호가 **3개** 있다(2024타경34089 / 2024타경3700
+            # / 2024타경4973). 지금은 물건번호가 마침 달라 무사하지만, 한쪽에 같은 물건번호가
+            # 생기는 순간 터진다 — 진행 중인 사건들이라 언제든 생길 수 있다.
+            #
+            # 조회 형태는 `storage/database.py:_document_status_item_id()` 와 맞춘다.
+            # 같은 것을 찾는 조회가 두 벌이면 한쪽만 고쳐진다.
             item = conn.execute(
-                "SELECT id FROM auction_item WHERE case_no = ? AND item_no = ?",
-                (row["case_no"], row["item_no"])
+                """
+                SELECT ai.id FROM auction_item ai
+                JOIN auction_case ac ON ac.id = ai.case_id
+                WHERE ac.court_code = ? AND ai.case_no = ? AND ai.item_no = ?
+                """,
+                (row["court_code"], row["case_no"], row["item_no"])
             ).fetchone()
             if not item:
                 continue
@@ -198,15 +224,35 @@ def execute():
         # 이 환경의 파이썬이 cp949로 인코딩하는데 이모지가 cp949에 없어 UnicodeEncodeError로
         # 죽는다. 커밋은 이미 끝난 뒤라 데이터는 정상이지만 스크립트가 exit 1로 종료되어
         # 매일 배치가 실패로 보고됐다(logs/migrate_execute.log에 11회 발생 실측).
+        # ★ [FAIL]을 찍고도 exit 0으로 끝나면 안 된다 (2026-08-14).
+        #
+        # 예전에는 이 두 검증이 **출력만** 했다. 그래서 `run_daily.bat`은
+        # `if errorlevel 1` 에 걸리지 않고 로그 끝에 `[SUCCESS]` 를 남겼다 —
+        # **자기 검증이 실패했다고 적어 둔 그 로그 파일에** 성공 마커가 함께 찍혔다.
+        #
+        # 사본 재현(2026-08-14): 법원이 다른 같은 (사건,물건)을 만들자
+        # `[FAIL] document_status 불일치: 5628 != 5631` 이 찍혔는데 **종료코드는 0**이었다.
+        # 문서 상태 3건이 유실됐는데 스케줄러에는 성공으로 보고된다.
+        #
+        # 이 저장소가 Sprint 13/54/99에서 `.bat` 계층에 대해 없앤 "실패 은폐"와 같은 모양이고,
+        # 이번에는 파이썬 쪽에 남아 있었다.
+        #
+        # 판정 대상은 **결정적인 건수 검증 두 개뿐**이다. 예전에 이모지 인코딩 때문에
+        # 데이터는 정상인데 exit 1로 끝나 매일 실패로 보고된 일이 있었다(위 주석) —
+        # 그런 거짓 실패가 다시 생기지 않게 판정 근거를 좁게 유지한다.
+        problems = []
+
         if ai == orig:
             print("  [OK] auction_item 건수 일치")
         else:
-            print(f"  [FAIL] auction_item 불일치: {ai} != {orig}")
+            problems.append(f"auction_item 불일치: {ai} != {orig}")
+            print(f"  [FAIL] {problems[-1]}")
 
         if ds == orig * 3:
             print("  [OK] document_status 건수 일치")
         else:
-            print(f"  [FAIL] document_status 불일치: {ds} != {orig * 3}")
+            problems.append(f"document_status 불일치: {ds} != {orig * 3}")
+            print(f"  [FAIL] {problems[-1]}")
 
         print("")
         print("=== 샘플 확인 ===")
@@ -220,6 +266,12 @@ def execute():
         for s in sample:
             print(f"  {s['case_no']} | {s['item_no']} | fail={s['fail_count']} | rate={s['bid_rate']} | {s['court_name']}")
 
+        if problems:
+            # 로그에도 남긴다 — stdout은 배치가 파일로 리다이렉트하지만, 사유가
+            # 한 줄로 모여 있어야 사고 때 찾기 쉽다.
+            logger.error("마이그레이션 검증 실패 %d건: %s", len(problems), " / ".join(problems))
+        return not problems
+
     except Exception as e:
         conn.rollback()
         logger.error("마이그레이션 실패: %s", str(e))
@@ -229,8 +281,9 @@ def execute():
         
 if __name__ == "__main__":
     try:
-        execute()
-        sys.exit(0)
+        # 검증이 실패하면 exit 1 — run_daily.bat의 `if errorlevel 1`이 이것을 보고
+        # 로그에 [FAILED]를 남긴다. 예전에는 [FAIL]을 찍고도 0으로 끝나 [SUCCESS]가 찍혔다.
+        sys.exit(0 if execute() else 1)
     except Exception as e:
         print("FATAL:", str(e))
         sys.exit(1)

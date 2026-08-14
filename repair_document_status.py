@@ -71,7 +71,17 @@ def document_exists(court_name: str, case_no: str, item_no: str, doc_type: str) 
         # 드라이브가 다르면 commonpath가 ValueError를 낸다 — 그것도 밖이다.
         return False
 
-    return os.path.exists(real_path)
+    # 크기까지 본다 — 이 저장소의 "문서가 있다" 정의는 하나다 (2026-08-14).
+    #
+    #     crawler/doc_paths.py:doc_exists()  =  exists() and getsize() > 0
+    #
+    # 여기서 `exists()`만 보면 **0바이트 파일을 보고 READY로 바꾼다.** 그런데 서빙
+    # 경로(`api/v1/documents.py`)는 0바이트를 404로 막는다. 결과는 바로 위 주석이
+    # 예고한 그 상태다 ― **화면은 "수집완료", 실제 다운로드는 404.**
+    # 이 스크립트의 목적이 정확히 그 불일치를 없애는 것이므로, 판정 기준도 같아야 한다.
+    #
+    # `isfile()`을 쓰는 이유: `exists()`는 디렉터리에도 True다.
+    return os.path.isfile(real_path) and os.path.getsize(real_path) > 0
 
 
 def scan(conn):

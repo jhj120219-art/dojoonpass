@@ -192,7 +192,11 @@ def test_reset_stale_queue():
                 "INSERT INTO document_queue (court_code, case_no, item_no, doc_type,"
                 " priority, auction_date, status, retry_count, enqueued_at, last_attempt_at)"
                 " VALUES (?,?,?,?,3,'2099-01-01',?,?, '2026-08-11T00:00:00',"
-                "         %s)" % ("NULL" if ago is None else "datetime('now', ?)"),
+                # ★ 'localtime'이 반드시 있어야 한다. 운영 코드는 last_attempt_at을
+                #   파이썬 `datetime.now()`(로컬)로 쓴다. 픽스처만 UTC로 넣으면
+                #   한국 기준 9시간 과거의 행을 만들게 되어, "1분 전"이라고 적어 둔 행이
+                #   실제로는 "9시간 1분 전"이 된다 — 검사가 의도한 상황을 못 만든다.
+                "         %s)" % ("NULL" if ago is None else "datetime('now','localtime', ?)"),
                 (("B000210", label, str(i), "spec", status, retry)
                  if ago is None else ("B000210", label, str(i), "spec", status, retry, ago)),
             )
@@ -254,8 +258,9 @@ def test_claim_next_queue_item():
             ("case-prio1", "1", "spec", "pending", 1, "2099-12-31", 0, None),
             ("case-prio1-early", "1", "spec", "pending", 1, "2099-01-01", 0, None),
             # 방금 시도한 건은 재시도 간격(30분) 전이라 집으면 안 된다
+            # 'localtime' 필수 — 운영 코드가 로컬 시각을 쓰기 때문이다(위 6번 주석 참고)
             ("case-recent", "1", "spec", "pending", 0, "2050-01-01", 1,
-             "datetime('now','-1 minutes')"),
+             "datetime('now','localtime','-1 minutes')"),
             # 집으면 안 되는 상태들
             ("case-done", "1", "spec", "done", 0, "2050-01-01", 0, None),
             ("case-failed", "1", "spec", "failed", 0, "2050-01-01", 3, None),
@@ -286,7 +291,8 @@ def test_claim_next_queue_item():
         check("더 집을 것이 없으면 None", dbmod.claim_next_queue_item(), None)
 
         # 재시도 간격이 지나면 다시 집힌다
-        c.execute("UPDATE document_queue SET last_attempt_at=datetime('now','-%d minutes')"
+        c.execute("UPDATE document_queue SET last_attempt_at="
+                  "datetime('now','localtime','-%d minutes')"
                   " WHERE case_no='case-recent'" % (dbmod.RETRY_INTERVAL_MINUTES + 5))
         c.commit()
         c.close()
@@ -925,6 +931,258 @@ def test_upsert_batch_partial_and_total_failure():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 16. 성공할 수 없는 항목이 매일 되살아나지 않는가 (2026-08-14 신설)
+#
+# `doc_worker.py`는 큐에서 집은 항목마다 `get_doc_button_id()`를 부르고, None이면
+# 브라우저를 열지 않는다. None이 되는 이유는 **둘 다 영구적**이다 — 현황조사서의
+# item_no != '1'(DOM으로 확인된 버튼 id가 없다), 그리고 알 수 없는 doc_type.
+#
+# 예전에는 이 경로가 `mark_queue_failed()`를 불렀다. 실패는 재시도 대상이고,
+# `reset_stale_queue()`는 하루 지난 failed를 pending + retry_count=0으로 되살린다.
+# 그래서 **성공 가능성이 0인 항목이 4일 주기로 영원히 재시도됐다.** 실측 재현:
+#
+#     1일차 pending retry=1  화면 COLLECTING
+#     2일차 pending retry=2  화면 COLLECTING
+#     3일차 failed  retry=3  화면 FAILED
+#     4일차 (reset_stale_queue가 되살린다)
+#     5일차 pending retry=1  화면 COLLECTING   <- 처음으로 되돌아간다
+#     ... 16일 동안 12회 시도
+#
+# 나쁜 점이 둘이다. (a) 절대 성공하지 못할 항목이 매일 claim 슬롯을 먹는다.
+# (b) **화면 상태가 "수집실패" <-> "수집중"을 4일마다 오간다** — 사용자는 같은 문서가
+# 며칠마다 상태를 바꾸는 것을 보지만 실제로 달라진 것은 없다.
+#
+# 이 검사는 **여러 날을 실제로 돌려** 그 고리가 끊겼는지 본다. 한 번의 호출만 보면
+# (예전 코드도 1일차는 똑같이 동작하므로) 이 결함을 잡지 못한다.
+# ---------------------------------------------------------------------------
+def _db_with_document_status():
+    """document_queue + `_set_document_status()`가 필요로 하는 v4.1 3개 테이블."""
+    d, conn = make_db()
+    conn.executescript("""
+        CREATE TABLE auction_case (id INTEGER PRIMARY KEY, case_no TEXT, court_code TEXT,
+                                   court_name TEXT);
+        CREATE TABLE auction_item (id INTEGER PRIMARY KEY, case_id INTEGER, case_no TEXT,
+                                   item_no TEXT, court_name TEXT);
+        CREATE TABLE document_status (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER,
+                                      doc_type TEXT, status TEXT, updated_at TEXT,
+                                      UNIQUE(item_id, doc_type));
+    """)
+    return d, conn
+
+
+def test_unsupported_item_does_not_retry_forever():
+    print("\n--- 16. 버튼 id가 없는 항목은 매일 되살아나지 않는다 ---")
+    import storage.database as dbmod
+    from config.settings import get_doc_button_id
+
+    d, conn = _db_with_document_status()
+    real = dbmod.DB_PATH
+    path = os.path.join(d, "t.db")
+    try:
+        conn.executescript("""
+            INSERT INTO auction_case VALUES (1,'2026타경1','B000210','서울중앙지방법원');
+            INSERT INTO auction_item VALUES (1,1,'2026타경1','7','서울중앙지방법원');
+            INSERT INTO document_status (item_id,doc_type,status,updated_at)
+                VALUES (1,'STATUS','COLLECTING','2026-08-01T00:00:00');
+        """)
+        # 영구 미지원 조합: 현황조사서 + item_no=7. 기일은 미래라 기일 방어선에 걸리지 않는다.
+        _seed_queue(conn, [("2026타경1", "7", "status", "pending", 1, "2099-01-01", 0, None)])
+        conn.close()
+        dbmod.DB_PATH = path
+
+        # 전제 확인 — 이 조합이 정말 "버튼 id 없음"인가. 아니면 이 검사는 공허하다.
+        check("전제: 이 조합은 버튼 id가 없다", get_doc_button_id("status", "7"), None)
+
+        def snapshot():
+            c = sqlite3.connect(path)
+            c.row_factory = sqlite3.Row
+            try:
+                q = c.execute("SELECT status, retry_count FROM document_queue").fetchone()
+                ds = c.execute("SELECT status FROM document_status"
+                               " WHERE item_id=1 AND doc_type='STATUS'").fetchone()
+                return q["status"], q["retry_count"], ds["status"]
+            finally:
+                c.close()
+
+        def age_one_day():
+            c = sqlite3.connect(path)
+            c.execute("UPDATE document_queue SET last_attempt_at="
+                      "datetime(last_attempt_at,'-1 day') WHERE last_attempt_at IS NOT NULL")
+            c.commit()
+            c.close()
+
+        attempts = 0
+        seen_ds = set()
+        for _ in range(16):          # 16일치 doc_worker 기동
+            dbmod.reset_stale_queue()
+            while True:
+                item = dbmod.claim_next_queue_item()
+                if not item:
+                    break
+                attempts += 1
+                if get_doc_button_id(item["doc_type"], item["item_no"]):
+                    raise AssertionError("이 행은 미지원이어야 한다")
+                # doc_worker.py의 `if not btn_id:` 분기와 같은 호출
+                dbmod.mark_queue_unsupported(item["id"], item["court_code"], item["case_no"],
+                                             item["item_no"], item["doc_type"])
+            seen_ds.add(snapshot()[2])
+            age_one_day()
+
+        status, retry, ds = snapshot()
+        # ★ 핵심: 16일을 돌려도 시도는 딱 한 번이어야 한다.
+        check("16일 동안 시도는 1회뿐이다(재시도 고리가 끊겼다)", attempts, 1)
+        check("큐는 종결 상태로 남는다", status, "SKIPPED_UNSUPPORTED")
+        check("실패가 아니므로 retry_count를 소모하지 않는다", retry, 0)
+        check("화면 상태는 FAILED로 고정된다", ds, "FAILED")
+        # 상태가 오가지 않는다 — 첫 시도 뒤로 FAILED 하나만 관측돼야 한다.
+        check("화면 상태가 오가지 않는다(관측된 값의 종류)", sorted(seen_ds), ["FAILED"])
+
+        # ★ 위 재현은 doc_worker의 분기를 **흉내낸** 것이다. 실제 호출부가 예전처럼
+        #   mark_queue_failed로 돌아가면 위 검사는 그대로 통과하면서 결함만 되살아난다.
+        #   그래서 호출부 자체를 소스로 고정한다(§14가 doc_worker 호출 형태를 고정한 것과
+        #   같은 방식).
+        src = open(os.path.join(ROOT, "doc_worker.py"), encoding="utf-8-sig").read()
+        branch = src[src.index("if not btn_id:"):]
+        branch = branch[:branch.index("continue")]
+        check_true("doc_worker의 '버튼 id 없음' 분기는 mark_queue_unsupported를 부른다",
+                   "mark_queue_unsupported(" in branch,
+                   "mark_queue_failed로 되돌아가면 매일 되살아나는 무한 재시도가 다시 생긴다: "
+                   + branch.strip())
+        check_true("그 분기는 mark_queue_failed를 부르지 않는다",
+                   "mark_queue_failed(" not in branch, branch.strip())
+    finally:
+        dbmod.DB_PATH = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 18. 종결 함수 넷 중 **셋만** 화면 상태를 쓴다 ― 그 비대칭을 고정한다 (2026-08-14 신설)
+#
+#     mark_queue_done            -> document_status = READY
+#     mark_queue_failed          -> document_status = FAILED    (최종 실패)
+#     mark_queue_unsupported     -> document_status = FAILED    (Sprint 101)
+#     mark_queue_skipped_expired -> **쓰지 않는다**             <- 다르다
+#
+# 이 비대칭은 **누락이 아니라 보류**다. Sprint 73이 검토하고 그대로 두기로 했다 ―
+# `document_status` enum에 "대상 아님"이 없어 FAILED로 쓰면 실패가 아닌 것을 실패로
+# 표기하게 되고, 새 상태를 만드는 것은 상태머신·화면 문구 결정이라 제품 판단이다.
+# 근거와 "함께 고쳐야 할 지점" 목록은 `test_document_status_sync.py` §6이 들고 있고,
+# 그 검사가 현재 동작(COLLECTING 유지)을 고정한다.
+#
+# 여기서 고정하는 것은 **다른 것**이다: 나머지 셋이 계속 화면 상태를 쓴다는 것.
+# 셋 중 하나가 조용히 빠지면 "수집중"에 영원히 머무는 문서가 새로 생기는데,
+# §6은 `skipped_expired` 하나만 보므로 그 손실을 알려 주지 않는다.
+#
+# ★ 왜 §9로는 부족한가 — §9는 큐의 status/retry_count/last_attempt_at만 본다.
+#   **화면 상태를 한 번도 보지 않는다.** 계약의 절반만 보는 검사라
+#   나머지 절반이 비어도 초록불이다.
+# ---------------------------------------------------------------------------
+def test_queue_terminal_functions_screen_status_contract():
+    print("\n--- 18. 종결 함수의 화면 상태 계약 ---")
+    import inspect
+    import storage.database as dbmod
+
+    # 화면 상태를 함께 쓰는 셋 — 하나라도 빠지면 '끝나지 않는 수집중'이 새로 생긴다.
+    for name in ("mark_queue_done", "mark_queue_failed", "mark_queue_unsupported"):
+        src = inspect.getsource(getattr(dbmod, name))
+        check_true("%s 는 document_status를 함께 갱신한다" % name,
+                   "_set_document_status" in src or "document_status" in src,
+                   "큐만 닫고 화면을 두면 '수집중'이 영원히 남는다")
+
+    # 그리고 넷째는 **일부러** 쓰지 않는다. 누가 이것을 배선하면 여기와
+    # `test_document_status_sync.py` §6이 함께 실패해 제품 판단이 필요함을 알린다.
+    src = inspect.getsource(dbmod.mark_queue_skipped_expired)
+    check_true("mark_queue_skipped_expired 는 화면 상태를 쓰지 않는다(제품 판단 대기)",
+               "_set_document_status" not in src,
+               "배선하려면 '대상 아님' 상태 정의가 먼저다 ― "
+               "test_document_status_sync.py §6의 근거를 보라")
+
+    # 실제 동작으로도 확인한다(소스 검사만 두면 구현이 바뀌어도 통과할 수 있다).
+    d, conn = _db_with_document_status()
+    real = dbmod.DB_PATH
+    path = os.path.join(d, "t.db")
+    try:
+        conn.executescript("""
+            INSERT INTO auction_case VALUES (1,'2020타경9','B000210','서울중앙지방법원');
+            INSERT INTO auction_item VALUES (1,1,'2020타경9','1','서울중앙지방법원');
+            INSERT INTO document_status (item_id,doc_type,status,updated_at)
+                VALUES (1,'SPEC','COLLECTING','2026-08-01T00:00:00');
+        """)
+        _seed_queue(conn, [("2020타경9", "1", "spec", "pending", 1, "2020-01-01", 0, None)])
+        qid = conn.execute("SELECT id FROM document_queue").fetchone()[0]
+        conn.close()
+        dbmod.DB_PATH = path
+
+        dbmod.mark_queue_skipped_expired(qid, "B000210", "2020타경9", "1", "spec", "2020-01-01")
+
+        c = sqlite3.connect(path)
+        c.row_factory = sqlite3.Row
+        try:
+            q = c.execute("SELECT status, retry_count FROM document_queue"
+                          " WHERE id=?", (qid,)).fetchone()
+            ds = c.execute("SELECT status FROM document_status"
+                           " WHERE item_id=1 AND doc_type='SPEC'").fetchone()["status"]
+        finally:
+            c.close()
+        check("큐는 SKIPPED_EXPIRED로 종결된다", q["status"], "SKIPPED_EXPIRED")
+        check("실패가 아니므로 retry_count를 소모하지 않는다", q["retry_count"], 0)
+        check("화면 상태는 그대로 수집중이다(§6이 고정한 현재 동작)", ds, "COLLECTING")
+
+        # 종결된 뒤에는 다시 집히지 않는다 ― 그래서 이 '수집중'은 **끝나지 않는다.**
+        dbmod.reset_stale_queue()
+        check_true("종결 후에는 큐에서 다시 집히지 않는다(그래서 끝나지 않는 수집중이다)",
+                   dbmod.claim_next_queue_item() is None)
+    finally:
+        dbmod.DB_PATH = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_supported_item_still_retries():
+    """미지원 종결이 **정상 실패의 재시도까지** 죽이지 않는가 (반대 방향 회귀).
+
+    위 16번을 만족시키려고 "실패하면 무조건 종결"로 바꾸면 일시적 장애(네트워크/팝업
+    타이밍)로 실패한 문서가 한 번에 영구 포기된다 — 고치려던 것보다 나쁘다.
+    버튼 id가 **있는** 항목은 예전 그대로 3회까지 재시도돼야 한다.
+    """
+    print("\n--- 17. 버튼 id가 있는 항목의 재시도는 그대로다 ---")
+    import storage.database as dbmod
+    from config.settings import get_doc_button_id
+
+    d, conn = _db_with_document_status()
+    real = dbmod.DB_PATH
+    path = os.path.join(d, "t.db")
+    try:
+        _seed_queue(conn, [("2026타경2", "1", "spec", "pending", 1, "2099-01-01", 0, None)])
+        conn.close()
+        dbmod.DB_PATH = path
+        check_true("전제: 이 조합은 버튼 id가 있다", bool(get_doc_button_id("spec", "1")))
+
+        attempts = 0
+        for _ in range(6):
+            item = dbmod.claim_next_queue_item()
+            if not item:
+                break
+            attempts += 1
+            dbmod.mark_queue_failed(item["id"], item["retry_count"])
+            c = sqlite3.connect(path)
+            c.execute("UPDATE document_queue SET last_attempt_at="
+                      "datetime(last_attempt_at,'-1 hour')")
+            c.commit()
+            c.close()
+
+        c = sqlite3.connect(path)
+        c.row_factory = sqlite3.Row
+        row = c.execute("SELECT status, retry_count FROM document_queue").fetchone()
+        c.close()
+        check("MAX_DOC_RETRY만큼 재시도한다", attempts, dbmod.MAX_DOC_RETRY)
+        check("재시도를 소진하면 failed", row["status"], "failed")
+        check("retry_count가 소진된다", row["retry_count"], dbmod.MAX_DOC_RETRY)
+    finally:
+        dbmod.DB_PATH = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def run():
     test_multi_item_case_all_enqueued()
     test_duplicate_still_ignored()
@@ -942,6 +1200,9 @@ def run():
     test_relist_does_not_touch_unrelated_rows()
     test_get_doc_button_id_contract()
     test_upsert_batch_partial_and_total_failure()
+    test_unsupported_item_does_not_retry_forever()
+    test_queue_terminal_functions_screen_status_contract()
+    test_supported_item_still_retries()
 
     print("\n" + "=" * 55)
     if failures:

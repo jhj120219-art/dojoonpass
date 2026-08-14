@@ -210,7 +210,48 @@ def test_requirements_covers_all_imports():
 
     # 반대 방향: 목록에만 있고 아무도 안 쓰는 항목은 "설치했는데 왜 필요한지 모르는" 상태를 만든다.
     used_dists = {DIST_NAME.get(m, m).lower().replace("_", "-") for m in imported}
-    # httpx는 import 스캔에 안 잡힐 수 있다(테스트 도구/전이 의존성) — 예외로 둔다.
+
+    # ── httpx: 예외가 아니라 **강제되는 요구사항**으로 다룬다 (2026-08-14) ──────
+    #
+    # 예전에는 여기서 `- {"httpx"}`로 조용히 빼기만 했다("import 스캔에 안 잡힐 수 있다").
+    # 그러면 검사가 **한 방향만** 본다 — 누가 requirements 에서 httpx 를 지워도
+    # `stale`이 비어 통과한다. 실제로 지우기 쉬운 항목이다: 소스 전체에서
+    # `import httpx`가 **0건**이라 "안 쓰는 의존성"처럼 보인다(2026-08-14 전수 확인).
+    #
+    # 그런데 지우면 TestClient 기반 회귀가 통째로 못 돈다. 실측 근거:
+    #
+    #   from fastapi.testclient import TestClient  -> sys.modules 에 httpx 적재  True
+    #   import api_server (운영 경로)               -> httpx 적재                False
+    #
+    # 즉 **테스트 전용이지만 없어서는 안 되는** 의존성이다. 그래서 빼는 대신
+    # "반드시 있어야 한다"를 직접 단언하고, 그 근거(TestClient 사용 테스트가 실재함)도
+    # 함께 확인한다. 근거가 사라지면(TestClient 를 아무도 안 쓰게 되면) 그때 다시 판단한다.
+    #
+    # ★ starlette 이 `httpx` 대신 `httpx2` 를 권고하는 경고를 낸다(deprecated).
+    #   전환은 starlette 업그레이드와 함께 해야 하므로 지금 버전만 바꾸지 않는다 —
+    #   자세한 근거는 `requirements.txt` 의 httpx 주석 참고.
+    tc_users = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                with open(fp, encoding="utf-8-sig") as fh:
+                    if "TestClient" in fh.read():
+                        tc_users.append(os.path.relpath(fp, root))
+            except OSError:
+                continue
+
+    check_true("httpx 가 requirements 에 있다(TestClient 회귀의 전제)",
+               "httpx" in listed,
+               "소스가 직접 import 하지 않아 '안 쓰는 의존성'처럼 보이지만, 지우면 "
+               "TestClient 기반 테스트가 전부 실행되지 않는다")
+    check_true("httpx 가 필요한 근거가 실재한다(TestClient 사용 파일 존재)",
+               len(tc_users) > 0, tc_users)
+    print("   TestClient 사용 파일 %d개 -> httpx 필수" % len(tc_users))
+
     stale = sorted(listed - used_dists - {"httpx"})
     check("목록에만 있고 소스에서 안 쓰는 항목 없음", stale, [])
 
@@ -678,6 +719,61 @@ def test_code_dependent_unique_constraints():
 #
 # git이 없는 환경(배포된 tarball 등)에서는 조용히 건너뛴다 — 검사 자체가 실패 원인이 되면 안 된다.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 한글이 든 .ps1 은 **반드시** UTF-8 BOM 으로 저장돼야 한다 (2026-08-14 신설)
+#
+# 아래 §8은 "HEAD와 같은가"를 본다. 이건 다른 종류의 규칙이다 ― **절대 요건**이고,
+# 신규 파일에도 적용되며(§8은 HEAD가 없는 새 파일을 건너뛴다), `.ps1` 은 §8의 대상 확장자도
+# 아니다.
+#
+# 왜 절대 요건인가 ― Windows PowerShell 5.1(이 PC의 기본 `powershell.exe`)은 BOM이 없는
+# `.ps1` 을 **시스템 ANSI 코드페이지(cp949)** 로 읽는다. UTF-8로 저장된 한글은 깨지고,
+# 깨진 바이트가 따옴표·괄호를 삼켜 **파싱 자체가 실패한다.**
+#
+# 2026-08-14에 실제로 겪었다. `register_scheduler_tasks.ps1` 을 BOM 없이 저장했더니:
+#
+#     Unexpected token '?섏쭛' in expression or statement.
+#     The string is missing the terminator: ".
+#     Missing closing '}' in statement block or type definition.
+#
+# 스크립트가 한 줄도 실행되지 않았다. BOM 3바이트를 붙이자 그대로 정상 동작했다.
+#
+# 이 트랩이 특히 나쁜 이유: 편집기에서는 멀쩡해 보이고, 파일을 "고친" 사람은
+# BOM을 떨어뜨렸다는 사실을 모른다(실제로 이 세션에서 `favorites.py` 의 BOM을
+# 같은 방식으로 떨어뜨린 적이 있다 ― §8이 그때 잡았다).
+# ---------------------------------------------------------------------------
+def test_powershell_scripts_have_bom():
+    print("\n--- 한글이 든 .ps1 의 UTF-8 BOM ---")
+    import codecs
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    BOM = codecs.BOM_UTF8
+
+    scripts = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in ("node_modules", ".git", "__pycache__", ".next", ".claude")]
+        scripts += [os.path.join(dirpath, f) for f in filenames if f.endswith(".ps1")]
+
+    missing, checked = [], 0
+    for path in sorted(scripts):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        try:
+            data.decode("ascii")
+            continue          # 순수 ASCII 는 코드페이지와 무관하다 ― 요건 아님
+        except UnicodeDecodeError:
+            pass
+        checked += 1
+        if not data.startswith(BOM):
+            missing.append(os.path.relpath(path, root).replace("\\", "/"))
+
+    print("    .ps1 %d개 중 비ASCII 포함 %d개" % (len(scripts), checked))
+    check("BOM 없는 비ASCII .ps1", missing, [])
+    if missing:
+        print("      PowerShell 5.1 이 cp949 로 읽어 파싱이 깨진다 ― BOM 3바이트를 붙일 것")
+
+
 def test_source_bom_matches_head():
     print("\n--- 8. 소스 BOM 상태가 HEAD와 동일한가 (Sprint 78) ---")
     import codecs
@@ -984,6 +1080,139 @@ def test_init_db_failure_is_loud():
     check("운영 DB 경로가 복원됐다", dbmod.DB_PATH, saved_path)
 
 
+# ---------------------------------------------------------------------------
+# 목록 조회 GET 은 "HTTP 200 = 성공"이어야 한다 (2026-08-14 신설)
+#
+# 이 API 에는 실패 응답이 **두 형태**로 있고, 그것 자체는 의도된 상태다(§5 참고).
+#
+#     error_response(code,msg)  -> HTTP 200 + {success:false, error:"CODE", ...}
+#     raise HTTPException(...)  -> HTTP 4xx  + {"detail": "..."}
+#
+# 문제는 프런트가 목록을 받는 방식이다. 아래 네 화면은 전부 이렇게 쓴다.
+#
+#     const result = await fetchAuthedJSON<T[]>(path, token)
+#     setItems(result.data ?? [])          // <- success 를 보지 않는다
+#
+# 지금은 **안전하다**. 네 엔드포인트 모두 `error_response` 를 한 번도 쓰지 않아
+# HTTP 200 이면 반드시 성공이기 때문이다(2026-08-14 전수 확인). 즉 `success` 확인이
+# 생략된 것이 아니라 **생략해도 되는 상태**다.
+#
+# 그런데 그 전제는 깨지기 쉽다. 누가 이 GET 중 하나에 `error_response(...)` 를 하나만
+# 추가하면 — 예컨대 "구독이 필요합니다" — 프런트는 그 응답을 **빈 목록**으로 그린다.
+# 사용자는 오류 대신 "관심물건이 없습니다"를 본다. 실패가 정상 화면으로 둔갑한다.
+#
+# 그래서 전제를 검사로 고정한다. 이 GET 들에 `error_response` 를 넣으려면 프런트의
+# 호출부도 함께 고쳐야 하고, 이 검사가 그 사실을 먼저 알려 준다.
+# ---------------------------------------------------------------------------
+# (파일, GET 경로) — 프런트가 success 를 보지 않고 data 만 쓰는 목록 엔드포인트
+DATA_ONLY_LIST_GETS = [
+    ("favorites.py", "/favorites"),
+    ("recent_items.py", "/recent-items"),
+    ("search_presets.py", "/search-presets"),
+    ("registry.py", "/registry-requests"),
+]
+
+
+def test_list_gets_never_return_success_false():
+    print("\n--- 12. 목록 GET 은 HTTP 200 = 성공이어야 한다 ---")
+    import re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    offenders, checked = [], 0
+    for fname, route in DATA_ONLY_LIST_GETS:
+        path = os.path.join(root, "api", "v1", fname)
+        if not os.path.exists(path):
+            check_true("%s 가 존재한다" % fname, False, path)
+            continue
+        src = open(path, encoding="utf-8-sig").read()
+        # 해당 라우트의 GET 핸들러 본문만 잘라 본다(다음 @router 데코레이터까지).
+        m = re.search(r'@router\.get\(\s*["\']%s["\']' % re.escape(route), src)
+        check_true("%s 의 GET %s 핸들러를 찾았다" % (fname, route), m is not None, route)
+        if not m:
+            continue
+        start = m.end()
+        nxt = src.find("@router.", start)
+        body = src[start:nxt if nxt > 0 else len(src)]
+        code = "\n".join(l.split("#")[0] for l in body.splitlines())
+        checked += 1
+        if "error_response(" in code:
+            offenders.append("%s %s" % (fname, route))
+
+    check_true("검사 대상 GET 을 실제로 찾았다", checked == len(DATA_ONLY_LIST_GETS), checked)
+    check("목록 GET 이 success=false 를 돌려주지 않는다", offenders, [])
+    if offenders:
+        print("      프런트(favorites/recent/search-presets/mypage)는 `result.data ?? []` 만"
+              " 쓰므로, 이 응답은 화면에서 **빈 목록**이 된다.")
+
+
+# ---------------------------------------------------------------------------
+# 뜻이 비슷한 컬럼 중 **잘못된 쪽**을 고르지 않는가 (2026-08-14 신설)
+#
+# `registry_credits` / `registry_credit_logs` 에는 이름이 비슷한 컬럼이 **둘** 있다.
+#
+#     reason_type   GRANT / DEDUCT / RESET / USAGE / EVENT / REFUND / OTHER   <- enum
+#     reason        "등기부 신청 (item_id=123)"                                <- 자유 텍스트
+#
+# 이런 자리는 **반드시 한 번은 잘못 고른다.** 실제로 2026-08-14에 새 검사를 쓰면서
+# `WHERE reason = 'REFUND'` 라고 썼다. 자유 텍스트에 그 값이 들어갈 일이 없으니
+# **보상이 실제로 있어도 영원히 0으로 세는** 검사가 될 뻔했다(사본 검증에서 잡았다).
+#
+# 조용히 틀리는 종류라 더 나쁘다 — 예외도 안 나고 결과가 0이라 "문제 없음"처럼 보인다.
+#
+# 운영 코드는 지금 전부 `reason_type` 을 쓴다(전수 확인). 그 상태를 고정한다.
+# 같은 이유로 `status` 에 검증 결과(PASS/FAIL)를 비교하는 것도 막는다 —
+# `auction_item` 에는 `status`("유찰 2회")와 `validation_status`("PASS"/"FAIL")가 함께 있다.
+# ---------------------------------------------------------------------------
+CREDIT_REASON_ENUM = ("GRANT", "DEDUCT", "RESET", "USAGE", "EVENT", "REFUND", "OTHER")
+
+
+def test_no_confusable_column_misuse():
+    print("\n--- 13. 뜻이 비슷한 컬럼을 잘못 고르지 않는가 ---")
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    p = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                       capture_output=True, text=True)
+    files = [f for f in p.stdout.split() if f]
+    check_true("검사할 파일을 찾았다", len(files) > 10, len(files))
+
+    # ★ 범위를 정확히 좁힌다. 처음에는 `status = "PASS"` 를 전부 잡았는데,
+    #   테스트들이 **출력 라벨용 지역 변수**로 그 이름을 쓴다
+    #   (`status = "PASS" if ok else "FAIL"` — DB 컬럼과 무관하다).
+    #   그런 오탐을 남기면 검사가 곧 무시당한다. 그래서 두 형태만 본다:
+    #     (a) SQL 문자열 안의 컬럼 비교  ... WHERE status='PASS'
+    #     (b) 행에서 꺼낸 값의 비교      row["status"] == "PASS" / .status == "PASS"
+    enum_alt = "|".join(CREDIT_REASON_ENUM)
+    SQL_HINT = re.compile(r"\b(SELECT|WHERE|UPDATE|DELETE|AND|OR)\b", re.I)
+
+    sql_reason = re.compile(r"(?<![\w_])reason\s*(?:=|==|!=)\s*['\"](?:%s)['\"]" % enum_alt)
+    row_reason = re.compile(
+        r"""(?:\[\s*['"]reason['"]\s*\]|\.reason)\s*(?:==|!=)\s*['"](?:%s)['"]""" % enum_alt)
+    sql_status = re.compile(r"(?<![\w_])status\s*(?:=|==|!=)\s*['\"](?:PASS|FAIL)['\"]")
+    row_status = re.compile(
+        r"""(?:\[\s*['"]status['"]\s*\]|\.status)\s*(?:==|!=)\s*['"](?:PASS|FAIL)['"]""")
+
+    hits_reason, hits_status = [], []
+    for rel in files:
+        path = os.path.join(root, rel)
+        try:
+            src = open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        for i, line in enumerate(src.splitlines(), 1):
+            code = line.split("#")[0]
+            in_sql = bool(SQL_HINT.search(code))
+            if row_reason.search(code) or (in_sql and sql_reason.search(code)):
+                hits_reason.append("%s:%d" % (rel, i))
+            if row_status.search(code) or (in_sql and sql_status.search(code)):
+                hits_status.append("%s:%d" % (rel, i))
+
+    check("크레딧 enum 을 자유 텍스트 reason 과 비교하지 않는다", hits_reason, [])
+    check("검증 결과(PASS/FAIL)를 status 와 비교하지 않는다", hits_status, [])
+    print("    %d개 파일에서 reason/reason_type · status/validation_status 사용을 대조" % len(files))
+
+
 LEGACY_DOC_FLAGS = ("has_spec_pdf", "has_status_doc", "has_appraisal_pdf")
 
 
@@ -1037,6 +1266,235 @@ def test_api_never_reads_legacy_doc_flags():
         db_src = fh.read()
     for flag in LEGACY_DOC_FLAGS:
         check_true("%s는 수집 경로에 아직 존재한다" % flag, flag in db_src)
+
+
+# ---------------------------------------------------------------------------
+# SQL 텍스트에 새 보간이 생기면 알린다 (2026-08-14 신설)
+#
+# 이 API 는 WHERE 절을 **문자열로 조립한다.**
+#
+#     conditions.append("sigungu LIKE ?")      # 조각은 전부 상수 + ? 바인딩
+#     where = " AND ".join(conditions)
+#     conn.execute(f"SELECT * FROM auction_item WHERE {where}", params)
+#
+# 2026-08-14 실측 결과 **지금은 인젝션이 없다.** 정적/동적 양쪽으로 확인했다.
+#
+#   - 정적: SQL 텍스트를 만드는 보간 지점 22곳을 AST 로 전수. 요청으로 도달 가능한 7곳
+#           (search 3 / admin 2 / audit 2)의 조각이 전부 **상수**이거나 상수의 반복이다.
+#           유일한 f-string 조각 `f"({or_clause})"` 도 `["property_type LIKE ?"] * len(...)`
+#           이라 **길이만** 가변이다. 값은 전부 `?` 로 바인딩된다.
+#   - 동적: `' OR '1'='1` / `'; DROP TABLE auction_item; --` / UNION 등 6개 페이로드를
+#           sido·sigungu·dong·case_no·court_name·status·address_detail·property_type 에
+#           넣어 실제 요청. 전부 리터럴로 취급됐고(결과 0건), 테이블 26개와 1,876행이
+#           그대로였다. 정렬 파라미터는 화이트리스트 밖이면 **HTTP 400**이다.
+#
+# 그러니 이 검사는 "안전함을 증명"하지 않는다 — 그건 위 실측이 이미 했다.
+# 이 검사가 하는 일은 하나다: **SQL 텍스트에 새로운 보간이 들어오면 실패한다.**
+#
+# 지켜야 할 것이 그 지점이기 때문이다. 지금 구조에서 인젝션이 생기는 유일한 방법은
+# 누가 조각 하나를 상수가 아니게 쓰는 것이다.
+#
+#     conditions.append(f"sido = '{sido}'")    # <- 이 한 줄이면 뚫린다
+#
+# 페이로드 검사는 **내가 생각해 낸 공격만** 잡지만, 이 검사는 위 한 줄을 잡는다.
+# 새 보간이 정당하면 아래 목록에 추가하면 된다 — 그때 사람이 한 번 보게 하는 것이 목적이다.
+# ---------------------------------------------------------------------------
+# (파일, 보간되는 표현식) — SQL **텍스트**에 들어가는 것만. `f"%{x}%"` 같은
+# 바인딩 **값**은 애초에 대상이 아니다(리터럴 부분에 SQL 키워드가 없다).
+ALLOWED_SQL_TEXT_INTERPOLATIONS = {
+    ("api/v1/search.py", "where"),          # " AND ".join(상수 조각들)
+    ("api/v1/search.py", "order_clause"),   # SORT_COLUMNS 화이트리스트 + ASC/DESC
+    ("api/v1/search.py", "placeholders"),   # "?,?,?" (id 개수)
+    ("api/v1/admin.py", "where"),           # " AND ".join(상수 조각들)
+    # 부트스트랩 스크립트의 결과 출력. 테이블명을 `sqlite_master` 가 돌려준 그대로 쓴다 —
+    # DB 자신이 만든 이름이고 요청으로 도달하는 경로가 아니다.
+    ("storage/migrate_v4_1.py", "t[0]"),
+    # 백필 스크립트(CLI). `table` 은 호출부에서 `"auction"` / `"auction_item"` 리터럴로만
+    # 넘어온다(2026-08-14 확인). 요청으로 도달하는 경로가 아니다.
+    ("backfill_dong_normalize.py", "table"),
+    ("backfill_dong_fix_mismatch.py", "table"),
+}
+# ★ 문자열 `+` 연결도 SQL 텍스트를 만든다 (2026-08-14 추가).
+#
+#   처음 이 검사를 만들 때 f-string 과 %-포맷만 봤다. **세 번째 형태를 통째로 놓쳤다** —
+#   `storage/database.py:get_auctions()` 와 `api/v1/admin.py` 의 목록 3개가 그 형태다.
+#
+#       "SELECT * FROM payments WHERE " + where + " ORDER BY ..."
+#       "SELECT * FROM auction " + where + " ORDER BY auction_date DESC LIMIT ?"
+#       "UPDATE auction SET " + col + "=1 WHERE ..."
+#
+#   즉 인벤토리가 22곳이라고 적어 뒀는데 실제로는 그보다 많았다. 다시 세어 전부 확인했다:
+#   조각은 여전히 전부 상수이고 값은 `?` 로 바인딩되며, `col` 은 3개 리터럴 dict 조회
+#   (모르는 키는 `KeyError` 로 막힌다)라 **인젝션은 없다**. 빠졌던 것은 검사 범위다.
+ALLOWED_SQL_CONCAT_OPERANDS = {
+    ("api/v1/admin.py", "where"),                    # " AND ".join(상수 조각들)
+    ("api/v1/admin.py", "base"),                     # 상수 SELECT 문
+    ("storage/database.py", "where"),                # " AND ".join(상수 조각들)
+    ("storage/database.py", "' AND '.join(conditions)"),
+    ("storage/database.py", "col"),                  # 3개 리터럴 dict 조회 (KeyError 로 fail-closed)
+    ("storage/database.py", "_NOW_LOCAL"),           # 모듈 상수 "datetime('now','localtime')"
+    ("storage/database.py", "str(RETRY_INTERVAL_MINUTES)"),   # 모듈 상수 int
+    # `filter/` 는 어디에도 배선되지 않은 죽은 코드지만(docs/CLAUDE.md), 조각은 상수다.
+    ("filter/filter_engine.py", "where"),
+    ("filter/filter_engine.py", "' AND '.join(conditions)"),
+    # SQL 이 아니다 — 진단 출력 문자열이 "[select ..." 라 키워드 매칭에 걸린다.
+    ("verify_courts.py", "sel_id"),
+    ("verify_courts.py", "sel_name"),
+    ("verify_courts.py", "str(s_idx)"),
+}
+# %-포맷으로 만드는 SQL 은 좌변 템플릿 자체를 고정한다(우변은 상수 조각/`?` 반복뿐).
+ALLOWED_SQL_PERCENT_TEMPLATES = {
+    ("api/v1/audit.py", "SELECT COUNT(*) FROM audit_logs WHERE %s"),
+    ("api/v1/audit.py",
+     "SELECT * FROM audit_logs WHERE %s ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"),
+    ("api/v1/payments.py", "UPDATE payment_logs SET payment_id=? WHERE id IN (%s)"),
+    ("storage/database.py", "PRAGMA foreign_keys = %s"),
+    # 아래는 전부 CLI 운영 스크립트다(요청으로 도달하지 않는다). 2026-08-14 확인:
+    #   `%s` 자리에 들어가는 것은 호출부의 테이블 리터럴이거나 `?` 반복뿐이고,
+    #   값은 예외 없이 바인딩된다. `TARGET_COLUMNS` 도 모듈 상수 튜플이다.
+    ("backfill_region_normalize.py", "SELECT id, full_address, sido, sigungu FROM %s"),
+    ("backfill_region_normalize.py", "UPDATE %s SET %s = ? WHERE id = ?"),
+    ("load_rights_data.py", "DELETE FROM rights_summary WHERE item_id IN (%s)"),
+    ("load_rights_data.py",
+     "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
+    ("load_spec_data.py",
+     "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"),
+    ("reset_failures.py",
+     "SELECT COUNT(*) FROM document_status WHERE status='FAILED' AND id IN (%s)"),
+    ("reset_failures.py",
+     "UPDATE document_status SET status='COLLECTING', updated_at=? "
+     "WHERE status='FAILED' AND id NOT IN (%s)"),
+}
+_SQL_KEYWORDS = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "WHERE ", "ORDER BY",
+                 " FROM ", "VALUES", "SET ", "JOIN ", "GROUP BY", "PRAGMA ", "CREATE ")
+
+
+def _sql_text_interpolations(root):
+    """(경로, f-string 보간식) / (경로, %-템플릿) / (경로, + 연결 피연산자) 세 집합."""
+    import ast
+
+    fstr, pct, cat = set(), set(), set()
+    targets = []
+    # `filter/` 와 루트 스크립트도 본다 — `api`/`storage` 만 보면 SQL 을 만드는 곳을 놓친다
+    # (2026-08-14: 실제로 `filter/filter_engine.py` 와 루트 스크립트가 빠져 있었다).
+    for base in ("api", "storage", "crawler", "validator", "normalizer", "filter"):
+        d = os.path.join(root, base)
+        if not os.path.isdir(d):
+            continue
+        for dp, dn, fn in os.walk(d):
+            dn[:] = [x for x in dn if x != "__pycache__"]
+            targets += [os.path.join(dp, f) for f in fn if f.endswith(".py")]
+    targets += [os.path.join(root, f) for f in os.listdir(root)
+                if f.endswith(".py")
+                and not f.startswith(("test_", "step", "check_", "patch_"))]
+
+    def _flatten_add(node, out):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            _flatten_add(node.left, out)
+            _flatten_add(node.right, out)
+        else:
+            out.append(node)
+
+    for path in sorted(set(targets)):
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        with open(path, "rb") as f:
+            tree = ast.parse(f.read().decode("utf-8-sig"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                lit = "".join(v.value for v in node.values
+                              if isinstance(v, ast.Constant) and isinstance(v.value, str))
+                if any(k in lit.upper() for k in _SQL_KEYWORDS):
+                    for v in node.values:
+                        if isinstance(v, ast.FormattedValue):
+                            fstr.add((rel, ast.unparse(v.value)))
+            elif (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+                  and isinstance(node.left, ast.Constant)
+                  and isinstance(node.left.value, str)
+                  and any(k in node.left.value.upper() for k in _SQL_KEYWORDS)):
+                pct.add((rel, " ".join(node.left.value.split())))
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                parts = []
+                _flatten_add(node, parts)
+                consts = [p for p in parts
+                          if isinstance(p, ast.Constant) and isinstance(p.value, str)]
+                if any(any(k in p.value.upper() for k in _SQL_KEYWORDS) for p in consts):
+                    for p in parts:
+                        if not (isinstance(p, ast.Constant) and isinstance(p.value, str)):
+                            cat.add((rel, ast.unparse(p)[:52]))
+    return fstr, pct, cat
+
+
+def test_no_new_sql_text_interpolation():
+    print("\n--- SQL 텍스트 보간 지점 고정 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    fstr, pct, cat = _sql_text_interpolations(root)
+
+    new_c = sorted(cat - ALLOWED_SQL_CONCAT_OPERANDS)
+    check_true("+ 연결 SQL 에 새 피연산자 없음", not new_c,
+               "허용 목록에 없다(정당하면 ALLOWED_SQL_CONCAT_OPERANDS 에 추가): %s" % new_c)
+
+    new_f = sorted(fstr - ALLOWED_SQL_TEXT_INTERPOLATIONS)
+    check_true("f-string SQL 에 새 보간 없음", not new_f,
+               "허용 목록에 없다(정당하면 ALLOWED_SQL_TEXT_INTERPOLATIONS 에 추가): %s" % new_f)
+    new_p = sorted(pct - ALLOWED_SQL_PERCENT_TEMPLATES)
+    check_true("%-포맷 SQL 에 새 템플릿 없음", not new_p,
+               "허용 목록에 없다: %s" % new_p)
+
+    # 목록이 실제 코드보다 앞서 나가지 않게 한다 — 지워진 지점이 남아 있으면 검사가 헐거워진다.
+    gone = sorted((ALLOWED_SQL_TEXT_INTERPOLATIONS | ALLOWED_SQL_PERCENT_TEMPLATES
+                   | ALLOWED_SQL_CONCAT_OPERANDS) - (fstr | pct | cat))
+    check_true("허용 목록에 죽은 항목 없음", not gone, "코드에서 사라진 항목: %s" % gone)
+
+    # 조각이 상수인지 — WHERE 조각을 모으는 리스트에 상수 아닌 것이 들어가면 알린다.
+    # (`f"({or_clause})"` 는 상수의 반복이라 예외로 둔다. 위 주석의 실측 근거 참고.)
+    import ast
+    # ★ 대상 파일을 손으로 적지 않는다 (2026-08-14 정정).
+    #   처음에는 3개를 박아 뒀는데 `conditions.append` 를 쓰는 파일은 **5개**였다
+    #   (`storage/database.py` / `filter/filter_engine.py` 가 빠져 있었다).
+    #   Sprint 109·116·118 에서 반복해 고친 것과 같은 모양이라 여기서도 코드에서 유도한다.
+    cond_files = []
+    for base in ("api", "storage", "filter"):
+        d = os.path.join(root, base)
+        for dp, dn, fn in os.walk(d):
+            dn[:] = [x for x in dn if x != "__pycache__"]
+            for f_ in fn:
+                if not f_.endswith(".py"):
+                    continue
+                p = os.path.join(dp, f_)
+                with open(p, "rb") as fh:
+                    if b"conditions.append" in fh.read():
+                        cond_files.append(os.path.relpath(p, root).replace("\\", "/"))
+    cond_files = sorted(set(cond_files))
+    print("    conditions.append 사용 파일 %d개: %s" % (len(cond_files), ", ".join(cond_files)))
+    check_true("WHERE 조각을 모으는 파일을 실제로 찾았다", len(cond_files) >= 4, cond_files)
+
+    bad = []
+    for rel in cond_files:
+        with open(os.path.join(root, rel), "rb") as f:
+            tree = ast.parse(f.read().decode("utf-8-sig"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "append"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "conditions"):
+                continue
+            arg = node.args[0] if node.args else None
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                continue
+            if isinstance(arg, ast.Name) and arg.id in ("addr_sql",):
+                continue          # _address_condition() 이 돌려주는 상수 조각
+            # `f"({or_clause})"` 만 예외. 따옴표 종류에 흔들리지 않게 **구조로** 본다.
+            # (`or_clause` 는 `["property_type LIKE ?"] * len(...)` ― 길이만 가변이다.)
+            if isinstance(arg, ast.JoinedStr):
+                names = [ast.unparse(v.value) for v in arg.values
+                         if isinstance(v, ast.FormattedValue)]
+                lits = "".join(v.value for v in arg.values
+                               if isinstance(v, ast.Constant) and isinstance(v.value, str))
+                if names == ["or_clause"] and lits == "()":
+                    continue
+            bad.append("%s:%d %s" % (rel, node.lineno, ast.unparse(arg) if arg else "?"))
+    check_true("WHERE 조각이 전부 상수", not bad,
+               "상수가 아닌 조각은 값이 SQL 텍스트가 된다: %s" % bad)
 
 
 # ---------------------------------------------------------------------------
@@ -1169,10 +1627,14 @@ def run():
     test_no_new_tracked_but_ignored_files()
     test_migration_runner_skip_and_failure()
     test_code_dependent_unique_constraints()
+    test_powershell_scripts_have_bom()
     test_source_bom_matches_head()
     test_court_list_integrity()
     test_init_db_upgrades_old_schema()
     test_api_never_reads_legacy_doc_flags()
+    test_list_gets_never_return_success_false()
+    test_no_confusable_column_misuse()
+    test_no_new_sql_text_interpolation()
     test_init_db_failure_is_loud()
 
     print("\n" + "=" * 55)

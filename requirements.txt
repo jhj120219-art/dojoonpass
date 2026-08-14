@@ -66,4 +66,17 @@ pdfplumber==0.11.10
 # 회귀 스위트는 표준 라이브러리(urllib/sqlite3)만 쓴다 — 추가 의존성 없음.
 # test_docs.py / test_docs2.py / test_db.py는 selenium을 직접 import하므로
 # 위 크롤러 그룹이 설치돼야 실행된다.
+#
+# httpx: **어떤 소스도 직접 import 하지 않는다.** 그래서 "안 쓰는 의존성"으로 보이고
+# 실제로 2026-08-14 의존성 감사에서 그렇게 잡혔다. 지우면 안 된다 —
+# `fastapi.testclient.TestClient`가 감싸는 `starlette.testclient`가 내부에서 쓴다
+# (`inspect.getsource(starlette.testclient)`에 `import httpx` 확인). 이게 없으면
+# test_api_regression / test_auth_jwt / test_beta_journey 등 TestClient 기반
+# 회귀가 통째로 실행되지 않는다.
+#
+# ★ 주의(2026-08-14 실측): 현재 starlette이 이런 경고를 낸다 —
+#     StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is
+#     deprecated; install `httpx2` instead.
+#   지금은 버전을 고정해 두어 동작에 문제가 없다. starlette을 올릴 때
+#   httpx -> httpx2 전환이 함께 필요하다(그때까지 이 핀을 풀지 말 것).
 httpx==0.28.1

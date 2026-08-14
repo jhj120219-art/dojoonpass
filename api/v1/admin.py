@@ -159,11 +159,24 @@ def _require_existing_registry_document(doc_url: str) -> None:
             status_code=400,
             detail=f"doc_url이 등기부 문서 디렉터리 밖을 가리킵니다: {doc_url}",
         )
-    if not os.path.isfile(real_path):
+    # 크기까지 본다 — **다운로드 경로와 같은 정의**여야 한다 (2026-08-14).
+    #
+    # 위 docstring이 약속한 "다운로드 경로와 똑같이 맞춘다"가 한동안 지켜지지 않았다.
+    # 이쪽은 `isfile()`만 봤고 다운로드 쪽은 `exists()`만 봐서, 둘 다 **0바이트 파일을
+    # 통과**시켰다. 그 결과 사용자는 등기부 값을 내고 **빈 파일**을 받았다(실측 재현).
+    #
+    # 다운로드 쪽을 `isfile() and getsize() > 0`으로 고치면서, 여기만 그대로 두면
+    # 이번엔 반대 방향으로 어긋난다 — **admin은 COMPLETED를 허용하는데 사용자는 404**.
+    # 그것이 정확히 Sprint 95가 없앤 "등록은 됐는데 못 받는" 상태다.
+    #
+    # 정의는 `crawler/doc_paths.py:doc_exists()`(= `exists() and getsize() > 0`)를 따른다.
+    # 0바이트를 여기서 막으면 운영자가 **연결하는 순간** 알게 된다 — 사용자가 404를
+    # 만나고 나서가 아니라.
+    if not os.path.isfile(real_path) or os.path.getsize(real_path) == 0:
         raise HTTPException(
             status_code=400,
-            detail=f"해당 문서 파일이 없습니다: {doc_url} "
-                   f"(registry_documents/ 아래에 먼저 파일을 두고 연결하세요)",
+            detail=f"해당 문서 파일이 없거나 비어 있습니다: {doc_url} "
+                   f"(registry_documents/ 아래에 내용이 있는 파일을 두고 연결하세요)",
         )
 
 
@@ -336,7 +349,15 @@ def update_registry_request_status(
                     status_code=409,
                     detail=f"다른 요청이 먼저 상태를 바꿨습니다 (기대한 현재 상태: {current['status']})",
                 )
-            conn.commit()
+            # ★ 여기서 commit 하지 않는다 (2026-08-14).
+            #
+            #   예전에는 이 자리에서 커밋했다. 그러면 **상태 전이가 먼저 확정되고**
+            #   아래 `record_audit()` 는 별도 트랜잭션이 된다. 그 사이에 감사 기록이
+            #   실패하거나 프로세스가 죽으면 **기록 없는 특권 조작**이 영구히 남는다.
+            #
+            #   같은 파일의 다른 세 곳(webhook 재처리 / 환불 / 구독 상태 변경)은 이미
+            #   본 작업과 감사를 **한 커밋**으로 묶고 있다. 여기만 규칙이 달랐다.
+            #   커밋을 아래 record_audit() 뒤로 옮겨 셋과 같은 모양으로 맞춘다.
         except HTTPException:
             raise
         except Exception:
@@ -460,7 +481,16 @@ def adjust_registry_credit(
                 conn, req.user_id.strip(), req.reason_type, req.amount,
                 req.reason, created_by=admin_role,
             )
-            conn.commit()
+            # ★ 여기서 commit 하지 않는다 (2026-08-14) — 아래 record_audit() 와 한 트랜잭션.
+            #
+            #   이 엔드포인트는 **과금에 직접 영향을 주는 조작**이라 바로 아래 주석이
+            #   "반드시 감사 로그를 남긴다"고 적고 있다. 그런데 여기서 커밋해 버리면
+            #   크레딧 조정만 확정되고 감사 기록은 별도 트랜잭션이 된다 — 그 사이에
+            #   실패하면 **누가 왜 무료 횟수를 바꿨는지 알 수 없는 조정**이 영구히 남는다.
+            #
+            #   아래 `record_audit()` 의 after 가 `get_credit_adjustment(conn, ...)` 로
+            #   조정 결과를 다시 읽는데, 같은 커넥션이라 **커밋 전에도 자기 쓰기를 본다.**
+            #   따라서 커밋을 뒤로 미뤄도 감사 내용은 그대로다.
         except ValueError as e:
             conn.rollback()
             raise HTTPException(status_code=400, detail=str(e))

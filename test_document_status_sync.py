@@ -376,12 +376,14 @@ def test_live_expired_collecting_is_measurable():
         expired_collecting = c.execute("""
             SELECT COUNT(*) FROM document_status ds
             JOIN auction_item ai ON ai.id = ds.item_id
-            WHERE ds.status = 'COLLECTING' AND ai.auction_date < date('now')
+            WHERE ds.status = 'COLLECTING'
+              AND ai.auction_date < date('now','localtime')
         """).fetchone()[0]
         live_collecting = c.execute("""
             SELECT COUNT(*) FROM document_status ds
             JOIN auction_item ai ON ai.id = ds.item_id
-            WHERE ds.status = 'COLLECTING' AND ai.auction_date >= date('now')
+            WHERE ds.status = 'COLLECTING'
+              AND ai.auction_date >= date('now','localtime')
         """).fetchone()[0]
         print("    만료 물건의 COLLECTING: %d건 / 진행중 물건의 COLLECTING: %d건"
               % (expired_collecting, live_collecting))
@@ -485,9 +487,13 @@ def _make_stale(db, queue_status, doc_status, ago):
     """큐 900번을 원하는 상태로 만들고 화면 상태도 맞춘 뒤 복구를 실행한다."""
     conn = dbmod.get_connection()
     try:
+        # ★ 'localtime' 필수. 운영 코드는 `last_attempt_at`을 파이썬
+        #   `datetime.now().isoformat()`(로컬)으로 쓰고, `reset_stale_queue()`도 로컬로
+        #   비교한다. 픽스처만 UTC로 넣으면 "-1 hours"라고 적어 둔 행이 한국 기준으로는
+        #   **10시간 전**이 되어, 검사가 의도한 상황을 실제로는 만들지 못한다.
         conn.execute(
             "UPDATE document_queue SET status=?, retry_count=3,"
-            " last_attempt_at=datetime('now', ?) WHERE id=900",
+            " last_attempt_at=datetime('now','localtime', ?) WHERE id=900",
             (queue_status, ago))
         conn.execute(
             "UPDATE document_status SET status=? WHERE item_id=111 AND doc_type='SPEC'",
@@ -543,7 +549,8 @@ def test_retry_recovery_restores_screen_status():
         try:
             conn.execute("DELETE FROM document_status WHERE item_id=111 AND doc_type='SPEC'")
             conn.execute("UPDATE document_queue SET status='failed', retry_count=3,"
-                         " last_attempt_at=datetime('now','-2 days') WHERE id=900")
+                         " last_attempt_at=datetime('now','localtime','-2 days')"
+                         " WHERE id=900")
             conn.commit()
         finally:
             conn.close()
@@ -574,7 +581,8 @@ def test_retry_recovery_restores_screen_status():
         conn = dbmod.get_connection()
         try:
             conn.execute("UPDATE document_queue SET status='failed', retry_count=3,"
-                         " last_attempt_at=datetime('now','-2 days') WHERE id=900")
+                         " last_attempt_at=datetime('now','localtime','-2 days')"
+                         " WHERE id=900")
             conn.commit()
             # 화면 테이블을 없애 동기화가 반드시 실패하게 만든다.
             conn.execute("DROP TABLE document_status")
@@ -654,7 +662,11 @@ def test_orphan_queue_rows_are_measurable():
         wasteful = c.execute(
             "SELECT COUNT(*) " + JOIN +
             " WHERE ai.id IS NULL AND q.status='pending'"
-            "   AND q.auction_date IS NOT NULL AND q.auction_date >= date('now')"
+            # doc_worker가 만료를 판정할 때 쓰는 "오늘"은 로컬 기준
+            # (`datetime.now().strftime("%Y-%m-%d")`)이다. 여기서 UTC로 물으면
+            # 배치가 도는 02:00 KST에 날짜가 하루 어긋나 서로 다른 "오늘"을 보게 된다.
+            "   AND q.auction_date IS NOT NULL"
+            "   AND q.auction_date >= date('now','localtime')"
         ).fetchone()[0]
         print("    그중 기일이 미래인 pending(실제 낭비): %d행" % wasteful)
         check("기일이 미래인 고아 pending은 없다", wasteful, 0)
@@ -786,6 +798,107 @@ def test_ready_means_the_viewer_can_serve_it():
         for line in unservable[:5]:
             print("      " + line)
 
+    # ── 반대 방향도 본다 (2026-08-14 추가) ──────────────────────────────────
+    #
+    # 위 검사는 "READY -> 파일이 있는가" 한 방향이다. 반대쪽도 결함이다 ―
+    # **파일은 있는데 상태가 READY가 아니면**, 실제로 받아 둔 문서를 사용자가 못 본다.
+    # 화면은 "수집중"을 띄우고, 뷰어를 여는 버튼도 나오지 않는다.
+    #
+    # 정상 경로에서는 생길 수 없다. `mark_queue_done()`이 파일 저장과 상태 갱신을
+    # 같은 트랜잭션에서 하기 때문이다. 그래서 이 값이 0이 아니게 되는 경우는
+    # **경로 밖에서 파일이 들어온 것**이다 ― 운영 스크립트, 수동 복사,
+    # `collect_documents.py`(어떤 스케줄러도 실행하지 않는 모듈).
+    # Sprint 111의 빈 캡처와 정확히 같은 부류의 입구다.
+    #
+    # 2026-08-14 실측: 서빙 가능한 파일 **556개** = READY **556행**, 양방향 모두 0건.
+    # 지금 0이므로, 1건이라도 생기는 순간이 곧 회귀다(위와 같은 원칙).
+    c = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True)
+    c.row_factory = sqlite3.Row
+    try:
+        others = c.execute(
+            "SELECT ds.doc_type, ds.status, ai.court_name, ai.case_no, ai.item_no"
+            " FROM document_status ds JOIN auction_item ai ON ds.item_id = ai.id"
+            " WHERE ds.status != 'READY'"
+        ).fetchall()
+    finally:
+        c.close()
+
+    hidden = []
+    for r in others:
+        if r["doc_type"] not in DOC_TYPE_FILES:
+            continue
+        if not r["court_name"] or not r["case_no"]:
+            continue
+        path = os.path.join(viewer_doc_dir(r["court_name"], r["case_no"], r["item_no"]),
+                            DOC_TYPE_FILES[r["doc_type"]][0])
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                hidden.append("%s (status=%s): %s" % (r["doc_type"], r["status"], path))
+        except OSError:
+            continue
+
+    print("    READY 아님 %d행 대조" % len(others))
+    check("파일은 있는데 화면 상태가 READY가 아닌 행", len(hidden), 0)
+    for line in hidden[:5]:
+        print("      " + line)
+
+
+# ---------------------------------------------------------------------------
+# 13. 디스크에 빈 현황조사서 캡처가 남아 있지 않은가 (2026-08-14 신설)
+#
+# `test_doc_storage_atomicity.py` §4가 이미 두 가지를 지킨다 ― 판별 함수
+# (`status_overlay_has_data`)가 빈 골격을 걸러 내는지, 그리고 `collect_status()`가
+# **저장 직전에** 그 관문을 두는지. 둘 다 합성 HTML과 소스 검사다.
+#
+# 빠진 것은 **실제 디스크**다. 2026-08-12에 `status.html` 194건 중 33건이 빈 캡처였고
+# (`crawler/doc_paths.py`의 근거), `repair_empty_status_capture.py`로 정리했다.
+# 2026-08-14 재측정: **총 163건, 빈 캡처 0건.**
+#
+# 0으로 만들어 놓은 것을 0으로 지킨다. 이 파일 §11이 같은 자리에서 이미 세운 원칙이다 ―
+# *"지금 0이므로, 1건이라도 생기는 순간이 곧 회귀다."*
+#
+# 왜 소스 검사만으로는 부족한가 — 관문은 `collect_status()` 하나에만 있다. 다른 경로로
+# 파일이 들어오면(운영 스크립트, 수동 복사, `collect_documents.py`) 관문을 지나지 않는다.
+# 그리고 한 번 저장되면 `doc_exists()`가 완료로 판정해 **영구히 재수집에서 빠진다.**
+#
+# 판정은 **운영 함수에 묻는다.** 기준을 여기 베끼면 두 기준이 갈라져도 통과한다.
+# ---------------------------------------------------------------------------
+def test_no_empty_status_captures_on_disk():
+    print("\n--- 13. 디스크의 빈 현황조사서 캡처 (Sprint 111) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    docroot = os.path.join(root, "documents")
+    if not os.path.isdir(docroot):
+        print("[SKIP] documents/ 없음 (fresh clone)")
+        return
+
+    from crawler.doc_crawler import status_overlay_has_data
+
+    htmls = []
+    for dirpath, dirnames, filenames in os.walk(docroot):
+        htmls += [os.path.join(dirpath, f) for f in filenames if f == "status.html"]
+
+    # 0건이면 "빈 캡처 없음"이 공허하게 참이 된다(§11이 경고한 빈 집합 함정).
+    check_true("검사할 status.html이 존재한다(검사가 공허하지 않다)", len(htmls) > 0, len(htmls))
+
+    empty, unreadable = [], []
+    for path in htmls:
+        try:
+            with open(path, "rb") as f:
+                text = f.read().decode("utf-8", "ignore")
+        except OSError as exc:
+            unreadable.append("%s (%s)" % (os.path.relpath(path, docroot), exc))
+            continue
+        if not status_overlay_has_data(text):
+            empty.append(os.path.relpath(path, docroot))
+
+    print("    status.html %d건" % len(htmls))
+    check("빈 캡처가 디스크에 없다", len(empty), 0)
+    for line in empty[:5]:
+        print("      빈 캡처: " + line)
+    check("읽을 수 없는 status.html이 없다", len(unreadable), 0)
+    for line in unreadable[:3]:
+        print("      " + line)
+
 
 def run():
     test_done_marks_ready()
@@ -802,6 +915,7 @@ def run():
     test_orphan_queue_rows_are_measurable()
     test_current_status_lookup_guards()
     test_ready_means_the_viewer_can_serve_it()
+    test_no_empty_status_captures_on_disk()
 
     print("\n" + "=" * 55)
     if failures:

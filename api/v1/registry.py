@@ -345,7 +345,22 @@ def download_registry(request_id: int, user_id: str = Depends(get_current_user))
         real_file_path = os.path.realpath(file_path)
         if os.path.commonpath([real_root, real_file_path]) != real_root:
             raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
-        if not os.path.exists(real_file_path):
+        # "있다"의 기준을 **저장소의 다른 파일 서빙 경로와 같게** 맞춘다 (2026-08-14).
+        #
+        #   예전에는 `os.path.exists()`만 봤다. 두 가지가 새어 나갔다.
+        #
+        #   1. **0바이트 파일이 200으로 나간다.** 사용자는 등기부 발급에 돈을 내고
+        #      **빈 파일**을 받는다. 오류 안내조차 없다(실측 재현: HTTP 200 / 0 bytes).
+        #      `api/v1/documents.py`(무료 법원문서)는 Sprint 98에 이미 이것을 막았는데,
+        #      **돈이 걸린 이쪽이 더 느슨하게 남아 있었다.**
+        #   2. `exists()`는 **디렉터리에도 True**다. 그 경우 아래 FileResponse가 터져
+        #      404가 아니라 500이 된다.
+        #
+        #   기준은 이 저장소가 이미 합의해 둔 것을 쓴다 —
+        #   `crawler/doc_paths.py:doc_exists()` = `exists() and getsize() > 0`.
+        #   쓰는 쪽(크롤러)과 읽는 쪽(API)이 같은 정의를 쓰지 않으면, 한쪽은 "없음"이라
+        #   재수집 대상으로 보는 파일을 다른 쪽은 "있음"이라고 답하게 된다.
+        if not os.path.isfile(real_file_path) or os.path.getsize(real_file_path) == 0:
             raise HTTPException(status_code=404, detail="문서 파일을 찾을 수 없습니다")
 
         media_type, _ = mimetypes.guess_type(real_file_path)

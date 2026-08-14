@@ -23,6 +23,7 @@ import sys
 import os
 import re
 import io
+import ast
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -139,6 +140,97 @@ def test_entrypoints_propagate_exit_code():
         check_true("%s: 판정 결과를 반환한다(상수 반환 아님)" % name,
                    "exit_code()" in src,
                    "main()이 Outcome의 판정을 쓰지 않고 상수를 돌려줍니다")
+
+
+def _is_main_guard(node) -> bool:
+    """`if __name__ == "__main__":` 인가."""
+    test = node.test
+    return (isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name) and test.left.id == "__name__"
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == "__main__")
+
+
+def test_every_scheduled_script_propagates_failure():
+    """배치가 실행하는 **모든** 스크립트가 실패를 종료 코드로 알리는가 (2026-08-14 신설).
+
+    위 §5는 `mvp_scraper.py` / `doc_worker.py` **두 개를 손으로 적어** 검사한다.
+    그런데 배치가 실행하는 스크립트는 넷이고, 빠져 있던 `migrate_execute.py` 에서
+    실제로 결함이 나왔다 — `[FAIL] document_status 불일치` 를 찍고도 `sys.exit(0)` 이라
+    `run_daily.bat` 이 같은 로그 파일에 `[SUCCESS]` 를 남겼다(2026-08-14 Sprint 115).
+
+    손으로 적은 목록은 파이프라인이 늘면 어긋난다. 그래서 **배치에서 목록을 읽는다** —
+    새 스크립트가 파이프라인에 들어오면 자동으로 검사 대상이 된다.
+
+    허용되는 형태는 둘이다.
+
+        (a) `sys.exit(...)` 로 판정을 종료 코드에 싣는다
+        (b) `main() -> None` 이고 실패는 예외로 나간다
+            -> 파이썬이 스스로 exit 1 한다. `refresh_priority.py` 가 이 형태다.
+
+    (b)를 허용하되 **의도한 것만** 허용한다 — 목록을 고정해 두고, 새 스크립트가
+    말없이 (b)로 들어오면 실패시킨다. 실패를 표현할 방법이 있는데 안 쓰는 것과
+    애초에 없는 것은 다르다.
+    """
+    print("\n--- 5-B. 배치가 실행하는 모든 스크립트의 실패 전달 ---")
+    scripts = set()
+    for name in ("run_daily.bat", "run_doc_worker.bat", "run_priority_refresh.bat"):
+        src = io.open(os.path.join(ROOT, name), encoding="utf-8-sig").read()
+        for ln in src.splitlines():
+            if ln.strip().upper().startswith("REM"):
+                continue
+            m = re.match(r'^\s*"%PY%"\s+(\S+\.py)', ln)
+            if m:
+                scripts.add(m.group(1))
+
+    # 파이프라인 구성이 바뀌면 알린다 — 새 스크립트의 종료 코드 계약을 사람이 한 번 보게 한다.
+    EXPECTED = {"mvp_scraper.py", "migrate_execute.py", "doc_worker.py", "refresh_priority.py"}
+    check("배치가 실행하는 스크립트 목록", sorted(scripts), sorted(EXPECTED))
+
+    # 실패를 예외로만 알리는 것이 의도된 스크립트(위 (b)).
+    RAISES_ONLY = {"refresh_priority.py"}
+
+    for name in sorted(scripts):
+        path = os.path.join(ROOT, name)
+        if not os.path.exists(path):
+            check_true("%s: 파일이 존재한다" % name, False, path)
+            continue
+        src = io.open(path, encoding="utf-8-sig").read()
+        idx = src.find('if __name__ == "__main__":')
+        check_true("%s: __main__ 진입점이 있다" % name, idx >= 0)
+        if idx < 0:
+            continue
+        main_block = src[idx:]
+        has_exit = "sys.exit(" in main_block
+        if name in RAISES_ONLY:
+            # 형태가 바뀌어 판정을 갖게 되면 그때는 종료 코드에 실어야 한다.
+            check_true("%s: main()이 여전히 -> None 이다(실패는 예외로만)" % name,
+                       re.search(r"def main\(\)\s*->\s*None", src) is not None,
+                       "판정을 돌려주기 시작했다면 sys.exit()로 실어야 한다")
+        else:
+            check_true("%s: __main__ 이 sys.exit(...) 로 결과를 싣는다" % name,
+                       has_exit,
+                       "판정이 종료 코드로 이어지지 않으면 배치가 [SUCCESS]를 남긴다")
+            # ★ 문자열로 보면 뚫린다. 예외 분기의 `sys.exit(1)` 하나만 있어도
+            #   "상수만 있지는 않다"가 참이 되기 때문이다 — 처음 만든 검사가 정확히
+            #   그렇게 통과했고, `execute(); sys.exit(0)` 변이를 놓쳤다.
+            #
+            #   판정 기준은 **정상 경로의 인자가 런타임 값인가** 다. AST로 본다.
+            #   `sys.exit(main())` / `sys.exit(0 if execute() else 1)` 는 통과하고,
+            #   `sys.exit(0)` 과 `sys.exit(1)` 뿐이면 실패한다.
+            exits = []
+            for node in ast.walk(ast.parse(src)):
+                if not (isinstance(node, ast.If) and _is_main_guard(node)):
+                    continue
+                for sub in ast.walk(node):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr == "exit" and sub.args):
+                        exits.append(sub.args[0])
+            check_true("%s: 종료 코드에 런타임 판정이 실린다(상수만 있지 않다)" % name,
+                       any(not isinstance(a, ast.Constant) for a in exits),
+                       "sys.exit 인자가 전부 상수다: %s"
+                       % [ast.unparse(a) for a in exits])
 
 
 def test_batches_check_errorlevel():
@@ -286,6 +378,7 @@ def run():
     test_persisted_arithmetic()
     test_doc_worker_outcome()
     test_entrypoints_propagate_exit_code()
+    test_every_scheduled_script_propagates_failure()
     test_batches_check_errorlevel()
     test_live_crawl_scripts_are_guarded()
     test_batch_candidates_are_non_interactive()

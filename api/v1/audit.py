@@ -16,12 +16,36 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+# 민감 키 마스킹은 `payment_logs.py` 것을 **재사용**한다 (2026-08-14).
+#
+# 세 번째 복사본을 만들지 않는다 — 같은 판정을 여러 벌 두면 한쪽만 고쳐져 갈라진다는 것이
+# 이 저장소가 반복해서 겪은 문제다(0바이트 판정 5벌, 시각 비교 2벌 …).
+# `payment_logs`는 audit 를 import 하지 않으므로 순환도 생기지 않는다.
+from api.v1.payment_logs import mask_sensitive  # noqa: E402
+
+
 def _dump(value: Any) -> Optional[str]:
+    """감사 로그용 직렬화. **마스킹을 거친다.**
+
+    위 docstring 이 "전체 행을 통째로 넣으면 민감정보가 섞여 들어갈 여지가 커진다"고
+    경고하지만, 그건 **관례**일 뿐 강제되지 않았다. 실제 호출부 5곳은 전부 손으로 고른
+    스칼라 dict 를 넘기고 있어 지금은 안전하다(2026-08-14 전수 확인 — `card_no`/`cvc`/
+    `access_token` 같은 키가 하나도 없다).
+
+    문제는 그 다음이다. 누가 `before=webhook_row` 처럼 행을 통째로 넘기면 그대로
+    `audit_logs` 에 저장되고, **그 로그는 운영자가 폭넓게 열람한다.**
+    결제 로그(`payment_logs._dump`)는 이미 마스킹을 하는데 감사 로그만 하지 않아
+    **같은 성질의 기록에 서로 다른 기준**이 적용되고 있었다.
+
+    지금 payload 들에는 민감 키가 없으므로 이 변경은 **동작상 무영향**(no-op)이고,
+    앞으로의 사고만 막는다. `default=str` 은 그대로 둔다 — datetime 등이 섞여도
+    직렬화가 죽지 않아야 한다(감사 기록을 잃는 것이 더 나쁘다).
+    """
     if value is None:
         return None
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(mask_sensitive(value), ensure_ascii=False, default=str)
 
 
 def record_audit(
