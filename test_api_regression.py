@@ -155,6 +155,23 @@ def test_health_and_stats():
     check("document-stats total_failures = document_collect_failures 건수",
           stats["total_failures"], db_failures)
 
+    # 2026-08-16 Sprint 141 신설 — document_queue 적체 규모. 운영자가 API/Admin
+    # 어디서도 이 큐 크기를 볼 수 없어서 doc_worker.py 스케줄 미등록이 최소 5주간
+    # (2026-07-08 최초 대기 건 기준) 발견되지 않았다(docs/SPRINT141_SCHEDULER_STATUS_CORRECTION.md).
+    # 세 값 전부 자기 출처(document_queue.status)와 직접 대조한다.
+    conn = get_connection()
+    try:
+        queue_pairs = {row[0]: row[1] for row in conn.execute(
+            "SELECT status, COUNT(*) FROM document_queue GROUP BY status")}
+    finally:
+        conn.close()
+    check("document-stats queue_pending = document_queue(status=pending) 건수",
+          stats["queue_pending"], queue_pairs.get("pending", 0))
+    check("document-stats queue_in_progress = document_queue(status=in_progress) 건수",
+          stats["queue_in_progress"], queue_pairs.get("in_progress", 0))
+    check("document-stats queue_failed = document_queue(status=failed) 건수",
+          stats["queue_failed"], queue_pairs.get("failed", 0))
+
     # ★ 위 한 줄만으로는 부족하다 — 현재 DB에서 document_collect_failures(3)와
     #   document_status FAILED(3)가 **우연히 같아서**, 출처 테이블을 바꿔치기하는 변이가
     #   그대로 살아남는다(2026-08-12 Sprint 66에 변이 테스트로 실제 확인).
@@ -1326,6 +1343,66 @@ def test_payment_and_subscription():
     check("retry after failed payment succeeds", retry_body["success"], True)
     check("retry creates a subscription", retry_body["data"]["subscription"]["plan"], "BASIC")
 
+    # Provider 성공 + 그 이후 DB 처리 실패(2026-08-16, Sprint 132) — 위는 "provider가
+    # 거절"만 재현했다. 반대 방향(provider는 승인했는데 그 뒤 우리 코드가 죽는 경우)은
+    # 아직 아무 테스트도 만든 적이 없었다 — Sprint 129가 고친 "provider 호출보다 락이
+    # 먼저"는 레이스 패자가 provider까지 도달하는 것을 막았을 뿐, provider가 정상 승인한
+    # **뒤에** DB 쪽에서 예외가 나는 경우는 별개 경로다(BEGIN IMMEDIATE 안에서
+    # create_subscription()이 죽는 경우). MockProvider는 실패를 만들지 않으므로
+    # create_subscription() 자체를 강제로 예외를 던지도록 바꿔 재현한다.
+    #
+    # 기대: 같은 트랜잭션이므로 payments/payment_logs까지 전부 롤백되어 고아가 남지
+    # 않아야 하고(승인만 되고 기록은 없는 반쪽 상태 금지), 이어지는 재시도는 정상
+    # 성공해야 한다.
+    db_fail_user = TEST_USER + "-dbfail"
+    hdb = auth_headers(db_fail_user)
+    _orig_create_sub = payments_module.create_subscription
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("qa-injected-post-provider-db-failure")
+
+    payments_module.create_subscription = _boom
+    try:
+        try:
+            boom_r = client.post("/api/v1/payments",
+                                 json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                                       "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                                       "billing_cycle": BILLING_MONTHLY}, headers=hdb)
+            check("provider 성공 후 DB 예외는 500", boom_r.status_code, 500)
+        except RuntimeError as e:
+            # TestClient는 기본적으로 서버 예외를 그대로 올린다(raise_server_exceptions=True) —
+            # FastAPI가 500으로 바꿔 주는 것은 실제 uvicorn 하에서만이다. 여기서는 "예외가
+            # 그대로 escape했다"는 사실 자체가 "커밋되지 않았다"는 확신을 준다(핸들러가
+            # 끝까지 실행돼 return에 도달하지 못했다는 뜻이므로).
+            check_true("provider 성공 후 DB 예외가 그대로 전파된다(요청이 조용히 성공하지 않았다)",
+                      "qa-injected-post-provider-db-failure" in str(e))
+    finally:
+        payments_module.create_subscription = _orig_create_sub
+
+    conn = get_connection()
+    try:
+        orphan_sub = conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (db_fail_user,)).fetchone()[0]
+        orphan_pay = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (db_fail_user,)).fetchone()[0]
+        orphan_log = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs WHERE user_id=?", (db_fail_user,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("DB 예외 시 subscription 고아 없음(롤백됨)", orphan_sub, 0)
+    check("DB 예외 시 payment 고아 없음(provider 승인 기록도 함께 롤백됨)", orphan_pay, 0)
+    check("DB 예외 시 payment_logs 고아 없음", orphan_log, 0)
+
+    # provider가 원상복구된 뒤 재시도는 정상 성공해야 한다 — 앞선 예외가 커넥션/상태를
+    # 오염시켜 다음 요청까지 막지 않는지 확인한다.
+    retry2 = client.post("/api/v1/payments",
+                         json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+                               "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+                               "billing_cycle": BILLING_MONTHLY}, headers=hdb)
+    retry2_body = retry2.json()
+    check("DB 예외 후 재시도는 정상 성공", retry2_body["success"], True)
+    check("DB 예외 후 재시도가 구독을 만든다", retry2_body["data"]["subscription"]["plan"], "BASIC")
+
     # 결제 내역 조회 + 소유권 격리
     r = client.get("/api/v1/payments", headers=h)
     check_true("payment history", len(r.json()["data"]) >= 1)
@@ -1735,8 +1812,8 @@ def test_admin():
     try:
         now = datetime.now().isoformat()
         case_id = conn.execute(
-            "INSERT INTO auction_case (case_no, court_name, created_at) VALUES (?,?,?)",
-            (orphan_case, "QA법원", now)).lastrowid
+            "INSERT INTO auction_case (case_no, court_code, court_name, created_at) VALUES (?,?,?,?)",
+            (orphan_case, "QA법원", "QA법원", now)).lastrowid
         item_id = conn.execute(
             "INSERT INTO auction_item (case_id, case_no, item_no, full_address, created_at) "
             "VALUES (?,?,?,?,?)",
@@ -1781,6 +1858,13 @@ def test_admin():
             patched = "예외: %r" % (exc,)
         check("사라진 물건의 신청도 상태를 바꿀 수 있다", patched, 200)
     finally:
+        # ★ `conn`을 먼저 정리한다. 위 try 본문이 실패하면(예: INSERT가 제약 위반으로
+        # 죽으면) `conn`이 커밋도 롤백도 안 된 트랜잭션을 쥔 채로 남는다 - 그 상태에서
+        # 아래 `mig`(별도 커넥션)가 같은 파일에 쓰려고 하면 "database is locked"로
+        # 죽어 진짜 원인(위 IntegrityError 등)이 그 아래 예외에 가려진다. 정리 커넥션을
+        # 열기 전에 `conn`의 잠금부터 확실히 풀어야 cleanup 자체가 신뢰할 수 있다.
+        conn.rollback()
+        conn.close()
         mig = get_connection(enforce_foreign_keys=False)
         try:
             # PATCH가 감사 로그를 남긴다 — 신청 행을 지우기 전에 그 id로 함께 지운다
@@ -1796,7 +1880,6 @@ def test_admin():
             mig.commit()
         finally:
             mig.close()
-        conn.close()
     left = client.get("/api/v1/admin/registry-requests?user_id=%s" % orphan_user,
                       headers=ah).json()["data"]["total"]
     check("고아 픽스처가 정리됐다", left, 0)
@@ -2130,6 +2213,77 @@ def test_deterministic_ordering():
 
 
 # ---------------------------------------------------------------------------
+# 13-B. /api/v1/search의 정렬 결정성 (2026-08-15 Sprint 122)
+#
+# 위 §13이 다루는 목록(registry-requests/search-presets)은 Sprint 26이 이미 id
+# tie-break를 붙인 것들이다. 그런데 **가장 많이 쓰이는 목록인 /api/v1/search 자체는
+# 그 정리에서 빠져 있었다** ― 기본 정렬(auction_date, fail_count)도 커스텀 정렬
+# (예: minimum_bid_price)도 동률에서 id로 전순서를 잡지 않았다. 실 DB 실측:
+# auction_date+fail_count 동률 최대 27건, minimum_bid_price 동률 최대 8건 ―
+# 흔한 페이지 크기(20)를 가볍게 넘어서는 규모라 동률이 페이지 경계에 걸치기 쉽다.
+# ---------------------------------------------------------------------------
+def test_search_ordering_is_deterministic():
+    print("\n--- 13-B. /api/v1/search 정렬 결정성 (동률 tie-break) ---")
+    tag = "QA-TIEBREAK-%d" % int(datetime.now().timestamp())
+    conn = get_connection()
+    made_ids = []
+    try:
+        try:
+            case_id = conn.execute(
+                "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                ("서울중앙지방법원", tag)).lastrowid
+            # 5개 물건이 auction_date/fail_count/minimum_bid_price 전부 동률이다 ―
+            # 기본 정렬과 커스텀 정렬(minimum_bid_price) 양쪽 다 이 한 세트로 검증한다.
+            same_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
+            for i in range(5):
+                made_ids.append(conn.execute(
+                    "INSERT INTO auction_item"
+                    " (case_id, case_no, item_no, court_name, auction_date, fail_count,"
+                    "  full_address, appraisal_price, minimum_bid_price)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (case_id, tag, str(i), "서울중앙지방법원", same_date, 2,
+                     "서울특별시 강남구 역삼동 1", 100000000, 70000000)).lastrowid)
+            conn.commit()
+
+            def page_ids(qs, size):
+                seen, page = [], 1
+                while True:
+                    r = client.get("/api/v1/search?case_no=%s&size=%d&page=%d&%s"
+                                   % (tag, size, page, qs))
+                    items = r.json()["items"]
+                    if not items:
+                        break
+                    seen.extend(i["id"] for i in items)
+                    page += 1
+                    if page > 10:  # 안전판 ― 무한 루프 방지
+                        break
+                return seen
+
+            for label, qs in (("기본 정렬", "include_closed=true"),
+                               ("커스텀 정렬(minimum_bid_price)",
+                                "include_closed=true&sort_by=minimum_bid_price&sort_order=asc")):
+                collected = page_ids(qs, size=2)  # 5건을 2/2/1로 쪼갠다 ― 동률이 경계에 걸린다
+                check("%s: 페이지를 다 모으면 중복/누락 없이 5건" % label,
+                      sorted(collected), sorted(made_ids))
+                check("%s: 페이지 사이 중복 없음" % label,
+                      len(collected) - len(set(collected)), 0)
+                collected_again = page_ids(qs, size=2)
+                check("%s: 반복 호출에도 순서가 흔들리지 않는다" % label,
+                      collected_again, collected)
+        finally:
+            if made_ids:
+                conn.execute("DELETE FROM auction_item WHERE id IN (%s)"
+                             % ",".join("?" * len(made_ids)), made_ids)
+            conn.execute("DELETE FROM auction_case WHERE case_no=?", (tag,))
+            conn.commit()
+    finally:
+        conn.close()
+
+    leftover = client.get("/api/v1/search?include_closed=true&case_no=%s" % tag).json()["total"]
+    check("QA 픽스처가 정리됐다", leftover, 0)
+
+
+# ---------------------------------------------------------------------------
 # 14. 구독 플랜 해석 — 같은 시각에 만들어진 두 구독 중 나중 것이 이겨야 한다.
 #     (플랜 업그레이드 직후 등기부 한도가 옛 플랜으로 계산되던 버그의 회귀 방지)
 # ---------------------------------------------------------------------------
@@ -2407,6 +2561,46 @@ def test_cors_configuration():
         else:
             os.environ["CORS_ALLOW_ORIGINS"] = saved
         importlib.reload(api_server)
+
+
+# ---------------------------------------------------------------------------
+# 18-B. 보안 응답 헤더 (2026-08-15 Sprint 127)
+#
+# `X-Content-Type-Options`/`Referrer-Policy`는 모든 응답(성공/실패/파일)에 실려야 한다.
+#
+# ★ `X-Frame-Options`는 **일부러 넣지 않았다** - 이 백엔드 자체가
+# `properties/[id]/page.tsx`의 문서 뷰어 iframe이 담는 대상이다(`<iframe src="{API}/api/v1/
+# item/{id}/documents/{doc_type}">`). 프런트(3000)/백엔드(8000)는 다른 origin이라
+# `SAMEORIGIN`조차 이 뷰어를 깬다. 프런트(`next.config.ts`)에는 있고 여기는 없는 것이
+# 실수가 아니라 의도라는 것을, 실린 것과 안 실린 것 둘 다 검사로 고정해 다음 세션이
+# "빠뜨렸나 보다" 하고 무심코 채워 넣지 않게 한다.
+# ---------------------------------------------------------------------------
+def test_backend_security_headers():
+    print("\n--- 18-B. 백엔드 보안 응답 헤더 ---")
+    endpoints = [
+        ("성공 응답(JSON)", lambda: client.get("/api/v1/search?page=1&size=1")),
+        ("실패 응답(404)", lambda: client.get("/api/v1/item/999999999")),
+        ("인증 실패(401)", lambda: client.get("/api/v1/favorites")),
+    ]
+    for label, call in endpoints:
+        r = call()
+        check("%s: X-Content-Type-Options" % label,
+              r.headers.get("x-content-type-options"), "nosniff")
+        check("%s: Referrer-Policy" % label,
+              r.headers.get("referrer-policy"), "strict-origin-when-cross-origin")
+        check_true("%s: X-Frame-Options가 없다(백엔드는 iframe 대상이라 의도적으로 제외)"
+                   % label, "x-frame-options" not in r.headers,
+                   dict(r.headers))
+
+    # 실제 문서 파일 응답(FileResponse 경로, 위 JSONResponse 경로와 미들웨어 통과가 다를 수 있다)
+    row = get_connection().execute(
+        "SELECT item_id, doc_type FROM document_status WHERE status='READY' LIMIT 1").fetchone()
+    if row:
+        r = client.get("/api/v1/item/%s/documents/%s" % (row["item_id"], row["doc_type"]))
+        check("파일 응답: X-Content-Type-Options", r.headers.get("x-content-type-options"), "nosniff")
+        check_true("파일 응답: X-Frame-Options가 없다", "x-frame-options" not in r.headers, dict(r.headers))
+    else:
+        print("   [SKIP] READY 문서가 없어 파일 응답 경로는 못 대조했다")
 
 
 # ---------------------------------------------------------------------------
@@ -5757,11 +5951,13 @@ def run():
         test_admin()
         test_payment_providers()
         test_deterministic_ordering()
+        test_search_ordering_is_deterministic()
         test_subscription_plan_tiebreak()
         test_plans_api()
         test_api_surface()
         test_response_envelope()
         test_cors_configuration()
+        test_backend_security_headers()
         test_admin_roles()
         test_registry_credits()
         test_payment_logs()

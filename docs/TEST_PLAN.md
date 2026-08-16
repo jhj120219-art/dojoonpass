@@ -187,6 +187,22 @@ python test_validation_log_integrity.py # validator/validation_engine.py의 logs
 python test_crawl_resume.py         # crawler/resume.py:resume_start_idx()(Sprint 47 분리) 체크포인트 재개 순수 로직(Selenium 무의존) — 정상 매칭/묶인 사건번호/체크포인트가 오늘 목록에 없을 때의 안전한 0-폴백 (2026-08-10 Sprint 43 신규, 10 검사, crawl_court() 인라인 로직을 순수 함수로 추출)
 ```
 
+**2026-08-16(Sprint 140, Documentation Drift Audit) 추가** — 이 문서는 Sprint 53
+(2026-08-11) 이후 개별 파일 목록을 갱신하지 않았다. 그 뒤 신설된 것 중 위
+목록에 없는 것만 간단히 보충한다(상세 설명은 각 신설 Sprint 문서 참고,
+전면 재작성은 하지 않는다 — 이 문서 범위를 넘는 별도 작업):
+
+```
+python test_bootstrap.py            # 부트스트랩 3단계(init_db/migrate_v4_1/run_migrations) 정합성 + fresh clone 스키마 대조(Sprint 99, §3-B는 Sprint 122 컬럼/인덱스 드리프트 allowlist)
+python test_pipeline_integrity.py   # document_queue 상태머신 불변식 + 정규화 드리프트 상한 + 크롤 파이프라인 정합성 전수
+python test_console_encoding.py     # cp949 콘솔 출력 리터럴 전수 스캔(EM DASH 등) — Sprint 72 신설, Sprint 133이 "출력 래퍼 함수" 탐지로 확장
+python test_crawl_exit_code.py      # 크롤러/repair 스크립트들의 종료 코드 계약(빈 입력=0, 실패=1, 거짓 성공 금지)
+python test_crawler_parsing.py      # 크롤러 파싱 로직 순수 함수(Selenium 무의존)
+python test_rights_data_load.py     # 권리분석 데이터 적재 로직
+python test_false_success.py        # 0바이트/orphan 문서가 "성공"으로 보이지 않는지 전수(Sprint 98 계열과 연결)
+python test_doc_worker_recovery.py  # doc_worker.py 드라이버 크래시/재시작 복구(Sprint 137 신설) — 재시작 자체가 실패하면 남은 큐를 갉아먹지 않고 이번 실행을 중단하는지 검증
+```
+
 **2026-08-10(Sprint 45) 주의 — `test_search.py`의 3건 실패는 회귀가 아니다**:
 `address_detail='서울'`/`'서울시'`/`'서울특별시'` 3개 검사가 `total=269`인데 기대값이 `284`로
 하드코딩돼 있어 실패한다. 크롤러가 매일 데이터를 갱신하므로 **기대 건수가 노후화된 것**이며

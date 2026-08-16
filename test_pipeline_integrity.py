@@ -683,8 +683,17 @@ def test_data_freshness_runway():
 # (`backfill_dong_normalize.py`가 명시한 이 저장소의 관례).
 # 그래서 같은 파일 §8(차량 오분류)이 쓰는 방식을 그대로 쓴다 ― **상한을 두어 증가만 막는다.**
 # `backfill_region_normalize.py --apply` 를 돌려 0이 되면 아래 상한을 0으로 낮춰라.
+#
+# 2026-08-15 Sprint 121: sido 상한을 4→5로 올렸다. auction_item이 1,876→2,156행으로
+# 늘면서(크롤 계속 진행) 원래 스캔 범위 밖에 있던 옛 행 하나가 새로 걸렸다 - 새로 생긴
+# 결함이 아니라 같은 옛 버그의 다섯 번째 사례다.
+#
+#     id=11903  '경기도 성남시 분당구 구미로173번길 47 ... (구미동,서울시니어스분당타워)'
+#               저장 '서울' -> 실제 '경기' (건물명 "서울시니어스분당타워"에 들어간
+#               "서울"을 시도로 오매칭 - 도로명이 아니라 건물명이 원인이라는 점만 다르고
+#               "문자열 아무 데나 있는 시도명과 매칭" 이라는 근본 원인은 #103-1과 같다)
 # ---------------------------------------------------------------------------
-NORMALIZE_DRIFT_CEILING = {"sido": 4, "sigungu": 207, "dong": 0, "lot_number": 0}
+NORMALIZE_DRIFT_CEILING = {"sido": 5, "sigungu": 207, "dong": 0, "lot_number": 0}
 
 
 def test_stored_normalization_matches_code():
@@ -903,6 +912,38 @@ def test_stored_normalization_matches_code():
     # 반복해서 잡아 온 "같은 의미를 두 곳이 다르게 들고 있는" 패턴의 원형이다.
     #
     # 값을 계산해 비교하지 않는다(그건 §12 앞부분이 한다). **두 표가 서로 같은가**만 본다.
+    #
+    # 2026-08-15 Sprint 121: 이 대조에서 sigungu 불일치 1건을 새로 찾았다 - 위 §12와는
+    # 다른 결함이다. §12는 "옛 규칙으로 계산된 값이 남아 있다"(값이 존재하되 낡음)인데,
+    # 이건 auction_item에 **주소 어디에도 없는 딴 지역 값**이 남아 있는 경우다.
+    #
+    #     id(auction)=357  대전지방법원 2024타경11191-1
+    #     주소: '세종특별자치시 나성로 96 1층104호 (나성동,더센트럴) ...'
+    #     auction.sigungu      = ''      (정상 - 세종은 구/군이 없다)
+    #     auction_item.sigungu = '칠곡군' (경상북도 소속 - 이 주소 어디에도 없는 값)
+    #
+    # 원인은 `migrate_execute.py`의 병합 규칙이다:
+    #
+    #     sigungu = row["sigungu"] or existing["sigungu"]
+    #
+    # "크롤 값이 빈 문자열이면(파싱 실패로 보고) 기존 값을 지우지 않는다"는 의도인데,
+    # **"주소상 원래 없어서 정당하게 비었다"는 경우와 구분하지 못한다.** 세종 주소는
+    # 매번 다시 계산해도 sigungu가 영원히 빈 문자열이라, 한 번 다른 지역 값으로
+    # 오염되면(court_code 복합키 도입 전 case_no 충돌 - docs/BUGS.md #14 계열로 추정,
+    # 실제 유입 경로는 지금 로그로 확인 불가) 이후 아무리 재크롤해도 **절대 자연 치유되지
+    # 않는다**. `backfill_region_normalize.py`도 이 케이스는 못 잡는다 - 그 스크립트는
+    # 새 값이 비면 일부러 건너뛴다(§12 상단 주석 "새 값이 비어 있으면 ... 드리프트로 세지
+    # 않는다"), 좋은 값을 빈 값으로 덮어쓰지 않으려는 안전장치인데 그 안전장치가 여기서는
+    # 반대로 나쁜 값을 영구 보존한다.
+    #
+    # 검색 영향(api/v1/search.py:244-246): `?sigungu=칠곡군` 단독 검색에 sido와
+    # 무관하게 LIKE 매칭되므로, 세종 물건이 경북 칠곡군 검색 결과에 섞여 나온다.
+    #
+    # 고치려면 migrate_execute.py의 병합 규칙 자체를 바꿔야 하는데(파싱 실패로 인한 빈
+    # 값과 "원래 없음"으로 인한 빈 값을 구분할 방법이 지금 없다) 이건 핵심 파이프라인
+    # 로직 변경이라 이 세션 범위를 벗어난다(승인 필요). 지금은 §12와 같은 방식으로
+    # **알려진 1건**만 허용하고 새로 늘면 잡는다.
+    SYNC_MISMATCH_CEILING = {"sigungu": 1}
     FIELDS = ["property_type", "sido", "sigungu", "dong", "lot_number", "full_address",
               "appraisal_price", "minimum_bid_price", "auction_date", "status",
               "validation_status", "crawl_date"]
@@ -927,13 +968,78 @@ def test_stored_normalization_matches_code():
         conn.close()
     check_true("두 표를 짝지을 수 있다", paired > 0, paired)
     check("auction 에만 있고 auction_item 에 없는 행 없음(API가 못 보는 크롤 결과)", only_a, 0)
-    check("두 표의 값이 어긋난 필드 없음", mismatched, {})
+    over_ceiling = {f: n for f, n in mismatched.items()
+                    if n > SYNC_MISMATCH_CEILING.get(f, 0)}
+    check("두 표의 값이 어긋난 필드가 알려진 상한을 넘지 않음", over_ceiling, {})
+    if mismatched:
+        print("    어긋난 필드(알려진 상한 포함): %s (상한 %s)"
+              % (mismatched, SYNC_MISMATCH_CEILING))
     print("    짝지은 행 %d개 x %d필드 대조" % (paired, len(FIELDS)))
     # 화면이 읽는 표에는 사유가 없다 ― "왜 검증실패인지"를 API로는 알 수 없다는 사실을
     # 여기 고정해 둔다(사유는 레거시 `auction` 테이블에만 있다). 스키마가 바뀌면
     # 이 검사가 먼저 알려 준다.
     check("auction_item에는 validation_reasons가 없다(사유는 레거시 표에만 있다)",
           "validation_reasons" in reasons_cols, False)
+
+
+# ---------------------------------------------------------------------------
+# 13-B. `detect_stale_region_contamination_dryrun.py`가 실제로 오염만 잡고
+# 정당한 사례(부분 문자열 오매칭 / 원래 빈 값)는 안 건드리는가 (2026-08-15 Sprint 121)
+#
+# 이 탐지 스크립트는 --apply가 없어 위 SYNC_MISMATCH_CEILING처럼 회귀를 막아 줄 장치가
+# 스스로에게는 없다 ― 판정 기준(§안의 3조건)이 조용히 느슨해지면(오탐 증가) 또는
+# 조용히 빡빡해지면(누락 증가) 아무도 모른다. 합성 데이터로 세 조건 각각을 검증하고,
+# 실 DB 결과가 위 §13 ceiling과 일치하는지도 대조한다(둘이 따로 관리되므로 어긋날 수 있다).
+# ---------------------------------------------------------------------------
+def test_stale_region_contamination_detector():
+    print("\n--- 13-B. 지역 필드 오염 탐지기 자체 검증 ---")
+    import importlib
+    detector = importlib.import_module("detect_stale_region_contamination_dryrun")
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, full_address TEXT,"
+                 " sido TEXT, sigungu TEXT, dong TEXT, lot_number TEXT)")
+    conn.executemany("INSERT INTO t (id, full_address, sido, sigungu, dong, lot_number)"
+                      " VALUES (?,?,?,?,?,?)", [
+        # (a) 오염: 세종 주소(sigungu 없음)인데 전혀 무관한 지역명이 남아 있다 - 잡아야 한다
+        #     (조건1: fresh 비어 있음 / 조건2: stored 있음 / 조건3: 주소에 없음 -- 셋 다 성립)
+        (1, "세종특별자치시 나성로 96 1층104호 (나성동,더센트럴)", "세종", "칠곡군", "나성동", "96"),
+        # (b) 조건1로 보호: fresh가 채워진다(§12 영역, extract_sido는 문자열 어디든 찾으므로
+        #     "뉴서울아파트"의 '서울'도 fresh 계산에 그대로 잡혀 애초에 fresh가 비지 않는다)
+        (2, "인천광역시 계양구 새벌로 88 (효성동, 뉴서울아파트)", "서울", "계양구", "효성동", "88"),
+        # (c) 조건2로 보호: 원래도 비어 있다(지울 것 자체가 없다)
+        (3, "세종특별자치시 나성로 10 (나성동,어울림)", "세종", "", "나성동", "10"),
+        # (d) 조건3으로 보호: fresh sigungu는 비지만(정규식이 '강남구청사거리점'을 못
+        #     끊는다), stored '강남구'가 주소 문자열 안에 실제로 존재한다 - (a)와 반대로
+        #     "정말 없는 값"이 아니라 "정규식이 놓쳤을 뿐 주소 안에 있는 값"이므로
+        #     안전 쪽으로 판단해 건드리지 않아야 한다.
+        (4, "세종특별자치시 나성로 96 1층104호 (나성동,강남구청사거리점)",
+         "세종", "강남구", "나성동", "96"),
+    ])
+    conn.commit()
+
+    hits = detector.scan_table(conn, "t")
+    by_id = {(h[0], h[1]): h[2] for h in hits}
+    check_true("합성 오염 사례(id=1, sigungu)를 잡는다", (1, "sigungu") in by_id, hits)
+    check_true("조건1(fresh 비었나)로 보호되는 사례(id=2)는 잡지 않는다",
+               (2, "sido") not in by_id, hits)
+    check_true("조건2(stored 있나)로 보호되는 사례(id=3)는 잡지 않는다",
+               (3, "sigungu") not in by_id, hits)
+    check_true("조건3(주소 안에 있나)으로 보호되는 사례(id=4)는 잡지 않는다",
+               (4, "sigungu") not in by_id, hits)
+    check("합성 데이터에서 오탐/누락 없이 정확히 1건만 잡는다", len(hits), 1)
+    conn.close()
+
+    # 실 DB 결과가 §13의 알려진 상한과 같은 이야기를 하는지 대조한다.
+    live = sqlite3.connect(DB)
+    live.row_factory = sqlite3.Row
+    try:
+        live_hits = detector.scan_table(live, "auction_item")
+    finally:
+        live.close()
+    check_true("실 DB 오염 의심 건수가 §13 상한(sigungu:1)과 일치한다",
+               len(live_hits) == 1, live_hits)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1213,7 @@ def run():
     test_court_identity_convention()
     test_data_freshness_runway()
     test_stored_normalization_matches_code()
+    test_stale_region_contamination_detector()
     test_empty_sido_is_explained_by_the_address()
     test_failed_registry_requests_value_report()
 

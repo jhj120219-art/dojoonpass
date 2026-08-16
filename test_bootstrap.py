@@ -225,6 +225,143 @@ def test_bootstrap_matches_live_schema():
     print("   운영 %d개 / 부트스트랩 %d개" % (len(live_tables), len(made)))
 
 
+# ---------------------------------------------------------------------------
+# 3-B. 부트스트랩 스키마 == 운영 스키마, **컬럼/인덱스 단위까지** (2026-08-15 Sprint 122)
+#
+# 위 test_bootstrap_matches_live_schema()는 "같은 테이블 집합인가"만 본다. 실제로는
+# **테이블 이름은 같은데 컬럼 제약이나 인덱스가 다른** 경우가 있었다 - 실측(2026-08-15):
+#
+#     auction_case.court_code       fresh=nullable       live=NOT NULL
+#     payment_webhooks.raw_payload  fresh=NOT NULL       live=nullable
+#     payment_webhooks.processing_status  fresh=DEFAULT 'RECEIVED'   live=기본값 없음
+#     registry_credits.amount / registry_credit_logs.delta  fresh=DEFAULT '0'  live=기본값 없음
+#     payment_logs / payment_webhooks / registry_credit_logs / registry_credits
+#         인덱스 존재 여부가 서로 다름(양쪽 다 상대에 없는 인덱스가 있다)
+#     audit_logs.idx_audit_logs_admin_id            live에만 있음(추적 불가, test_schema_hygiene.py
+#         KNOWN_DUPLICATE_INDEXES에도 별도로 기록됨)
+#
+# 원인: `storage/migrations/014_create_payment_logs.sql`/`011_.../016_...` 같은 파일이
+# **이미 운영 DB에 적용된 뒤 내용이 편집됐다.** 마이그레이션 러너는 파일명으로만 "적용됨"을
+# 판단해 스킵하므로(001~019 전부 이미 `migration_history`에 있다), 편집된 내용은 운영 DB에
+# **다시 반영되지 않는다.** 그 결과 지금 파일을 그대로 실행하는 fresh clone은 운영과 다른
+# (이 경우는 더 엄격한) 제약을 갖게 된다 - `payment_webhooks.raw_payload NOT NULL`은 실제로
+# `api/v1/payment_logs.py:_dump()`가 `payload is None`이면 `None`을 그대로 반환하는 경로가
+# 있어(운영에서는 nullable이라 통과하지만) fresh clone에서는 INSERT가 IntegrityError로
+# 죽을 수 있다 - "운영에서는 되는데 새 배포에서만 깨지는" 정확히 그 모양이다.
+#
+# 여기서는 라이브 DB 스키마를 고치지 않는다(스키마 변경은 승인 영역). 지금 상태를
+# **알려진 것으로 못 박고, 새로운 드리프트가 조용히 늘면 잡는다** - 이 저장소가 반복해서
+# 쓰는 상한/allowlist 패턴과 같다.
+# ---------------------------------------------------------------------------
+
+# (table, (col_name, col_type, notnull, default)) - fresh clone에만 있고 운영에는 없는 컬럼 정의
+KNOWN_FRESH_ONLY_COLUMNS = {
+    ("auction_case", ("court_code", "TEXT", 0, None)),
+    ("payment_webhooks", ("raw_payload", "TEXT", 1, None)),
+    ("payment_webhooks", ("processing_status", "TEXT", 1, "'RECEIVED'")),
+    ("registry_credit_logs", ("delta", "INTEGER", 1, "0")),
+    ("registry_credits", ("amount", "INTEGER", 1, "0")),
+}
+# 운영에만 있고 fresh clone에는 없는 컬럼 정의(같은 컬럼의 다른 제약 - 위 항목과 쌍을 이룬다)
+KNOWN_LIVE_ONLY_COLUMNS = {
+    ("auction_case", ("court_code", "TEXT", 1, None)),
+    ("payment_webhooks", ("raw_payload", "TEXT", 0, None)),
+    ("payment_webhooks", ("processing_status", "TEXT", 1, None)),
+    ("registry_credit_logs", ("delta", "INTEGER", 1, None)),
+    ("registry_credits", ("amount", "INTEGER", 1, None)),
+}
+# (table, index_name) - fresh clone에만 있고 운영에는 없는 인덱스(파일 편집 후 운영에 재적용 안 됨)
+KNOWN_FRESH_ONLY_INDEXES = {
+    ("payment_logs", "idx_payment_logs_created_at"),
+    ("payment_logs", "idx_payment_logs_event_type"),
+    ("payment_webhooks", "idx_payment_webhooks_received_at"),
+    ("payment_webhooks", "idx_payment_webhooks_status"),
+    ("registry_credits", "idx_registry_credits_created_at"),
+}
+# 운영에만 있고 fresh clone에는 없는 인덱스
+KNOWN_LIVE_ONLY_INDEXES = {
+    ("audit_logs", "idx_audit_logs_admin_id"),  # 출처 불명(test_schema_hygiene.py 참고)
+    ("registry_credit_logs", "idx_registry_credit_logs_user_id"),
+}
+
+
+def test_bootstrap_matches_live_schema_columns_and_indexes():
+    """부트스트랩 스키마가 운영과 **컬럼 제약/인덱스 단위**까지 같은가.
+
+    test_bootstrap_matches_live_schema()가 놓치는 사각지대를 메운다 - 테이블 집합이
+    같아도 그 안의 컬럼 제약이나 인덱스가 다르면 "부트스트랩은 성공했는데 동작이 다른"
+    상태가 된다(정확히 이 저장소가 반복해서 잡아 온 패턴).
+    """
+    print("\n--- 3-B. 부트스트랩 스키마 == 운영 스키마 (컬럼/인덱스) ---")
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as v41
+
+    live_path = os.path.join(REPO_ROOT, "auction.db")
+    if not os.path.isfile(live_path):
+        print("[SKIP] 운영 DB가 없다 - 비교 생략")
+        return
+
+    def _schema(db_path, readonly):
+        conn = (sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"), uri=True)
+                if readonly else sqlite3.connect(db_path))
+        try:
+            tables = sorted(r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+            cols, idxs = set(), set()
+            for t in tables:
+                for c in conn.execute("PRAGMA table_info(%s)" % t).fetchall():
+                    cols.add((t, (c[1], c[2], c[3], c[4])))
+                for r in conn.execute("PRAGMA index_list(%s)" % t).fetchall():
+                    if not r[1].startswith("sqlite_autoindex"):
+                        idxs.add((t, r[1]))
+            return cols, idxs
+        finally:
+            conn.close()
+
+    live_cols, live_idxs = _schema(live_path, readonly=True)
+
+    tmp = tempfile.mkdtemp(prefix="qa_boot_cols_")
+    db = os.path.join(tmp, "fresh.db")
+    saved = dbmod.DB_PATH
+    dbmod.DB_PATH = db
+    try:
+        dbmod.init_db()
+        v41.migrate()
+        _load_runner().run()
+        fresh_cols, fresh_idxs = _schema(db, readonly=False)
+    finally:
+        dbmod.DB_PATH = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    fresh_only_cols = fresh_cols - live_cols
+    live_only_cols = live_cols - fresh_cols
+    new_fresh_only_cols = sorted(fresh_only_cols - KNOWN_FRESH_ONLY_COLUMNS)
+    new_live_only_cols = sorted(live_only_cols - KNOWN_LIVE_ONLY_COLUMNS)
+    check("새로운 컬럼 제약 드리프트 없음(fresh에만 있는 것)", new_fresh_only_cols, [])
+    check("새로운 컬럼 제약 드리프트 없음(운영에만 있는 것)", new_live_only_cols, [])
+
+    fresh_only_idxs = fresh_idxs - live_idxs
+    live_only_idxs = live_idxs - fresh_idxs
+    new_fresh_only_idxs = sorted(fresh_only_idxs - KNOWN_FRESH_ONLY_INDEXES)
+    new_live_only_idxs = sorted(live_only_idxs - KNOWN_LIVE_ONLY_INDEXES)
+    check("새로운 인덱스 드리프트 없음(fresh에만 있는 것)", new_fresh_only_idxs, [])
+    check("새로운 인덱스 드리프트 없음(운영에만 있는 것)", new_live_only_idxs, [])
+
+    resolved_cols = sorted((KNOWN_FRESH_ONLY_COLUMNS - fresh_only_cols)
+                            | (KNOWN_LIVE_ONLY_COLUMNS - live_only_cols))
+    resolved_idxs = sorted((KNOWN_FRESH_ONLY_INDEXES - fresh_only_idxs)
+                            | (KNOWN_LIVE_ONLY_INDEXES - live_only_idxs))
+    if resolved_cols or resolved_idxs:
+        print("   [정리됨] 더 이상 드리프트가 아닌 알려진 항목 - 위 KNOWN_* 상수에서 빼십시오:")
+        for c in resolved_cols:
+            print("      컬럼", c)
+        for i in resolved_idxs:
+            print("      인덱스", i)
+    print("   알려진 컬럼 드리프트 %d건 / 알려진 인덱스 드리프트 %d건 (전부 알려진 항목)"
+          % (len(KNOWN_FRESH_ONLY_COLUMNS) + len(KNOWN_LIVE_ONLY_COLUMNS),
+             len(KNOWN_FRESH_ONLY_INDEXES) + len(KNOWN_LIVE_ONLY_INDEXES)))
+
+
 def test_batch_scripts_create_logs_before_redirecting():
     """예약 배치가 `logs\\`가 없는 새 배포에서 **조용히 성공으로 끝나지 않는가**.
 
@@ -466,6 +603,7 @@ def run():
     test_runner_refuses_without_prerequisites()
     test_full_bootstrap_from_scratch()
     test_bootstrap_matches_live_schema()
+    test_bootstrap_matches_live_schema_columns_and_indexes()
     test_batch_scripts_create_logs_before_redirecting()
     test_claude_md_bootstrap_claims_are_true()
     test_bootstrap_is_idempotent()

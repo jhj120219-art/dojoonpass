@@ -46,7 +46,15 @@ def run():
     # (2) 테스트가 자기만의 마이그레이션 디렉터리로 러너를 부를 때, 그 SQL은 auction_item을
     #     쓰지도 않는데 무조건 막혀 버린다(`test_schema_hygiene.py`의 러너 검사가 그렇다).
     # 지금 적용할 SQL이 그 테이블을 실제로 언급할 때만 확인한다.
-    PREREQ_TABLES = ("auction_item", "auction_case")
+    #
+    # 2026-08-15 Sprint 122: "auction"(레거시 크롤러 원본 테이블, init_db()가 만든다)이
+    # 이 목록에 빠져 있었다. 011/012가 `FROM auction`/`DROP TABLE auction` 등으로 그
+    # 테이블에 의존하는데, 빈 DB에서 안내대로 migrate_v4_1.py -> 이 러너만 돌리면(문서가
+    # 실제로 그렇게 안내하고 있었다 - docs/CLAUDE.md 참고) auction_item/auction_case는
+    # migrate_v4_1.py가 만들어 이 검사를 통과하지만, auction은 여전히 없어 011에서
+    # `sqlite3.OperationalError: no such table: auction`로 죽는다 - 이 preflight가
+    # 막아 주려던 바로 그 실패 모양인데, "auction"만 빠져서 못 잡고 있었다(실측 재현).
+    PREREQ_TABLES = ("auction_item", "auction_case", "auction")
     existing = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 

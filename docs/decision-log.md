@@ -318,8 +318,12 @@ Last Updated: 2026-08-07
 - `src/app/properties/[id]/page.tsx`: 월/연 토글 + 플랜 카드(정상가 취소선 + 판매가) UI로 교체,
   `billing_cycle`을 함께 전송
 - `storage/migrations/004_create_subscriptions.sql`: `plan`은 CHECK 제약 없는 TEXT라 **스키마
-  변경 없이 플랜명 교체 완료**. 다만 기존 `BETA_EARLYBIRD` row의 이관 방침은 여전히 미정
-  (현재 운영 DB에 해당 row가 있는지는 별도 확인 필요 — Pending Decisions 참고)
+  변경 없이 플랜명 교체 완료**. 기존 `BETA_EARLYBIRD` row의 이관 방침은 여전히 미정이지만,
+  **"현재 운영 DB에 해당 row가 있는지"는 2026-08-16(Sprint 142) 확인 완료** —
+  `SELECT DISTINCT plan FROM subscriptions`가 빈 결과다(BASIC/PRO를 포함해 어떤
+  plan 값의 행도 없음). 즉 지금은 이관 대상 자체가 없다 — 이관 **방침**은 여전히
+  제품 결정 필요(승인 영역)이지만, 데이터가 실제로 존재할 때까지는 실행 시급성이
+  없다는 것을 실측으로 못박는다
 
 ---
 
@@ -426,7 +430,10 @@ Last Updated: 2026-08-07
 영향
 - Webhook은 `event_id` UNIQUE로 멱등 처리(PG는 같은 노티를 재전송한다)
 - 민감정보는 저장 전 마스킹(`mask_sensitive`)
-- 수신 엔드포인트는 여전히 없다 — 구조만 준비된 상태
+- ~~수신 엔드포인트는 여전히 없다 — 구조만 준비된 상태~~ → **2026-08-11 Sprint 52
+  완료**: `POST /api/v1/payments/webhook/{provider_name}`(`receive_payment_webhook()`)
+  로 실제 연결됨. 서명 검증(fail-closed) + `event_id` UNIQUE 멱등 처리 전부 동작 확인,
+  `test_api_regression.py` §30이 지속 검증
 
 ### 6. registry_credit 구조
 
@@ -441,8 +448,15 @@ Last Updated: 2026-08-07
 
 ### 보류 (진행하지 않음)
 
-Sentry / Rate Limit / Selenium / Monitoring / Analytics / OCR / 지도 API / SNS API /
+Sentry / Rate Limit / ~~Selenium~~ / Monitoring / Analytics / OCR / 지도 API / SNS API /
 Storage 확장 / 외부 서비스 연동 / 패키지 설치
+
+**2026-08-16 정정(Sprint 142, Documentation Drift Audit)**: Selenium은 이 목록에
+있던 2026-08-07 이후 **2026-08-12 Sprint 61에 실제로 설치·승인됐다**
+(`requirements.txt`, `pip install -r requirements.txt`로 selenium/webdriver-manager/
+pandas/pdfplumber 확보 — 크롤러/문서수집 파이프라인의 핵심 의존성이라 대상에서
+빠질 수 없었다). 나머지(Sentry/Rate Limit/Monitoring 등)는 여전히 보류 상태
+유지(재확인 완료, `docs/roadmap.md` "기술부채" 절과 일치).
 
 
 ---

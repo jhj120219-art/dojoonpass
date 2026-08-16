@@ -60,6 +60,18 @@ def document_stats():
             "SELECT COUNT(*) FROM document_collect_failures"
         ).fetchone()[0]
 
+        # 2026-08-16 Sprint 141: document_queue 적체 규모를 추가한다. 이 API 전체를
+        # grep해도 document_queue를 실제로 조회하는 곳이 이 파일 자신의 주석 한 줄뿐이었다
+        # — 운영자가 "지금 큐가 얼마나 쌓여 있는지"를 API/Admin 경로 어디서도 볼 수 없었다
+        # (docs/SPRINT141_SCHEDULER_STATUS_CORRECTION.md — doc_worker.py 스케줄 미등록으로
+        # pending 3,996건이 최소 5주 넘게 쌓여 있었는데, 그걸 알아내려면 DB를 직접 열어
+        # 봐야 했다). 순수 추가 필드라 기존 응답 구조/필드명은 그대로 유지된다.
+        queue_counts = dict(
+            conn.execute(
+                "SELECT status, COUNT(*) AS cnt FROM document_queue GROUP BY status"
+            ).fetchall()
+        )
+
         return {
             "total_items": total_items,
             "spec_success": spec_ready,
@@ -69,6 +81,9 @@ def document_stats():
             "status_failed": status_failed,
             "appraisal_failed": appraisal_failed,
             "total_failures": total_failed,
+            "queue_pending": queue_counts.get("pending", 0),
+            "queue_in_progress": queue_counts.get("in_progress", 0),
+            "queue_failed": queue_counts.get("failed", 0),
         }
     finally:
         conn.close()

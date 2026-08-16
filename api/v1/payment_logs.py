@@ -161,8 +161,10 @@ def record_webhook(
     보장하고, 중복이면 새 행을 만들지 않고 기존 id와 `is_duplicate=True`를 돌려준다 —
     호출부는 이 값을 보고 후속 처리를 건너뛰면 된다.
 
-    수신 엔드포인트는 아직 없다(구조만 준비). 실연동 시 서명 검증을 통과한 뒤에만
-    `signature_verified=True`로 부를 것.
+    2026-08-15 정정: "수신 엔드포인트는 아직 없다(구조만 준비)"는 이 함수가 처음 만들어진
+    Sprint 27 시점 서술이었다 ― Sprint 52/53에서 `api/v1/payments.py:receive_payment_webhook()`가
+    이미 연결됐고, 그 경로가 서명 검증을 통과한 뒤에만 `signature_verified=True`로 호출한다
+    (문장을 지우지 않고 정정만 덧붙인다는 이 저장소 관례를 따른다).
     """
     now = (at or datetime.now()).isoformat()
 

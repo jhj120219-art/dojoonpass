@@ -4,6 +4,17 @@ Status: Active
 Last Updated: 2026-08-07 (Sprint 28)
 Owner: Project Management
 
+**2026-08-16 정정(Sprint 134, Documentation Drift Audit)**: 이 문서는 Sprint 28
+이후 갱신된 적이 없다 — 그 사이 Sprint 29~133이 이 문서의 여러 항목을 이미
+해소했다("이미 해소된 병목은 다시 올리지 않는다"는 이 문서 자신의 원칙과
+어긋난 상태로 방치돼 있었다는 뜻). 전면 재작성은 이 세션의 범위를 넘어(P0/P1/P2
+전 항목을 하나씩 재검증해야 한다) 지금 하지 않지만, **아래에서 확인된 것만
+직접 정정한다.** 현재 출시 준비 상태를 보려면 이 문서 대신
+`docs/CURRENT_STATE.md`(Sprint 1~99, 계속 갱신됨) +
+`docs/SPRINT99_RELEASE_READINESS_AUDIT.md`(가장 최근의 전용 Release Readiness
+감사, 2026-08-13) + `docs/SPRINT100_*.md`~`docs/SPRINT134_*.md`(Sprint 100 이후는
+이 파일과의 편집 충돌을 피하려 개별 파일로 분리됨)를 먼저 볼 것.
+
 이 문서는 **지금 출시를 막는 것만** 다룬다. 이미 해소된 병목은 다시 올리지 않는다
 (해소 이력은 `docs/CHANGELOG.md`, `docs/BUGS.md`에 있다).
 
@@ -31,7 +42,7 @@ Owner: Project Management
 | 등기부 발급/전달 | ⚠️ | 다운로드 엔진은 완성. **발급은 운영자 수동**(자동화는 Beta v2) |
 | 결제 | ❌ | `MockProvider` — 실제로 돈을 받을 수 없다 (P0). 단 **결제 로그/Webhook 구조는 선구축 완료**(실연동 시 Provider만 채우면 됨) |
 | Subscription | ✅ | 플랜/할인/기간/한도 서버 검증, 플랜 tie-break 버그 수정(2026-08-07) |
-| 관리자 | ⚠️ | API 완성 + **SUPER_ADMIN/ADMIN 2단계 권한**·등기부 한도 조정 추가. **키 미설정으로 현재 전체 500**, UI 없음 (P0/P1) |
+| 관리자 | ⚠️ | API 완성 + **SUPER_ADMIN/ADMIN 2단계 권한**·등기부 한도 조정 추가. ~~키 미설정으로 현재 전체 500~~ → **2026-08-16 재실측(Sprint 134): 두 키 모두 설정 확인, 이제 정상 403/200 응답**(위 P0-2 정정 참고) — UI 없음만 남음 (P1) |
 | 문서 | ✅ | 2026-08-07 전수 감사 — 코드와 어긋난 서술 정정 완료 + `API_KEY_CHECKLIST.md` 신설 |
 | Runtime | ✅ | Type Check / Lint / Build 전부 통과. **2026-08-08(Sprint 32) 최초로 HTTP 레벨 실제 실행**: `test_api_regression.py` **380검사**(377 + 신규 JWT 적대적 케이스 3건) 전부 PASS, `test_subscription_policy.py` **48항목** 전부 PASS(연속 2회 재실행으로 재현성 확인, 잔여 QA 데이터 0건) |
 | 로깅/추적 | ⚠️ | 2026-08-07 API 서버 로깅 설정 신설(그 전엔 `logger.info` 전량 유실). 외부 수집(Sentry 등)은 없음 (P2) |
@@ -67,7 +78,31 @@ Owner: Project Management
   두 메서드는 인터페이스에만 있고 호출부가 없다
 - **승인/외부 절차 필요 → 코드로 해결 불가**
 
-### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — **미설정 확정** (2026-08-13 실측)
+### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — ~~**미설정 확정**~~ → **2026-08-16 재실측: 지금은 둘 다 설정돼 있다(Sprint 134)**
+
+> **2026-08-16 재정정(Sprint 134, Documentation Drift Audit)** ― 아래 2026-08-13
+> 실측(Sprint 78) 이후 `.env`가 바뀌었다. **비밀값을 열람하지 않고** 같은 방식(이름
+> 존재 여부 + `os.getenv()` truthy 여부 + 실제 서버 응답)으로 다시 확인했다:
+>
+> ```
+> os.getenv() truthy       ADMIN_API_KEY        True   <- 2026-08-13엔 이름 자체가 없었다
+>                           SUPER_ADMIN_API_KEY  True
+>                           PAYMENT_WEBHOOK_SECRET False <- 이것만 여전히 비어 있다
+> 실제 서버 응답(키 없이)   /admin/users /admin/payments /admin/subscriptions /admin/audit-logs
+>                           전부 403 "권한이 없습니다" (2026-08-13엔 500 "관리자 키 미설정"이었다)
+> ```
+>
+> **즉 "Admin API 전체가 지금도 사용 불가"는 더 이상 사실이 아니다.** 키를 아는
+> 사람은 정상적으로 Admin API를 쓸 수 있고, 키 없는/틀린 요청은 500(설정 오류)이
+> 아니라 403(정상적인 권한 거부)을 받는다 — 이 도메인은 더 이상 P0가 아니다.
+> `PAYMENT_WEBHOOK_SECRET`은 여전히 비어 있어 Webhook 수신은 계속 fail-closed(401)
+> 상태다(아래 원문 그대로 유효). `.env`는 승인 영역이라 이 세션이 바꾼 것이 아니다
+> — 언제/누가 채웠는지는 이 세션 범위 밖.
+
+<details>
+<summary>2026-08-13 Sprint 78 실측 원문(정정 이전 기록 — 지우지 않고 보존)</summary>
+
+미설정 확정 (2026-08-13 실측)
 
 > **2026-08-13 실측 (Sprint 78 Release Audit)** ― "값 유효성 미확인"이던 이 항목을
 > **비밀값을 열람하지 않고** 확정했다. 이름 존재 여부(값이 아니라 키 이름만)와 서버 응답
@@ -99,6 +134,8 @@ Owner: Project Management
   확인 필요
 - 값이 비어 있다면 생성: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
 - **`.env` 수정은 승인 필요 → 이 세션에서는 확인만 가능, 수정 불가**
+
+</details>
 
 ### P0-3. Supabase Site URL / Redirect URLs 미확인 (회원가입 완료 불가 위험)
 

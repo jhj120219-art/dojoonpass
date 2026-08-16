@@ -12,6 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 from config.settings import random_delay, CourtInfo, MAX_ITEMS
+from crawler.resume import case_no_matches_list_entry
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +290,14 @@ def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str) -
     list_items = collect_list_items(driver, MAX_ITEMS)
     target = None
     for item in list_items:
-        if case_no in item["case_no"]:
+        # 2026-08-15 Sprint 121: `case_no in item["case_no"]`(부분 문자열 포함)이던
+        # 것을 정확 비교로 고쳤다(crawler/resume.py:case_no_matches_list_entry 참고 —
+        # crawler/resume.py의 resume_start_idx()가 같은 결함을 갖고 있었다). 여기서는
+        # 부분일치로 엉뚱한 사건에 먼저 걸려도 wait_for_detail()의 정확한 사건번호
+        # 대조가 최종 오염은 막아주지만(found & expected_nos, 부분일치 아님), 매번
+        # 같은 무관한 항목에 먼저 걸려 타임아웃 후 실패하므로 그 사건의 문서 수집이
+        # 재시도해도 계속 실패했다.
+        if case_no_matches_list_entry(case_no, item["case_no"]):
             target = item
             break
 

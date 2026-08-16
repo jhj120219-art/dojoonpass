@@ -85,9 +85,13 @@ Beta v1 Development
 
 - ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정 + 코드 반영 완료**(플랜별 월 단위: 베이직 5회 / 프로 10회, 월 자동 리셋)
 - ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**: `BASIC` 12,900원/월·154,800원/년, `PRO` 22,900원/월·연 정상가 274,800원→판매가 198,000원. 할인은 `list_price`/`sale_price` 분리 구조
-- `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`를 `.env`에 설정 — **2026-08-08/09 재확인**: 변수명
-  자체는 이제 `.env`에 존재한다(값 유효성은 Secret 열람 금지 원칙상 이 세션에서 미확인).
-  `docs/BETA_RELEASE_CHECKLIST.md` P0-2 참고
+- ~~`ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`를 `.env`에 설정~~ → **2026-08-16 재확인
+  완료(Sprint 135/138)**: 값 자체는 여전히 열람하지 않았지만(Secret 열람 금지
+  원칙), `.env` 직접 grep(이름 존재)에 이어 이번엔 **실제 서버를 기동해 라이브
+  응답으로 확인**했다 — `curl`로 키 없이 4개 Admin 엔드포인트를 호출한 결과
+  전부 `500 관리자 키 미설정`이 아니라 `403 권한이 없습니다`를 반환한다(코드
+  계약상 `os.getenv()`가 빈 값이면 500, 값이 있으면 403이므로 이는 값이 **실제로
+  채워져 있다**는 확실한 증거다). `docs/BETA_RELEASE_CHECKLIST.md` P0-2 참고
 - ~~`SUBSCRIPTION` 결제 금액 서버 검증~~ (2026-08-05 완료, 2026-08-06 `PLAN_CATALOG` 기준으로 교체 완료)
 
 ## Crawler
@@ -114,7 +118,8 @@ Priority 2 (대부분 완료, 2026-08-05)
 
 - ~~프론트엔드 결제 UI + `registry-requests` 연동~~ (완료 — `properties/[id]/page.tsx`)
 - ~~OVERAGE_USAGE 결제 → registry_requests 자동 연결~~ (완료)
-- ~~관리자 페이지(등기부 신청 상태 관리)~~ (MVP 완료, `ADMIN_API_KEY` 설정만 남음)
+- ~~관리자 페이지(등기부 신청 상태 관리)~~ (MVP 완료, ~~`ADMIN_API_KEY` 설정만 남음~~ →
+  **2026-08-16 완료 확인**(위 "In Progress > Backend" 참고), 남은 것은 화면(UI) 부재뿐)
 - ~~등기부 무료 한도 정책 확정~~ → 2026-08-06 확정 + 코드 반영 완료(플랜별 월 단위)
 - 권리분석 연동 — 2026-08-06 조사 결과 신규 DB 테이블(`registry_rights`) + OCR/파싱 파이프라인이
   선행돼야 하는 스키마 변경 승인 대기 상태로 확인됨(위 "In Progress > Frontend" 참고)
@@ -125,7 +130,11 @@ Priority 3
 - ~~등기부 다운로드 엔진(수동 배치 방식)~~ (완료, Sprint 6 — 아래 Beta v2의 "실제 발급기관 자동 연동"과는 별개)
 - ~~Payment Provider 구조 분리~~ (완료, Sprint 8 — PG사 확정 전 기반 구조만)
 - ~~PG사 확정~~ → **2026-08-06 KG이니시스로 확정(CTO)**, ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**. 남은 작업: Interface v2 6개 메서드의 실제 API 호출 구현(외부 API Key/계약 필요 — 승인 대기). `TossProvider`/`PortOneProvider`는 폐기 예정 표기 완료
-- `ADMIN_API_KEY` 운영 값 설정 + 역할(role) 구분 도입 여부 결정(현재 단일 공유키)
+- ~~`ADMIN_API_KEY` 운영 값 설정~~ → **2026-08-16 완료 확인**(위 참고). 역할(role)
+  구분은 이미 2단계(ADMIN/SUPER_ADMIN)로 도입돼 있다(`docs/CURRENT_STATE.md` 인가
+  매트릭스 — 돈·권한이 움직이는 4개 엔드포인트는 SUPER_ADMIN 전용). 남은 것은
+  **등급 안에서 개별 운영자를 구분하는 것**뿐(지금은 등급별 공유키) — 이건 운영
+  인원 확장 시 필요한 제품 결정이라 여전히 승인 영역
 - 성능 최적화
 
 ---
@@ -182,8 +191,12 @@ Priority 3
 - 검색 최적화
 - DB 백업 체계 구축
 - ~~`SUBSCRIPTION` 결제 금액 서버 검증 부재~~ → 2026-08-05 해결, 2026-08-06 `PLAN_CATALOG` 기반으로 갱신(할인가 포함 서버 재계산)
-- Admin 인증에 역할(role) 구분 없음 (`X-Admin-Key` 단일 공유키, MVP 한계). 2026-08-07 상태 전이
-  **감사 로그**는 추가했으나 단일 키라 개별 운영자를 특정할 수는 없다
+- ~~Admin 인증에 역할(role) 구분 없음~~ → **부분 해소**: 2단계(ADMIN/SUPER_ADMIN)
+  역할 구분은 이미 도입돼 있다(`docs/CURRENT_STATE.md` 인가 매트릭스 — 돈/권한이
+  움직이는 4개 엔드포인트는 SUPER_ADMIN 전용). 다만 **등급 안에서는 여전히
+  단일 공유키**(`X-Admin-Key`, MVP 한계)라 같은 등급 내 개별 운영자는 구분할
+  수 없다 — 이 부분만 남은 기술부채. 2026-08-07 상태 전이 **감사 로그**는
+  추가했으나 단일 키라 "누가" 했는지는 등급까지만 알 수 있다
 - ~~bare `except:` / 과잉 `except Exception` / 미사용 import / 함수 내부 import~~ → 2026-08-07 정리 완료
   (AST 전수 재조사 결과 미사용 import 잔여 **0건**)
 - ~~API 서버 로깅 설정 부재~~ → 2026-08-07 해소(`logging.basicConfig` + `LOG_LEVEL`)
@@ -192,14 +205,34 @@ Priority 3
   구조적으로는 서버가 카탈로그를 내려주는 편이 맞다
 - **목록 엔드포인트 LIMIT 부재**(`favorites`/`payments`/`registry-requests`) — 응답 구조 변경 필요
 - **`(user_id, status)` 복합 인덱스 부재** — 구독/초과결제 조회가 `status` 인덱스를 타고
-  TEMP B-TREE 정렬을 만든다(2026-08-07 실행계획 실측)
+  TEMP B-TREE 정렬을 만든다(2026-08-07 실행계획 실측). **2026-08-16 재실측(Sprint 139)**:
+  `get_entitled_subscription()`의 실제 쿼리 플랜을 다시 뽑아 확인했다 —
+  `SEARCH ... USING INDEX idx_subscriptions_user_id (user_id=?)` 다음
+  `USE TEMP B-TREE FOR ORDER BY`가 여전히 뜬다(사실 자체는 그대로 정확).
+  다만 이 TEMP B-TREE는 **테이블 전체가 아니라 `WHERE user_id=?`로 좁혀진
+  한 사용자의 구독 이력 행만** 정렬한다 — 한 사용자가 평생 만드는 구독 행
+  수는 실질적으로 항상 한 자릿수라, 전체 데이터가 아무리 늘어도(사용자
+  10만 명이든 100만 명이든) 이 정렬 비용은 늘지 않는다(사용자당 상수 비용).
+  즉 "인덱스가 없다"는 사실은 맞지만 **스케일 위험은 아니다** — search
+  정렬의 TEMP B-TREE(전체 테이블 대상, `docs/SPRINT134_PERFORMANCE_SCALE_MEASUREMENT.md`)와
+  겉모습은 같아도 위험 등급이 다르다. 인덱스 추가는 스키마 변경(승인
+  영역)이고 실측상 이득이 미미해 우선순위를 낮춘다
 - **외부 예외/로그 수집 없음**(Sentry 등) — 운영에서 과거 로그 추적 불가
-- **selenium 미설치** — 크롤러 **실동작** 테스트(`test_docs.py` 등)는 여전히 실행 불가.
-  다만 순수 로직 테스트 2건(`test_doc_storage_atomicity.py`/`test_crawl_resume.py`)은
-  2026-08-10 Sprint 47에 의존성 분리(`crawler/doc_paths.py`/`crawler/resume.py`)로 복구됨
-- **`storage/`가 통째로 gitignore** — 그 안의 수정이 이력 없이 사라질 수 있다.
-  실제로 Sprint 47에 `checkpoint.py`의 원자적 쓰기(BUGS #23)가 유실된 것을 발견해
-  복구했다(BUGS #28). 회귀 테스트가 유일한 안전장치다
+- ~~**selenium 미설치**~~ → **2026-08-16 재확인(Sprint 139): 이제 설치돼 있다**
+  (`python -c "import selenium"` 성공). 다만 `test_docs.py` 등 **실동작** 테스트는
+  여전히 별도 사유로 기본 실행되지 않는다 — 의존성이 아니라
+  `ALLOW_LIVE_CRAWL=1` 가드(2026-08-11 Sprint 51, docs/BUGS.md #51) 때문이다.
+  이 가드는 의도적 설계다(실제 법원 웹사이트로 나가는 네트워크 호출을
+  일상적 회귀에서 막기 위함) — 그대로 유지. 순수 로직 테스트
+  (`test_doc_storage_atomicity.py`/`test_crawl_resume.py`)는 2026-08-10
+  Sprint 47에 의존성 분리(`crawler/doc_paths.py`/`crawler/resume.py`)로 복구됨
+- ~~**`storage/`가 통째로 gitignore**~~ → **2026-08-11 Sprint 51에 해소됨**
+  (`docs/CLAUDE.md`가 이미 정정해 둔 내용 — 이번 세션은 문서 대조로 재확인만
+  했다). `.gitignore` 규칙이 `storage/*` + `!storage/*.py` + `!storage/migrations/*.sql`로
+  정밀화되어 지금은 소스 23개가 정상 추적되고, 데이터 산출물만 무시된다.
+  Sprint 47이 겪은 "checkpoint.py 원자적 쓰기(BUGS #23) 유실" 사고의 **구조적
+  원인이 제거**됐다는 뜻 — 회귀 테스트가 유일한 안전장치이던 상태에서
+  git 이력 자체가 안전장치로 복귀했다
 
 ---
 

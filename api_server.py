@@ -58,6 +58,21 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+
+# 2026-08-15 Sprint 127: 프런트(next.config.ts)에 붙인 보안 헤더 중 정책 결정이 필요
+# 없는 것만 이쪽에도 맞춘다. **`X-Frame-Options`는 여기 넣지 않는다** — 프런트와 달리
+# 이 백엔드 자체가 iframe **대상**이다(`properties/[id]/page.tsx`가
+# `<iframe src="{API_BASE_URL}/api/v1/item/{id}/documents/{doc_type}">`로 문서 뷰어를
+# 이 API에서 직접 담는다). 프런트(3000)와 백엔드(8000)는 포트가 달라 **다른 origin**이므로
+# `SAMEORIGIN`조차 이 뷰어를 깨뜨린다 - 넣으면 안 되는 자리에 그대로 복붙하지 않도록
+# 여기 남긴다(Sprint 126/127이 프런트에서 고른 것과 백엔드는 요구사항이 다르다).
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
 app.include_router(search_router, prefix="/api/v1", tags=["search"])
 app.include_router(item_router, prefix="/api/v1", tags=["item"])
 app.include_router(doc_stats_router, prefix="/api/v1", tags=["document"])

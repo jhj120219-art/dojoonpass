@@ -120,6 +120,50 @@ def _docstring_ids(tree):
     return ids
 
 
+def _wrapper_print_functions(tree):
+    """print()/logger.*()에 자신의 매개변수를 그대로 실어 보내는 "투명 출력 래퍼"
+    함수 이름 -> {그 문자열이 실리는 매개변수 위치} 딕셔너리.
+
+    2026-08-16 Sprint 133 신설(BUGS류). `cleanup_orphans_dryrun.py`가
+
+        def head(t):
+            print("\\n" + "=" * 74 + "\\n" + t + "\\n" + "=" * 74)
+        ...
+        head("... — ...")
+
+    형태로 U+2014 EM DASH를 실제로 출력하다가 cp949 콘솔에서 죽었는데(재현 확인),
+    아래 `output_literals()`는 원래 `print`/`logger.*` 호출에 **직접** 박힌 리터럴만
+    봐서 `head("...")`처럼 한 단계 감싼 호출은 놓쳤다 — 이 스캔이 "통과"를 보고하는
+    동안 실제로는 그 파일의 진짜 출력 경로를 보지 않고 있었다는 뜻이다(§0의 "SKIPPED
+    없어야 한다"는 원칙과 같은 종류의 함정). 매개변수 이름이 print/logger 호출의
+    인자(직접 또는 BinOp/JoinedStr 안)로 그대로 쓰이는 모듈 최상위 함수를 찾아 그
+    함수도 "출력 경로"로 취급한다.
+    """
+    wrappers = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        param_names = [a.arg for a in node.args.args]
+        if not param_names:
+            continue
+        printed_positions = set()
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            fn = sub.func
+            is_print = isinstance(fn, ast.Name) and fn.id in PRINT_FUNCS
+            is_log = isinstance(fn, ast.Attribute) and fn.attr in LOG_METHODS
+            if not (is_print or is_log):
+                continue
+            for arg in sub.args:
+                for name_node in ast.walk(arg):
+                    if isinstance(name_node, ast.Name) and name_node.id in param_names:
+                        printed_positions.add(param_names.index(name_node.id))
+        if printed_positions:
+            wrappers[node.name] = printed_positions
+    return wrappers
+
+
 def output_literals(path):
     """콘솔로 나갈 수 있는 문자열 리터럴을 (lineno, 값)으로 돌려준다.
 
@@ -165,12 +209,27 @@ def output_literals(path):
                 found.append((node.lineno, node.value))
         return found
 
+    wrapper_funcs = _wrapper_print_functions(tree)
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
         is_print = isinstance(fn, ast.Name) and fn.id in PRINT_FUNCS
         is_log = isinstance(fn, ast.Attribute) and fn.attr in LOG_METHODS
+        is_wrapper = isinstance(fn, ast.Name) and fn.id in wrapper_funcs
+        if is_wrapper:
+            # 래퍼 호출은 문자열이 실리는 그 위치의 인자만 본다(다른 인자는 출력과
+            # 무관할 수 있다 — head(t)처럼 매개변수가 하나뿐이면 사실상 전부지만,
+            # 매개변수가 여럿인 래퍼에서 과탐하지 않도록 위치를 좁힌다).
+            for pos in wrapper_funcs[fn.id]:
+                if pos < len(node.args):
+                    arg = node.args[pos]
+                    for sub in ast.walk(arg):
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                                and id(sub) not in docs:
+                            found.append((sub.lineno, sub.value))
+            continue
         if not (is_print or is_log):
             continue
         for sub in ast.walk(node):

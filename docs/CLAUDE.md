@@ -89,10 +89,22 @@ Separately: `doc_worker.py` (~02:00, via `run_doc_worker.bat`) drains `document_
 
 ### DB schema setup (once, against a fresh `auction.db`, in order)
 ```bash
+python -c "from storage.database import init_db; init_db()"   # creates the legacy auction, document_queue, document_version_log tables
 python storage/migrate_v4_1.py                 # creates auction_case, auction_item, document_status, doc_raw, parsed_document, tenant_rights, rights_summary, rights_analysis_history
 python -m storage.migrations.run_migrations     # applies numbered SQL files 001~019 (favorites, recent_items, search_presets, subscriptions, registry_usage, payments, registry_requests, indexes, payment_logs, registry_credits, audit/credit logs + soft-delete columns, document_collect_failures, document_queue UNIQUE+item_no, subscriptions.payment_id); tracked in `migration_history`, safe to re-run. Running it as a script (`python storage/migrations/run_migrations.py`) also works as of 2026-08-11 — before that only the `-m` form did.
 ```
-(2026-08-11 Sprint 53: `storage/migrate_doc_collect.py`는 Migration 017로 대체되어 제거됐다 — 부트스트랩은 위 두 명령만으로 완결된다.)
+2026-08-15 Sprint 122 정정: the `init_db()` step above is **required**, not optional. An earlier
+version of this doc listed only the last two commands and said "부트스트랩은 위 두 명령만으로
+완결된다" (bootstrap is complete with just these two) — that was wrong. Migrations 011/012 do
+`FROM auction`/`DROP TABLE auction` against the **legacy** `auction` table, which only `init_db()`
+creates; `migrate_v4_1.py` never touches it. Skipping `init_db()` and running only the last two
+commands (i.e. following the old wording literally) applies migrations 001–010 and then dies at
+011 with a bare `sqlite3.OperationalError: no such table: auction`, leaving `migration_history`
+half-populated (measured 2026-08-15). `storage/migrations/run_migrations.py`'s own preflight
+check now catches this and prints the same 3-step sequence as its stop message — but the doc
+itself should say it correctly the first time. `test_bootstrap.py` (`test_full_bootstrap_from_scratch`,
+`test_runner_refuses_without_prerequisites`) exercises this exact sequence.
+(2026-08-11 Sprint 53: `storage/migrate_doc_collect.py`는 Migration 017로 대체되어 제거됐다.)
 
 `storage/database.py`'s `init_db()` only creates the legacy `auction` + `document_queue` + `document_version_log` tables (idempotent, runs automatically on every `mvp_scraper.py`/`doc_worker.py` invocation) — it does **not** create the v4.1 tables above.
 

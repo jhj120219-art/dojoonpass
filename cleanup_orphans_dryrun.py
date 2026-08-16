@@ -51,7 +51,7 @@ def main() -> int:
     conn = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True)
     conn.row_factory = sqlite3.Row
 
-    head("1. document_queue 고아 — 대응 auction_item 이 없는 행")
+    head("1. document_queue 고아 - 대응 auction_item 이 없는 행")
     # ★ 3자 조인. case_no 단독 조인은 법원 간 동명 사건을 가린다.
     rows = conn.execute("""
         SELECT dq.* FROM document_queue dq
@@ -74,7 +74,7 @@ def main() -> int:
     if len(rows) > 12:
         print("    ... 외 %d행" % (len(rows) - 12))
 
-    head("2. 그 고아가 '진짜' 고아인가 — 물건이 정말 없는지 다시 확인")
+    head("2. 그 고아가 '진짜' 고아인가 - 물건이 정말 없는지 다시 확인")
     # 지우기 전에 반드시 확인해야 하는 것: 법원만 다르게 저장돼 있을 가능성.
     for r in rows[:12]:
         same_case = conn.execute(
@@ -85,7 +85,7 @@ def main() -> int:
         print("    %-14s %-16s 물건%-3s -> %s"
               % (r["court_code"], r["case_no"][:16], r["item_no"], note))
 
-    head("3. documents/ 고아 디렉터리 — 대응 물건이 없는 문서 폴더")
+    head("3. documents/ 고아 디렉터리 - 대응 물건이 없는 문서 폴더")
     empty_dirs, with_files = [], []
     if os.path.isdir(DOCUMENT_ROOT):
         for court in sorted(os.listdir(DOCUMENT_ROOT)):
@@ -120,7 +120,7 @@ def main() -> int:
         print("    %s / %s / %s -> %s (%.1f KB)"
               % (court, case, item_no, files, total / 1024))
 
-    head("4. 삭제 기준 제안 (실행하지 않는다 — 사람이 판단할 근거)")
+    head("4. 삭제 기준 제안 (실행하지 않는다 - 사람이 판단할 근거)")
     print("""  안전한 순서로만 적는다. 각 단계는 **되돌릴 수 없다.**
 
   [A] 빈 고아 디렉터리 (%d개)

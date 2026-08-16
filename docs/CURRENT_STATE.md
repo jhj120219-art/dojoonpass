@@ -335,7 +335,7 @@ KG이니시스) 대기로 수렴
 
 ☑ KG이니시스 Provider 자리 신설 (2026-08-07 — `KGInicisProvider` + `PAYMENT_PROVIDER=kginicis` 허용값. 실제 API 호출 구현은 계약/키 발급 필요로 승인 대기)
 
-☑ Payment Flow Migration (`payments.py`가 `create_order`→`confirm_payment`→`verify_payment` 순서로 provider 호출, `SUBSCRIPTION`/`OVERAGE_USAGE` 둘 다 새 Flow로 정상 동작 확인. `cancel_payment`/`handle_webhook`은 여전히 미연결)
+☑ Payment Flow Migration (`payments.py`가 `create_order`→`confirm_payment`→`verify_payment` 순서로 provider 호출, `SUBSCRIPTION`/`OVERAGE_USAGE` 둘 다 새 Flow로 정상 동작 확인. `cancel_payment`/`handle_webhook`은 이 시점엔 미연결이었으나 **2026-08-11 Sprint 52에서 연결 완료** — 아래 396행 정정 참고)
 
 ☑ `SUBSCRIPTION` 결제 금액 서버 검증 (`PLAN_PRICES`, `OVERAGE_USAGE`와 동일 방식 — 이제 둘 다 완료)
 
@@ -393,7 +393,13 @@ KG이니시스) 대기로 수렴
 
 □ ~~PG사 확정~~ → **2026-08-06 KG이니시스로 확정(CTO)**, ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**(클래스 + `PAYMENT_PROVIDER=kginicis` 허용값, 6개 메서드는 `NotImplementedError` 자리 구현). 남은 작업: Interface v2 6개 메서드의 **실제 KG이니시스 API 호출 구현** (외부 API Key/계약 필요 — 승인 대기). `TossProvider`/`PortOneProvider`는 폐기 예정 표기 + 선택 시 경고 로그
 
-□ 환불(`cancel_payment`)/Webhook(`handle_webhook`) 엔드포인트 신규 구현 — 여전히 미연결
+☑ ~~환불(`cancel_payment`)/Webhook(`handle_webhook`) 엔드포인트 신규 구현 — 여전히 미연결~~ →
+**2026-08-11 Sprint 52 완료, 2026-08-15 Sprint 131 재확인**: `api/v1/payments.py:refund_payment()`가
+`provider.cancel_payment()`를 호출하고(admin 전용 `POST /admin/payments/{id}/refund`에서
+진입), `receive_payment_webhook()`(`POST /payments/webhook/{provider_name}`)가
+`provider.handle_webhook(payload)`를 호출해 `_apply_webhook_event()`로 이어진다. 둘 다
+`test_api_regression.py`(§30 `test_payment_webhook`)/`test_race_conditions.py`(§9)/
+Sprint 129가 계속 실측 확인하고 있다 — 이 줄만 Sprint 52 이전 상태로 남아 있었다.
 
 □ **[2026-08-07 발견]** `/properties`(로그인 후 첫 화면)가 Supabase `properties` 테이블을 조회하면서
 링크는 `/properties/{id}`(FastAPI `auction_item`)로 보낸다 — id 채번 체계가 달라 엉뚱한 물건이

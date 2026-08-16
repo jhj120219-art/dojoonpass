@@ -2,9 +2,13 @@ from dataclasses import dataclass
 
 MAX_ITEMS: int = 10
 MAX_RETRY: int = 3
-PAGE_LOAD_TIMEOUT: int = 30
-ELEMENT_TIMEOUT: int = 20
-AJAX_TIMEOUT: int = 30
+
+# 2026-08-16 Sprint 136 정리: PAGE_LOAD_TIMEOUT/ELEMENT_TIMEOUT/AJAX_TIMEOUT도
+# 바로 위 MAX_DOC_RETRY/RETRY_INTERVAL_MINUTES와 같은 모양으로 죽은 중복이었다 —
+# `crawler/base_crawler.py`가 이미 이 파일에서 `random_delay`/`CourtInfo`/`MAX_ITEMS`를
+# import하면서도 타임아웃 세 값(값도 여기와 동일: 30/20/30)만은 자기 안에 따로
+# 선언해 쓰고 있었다(grep 확인, 이쪽 사본은 어디서도 import되지 않음). 실제
+# 타임아웃 정책은 `crawler/base_crawler.py`의 것 하나로 통일한다.
 
 import random
 def random_delay() -> float:
@@ -62,9 +66,17 @@ def get_doc_button_id(doc_type: str, item_no: str) -> str:
     return None
 
 
-# 재시도 정책
-MAX_DOC_RETRY: int = 3
-RETRY_INTERVAL_MINUTES: int = 30
+# 2026-08-16 Sprint 136 정리: 문서 수집 재시도 정책(MAX_DOC_RETRY/RETRY_INTERVAL_MINUTES)이
+# 여기 한 번, `storage/database.py`에 또 한 번(값도 같게, 3/30) 따로 선언돼 있었다 — grep
+# 확인 결과 실제로 쓰이는 것은 `storage/database.py`의 것뿐이고(`mark_queue_failed()`/
+# `claim_next_queue_item()`이 그 모듈 안의 값을 직접 참조), 여기 있던 사본은 어디서도
+# import되지 않는 죽은 중복이었다. 두 값이 지금은 우연히 같아 드러나지 않았지만, 한쪽만
+# 바꾸면 조용히 어긋날 수 있는 구조라 여기서 지웠다 — 실제 정책 값은
+# `storage/database.py:MAX_DOC_RETRY`/`RETRY_INTERVAL_MINUTES` 하나로 통일한다.
+# (그쪽을 여기서 import하는 방향으로 합치지 않은 이유: `test_pipeline_integrity.py`가
+# `storage/database.py`의 소스 텍스트에서 `MAX_DOC_RETRY\s*=\s*(\d+)` 리터럴 할당을 직접
+# 정규식으로 읽어 "테스트에 값을 복제하지 않는다"는 목적을 지키고 있다 — import 문으로
+# 바꾸면 그 검사가 깨진다. 안전한 쪽은 실제로 안 쓰이는 이 사본을 지우는 것이었다.)
 
 # Worker 종료 시각 (HH:MM, 24시간제)
 DOC_WORKER_END_TIME: str = "04:00"

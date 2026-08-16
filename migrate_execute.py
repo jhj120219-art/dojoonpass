@@ -56,6 +56,28 @@ def execute():
 
         logger.info("auction_case 완료: %d건", len(case_map))
 
+        # 2026-08-15 Sprint 129: (court_code, case_no) -> case_id를 한 번에 메모리로 읽어 온다.
+        # 아래 두 루프(§2 auction_item, §3 document_status)가 원래 각자 row마다
+        # `SELECT ... WHERE court_code=? AND case_no=?`를 따로 실행했다(N+1) — 위에서 이미
+        # case_map으로 (court_code, case_no) 단위 유니크 집합을 구해 뒀는데, 그 뒤 row 단위로
+        # 다시 조회하고 있었다. 인덱스가 있어 각 조회 자체는 빠르지만(현재 실측 2,156건에서
+        # 체감 지연 없음), row 수만큼 배로 늘어나는 구조라 크롤 데이터가 늘수록 그대로
+        # 커진다. `auction_case`는 과거 사건까지 계속 누적되는 테이블이라(오늘 기준
+        # 1,574건 = case_map과 우연히 같지만 항상 같다는 보장은 없다) 전체를 긁는 대신,
+        # SQLite의 row-value IN(3.15+, 이 환경 3.50)으로 지금 필요한 키만 한 번에 읽는다 —
+        # 결과는 기존 개별 조회와 동일하다(같은 UNIQUE(court_code, case_no) 제약을 그대로 사용).
+        case_keys = list(case_map.keys())
+        case_id_by_key = {}
+        if case_keys:
+            placeholders = ",".join(["(?,?)"] * len(case_keys))
+            params = [v for pair in case_keys for v in pair]
+            for cc_row in conn.execute(
+                f"SELECT id, court_code, case_no FROM auction_case "
+                f"WHERE (court_code, case_no) IN ({placeholders})",
+                params,
+            ).fetchall():
+                case_id_by_key[(cc_row["court_code"], cc_row["case_no"])] = cc_row["id"]
+
         # 2. auction_item UPSERT
         # Sprint: auction -> auction_item 최신화 동기화.
         # 기존 INSERT OR IGNORE는 최초 삽입 이후 재크롤링 값(가격/기일/상태/유찰횟수)이
@@ -75,13 +97,16 @@ def execute():
         item_count = 0
         item_inserted = 0
         item_updated = 0
+        # (case_id, item_no) -> auction_item.id. §3 document_status 루프가 다시 JOIN으로
+        # 같은 item_id를 조회하던 것을 대신한다(아래 §3 주석 참고).
+        item_id_by_key = {}
         for row in rows:
             # 조회도 복합키 기준이어야 한다 — case_no만으로 찾으면 동일 사건번호를 쓰는
             # 다른 법원의 auction_case row를 잘못 연결하게 된다(위 UPSERT와 동일한 이유).
-            case_id = conn.execute(
-                "SELECT id FROM auction_case WHERE court_code = ? AND case_no = ?",
-                (row["court_code"], row["case_no"])
-            ).fetchone()["id"]
+            # case_id는 위에서 이미 (court_code, case_no) 전체를 한 번에 읽어 둔 딕셔너리에서
+            # 가져온다(개별 SELECT였던 것을 Sprint 129에서 없앴다) — case_map이 만들어질 때
+            # 이 row의 (court_code, case_no)로 auction_case가 INSERT OR IGNORE됐으므로 항상 있다.
+            case_id = case_id_by_key[(row["court_code"], row["case_no"])]
 
             existing = conn.execute(
                 "SELECT * FROM auction_item WHERE case_id=? AND item_no=?",
@@ -122,8 +147,9 @@ def execute():
                     case_id, row["item_no"],
                 ))
                 item_updated += 1
+                item_id_by_key[(case_id, row["item_no"])] = existing["id"]
             else:
-                conn.execute("""
+                cur = conn.execute("""
                     INSERT INTO auction_item
                     (case_id, case_no, item_no, court_name, property_type,
                      sido, sigungu, dong, lot_number, full_address,
@@ -146,6 +172,7 @@ def execute():
                     now,
                 ))
                 item_inserted += 1
+                item_id_by_key[(case_id, row["item_no"])] = cur.lastrowid
             item_count += 1
 
         logger.info("auction_item 완료: %d건 (신규 %d건, 갱신 %d건)",
@@ -175,19 +202,16 @@ def execute():
             # / 2024타경4973). 지금은 물건번호가 마침 달라 무사하지만, 한쪽에 같은 물건번호가
             # 생기는 순간 터진다 — 진행 중인 사건들이라 언제든 생길 수 있다.
             #
-            # 조회 형태는 `storage/database.py:_document_status_item_id()` 와 맞춘다.
-            # 같은 것을 찾는 조회가 두 벌이면 한쪽만 고쳐진다.
-            item = conn.execute(
-                """
-                SELECT ai.id FROM auction_item ai
-                JOIN auction_case ac ON ac.id = ai.case_id
-                WHERE ac.court_code = ? AND ai.case_no = ? AND ai.item_no = ?
-                """,
-                (row["court_code"], row["case_no"], row["item_no"])
-            ).fetchone()
-            if not item:
+            # 2026-08-15 Sprint 129: 위 §2 루프가 이미 같은 신원(법원+사건→case_id,
+            # case_id+item_no→item_id)을 방금 확정해 `item_id_by_key`에 담아 뒀다 — 바로
+            # 아래에서 JOIN으로 다시 물어보던 조회를 그 결과 재사용으로 바꾼다(row 수만큼
+            # 반복되는 조회였다). 식별 로직 자체는 그대로다: (court_code, case_no)로 case_id를
+            # 먼저 구하고, (case_id, item_no)로 item을 특정한다 — `storage/database.py:
+            # _document_status_item_id()`와 맞춘 원래 조회의 두 단계와 동일한 키를 쓴다.
+            case_id = case_id_by_key.get((row["court_code"], row["case_no"]))
+            item_id = item_id_by_key.get((case_id, row["item_no"])) if case_id is not None else None
+            if item_id is None:
                 continue
-            item_id = item["id"]
 
             for doc_type, col in [
                 ("SPEC", "has_spec_pdf"),

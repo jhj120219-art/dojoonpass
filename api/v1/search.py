@@ -311,9 +311,20 @@ def search(
 
         order_col = SORT_COLUMNS.get(sort_by)
         order_dir = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+        # id를 동률 결정자로 끝에 붙인다(Sprint 26 - payments/favorites/recent_items/
+        # registry_requests/search_presets에 이미 적용된 것과 같은 규칙, 방향은 주 정렬과
+        # 맞춘다). 2026-08-15 Sprint 122 실측: 이 라우트만 그 정리에서 빠져 있었다 -
+        # 기본 정렬(auction_date, fail_count) 동률 그룹이 실 데이터에 최대 27건까지
+        # 있고(예: 2026-07-28 + fail_count=1), minimum_bid_price 동률도 최대 8건 있다.
+        # offset 페이지네이션에서 동률이 페이지 경계에 걸치면 같은 물건이 두 페이지에
+        # 중복 노출되거나 아예 빠질 수 있다 - 검색은 이 서비스의 가장 흔한 진입점이라
+        # 영향 범위가 다른 어떤 목록보다 크다.
         order_clause = (
-            f"{order_col} {order_dir}" if order_col
-            else "auction_date DESC, fail_count DESC"
+            f"{order_col} {order_dir}, id {order_dir}" if order_col
+            # 기본 정렬은 sort_by가 없을 때만 타므로 order_dir(sort_order)와 무관하게
+            # 고정이다 - 여기서도 고정 DESC로 맞춘다(order_dir을 섞으면 sort_by 없이
+            # sort_order만 준 요청에서 주 정렬은 그대로인데 동률 방향만 바뀌는 상태가 된다).
+            else "auction_date DESC, fail_count DESC, id DESC"
         )
 
         offset = (page - 1) * size

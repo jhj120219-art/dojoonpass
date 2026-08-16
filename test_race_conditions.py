@@ -46,6 +46,7 @@ TEST_USER_SUBSCRIPTION = "qa-race-sub-" + uuid.uuid4().hex[:10]
 TEST_USER_ADMIN_TARGET = "qa-race-admintarget-" + uuid.uuid4().hex[:10]
 TEST_USER_REFUND = "qa-race-refund-" + uuid.uuid4().hex[:10]
 TEST_USER_SUB_STATUS = "qa-race-substatus-" + uuid.uuid4().hex[:10]
+TEST_USER_WEBHOOK_REPROCESS = "qa-race-whreprocess-" + uuid.uuid4().hex[:10]
 failures = []
 
 
@@ -211,10 +212,14 @@ def test_overage_payment_race():
             "SELECT COUNT(*) FROM payments WHERE user_id=? AND payment_type='OVERAGE_USAGE'",
             (TEST_USER_PAYMENT,),
         ).fetchone()[0]
-        # payments 행 자체는 provider.confirm_payment까지 항상 SUCCESS로 기록되므로 n개 전부
-        # 생성될 수 있다(결제 자체는 Mock이라 항상 승인) — 레이스 방어의 핵심은 "그중 등기부
-        # 신청에 실제로 연결된 것이 1건뿐"이라는 사실이지, payments 행 개수가 아니다.
-        check("at least one payment row recorded", paid_payments >= 1, True)
+        # 2026-08-15 Sprint 129: 이전에는 payments 행이 provider.confirm_payment까지 항상
+        # SUCCESS로 기록되어 n개 전부 생성될 수 있었다(BEGIN IMMEDIATE가 target_request UPDATE
+        # 시점에만 걸려 있어, 레이스 패자도 provider 호출까지는 도달했다 — 지금은 MockProvider라
+        # 부작용이 없지만 실제 PG라면 패자 쪽도 카드 승인까지 갈 수 있었다는 뜻). 락을
+        # provider 호출보다 앞으로 당긴 뒤로는 패자가 target_request 재확인에서 즉시
+        # PAY_NO_TARGET_REQUEST로 거부되어 provider까지 도달하지 않는다 — payments 행도
+        # 정확히 1개만 생성돼야 한다.
+        check("exactly 1 payment row recorded (provider never reached by losers)", paid_payments, 1)
     finally:
         conn.close()
 
@@ -482,6 +487,101 @@ def test_refund_guard_is_structural():
     check_true("거부 시 롤백한다", "conn.rollback()" in body)
     check_true("거부 응답이 409다(다른 요청이 먼저 반영됨)",
                "409," in body or "409)" in body)
+
+
+def test_admin_webhook_reprocess_race():
+    """같은 Webhook 수신 1건에 재처리 요청 3개를 정확히 동시에 보낸다.
+
+    2026-08-16 (Sprint 140, Transaction/Concurrency Audit) ― 환불/등기부/구독
+    상태변경 레이스는 전부 실제 스레드로 재현하는 테스트가 있는데, Webhook
+    재처리(`admin_reprocess_webhook` → `reprocess_webhook()`)는 아래
+    `test_webhook_reprocess_guard_is_structural()`처럼 **소스 텍스트에
+    "BEGIN IMMEDIATE"가 있는지만** 확인하는 정적 검사뿐이었다 — 실제 동시
+    요청으로 락이 진짜 직렬화하는지 실행해 본 적이 없었다(전체 파일 grep으로
+    확인: 이 엔드포인트를 대상으로 한 `threading` 기반 테스트 0건). 정적 검사는
+    "그 문자열이 코드에 있다"만 보장하지, 순서가 뒤바뀌거나 락 범위가 좁아져도
+    같은 문자열이 남아 있으면 통과한다 — 실제 결함을 잡는 것은 이 테스트다.
+
+    RECEIVED 상태의 Webhook 수신 기록(PAID -> REFUNDED로 실제 상태를 바꾸는
+    이벤트)을 하나 만들어 두고, 재처리 요청 3개를 동시에 보낸다. `BEGIN
+    IMMEDIATE`가 실제로 직렬화하면 정확히 1건만 APPLIED고 나머지는
+    `webhook_reprocess_block_reason()`이 "이미 처리됨"으로 막아 400을 받는다.
+    """
+    print("\n--- 10. admin webhook reprocess race (3 threads, single RECEIVED webhook) ---")
+    r = client.post(
+        "/api/v1/payments",
+        json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+              "amount": resolve_plan_price("BASIC", BILLING_MONTHLY), "billing_cycle": BILLING_MONTHLY},
+        headers=auth_headers(TEST_USER_WEBHOOK_REPROCESS),
+    )
+    body = r.json()
+    check_true("설정: 결제 생성 성공", body.get("success"))
+    payment_id = body["data"]["payment"]["id"]
+
+    conn = get_connection()
+    try:
+        pg_txid = conn.execute(
+            "SELECT pg_transaction_id FROM payments WHERE id=?", (payment_id,)
+        ).fetchone()[0]
+        now = datetime.now().isoformat()
+        payload = '{"event_id": "qa-race-wh-1", "event_type": "PAYMENT_REFUNDED", ' \
+                  '"pg_transaction_id": "%s"}' % pg_txid
+        webhook_id = conn.execute(
+            """
+            INSERT INTO payment_webhooks
+            (provider, event_type, event_id, pg_transaction_id, payment_id,
+             signature_verified, processing_status, raw_payload, received_at)
+            VALUES ('mock','PAYMENT_REFUNDED','qa-race-wh-1',?,?,1,'RECEIVED',?,?)
+            """,
+            (pg_txid, payment_id, payload, now),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    n = 3
+    super_admin_headers = {"X-Admin-Key": os.environ["SUPER_ADMIN_API_KEY"]}
+    results = [None] * n
+    start_barrier = threading.Barrier(n)
+
+    def worker(idx):
+        start_barrier.wait()
+        resp = client.post(
+            f"/api/v1/admin/payments/webhooks/{webhook_id}/reprocess",
+            headers=super_admin_headers,
+        )
+        results[idx] = (resp.status_code, resp.json())
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = [code for code, _ in results]
+    applied = [b for code, b in results if code == 200 and b.get("data", {}).get("result") == "APPLIED"]
+    rejected = [code for code in statuses if code == 400]
+    check("모든 요청이 유효한 코드로만 응답(200 또는 400)",
+          all(c in (200, 400) for c in statuses), True)
+    check("정확히 1건만 APPLIED된다(중복 적용 없음)", len(applied), 1)
+    check("나머지 2건은 이미 처리됨으로 거부된다(400)", len(rejected), n - 1)
+
+    conn = get_connection()
+    try:
+        pay_row = conn.execute("SELECT status FROM payments WHERE id=?", (payment_id,)).fetchone()
+        wh_row = conn.execute(
+            "SELECT processing_status FROM payment_webhooks WHERE id=?", (webhook_id,)
+        ).fetchone()
+        applied_logs = conn.execute(
+            "SELECT COUNT(*) FROM payment_logs WHERE payment_id=? AND event_type='WEBHOOK' AND status='SUCCESS'",
+            (payment_id,),
+        ).fetchone()[0]
+        check("결제 상태가 정확히 한 번만 REFUNDED로 바뀐다", pay_row["status"], "REFUNDED")
+        check("Webhook 처리 상태는 PROCESSED로 정착된다(RECEIVED에 남지 않음)",
+              wh_row["processing_status"], "PROCESSED")
+        check("WEBHOOK 성공 로그가 정확히 1건뿐이다(중복 기록 없음)", applied_logs, 1)
+    finally:
+        conn.close()
 
 
 def test_webhook_reprocess_guard_is_structural():
@@ -830,12 +930,56 @@ def cleanup():
             )
             total += cur.rowcount
 
+        # Webhook 재처리 레이스 시나리오가 만든 payment_webhooks/audit_logs도 payment_id로
+        # 연결된다(payment_webhooks에는 user_id 컬럼 자체가 없다) ― payments를 지우기
+        # 전에 먼저 정리해야 한다(자식 -> 부모 순서).
+        wh_payment_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM payments WHERE user_id=?", (TEST_USER_WEBHOOK_REPROCESS,)
+            ).fetchall()
+        ]
+        if wh_payment_ids:
+            placeholders = ",".join("?" * len(wh_payment_ids))
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type='PAYMENT' AND target_id IN (%s)" % placeholders,
+                wh_payment_ids,
+            )
+            total += cur.rowcount
+        # 재처리 요청이 거부(SKIPPED)될 때는 payment_id 없이 target_type='PAYMENT_WEBHOOK'
+        # + target_id=webhook_id로 감사 로그가 남는다(`admin_reprocess_webhook()`의
+        # `linked_payment_id` 분기 — `_apply_webhook_event()`의 `skip()`은 payment_id를
+        # 돌려주지 않는다). 정상 동작에서는 이 분기가 애초에 실행되지 않지만(레이스 패자는
+        # `webhook_reprocess_block_reason()`에서 400으로 막혀 record_audit() 도달 전에
+        # 끝난다), 변이 검증처럼 그 방어를 일부러 깬 상태로 실행하면 이 모양의 행이 남는다
+        # — 실측으로 걸린 잔해였다(2026-08-16). payment_id로는 못 찾으므로 event_id로
+        # webhook_id를 다시 찾아 정리한다.
+        wh_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM payment_webhooks WHERE event_id='qa-race-wh-1'"
+            ).fetchall()
+        ]
+        if wh_ids:
+            placeholders = ",".join("?" * len(wh_ids))
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type='PAYMENT_WEBHOOK' AND target_id IN (%s)" % placeholders,
+                [str(i) for i in wh_ids],
+            )
+            total += cur.rowcount
+        if wh_payment_ids:
+            placeholders = ",".join("?" * len(wh_payment_ids))
+            cur = conn.execute(
+                "DELETE FROM payment_webhooks WHERE payment_id IN (%s)" % placeholders,
+                wh_payment_ids,
+            )
+            total += cur.rowcount
+
         # subscriptions가 payments **앞**이어야 한다 ― `subscriptions.payment_id`가
         # 생기면서 구독이 결제의 자식이 됐다 (2026-08-13 Sprint 96, BUGS #94).
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
                       "payment_logs", "subscriptions", "payments"):
             for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION,
-                         TEST_USER_ADMIN_TARGET, TEST_USER_REFUND, TEST_USER_SUB_STATUS):
+                         TEST_USER_ADMIN_TARGET, TEST_USER_REFUND, TEST_USER_SUB_STATUS,
+                         TEST_USER_WEBHOOK_REPROCESS):
                 cur = conn.execute("DELETE FROM %s WHERE user_id=?" % table, (user,))
                 total += cur.rowcount
         conn.commit()
@@ -852,6 +996,19 @@ def cleanup():
         left += conn.execute(
             "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (TEST_USER_SUB_STATUS,)
         ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (TEST_USER_WEBHOOK_REPROCESS,)
+        ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM payment_webhooks WHERE event_id='qa-race-wh-1'"
+        ).fetchone()[0]
+        if wh_ids:
+            placeholders = ",".join("?" * len(wh_ids))
+            left += conn.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE target_type='PAYMENT_WEBHOOK'"
+                " AND target_id IN (%s)" % placeholders,
+                [str(i) for i in wh_ids],
+            ).fetchone()[0]
         check("no test rows left", left, 0)
     finally:
         conn.close()
@@ -992,6 +1149,7 @@ def run():
         test_admin_refund_race()
         test_toctou_guard_is_structural()
         test_refund_guard_is_structural()
+        test_admin_webhook_reprocess_race()
         test_webhook_reprocess_guard_is_structural()
         test_admin_subscription_status_race()
         test_subscription_status_guard_is_structural()

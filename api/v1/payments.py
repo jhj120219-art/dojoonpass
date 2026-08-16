@@ -354,6 +354,32 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
 
     conn = get_connection()
     try:
+        # 2026-08-15 Sprint 129 ― 쓰기 락(BEGIN IMMEDIATE)을 **provider 호출보다 먼저** 잡는다.
+        #
+        # SUBSCRIPTION은 이미 이렇게 하고 있었다(2026-08-09, docs/BUGS.md #20) — "확인 후 생성"
+        # 레이스를 막으려면 확인 시점부터 락을 쥐어야 한다는 것. 그런데 그 원칙이 바로 아래
+        # OVERAGE_USAGE의 target_request 확인에는 적용되지 않고 있었다: 락 없이 SELECT한 뒤
+        # provider.create_order/confirm/verify까지 전부 실행하고(`create_payment_record`),
+        # 그 뒤에야(§ 아래 registry_requests 조건부 UPDATE) 레이스 패자를 걸러냈다.
+        #
+        # 최종 DB 상태는 항상 정합했다 — `test_race_conditions.py::test_overage_payment_race`가
+        # "등기부 신청에 실제로 연결된 결제는 항상 1건"임을 8스레드로 확인해 두었다. 하지만 그
+        # 테스트 자체가 명시하듯 "payments 행은 n개 전부 생성될 수 있다"(provider까지는 패자도
+        # 도달한다는 뜻) — 지금은 MockProvider라 부작용이 없지만, 실제 PG 연동 시 이 경로
+        # 그대로면 패자 쪽 provider 호출도 실제 카드 승인으로 이어질 수 있고, 그 결제는 뒤이은
+        # `conn.rollback()`으로 **우리 DB 기록(payments + payment_logs)만** 사라질 뿐 PG 쪽
+        # 청구는 취소되지 않는다 — 환불 인프라(`refund_payment()`/`provider.cancel_payment()`)는
+        # 이미 있지만 이 경로에서 호출되지 않는다.
+        #
+        # 지금 고치는 것은 그 앞단이다: SUBSCRIPTION과 동일하게 락을 provider 호출 앞으로
+        # 당겨, 패자가 애초에 provider까지 도달하지 못하게 한다(새 정책이 아니라 기존
+        # SUBSCRIPTION 수정과 같은 패턴을 옮기는 것). 락을 잡은 뒤 실제로 PG에 청구가
+        # 나간 다음 우리 쪽만 롤백되는 상황에 대한 보상(자동 cancel_payment 호출) 설계는
+        # 실제 PG 연동 시점의 별도 작업으로 SKIP — MockProvider만 있는 지금은 재현·검증
+        # 대상 자체가 없다(아래 SKIP 표에 남긴다).
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+
         # OVERAGE_USAGE는 이 결제로 해결할 등기부 신청을 먼저 확정한다(가장 오래된 미결제 건).
         # 여기서 대상이 없으면 결제 자체를 만들지 않는다 — 짝이 없는 payment row가 남지 않도록.
         target_request = None
@@ -367,6 +393,7 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
                 (user_id,)
             ).fetchone()
             if not target_request:
+                conn.commit()
                 return error_response(ErrorCode.PAY_NO_TARGET_REQUEST, "결제가 필요한 등기부 신청이 없습니다")
 
         # SUBSCRIPTION은 이미 유효한 구독(ACTIVE/GRACE_PERIOD)이 있으면 새로 만들지 않는다
@@ -375,16 +402,12 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
         # 않으므로("이미 구독 중이면 재구독 불가"가 기존에 이미 전제된 불변식이다) 여기 도달하는
         # 건 중복 클릭·새로고침 재제출·직접 API 호출뿐이다.
         #
-        # "확인 후 생성"은 그 자체로 SELECT -> 판단 -> INSERT 레이스다 — 기본 isolation_level은
-        # 첫 쓰기 문에야 트랜잭션을 시작하므로, 커밋되지 않은 두 요청이 동시에 이 SELECT를 지나가면
-        # 둘 다 "구독 없음"을 보고 통과할 수 있다(실측 재현: 동시 10회 요청 -> subscriptions/
-        # payments 10개씩 생성, 2026-08-09). registry.py의 등기부 중복신청 방지와 동일하게
-        # BEGIN IMMEDIATE로 쓰기 락을 먼저 선점해 확인+생성을 하나의 원자적 단위로 묶는다 —
-        # 뒤에 오는 결제/구독 생성·최종 commit까지 전부 이 트랜잭션 안에서 이어진다.
+        # "확인 후 생성"은 그 자체로 SELECT -> 판단 -> INSERT 레이스다. registry.py의 등기부
+        # 중복신청 방지와 동일하게, 위에서 이미 선점한 쓰기 락으로 확인+생성을 하나의 원자적
+        # 단위로 묶는다 — 뒤에 오는 결제/구독 생성·최종 commit까지 전부 이 트랜잭션 안에서
+        # 이어진다.
         existing_subscription = None
         if req.payment_type == "SUBSCRIPTION":
-            conn.isolation_level = None
-            conn.execute("BEGIN IMMEDIATE")
             existing_subscription = get_entitled_subscription(conn, user_id)
             if existing_subscription is not None:
                 conn.commit()

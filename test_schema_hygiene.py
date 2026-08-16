@@ -512,12 +512,21 @@ KNOWN_TRACKED_BUT_IGNORED = {
 #
 # 접두 포함(prefix)은 대상에서 뺀다 - SQLite가 더 작은 인덱스를 고르는 편이 유리한 경우가
 # 있어 의도적일 수 있다. **완전 중복은 어떤 경우에도 의도일 수 없다.**
+#
+# 5쌍째(2026-08-15 Sprint 121): idx_audit_logs_admin == idx_audit_logs_admin_id
+# (audit_logs.admin_id). 위 4쌍과 근본 원인이 다르다 - 저 4쌍은 서로 모르는 두 마이그레이션
+# 계통(`migrate_v4_1.py` vs 008/009)이 각자 만든 것이지만, `idx_audit_logs_admin_id`는
+# **어떤 소스에도 없다**(`grep -rn "idx_audit_logs_admin_id"` 결과 0건 - 016번 마이그레이션은
+# `idx_audit_logs_admin`만 만든다). 즉 이 인덱스는 마이그레이션을 거치지 않고 라이브 DB에
+# 직접 생성됐다 - fresh clone은 이 인덱스를 갖지 않는다(순수 중복이라 동작 차이는 없다).
+# 어떻게 생겼는지는 추적 불가(DB 변경 이력 없음). 드롭은 마찬가지로 스키마 변경이라 보류.
 # ---------------------------------------------------------------------------
 KNOWN_DUPLICATE_INDEXES = {
     ("auction_item", ("auction_date",)),
     ("auction_item", ("case_no",)),
     ("auction_item", ("minimum_bid_price",)),
     ("rights_summary", ("item_id",)),
+    ("audit_logs", ("admin_id",)),
 }
 
 
@@ -1313,6 +1322,12 @@ ALLOWED_SQL_TEXT_INTERPOLATIONS = {
     # 넘어온다(2026-08-14 확인). 요청으로 도달하는 경로가 아니다.
     ("backfill_dong_normalize.py", "table"),
     ("backfill_dong_fix_mismatch.py", "table"),
+    # 2026-08-15 Sprint 130 신설. `placeholders = ",".join(["(?,?)"] * len(case_keys))` —
+    # `api/v1/search.py`의 이미 허용된 `"placeholders"`(`"?,?,?"`, id 개수)와 정확히 같은
+    # 모양이다: 내용은 항상 `(?,?)` 문자만 반복되고 개수만 가변, 값은 전부 `?` 로 바인딩된다
+    # (N+1 쿼리 제거, docs/SPRINT130_MIGRATE_EXECUTE_N_PLUS_1.md). 요청으로 도달하는
+    # 경로가 아니라 일일 배치 스크립트다.
+    ("migrate_execute.py", "placeholders"),
 }
 # ★ 문자열 `+` 연결도 SQL 텍스트를 만든다 (2026-08-14 추가).
 #
@@ -1354,6 +1369,10 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
     #   값은 예외 없이 바인딩된다. `TARGET_COLUMNS` 도 모듈 상수 튜플이다.
     ("backfill_region_normalize.py", "SELECT id, full_address, sido, sigungu FROM %s"),
     ("backfill_region_normalize.py", "UPDATE %s SET %s = ? WHERE id = ?"),
+    # 2026-08-15 Sprint 121 신설, 같은 이유 - %s 자리는 호출부 리터럴("auction"/"auction_item")뿐,
+    # --apply 자체가 없어 UPDATE 경로도 없다(탐지 전용).
+    ("detect_stale_region_contamination_dryrun.py",
+     "SELECT id, full_address, sido, sigungu, dong, lot_number FROM %s"),
     ("load_rights_data.py", "DELETE FROM rights_summary WHERE item_id IN (%s)"),
     ("load_rights_data.py",
      "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
@@ -1616,6 +1635,120 @@ def test_migration_runner_skip_and_failure():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 8. 알려진 취약점이 있는 의존성 버전이 조용히 더 나빠지지 않는가 (2026-08-15 Sprint 125)
+#
+# `npm audit`의 축약 출력만 보고 "전부 빌드 툴체인, 런타임 무관"이라고 결론 냈다가
+# `npm audit fix --dry-run`(전체 출력)에서야 Next.js 자체의 CVE 9건을 발견했다
+# (`docs/SPRINT125_NEXTJS_CVE_CORRECTION.md`). 그중 2건은 이 저장소의 실제 설정
+# (App Router + Server Action, `src/app/login/actions.ts`)에 그대로 적용되고, 하나는
+# CVSS 8.2 미인증 DoS로 우회책이 없다. 고치려면 `next` 버전 설치가 필요해 승인
+# 영역이라 이 세션에서는 실행하지 않았다 - 대신 **적어도 더 나빠지지는 않는지**를
+# 검사로 고정한다(다른 이 저장소 관례와 같은 상한/allowlist 방식).
+#
+# 실패 조건으로 만들지 않는다 - 지금 상태 자체가 이미 알려진 취약점이 있는 상태라
+# "PASS해야 안전"이 아니라 "얼마나 뒤처졌는지 알려주는" 게 이 검사의 역할이다.
+# 업그레이드되면(버전이 KNOWN_SAFE_MIN 이상이 되면) 이 검사가 스스로 알려준다.
+# ---------------------------------------------------------------------------
+
+# next@16.2.11에서 CVE-2026-64643(Server Function 노출)/CVE-2026-64641(Server
+# Actions DoS, CVSS 8.2)이 고쳐졌다. 16.2.12까지 실재 확인(`npm view next versions`).
+KNOWN_VULNERABLE_NEXT_VERSION = "16.2.9"
+KNOWN_SAFE_MIN_NEXT_VERSION = "16.2.11"
+
+
+def _parse_version_tuple(v):
+    return tuple(int(p) for p in v.split(".") if p.isdigit())
+
+
+def test_known_dependency_cves_are_tracked():
+    print("\n--- 8. 알려진 CVE가 있는 의존성 버전 추적 (next) ---")
+    import json
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    pkg_path = os.path.join(root, "package.json")
+    check_true("package.json이 존재한다", os.path.exists(pkg_path), pkg_path)
+    if not os.path.exists(pkg_path):
+        return
+
+    with open(pkg_path, encoding="utf-8-sig") as fh:
+        pkg = json.load(fh)
+    next_ver = pkg.get("dependencies", {}).get("next", "")
+    check_true("package.json에 next 버전이 선언돼 있다", bool(next_ver), pkg.get("dependencies"))
+
+    cur = _parse_version_tuple(next_ver)
+    known = _parse_version_tuple(KNOWN_VULNERABLE_NEXT_VERSION)
+    safe_min = _parse_version_tuple(KNOWN_SAFE_MIN_NEXT_VERSION)
+
+    # 알려진 값보다 더 낮은 버전으로 조용히 후퇴하지는 않았는가(다운그레이드 감지).
+    check_true("next가 알려진 버전보다 낮게 후퇴하지 않았다(다운그레이드 감지)",
+               cur >= known, "package.json next=%s, 기준=%s" % (next_ver, KNOWN_VULNERABLE_NEXT_VERSION))
+
+    if cur < safe_min:
+        print("   [알려진 취약점] next=%s는 CVE-2026-64641(CVSS 8.2, App Router+Server Action "
+              "미인증 DoS, 우회책 없음)에 해당한다 - %s 이상으로 올리면 해소된다"
+              "(docs/SPRINT125_NEXTJS_CVE_CORRECTION.md, 승인 후 `npm install next@%s`)."
+              % (next_ver, KNOWN_SAFE_MIN_NEXT_VERSION, KNOWN_SAFE_MIN_NEXT_VERSION))
+    else:
+        print("   [정리됨] next=%s는 이미 %s 이상이다 - 위 KNOWN_VULNERABLE_NEXT_VERSION/"
+              "KNOWN_SAFE_MIN_NEXT_VERSION 상수와 SPRINT125 문서의 SKIP 항목을 정리하십시오."
+              % (next_ver, KNOWN_SAFE_MIN_NEXT_VERSION))
+
+
+def _module_level_constant_names(path):
+    """UPPER_SNAKE 이름의 최상위 상수 할당(`X = ...` 또는 `X: T = ...`) 이름 집합."""
+    import ast
+
+    with open(path, encoding="utf-8-sig") as f:
+        tree = ast.parse(f.read())
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id.isupper():
+                    names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id.isupper():
+            names.add(node.target.id)
+    return names
+
+
+def test_no_duplicate_config_constants():
+    """`config/settings.py`가 다른 모듈과 같은 이름의 상수를 독립적으로 다시 선언하지 않는다.
+
+    2026-08-16 Sprint 136 ― `MAX_DOC_RETRY`/`RETRY_INTERVAL_MINUTES`(→ storage/database.py와
+    중복)와 `PAGE_LOAD_TIMEOUT`/`ELEMENT_TIMEOUT`/`AJAX_TIMEOUT`(→ crawler/base_crawler.py와
+    중복) 5개가 이 저장소에 실제로 존재했다 — 값은 우연히 같았지만(`config/settings.py`
+    쪽은 어디서도 import되지 않는 죽은 사본), 한쪽만 바뀌면 조용히 어긋날 수 있는 구조였다.
+    둘 다 죽은 사본 쪽(config/settings.py)을 지워 원본 하나로 통일했다(각 Sprint 문서 참고).
+    이 검사는 같은 이름 재선언이 다시 생기면 잡는다 — "값이 우연히 같아 보이지 않는 결함"이
+    재발하는 것을 막는 목적이지, 지금 상태를 봉인하는 스냅샷 검사가 아니다.
+    """
+    print("\n--- 9. config/settings.py 상수 중복 재선언 없음 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    settings_path = os.path.join(root, "config", "settings.py")
+    check_true("config/settings.py가 존재한다", os.path.exists(settings_path), settings_path)
+    if not os.path.exists(settings_path):
+        return
+
+    settings_names = _module_level_constant_names(settings_path)
+    check_true("config/settings.py에서 상수를 읽었다", len(settings_names) > 0, settings_names)
+
+    peers = ("storage/database.py", "crawler/base_crawler.py")
+    overlaps = []
+    for rel in peers:
+        peer_path = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.exists(peer_path):
+            continue
+        peer_names = _module_level_constant_names(peer_path)
+        shared = sorted(settings_names & peer_names)
+        if shared:
+            overlaps.append("%s <-> config/settings.py: %s" % (rel, shared))
+
+    check("config/settings.py와 storage/database.py·crawler/base_crawler.py가 "
+          "같은 이름의 상수를 독립적으로 재선언하지 않는다", overlaps, [])
+
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -1636,6 +1769,8 @@ def run():
     test_no_confusable_column_misuse()
     test_no_new_sql_text_interpolation()
     test_init_db_failure_is_loud()
+    test_known_dependency_cves_are_tracked()
+    test_no_duplicate_config_constants()
 
     print("\n" + "=" * 55)
     if failures:

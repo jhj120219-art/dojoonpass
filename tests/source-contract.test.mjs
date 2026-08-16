@@ -418,3 +418,60 @@ describe('검색 파라미터 계약: 프런트가 보내는 것과 백엔드가
     }
   })
 })
+
+describe('응답 보안 헤더 (Sprint 127) — 소스 계약', () => {
+  // `next.config.ts`는 TypeScript라 이 Node 테스트 러너(.mjs, 트랜스파일러 없음)가
+  // 직접 import할 수 없다 — 이 파일의 기존 관례대로 텍스트로 읽어 정적으로 대조한다.
+  //
+  // 이 검사가 지키려는 것은 "값이 옳은가"가 아니라(그건 브라우저/curl로만 확인 가능,
+  // docs/SPRINT127_SECURITY_HEADERS_APPLIED.md 참고) **누군가 이 블록을 지우거나
+  // `X-Frame-Options`를 실수로 백엔드처럼 넣지 않는가**다 — 백엔드(`api_server.py`)는
+  // 반대로 `X-Frame-Options`를 **의도적으로 뺀 것**과 짝을 이루므로(이 백엔드 자체가
+  // 문서 뷰어 iframe의 대상), 두 파일이 서로 다른 이유로 서로 다른 값을 가져야
+  // 한다는 사실 자체가 실수로 합쳐지기 쉬운 지점이다.
+  async function read(file) {
+    const { promises: fs } = await import('node:fs')
+    return fs.readFile(file, 'utf8')
+  }
+
+  test('next.config.ts가 poweredByHeader를 끈다', async () => {
+    const src = await read('next.config.ts')
+    assert.ok(
+      /poweredByHeader\s*:\s*false/.test(src),
+      'poweredByHeader: false가 없습니다 — X-Powered-By: Next.js가 다시 노출됩니다'
+    )
+  })
+
+  test('next.config.ts의 headers()가 정책 결정 불필요한 4개를 전부 선언한다', async () => {
+    const src = await read('next.config.ts')
+    const expected = [
+      ['X-Content-Type-Options', 'nosniff'],
+      ['X-Frame-Options', 'DENY'],
+      ['Referrer-Policy', 'strict-origin-when-cross-origin'],
+      ['Permissions-Policy', 'camera=(), microphone=(), geolocation=()'],
+    ]
+    for (const [key, value] of expected) {
+      const re = new RegExp(
+        `key:\\s*["']${key}["']\\s*,\\s*value:\\s*["']${value.replace(/[()]/g, '\\$&')}["']`
+      )
+      assert.ok(re.test(src), `next.config.ts에 ${key}: ${value} 헤더가 없습니다`)
+    }
+  })
+
+  test('api_server.py는 X-Frame-Options를 넣지 않는다(이 백엔드가 iframe 대상이라 의도적)', async () => {
+    const src = await read('api_server.py')
+    // "언급"이 아니라 "실제로 헤더를 설정하는 코드"만 본다 — 이유를 설명하는 주석
+    // 자체에 "X-Frame-Options" 문자열이 들어 있으므로(바로 위 문단), 주석까지 걸리는
+    // 순진한 문자열 검색은 이 파일이 스스로를 위반으로 잡는 자기모순에 빠진다. 실제
+    // 설정 코드의 모양(`response.headers["X-Frame-Options"] = ...` 또는
+    // `headers["X-Frame-Options"] =`)만 규칙 위반으로 본다.
+    assert.ok(
+      !/headers\s*\[\s*["']X-Frame-Options["']\s*\]\s*=/i.test(src),
+      'api_server.py가 실제로 X-Frame-Options 헤더를 설정하고 있습니다 — 이 백엔드는 문서 뷰어 iframe의 대상이라 넣으면 깨집니다(docs/SPRINT127_SECURITY_HEADERS_APPLIED.md §3 참고)'
+    )
+    assert.ok(
+      /X-Content-Type-Options.*nosniff/s.test(src),
+      'api_server.py에 X-Content-Type-Options: nosniff가 없습니다'
+    )
+  })
+})

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # crawler/resume.py(순수 로직). 예전에는 crawler.court_crawler에서 가져왔는데 그 모듈이
 # base_crawler를 통해 selenium을 import하는 탓에 selenium 없는 환경에서 실행 자체가
 # 불가능했다(2026-08-10 Sprint 47). 검증 대상 함수는 동일한 그 함수다.
-from crawler.resume import resume_start_idx
+from crawler.resume import resume_start_idx, case_no_matches_list_entry
 
 failures = []
 
@@ -37,6 +37,25 @@ LIST_ITEMS = [
     {"case_no": "2026타경1002 / 2026타경1003"},  # 한 물건에 사건번호가 여럿인 경우
     {"case_no": "2026타경1004"},
 ]
+
+
+def test_case_no_matches_list_entry_is_exact_not_substring():
+    """2026-08-15 Sprint 121 신설. `case_no_matches_list_entry()`는 `resume_start_idx()`와
+    `crawler/base_crawler.py:go_to_case_detail()` 둘 다 쓰는 공용 판정 함수다(예전에는
+    두 곳이 각자 부분 문자열 `in`으로 따로 구현하고 있었다 — 같은 결함을 두 벌 가진
+    상태였다). 이 함수 하나만 검증하면 두 호출부 모두를 커버한다 — `go_to_case_detail()`
+    자체는 selenium 의존이라 여기서 직접 실행할 수는 없다.
+    """
+    print("\n--- 0. case_no_matches_list_entry: 정확 일치 (공용 판정 함수) ---")
+    check("단일 사건번호 정확 일치", case_no_matches_list_entry("2024타경1009", "2024타경1009"), True)
+    check("묶인 항목의 첫 번째와 일치",
+          case_no_matches_list_entry("2024타경1009", "2024타경1009 / 2024타경1010"), True)
+    check("묶인 항목의 두 번째와 일치",
+          case_no_matches_list_entry("2024타경1010", "2024타경1009 / 2024타경1010"), True)
+    check("무관한 사건번호의 부분 문자열이면 일치하지 않는다(실 DB 실측 사례)",
+          case_no_matches_list_entry("2024타경1009", "2024타경100920"), False)
+    check("역방향(긴 쪽을 찾을 때 짧은 쪽에 안 걸림)",
+          case_no_matches_list_entry("2024타경100920", "2024타경1009"), False)
 
 
 def test_no_checkpoint_starts_at_zero():
@@ -77,6 +96,32 @@ def test_checkpoint_not_in_todays_list_falls_back_to_zero():
           resume_start_idx(LIST_ITEMS, "2026타경9999-없어진사건"), 0)
 
 
+def test_checkpoint_does_not_match_an_unrelated_case_no_by_prefix():
+    """2026-08-15 Sprint 121: 실 DB(auction.db)에서 실제로 재현된 충돌 ―
+    "2024타경1009"가 무관한 다른 사건 "2024타경100920"의 부분 문자열이다(둘 다
+    같은 법원의 서로 다른 진짜 사건). 예전 구현(`resume_from in it["case_no"]`,
+    부분 문자열 포함)은 이런 경우 목록에서 더 먼저 나오는 무관한 사건을
+    "체크포인트가 매칭됐다"고 오판해 실제 체크포인트 위치를 건너뛸 수 있었다.
+
+    아래 목록은 그 충돌을 그대로 재현한다 ― 무관한 "...100920"이 진짜 체크포인트
+    "...1009"보다 앞에 있다. 부분 문자열로 매칭했다면 idx=0 다음(1)을 반환해
+    idx=1(진짜 체크포인트)을 건너뛰었을 것이다.
+    """
+    print("\n--- 3-B. unrelated case_no sharing a numeric prefix -> no false match ---")
+    collision_items = [
+        {"case_no": "2024타경100920"},   # 무관한 다른 사건 - "1009"를 포함하지만 다른 사건
+        {"case_no": "2024타경1009"},     # 진짜 체크포인트가 가리키는 사건
+        {"case_no": "2024타경1010"},
+    ]
+    check("무관한 접두 사건을 건너뛰고 진짜 사건 바로 다음부터 재개",
+          resume_start_idx(collision_items, "2024타경1009"), 2)
+    # 짧은 쪽이 체크포인트인데 목록에 없고, 그걸 포함하는 무관한 사건만 있는 경우도
+    # 안전하게 "못 찾음"(0부터 다시 훑기)으로 처리돼야 한다 ― 잘못된 항목을 완료로
+    # 오인해 건너뛰면 안 된다.
+    check("포함 관계만으로는 매칭되지 않고 안전하게 0으로 폴백",
+          resume_start_idx([{"case_no": "2024타경100920"}], "2024타경1009"), 0)
+
+
 def test_empty_list_items_returns_zero():
     print("\n--- 5. empty list_items -> 0 (no crash) ---")
     check("empty list with a checkpoint set", resume_start_idx([], "2026타경1000"), 0)
@@ -84,9 +129,11 @@ def test_empty_list_items_returns_zero():
 
 
 def run():
+    test_case_no_matches_list_entry_is_exact_not_substring()
     test_no_checkpoint_starts_at_zero()
     test_checkpoint_match_resumes_after_the_completed_item()
     test_checkpoint_matches_either_case_no_in_a_joined_entry()
+    test_checkpoint_does_not_match_an_unrelated_case_no_by_prefix()
     test_checkpoint_not_in_todays_list_falls_back_to_zero()
     test_empty_list_items_returns_zero()
 
