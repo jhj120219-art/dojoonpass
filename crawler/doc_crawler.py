@@ -179,6 +179,28 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _looks_like_pdf(path: str) -> bool:
+    """실제 바이트로 PDF인지 판정한다. 확장자(`.pdf`)는 Chrome이 붙인 이름일 뿐,
+    파일 내용까지 보증하지 않는다.
+
+    법원 서버가 오류 페이지(HTML)를 `Content-Type: application/pdf`로 잘못 내려주거나,
+    다운로드가 중간에 끊겨 잘린 파일이 남는 경우가 있을 수 있다. `wait_for_download()`는
+    크기가 0보다 크고 두 번 연속 같은 크기인지만 본다 — "0바이트가 아니다"와 "PDF다"는
+    다른 말이다. 이미지 파이프라인이 선언된 MIME을 안 믿고 매직 바이트로 판정하는 것
+    (`crawler/image_assets.py:sniff_image_ext`)과 같은 이유로, 여기서도 내용을 직접 본다.
+
+    PDF 표준(ISO 32000)은 `%PDF-`가 파일 **맨 앞**에 오는 것을 요구하지 않고 처음 1024
+    바이트 안이면 허용한다(일부 도구가 앞에 바이트를 덧붙이는 경우 대비) — 그 한도를
+    그대로 따른다.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return False
+    return b"%PDF-" in head
+
+
 # =====================================================================
 # SpecCollector (매각물건명세서) - 새 탭 전환 -> 파일저장 버튼 클릭 -> PDF 다운로드 감지
 # =====================================================================
@@ -252,6 +274,15 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
         downloaded_path = wait_for_download(before_files, timeout=30)
         if not downloaded_path:
             logger.warning("[%s-%s] spec 다운로드 미완료(타임아웃)", case_no, item_no)
+            return result
+
+        if not _looks_like_pdf(downloaded_path):
+            logger.warning("[%s-%s] spec 다운로드가 PDF가 아니다(오류 페이지/손상 의심) - 저장하지 않음: %s",
+                           case_no, item_no, downloaded_path)
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
             return result
 
         new_hash = calc_file_hash(downloaded_path)
@@ -583,6 +614,15 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
         downloaded_path = wait_for_download(before_files, timeout=30)
         if not downloaded_path:
             logger.warning("[%s-%s] appraisal 다운로드 미완료(타임아웃)", case_no, item_no)
+            return result
+
+        if not _looks_like_pdf(downloaded_path):
+            logger.warning("[%s-%s] appraisal 다운로드가 PDF가 아니다(오류 페이지/손상 의심) - 저장하지 않음: %s",
+                           case_no, item_no, downloaded_path)
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
             return result
 
         new_hash = calc_file_hash(downloaded_path)

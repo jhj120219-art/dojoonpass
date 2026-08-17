@@ -311,11 +311,27 @@ def test_no_orphan_rows_in_pipeline_tables():
         ):
             check(label, one(sql), 0)
 
-        # document_status의 doc_type은 세 종류만이어야 한다(대문자 표기).
+        # document_status/document_queue의 doc_type은 storage.database.QUEUE_TO_DOC_STATUS_TYPE
+        # 에 등록된 값만이어야 한다 — 그 표가 유일한 정의처다(단일 소스, 하드코딩 사본 금지).
+        #
+        # 2026-08-18 Sprint 188 실측: 여기 원래 있던 하드코딩 리스트
+        # (`["appraisal","spec","status"]`, `["APPRAISAL","SPEC","STATUS"]`)가 실제 큐 값과
+        # 어긋나 FAIL했다 — `image`(Sprint 144에서 추가된 정상 doc_type, 사진은 버튼 없이
+        # 상세페이지 DOM을 바로 읽으므로 `get_doc_button_id()`가 몰라도 결함이 아니다)가
+        # 실제로 이 DB의 `document_queue`에 처음 나타났기 때문이다. "정상적으로 새 doc_type이
+        # 하나 늘면 이 검사가 거짓 FAIL을 낸다"는 것 자체가 하드코딩 리스트의 함정이라,
+        # 목록을 복제하는 대신 같은 표를 그대로 가져와 비교한다.
+        sys.path.insert(0, ROOT)
+        from storage.database import QUEUE_TO_DOC_STATUS_TYPE
+        known_lower = sorted(QUEUE_TO_DOC_STATUS_TYPE.keys())
+        known_upper = sorted(QUEUE_TO_DOC_STATUS_TYPE.values())
+
         kinds = sorted(r[0] for r in conn.execute("SELECT DISTINCT doc_type FROM document_status"))
-        check("document_status.doc_type 표기", kinds, ["APPRAISAL", "SPEC", "STATUS"])
+        check_true("document_status.doc_type 표기 - 알려진 값만 (%s)" % known_upper,
+                   set(kinds) <= set(known_upper), kinds)
         kinds_q = sorted(r[0] for r in conn.execute("SELECT DISTINCT doc_type FROM document_queue"))
-        check("document_queue.doc_type 표기", kinds_q, ["appraisal", "spec", "status"])
+        check_true("document_queue.doc_type 표기 - 알려진 값만 (%s)" % known_lower,
+                   set(kinds_q) <= set(known_lower), kinds_q)
     finally:
         conn.close()
 

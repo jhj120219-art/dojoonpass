@@ -5061,3 +5061,243 @@ if previous_hash and previous_hash != new_hash:
 법원 축소(complete=True)   -> removed_stale 2, 3장으로 줄어듦
 전체 실패(저장 0장)         -> 어느 쪽이든 삭제 0, 기존 보존
 ```
+
+--------
+
+#115
+
+**문서(doc_raw)는 내용이 같아도 재수집마다 버전이 올랐다** — 이미지 BUGS #113과 같은 계열
+
+해결 (2026-08-17, Sprint 187)
+
+**[경위]** Sprint 186이 이미지 파이프라인을 법원 원천부터 상세페이지까지 전수 추적한 것과
+같은 방식으로, 이번에는 **문서** 파이프라인을 같은 깊이로 훑었다. `document_version_log`는
+이미 `previous_hash != new_hash`일 때만 기록하도록 돼 있는데(Sprint 78 §8), 같은
+`mark_queue_done()`이 여는 같은 트랜잭션에서 `_record_doc_raw()`가 쓰는 `doc_raw.doc_version`은
+그 판단이 **전혀 없이** 매번 `MAX(doc_version)+1`을 무조건 삽입했다
+(`storage/database.py:984-1000`, 수정 전).
+
+`api/v1/item.py`가 이 `doc_version`을 그대로 응답에 실어(`doc_raw_by_type` -> `_document_entry`)
+사용자에게 노출한다. 즉 문서 재수집을 켜는 순간(현재는 `overwrite=True`를 아무도 넘기지
+않아 도달하지 않는다 — roadmap "문서 재수집 정책" 참고) **내용이 한 글자도 안 바뀐 문서도
+매일 밤 버전이 올라가는 형태**로 사용자에게 드러나게 되어 있었다.
+
+```
+document_version_log 의 조건:  previous_hash != new_hash 일 때만 기록  (Sprint 78, 정상)
+doc_raw.doc_version 의 조건:   없음 — 성공할 때마다 무조건 +1          (Sprint 187 이전, 결함)
+```
+
+**[해결]** `_record_doc_raw()`가 삽입 전에 직전 `doc_raw` 행의 `file_hash`와 지금 저장하는
+파일의 sha256을 **직접 비교**한다. 같으면 새 행을 만들지 않고 조용히 반환한다(버전 유지).
+비교 근거는 `mark_queue_done()`에 넘어오는 `previous_hash`/`new_hash` 인자가 아니라 이
+함수가 자기 손으로 다시 계산한 해시로 뒀다 — 그 인자들은 크롤러 계층
+(`crawler/doc_crawler.py`)이 doc_type마다 각자 계산해 넘기는 값이라, `status`처럼 파일이
+두 개(`status.html`+`status.json`)인 경우 대표 파일(`doc_raw`가 기록하는 파일)과 반드시
+같은 파일을 가리킨다는 보장이 없다. `doc_raw` 자기 행끼리 비교하면 그 가정이 필요 없다.
+
+**[회귀]** `test_asset_pipeline.py`에 `test_doc_raw_version_does_not_bump_on_unchanged_content`
+신설. 같은 내용으로 두 번째 `mark_queue_done()`을 부르면 버전이 그대로임을,
+이어서 내용을 실제로 바꿔 세 번째로 부르면 버전이 오름을 **한 검사 안에서** 확인한다
+(반대 상황을 구분하므로 공허할 수 없다). 기존 `test_mark_queue_done_records_doc_raw`의
+"재수집 시 버전 증가" 검사는 previous_hash/new_hash 문자열만 다르고 실제 파일 내용은
+그대로였던 픽스처였다 — 새 판정 기준(파일 내용)에서는 **틀린 기대값**이 되므로, 파일
+내용을 실제로 바꾸도록 함께 고쳤다(고치지 않았다면 이 수정이 기존 검사를 깼을 것이다).
+
+**[교훈]** Sprint 186의 교훈("같은 계약을 쓴다고 같은 수준으로 구현돼 있다고 가정하면
+안 된다")이 한 단계 더 안쪽에도 적용됐다 — 이번에는 이미지 vs 문서가 아니라
+`document_version_log` vs `doc_raw`, **같은 함수 안의 두 기록 대상**이었다.
+
+--------
+
+#116
+
+**spec/appraisal PDF 다운로드가 내용 검증 없이 저장됐다** — 이미지의 매직바이트 판정과
+다른 수준
+
+해결 (2026-08-17, Sprint 187)
+
+**[경위]** `wait_for_download()`(`crawler/doc_crawler.py`)는 다운로드 완료를 "크기가
+0보다 크고 두 번 연속 같은 크기"로만 판정한다. **내용이 실제로 PDF인지는 보지 않는다.**
+법원 서버가 오류 페이지(HTML)를 `Content-Type: application/pdf`로 잘못 내려주거나
+다운로드가 중간에 끊겨 잘린 파일이 남으면, 그 파일도 이 조건은 통과해 그대로
+`shutil.move()`로 목적지(`spec.pdf`/`appraisal.pdf`)에 저장되고 `document_status`가
+READY로 바뀔 수 있는 구조였다.
+
+이미지 파이프라인은 선언된 MIME을 믿지 않고 매직 바이트로 판정한다
+(`crawler/image_assets.py:sniff_image_ext`, 판정 못 하면 저장하지 않음) — 문서 쪽에는
+같은 수준의 방어가 없었다. `collect_documents.py`(스케줄러가 부르지 않는 죽은 스크립트,
+`docs/CLAUDE.md` 참고)의 0바이트 방어(BUGS #65)와 헷갈리면 안 된다 — **실제 운영 경로**인
+`doc_worker.py -> crawler/doc_crawler.py`에는 이 검증이 아예 없었다.
+
+**[해결]** `_looks_like_pdf()` 신설 — 파일 앞 1024바이트 안에 `%PDF-`가 있는지로 판정한다
+(PDF 표준이 파일 맨 앞을 강제하지 않고 처음 1024바이트를 허용하는 것을 그대로 따름).
+`collect_spec()`/`collect_appraisal()`이 `wait_for_download()` 직후, `shutil.move()` 전에
+이 판정을 거친다. 실패하면 저장하지 않고(기존 정상 파일이 있었다면 그대로 보존) 다운로드
+폴더의 가짜 파일을 지운다(고아 방지, BUGS #114와 같은 원칙).
+
+`status`(html+json)에는 적용하지 않았다 — 그쪽은 이미 별도의 내용 검증
+(`status_overlay_has_data()`, Sprint 62)이 저장 직전에 있고, 판정 대상이 PDF가 아니다.
+
+**[회귀]** `test_doc_storage_atomicity.py`에 두 검사 신설:
+- `test_looks_like_pdf_rejects_non_pdf_bytes` — 실제 PDF/HTML 오류 페이지/빈 파일/헤더
+  없는 바이너리/존재하지 않는 파일 5가지를 판정 함수 단위로 고정.
+- `test_collect_spec_refuses_non_pdf_download` — `wait_for_download()`를 몽키패치해
+  "다운로드는 끝났다고 보고하되 내용은 HTML"인 상황을 만들어 `collect_spec()`이 실제로
+  저장을 거부하는 것을, 대조군으로 진짜 PDF는 정상 저장되는 것을 **같은 호출 경로**로
+  확인한다(형식적 PASS가 아니다).
+
+--------
+
+#117
+
+**[운영 환경 실측 — Release Blocker] `auction.db`에 마이그레이션 020이 적용되지 않아
+검색/상세 API가 전면 500을 낸다**
+
+미해결 — 승인 필요 (2026-08-17, Sprint 187)
+
+**[경위]** Sprint 187에서 문서 파이프라인을 상세페이지까지 실제로 확인하려고 `api_server.py`를
+띄워 `/api/v1/search`와 `/api/v1/item/<id>`를 직접 호출했다. 둘 다 **500**을 반환했다.
+
+```python
+>>> conn.execute("SELECT item_id FROM auction_image GROUP BY item_id").fetchall()
+sqlite3.OperationalError: no such table: auction_image
+```
+
+이 환경의 `auction.db`(저장소 루트, `.gitignore` 대상이라 환경마다 로컬 사본)에
+`migration_history`가 마지막으로 기록한 것은 `019_add_subscription_payment_id.sql`
+(2026-08-13)이고, `020_create_auction_image.sql`(migration 파일은 `storage/migrations/`에
+존재하고 코드도 그것을 전제로 짜여 있다 — Sprint 144+)이 **적용되지 않았다**. 그 결과
+`auction_image` 테이블 자체가 없다.
+
+`api/v1/search.py`와 `api/v1/item.py`가 이 테이블을 try/except 없이 직접 조회하므로
+(대표 이미지/썸네일 조회), 이 환경에서는 **검색 결과 목록과 물건 상세 둘 다 열리지 않는다** —
+문서/사진이 안 보이는 정도가 아니라 **API 전체가 죽는다.**
+
+`test_schema_hygiene.py`(§3, `migration_history completeness`)가 이미 이 어긋남을 잡고
+있었다(`[FAIL] every .sql file on disk is recorded as applied: ['020_create_auction_image.sql']`) —
+이번에 그 원인과 사용자 영향(전면 500)까지 실측으로 연결했다.
+
+**[영향 확인]**
+```
+GET /api/v1/search?limit=3   -> 500 {"detail":"검색 처리 중 오류가 발생했습니다"}
+GET /api/v1/item/58          -> 500 Internal Server Error   (58 = 실제 존재하는 item id)
+```
+
+**[근본 원인이 이것뿐인지]** 같은 환경의 스케줄러 실측(roadmap.md Sprint 187 정정 참고)과
+합쳐 보면 앞뒤가 맞는다 — `doc_worker.py`가 애초에 스케줄러에 등록된 적이 없어
+`save_auction_images()`가 호출된 적이 없고, 그래서 `auction_image` 테이블이 비어 있는 게
+아니라 **아예 없다는 사실**이 지금까지 드러나지 않았을 뿐이다. 이 저장소의 다른 세션/환경에서
+작성된 것으로 보이는 앞선 Sprint 문서(Sprint 186 등)의 "auction_image 45행" 실측은 **이
+환경의 이 `auction.db` 파일**과는 다른 상태에서 관측된 값이다 — `*.db`가 gitignore 대상이라
+세션/환경마다 로컬 사본이 갈릴 수 있다는 뜻이고, 그 자체가 하나의 교훈이다(아래 참고).
+
+**[해결 방법 — 준비 완료, 실행만 승인 필요]** `docs/CLAUDE.md`의 DB 스키마 변경 승인 규칙에
+따라 **여기서 직접 실행하지 않는다.** 승인 후 아래를 실행하면 된다(이미 코드에 있고
+Sprint 144+가 검증한, 새로 만드는 마이그레이션이 아니다):
+
+```bash
+python -m storage.migrations.run_migrations   # idempotent, 001~020 중 미적용분만 적용
+python test_schema_hygiene.py                 # §3이 통과하는지로 재확인
+```
+
+적용 후에도 `auction_image`가 비어 있는 것은 정상이다(위 스케줄러 정정 참고 — `doc_worker`가
+아직 등록되지 않았으므로). 사진이 실제로 채워지려면 `DojoonPass-DocWorker` 작업 등록도
+함께 필요하다(같은 승인 영역, roadmap.md에 정리).
+
+**[교훈]** 이전 Sprint 문서의 "실측"은 **그 문서를 쓴 세션의 환경**에서 참이었던 값이지,
+이 저장소를 여는 모든 환경에서 항상 참인 상수가 아니다. `*.db`처럼 gitignore된 로컬
+산출물을 근거로 한 실측은 "코드가 그렇게 동작한다"와 "지금 이 환경이 그 상태다"를
+구분해서 읽어야 한다 — 이번 감사는 실행 중인 API를 직접 두드려(`curl`) 후자를 확인했다.
+
+--------
+
+#118
+
+**검색 API의 예상치 못한 서버 오류가 로그에 원인을 남기지 않았다** — BUGS #117을
+조사하다 발견
+
+해결 (2026-08-18, Sprint 188)
+
+**[경위]** BUGS #117(마이그레이션 020 미적용으로 검색/상세 API 전면 500)을 실제
+서버 로그로 재확인하려다, `logs`에 원인이 **전혀 남지 않는 것**을 발견했다.
+
+`api/v1/search.py`의 `search()`/`get_regions()`는 이렇게 돼 있었다:
+
+```python
+except Exception as e:
+    raise HTTPException(status_code=500, detail="검색 처리 중 오류가 발생했습니다") from e
+```
+
+FastAPI는 `HTTPException`을 "의도된 응답"으로 취급해 **트레이스백을 찍지 않는다.**
+그래서 `sqlite3.OperationalError: no such table: auction_image` 같은 진짜 원인이
+서버 어디에도 기록되지 않고, 사용자에게 보이는 일반 오류 문구만 남았다 — 운영자가
+"왜 500인지"를 로그만으로는 영원히 알 수 없는 구조였다.
+
+같은 저장소 안에서도 라우터마다 방식이 갈려 있었다 — `api/v1/payments.py`의 웹훅
+처리(`_handle_webhook` 계열)는 같은 자리에서 이미 `logger.exception(...)`을 먼저
+부르고 있었다. `search.py`만 그 관례를 놓치고 있었다.
+
+**[해결]** 두 핸들러 모두 `raise` 앞에 `logger.exception(...)`을 추가했다(요청
+파라미터도 함께 남겨 재현에 도움이 되게 했다). 응답 상태코드/본문은 그대로다 —
+로그만 추가했다.
+
+**[회귀]** 신규 `test_error_logging.py`.
+- 1~2번: `TestClient`로 실제 HTTP 요청을 보내고 `get_connection()`을 예외를 던지는
+  가짜로 바꿔치기해, 응답은 그대로(500 + 같은 문구)인데 로그에 원인이 남는지 확인.
+  `git stash`로 수정을 되돌려 실제로 FAIL하는 것을 확인했다(공허한 검사 아님).
+- 3번: **목록에 의존하지 않고** `api/` 전체를 AST로 훑어 "`except Exception`이
+  `HTTPException`을 새로 던지면서 로그가 없는 지점"을 동적으로 찾는다. 검사 로직
+  자체가 결함 있는/정상 샘플을 실제로 구분하는지부터 먼저 확인한 뒤 전수 검사한다 —
+  이 검사가 있으면 **다음에 같은 실수를 하는 새 라우터도 자동으로 잡힌다.**
+
+**[교훈]** `except Exception: ... raise HTTPException(...)` 패턴은 응답 계약을
+지키면서도 원인을 조용히 지울 수 있다 — 결함이 사용자에게는 안 보이고 **운영자에게만**
+안 보이는 종류라, 응답 검사 위주인 `test_api_regression.py`류로는 절대 못 잡는다.
+로그 출력 자체를 캡처하는 검사가 따로 필요했다.
+
+--------
+
+#119
+
+**하드코딩된 doc_type 목록 회귀 2건이 실 데이터 변화에 거짓 FAIL을 냈다** — BUGS #118
+작업 중 전체 회귀를 재실행하다 발견
+
+해결 (2026-08-18, Sprint 188)
+
+**[경위]** #118 수정 뒤 관련 스위트를 다시 돌리다, 전날(Sprint 187)에는 전부 PASS했던
+`test_document_queue.py`/`test_pipeline_integrity.py`가 **새로 FAIL**했다.
+
+```
+[FAIL] 큐의 doc_type 중 이 함수가 모르는 값 없음: ['image'] (expected [])
+[FAIL] document_queue.doc_type 표기: ['appraisal', 'image', 'spec', 'status']
+                                      (expected ['appraisal', 'spec', 'status'])
+```
+
+원인은 제품 결함이 아니라 **실 `auction.db`가 하루 사이에 실제로 바뀐 것**이다 —
+매일 03:00에 도는 `mvp_scraper.py`(`enqueue_documents()`)가 `document_queue`에
+`'image'` 행을 계속 쌓아 왔는데(Sprint 144부터 정상 동작), 이 두 검사는 그 값이
+실제로 큐에 나타나기 전까지 우연히 통과하고 있었을 뿐이다. 둘 다 `["appraisal",
+"spec", "status"]`류 **하드코딩 목록**과 정확히 같아야 한다고 단언하고 있었다 —
+이 저장소가 `docs/CLAUDE.md`/roadmap 여러 곳에서 이미 경계해 온 바로 그 패턴이다
+("목록으로 대상을 지정하는 검사는 목록에서 빠진 파일을 영원히 못 본다").
+
+`'image'`는 정상적인 doc_type이다(Sprint 144) — 사진은 버튼 없이 상세페이지 DOM을
+바로 읽으므로 `get_doc_button_id()`가 모르는 게 맞고(`doc_worker.py`의
+`needs_button = doc_type != "image"`), `document_status`/`document_queue`에 `IMAGE`/
+`image`가 나타나는 것도 정상이다. 검사가 **정상 상태를 결함으로 오판**하고 있었다.
+
+**[해결]**
+- `test_pipeline_integrity.py`: 하드코딩 리스트를 지우고 `storage.database.
+  QUEUE_TO_DOC_STATUS_TYPE`(doc_type의 유일한 정의처)에서 알려진 값 집합을 가져와
+  부분집합 검사로 바꿨다. 새 doc_type이 정상적으로 추가돼도 그 표만 갱신하면
+  검사가 저절로 따라간다 — 하드코딩 사본을 유지할 필요가 없다.
+- `test_document_queue.py`: `image`(버튼이 구조적으로 없는 유일한 종류)를 명시적으로
+  제외하고 이유를 주석에 남겼다 — 목록에서 그냥 빼는 게 아니라 **왜 아는 값인데도
+  None이 맞는지**를 기록해, 다음에 또 다른 버튼 없는 종류가 생기면 이 자리부터
+  다시 판단하게 했다.
+
+**[교훈]** 실 데이터에 대고 도는 회귀는 데이터가 자라면서 **전에 안 드러났던
+가정**을 드러낸다. 이번 것은 무해했지만(실제로는 결함이 없었다), 하드코딩 목록이
+"결함 없음"과 "아직 그 값이 안 나타났을 뿐"을 구분하지 못한다는 것 자체가 문제다 —
+단일 소스(예: `QUEUE_TO_DOC_STATUS_TYPE`)를 참조하는 검사만이 그 둘을 구조적으로
+구분한다.

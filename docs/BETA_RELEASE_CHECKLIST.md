@@ -67,6 +67,23 @@ Python이 **사용자 프로필**에 설치돼 있어(`C:\Users\jhj12\AppData\Lo
 (`-StartWhenAvailable`, `-DontStopIfGoingOnBatteries`, 4시간 제한)는
 `docs/SPRINT112_SCHEDULER_HANDOFF.md` 참고.
 
+**2026-08-17 Sprint 187 정정 — "등록 0개"는 이제 절반만 사실이다.** 재실측
+(`Get-ScheduledTask`) 결과, **물건 기본정보 수집(`run_daily.bat`)은 실제로 매일
+03:00에 돌고 있다**(작업명 `DOJOONPASS_DAILY`, 이 스크립트가 등록하는 이름과 달라서
+아마 수동으로 등록됐을 것, 오늘도 성공). 위 검색 결과 0건 시나리오는 이 부분에는
+더 이상 해당하지 않는다.
+
+**그러나 사진/문서 수집(`run_doc_worker.bat`)과 우선순위 재계산
+(`run_priority_refresh.bat`)은 여전히 등록된 적이 없다.** 이 둘이 없으면 물건은
+계속 검색에 뜨지만 **사진도 문서도 영원히 "수집중"에 머문다** — 상세페이지의
+사진/문서 카드가 사실상 죽어 있는 채로 출시되는 셈이다. 실측(2026-08-17):
+`document_status` COLLECTING 6,180 / READY 555(과거 1회성), `document_queue`
+pending 4,008행(계속 쌓이기만 함), `doc_raw` 0행. 조치는 여전히
+`.\register_scheduler_tasks.ps1 -Apply` 한 줄이지만, **기존 `DOJOONPASS_DAILY`와
+새로 등록될 `DojoonPass-DailyCrawl`(06:00)이 중복**되므로 적용 전에 하나를 정리할지
+결정해야 한다(스크립트가 이제 이 경고를 자동으로 띄운다, 상세는
+`docs/SPRINT187_DOCUMENT_PIPELINE_AUDIT.md` §5).
+
 ### P0-B. 지금 상태로 커밋하면 API가 부팅되지 않는다
 
 Sprint 144~146에서 만든 실동작 모듈이 아직 `git add`되지 않았고, **추적 중인 파일이
@@ -82,6 +99,30 @@ ModuleNotFoundError: No module named 'api.http_cache'   (api/v1/documents.py:6)
 
 **반드시 `git add -A` 후 커밋할 것. `git commit -a`나 파일을 골라서 하는 커밋은 안 된다.**
 
+### P0-C. **[2026-08-17 신규, Sprint 187]** 이 환경의 `auction.db`에 마이그레이션
+020이 빠져 검색/상세 API가 전면 500
+
+`api_server.py`를 띄우고 직접 확인했다:
+
+```
+GET /api/v1/search?limit=3   -> 500  {"detail":"검색 처리 중 오류가 발생했습니다"}
+GET /api/v1/item/58          -> 500  Internal Server Error
+```
+
+원인: `migration_history`가 019까지만 기록돼 있고 `020_create_auction_image.sql`이
+적용되지 않아 `auction_image` 테이블이 없다. `api/v1/search.py`/`api/v1/item.py`가
+이 테이블을 try/except 없이 직접 조회한다 — **검색과 상세 둘 다, 사진/문서 유무와
+무관하게 100% 500이다.** `docs/BUGS.md` #117 / `docs/SPRINT187_DOCUMENT_PIPELINE_AUDIT.md` §5 참고.
+
+`*.db`는 gitignore 대상이라 환경마다 로컬 사본이 다를 수 있다 — **실제 출시
+환경(서버)에서도 같은 방식으로 마이그레이션 적용 여부를 직접 확인할 것.** 이 세션의
+발견을 "이 컴퓨터만의 문제"로 넘기지 말 것.
+
+조치(DB 스키마 변경, 승인 필요):
+```bash
+python -m storage.migrations.run_migrations
+python test_schema_hygiene.py   # §3 통과 확인
+```
 
 분류 기준
 

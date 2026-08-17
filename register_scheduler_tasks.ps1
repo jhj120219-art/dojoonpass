@@ -100,6 +100,33 @@ foreach ($d in ($machinePath -split ';')) {
 }
 Write-Host ("  머신 PATH 로 해석 가능 : {0}" -f $(if ($machineHasPy) { '예' } else { '아니오 -> SYSTEM 계정 등록 금지' }))
 
+# --- 이 스크립트가 모르는, 같은 .bat 을 가리키는 기존 작업 탐지 (2026-08-17 Sprint 187) ---
+#
+# 실측(2026-08-17): 이 저장소를 가리키는 작업이 "DOJOONPASS_DAILY"라는 **다른 이름**으로
+# 이미 등록돼 있었다 (매일 03:00, run_daily.bat, LastTaskResult 0 = 정상 동작 중).
+# 이 스크립트는 자기가 등록/조회하는 이름(DojoonPass-DailyCrawl 등)만 알아서 그 존재를
+# 모르고, 그대로 -Apply 하면 **같은 run_daily.bat 을 하루 두 번(03:00 기존 + 06:00 신규)
+# 도는 중복 작업**이 생긴다 — mvp_scraper.py 는 idempotent upsert라 데이터가 깨지지는
+# 않지만, 법원 사이트에 불필요한 크롤을 두 배로 걸고 로그도 두 갈래로 갈린다.
+#
+# 자동으로 지우지 않는다 — 어떤 이름의 기존 작업을 정리할지는 이 스크립트가 판단할
+# 일이 아니라 실행하는 사람의 몫이다. 여기서는 **알아채지 못하고 지나치는 일**만 막는다.
+$knownNames = $Tasks.Name
+$legacyCandidates = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+    $_.TaskName -notin $knownNames -and
+    ($_.Actions | ForEach-Object { $_.Arguments }) -match 'run_daily\.bat|run_doc_worker\.bat|run_priority_refresh\.bat'
+}
+if ($legacyCandidates) {
+    Write-Host ''
+    Write-Host '★ 이 스크립트가 등록/관리하지 않는, 같은 배치를 가리키는 기존 작업이 있다:'
+    foreach ($lc in $legacyCandidates) {
+        $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -ErrorAction SilentlyContinue
+        Write-Host ("    - {0}  (마지막 실행 {1}, 결과 {2})" -f $lc.TaskName, $info.LastRunTime, $info.LastTaskResult)
+    }
+    Write-Host '  -Apply 로 그대로 진행하면 같은 배치가 하루 두 번 이상 돈다.'
+    Write-Host '  계속하기 전에 위 작업을 남길지/지울지 직접 판단할 것 (이 스크립트는 지우지 않는다).'
+}
+
 if ($problems) {
     Write-Host ''
     Write-Host '★ 선행 조건이 충족되지 않았다. 등록해도 실행 시 실패한다:'

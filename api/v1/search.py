@@ -424,6 +424,14 @@ def search(
     except HTTPException:
         raise
     except Exception as e:
+        # 2026-08-18 Sprint 188: 원인을 로그에 남기지 않고 곧바로 HTTPException으로
+        # 바꿔 던지고 있었다 — FastAPI는 HTTPException을 "의도된 응답"으로 취급해
+        # 트레이스백을 찍지 않으므로, 실제 원인(예: 테이블 누락 같은 서버측 결함)이
+        # 서버 로그 어디에도 남지 않고 사용자에게 보이는 일반 오류 문구만 남았다
+        # (BUGS #117 실측 과정에서 발견 — `payments.py`의 웹훅 처리는 이미
+        # `logger.exception()`을 쓰고 있어 같은 저장소 안에서도 일관되지 않았다).
+        logger.exception("검색 처리 중 오류 (sido=%r, court_name=%r, page=%r, size=%r)",
+                          sido, court_name, page, size)
         raise HTTPException(status_code=500, detail="검색 처리 중 오류가 발생했습니다") from e
     finally:
         conn.close()
@@ -470,6 +478,9 @@ def get_regions(sido: str = Query(...)):
         # 로컬 `sigunguKey` + `cancelled` 플래그로 한다(`SearchForm.tsx:265,274-287`).
         return {"sido": sido, "sigungu": [r["sigungu"] for r in rows]}
     except Exception as e:
+        # 위 /search 핸들러와 같은 이유(2026-08-18 Sprint 188) — HTTPException으로
+        # 바로 바꿔 던지면 FastAPI가 트레이스백을 안 찍어 원인이 로그에 안 남는다.
+        logger.exception("지역 목록 조회 중 오류 (sido=%r)", sido)
         raise HTTPException(status_code=500, detail="지역 목록 조회 중 오류가 발생했습니다") from e
     finally:
         conn.close()

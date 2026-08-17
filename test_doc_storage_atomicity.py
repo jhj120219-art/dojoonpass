@@ -493,6 +493,149 @@ def test_document_hash_functions_agree():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_looks_like_pdf_rejects_non_pdf_bytes():
+    """★ Sprint 187 신설. `_looks_like_pdf()` — 확장자가 아니라 내용으로 PDF를 판정한다.
+
+    `wait_for_download()`는 크기 > 0과 두 번 연속 안정된 크기만 본다. 법원 서버가 오류
+    페이지(HTML)를 `Content-Type: application/pdf`로 잘못 내려주거나 다운로드가 중간에
+    끊기면, 그 파일도 "0바이트 아님 + 안정됨" 조건은 통과한다. 이미지 파이프라인이 선언된
+    MIME을 안 믿고 매직 바이트로 판정하는 것(`sniff_image_ext`)과 같은 결함 계열이라,
+    문서 쪽에도 같은 방식의 방어를 둔다.
+    """
+    from crawler.doc_crawler import _looks_like_pdf
+
+    print("\n--- 7b. PDF 매직 바이트 판정 (Sprint 187) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_pdfmagic_")
+    try:
+        real_pdf = os.path.join(tmp, "real.pdf")
+        with open(real_pdf, "wb") as f:
+            f.write(b"%PDF-1.4\n" + b"x" * 500)
+        check_true("실제 PDF는 통과", _looks_like_pdf(real_pdf))
+
+        html_error = os.path.join(tmp, "error.pdf")
+        with open(html_error, "wb") as f:
+            f.write(b"<html><body>500 Internal Server Error</body></html>")
+        check_true("HTML 오류 페이지는 거부", not _looks_like_pdf(html_error))
+
+        empty = os.path.join(tmp, "empty.pdf")
+        open(empty, "wb").close()
+        check_true("빈 파일은 거부", not _looks_like_pdf(empty))
+
+        truncated = os.path.join(tmp, "truncated.pdf")
+        with open(truncated, "wb") as f:
+            f.write(b"\x00\x01\x02garbage-no-header")
+        check_true("PDF 헤더 없는 바이너리는 거부", not _looks_like_pdf(truncated))
+
+        missing = os.path.join(tmp, "does_not_exist.pdf")
+        check_true("존재하지 않는 파일은 거부(예외 없이)", not _looks_like_pdf(missing))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _FakeSpecViewerDriver:
+    """`collect_spec()`이 요구하는 최소한의 driver 표면만 흉내낸다.
+
+    실제 timing(새 탭 대기 0.5초 폴링)은 그대로 두되, 첫 execute_script 호출(=문서 보기
+    버튼 클릭)에서 곧바로 새 창 핸들을 추가해 최악의 경우에도 0.5~1초 안에 대기가 끝나게
+    한다 - `NEW_WINDOW_TIMEOUT`(15초) 전부를 태우지 않는다.
+    """
+    def __init__(self):
+        self.current_window_handle = "main"
+        self._handles = ["main"]
+
+    @property
+    def window_handles(self):
+        return list(self._handles)
+
+    def find_element(self, by, value):
+        return object()
+
+    def find_elements(self, by, value):
+        return [object()]
+
+    def execute_script(self, script, *args):
+        if "viewer" not in self._handles:
+            self._handles.append("viewer")
+        return None
+
+    class _SwitchTo:
+        def __init__(self, outer):
+            self._outer = outer
+
+        def window(self, handle):
+            self._outer.current_window_handle = handle
+
+    @property
+    def switch_to(self):
+        return self._SwitchTo(self)
+
+    def close(self):
+        if self.current_window_handle in self._handles:
+            self._handles.remove(self.current_window_handle)
+
+
+def test_collect_spec_refuses_non_pdf_download():
+    """★ Sprint 187. `collect_spec()`이 `wait_for_download()`가 돌려준 파일을 그대로
+    믿지 않고, `_looks_like_pdf()`로 다시 확인하는 실제 호출 경로를 고정한다.
+
+    `wait_for_download()`를 몽키패치해 "다운로드가 끝났다"고 보고하되 그 파일은 HTML
+    오류 페이지로 만든다 — 이 함수가 실제로 도달 가능한 유일한 실패 모드다(서버가
+    `Content-Type: application/pdf`를 잘못 붙이는 경우). 대조군으로 같은 경로에 실제
+    PDF를 흘려보내 정상 저장까지 함께 고정한다(반대 상황을 구분하지 못하면 이 검사는
+    공허하다).
+    """
+    import crawler.doc_crawler as doc_crawler_mod
+    import crawler.doc_paths as doc_paths_mod
+
+    print("\n--- 7c. collect_spec이 가짜 PDF를 저장하지 않는다 (Sprint 187) ---")
+    docs_root = tempfile.mkdtemp(prefix="qa_specfake_docs_")
+    download_dir = None
+    orig_document_root = doc_paths_mod.DOCUMENT_ROOT
+    orig_download_dir = doc_crawler_mod.DOWNLOAD_DIR
+    orig_wait = doc_crawler_mod.wait_for_download
+    try:
+        court, case_no, item_no = "QA법원", "2026타경1", "1"
+        doc_paths_mod.DOCUMENT_ROOT = docs_root  # get_doc_dir()이 이 경로 아래에만 쓰게 격리
+        dest_path = os.path.join(doc_paths_mod.get_doc_dir(court, case_no, item_no), "spec.pdf")
+
+        download_dir = tempfile.mkdtemp(prefix="qa_specfake_dl_")
+        doc_crawler_mod.DOWNLOAD_DIR = download_dir
+
+        # --- 1) 오류 페이지가 .pdf로 떨어진 경우: 저장을 거부해야 한다 ---
+        bad_file = os.path.join(download_dir, "bad.pdf")
+        with open(bad_file, "wb") as f:
+            f.write(b"<html>error</html>")
+        doc_crawler_mod.wait_for_download = lambda before, timeout=30: bad_file
+
+        driver = _FakeSpecViewerDriver()
+        result = doc_crawler_mod.collect_spec(driver, court, case_no, item_no, "btn-id")
+
+        check("가짜 PDF는 success=False", result["success"], False)
+        check_true("가짜 PDF는 목적지에 저장되지 않는다", not os.path.exists(dest_path))
+        check_true("가짜 PDF는 다운로드 폴더에서도 치워진다", not os.path.exists(bad_file))
+
+        # --- 2) 대조군: 진짜 PDF는 정상 저장된다 ---
+        good_file = os.path.join(download_dir, "good.pdf")
+        with open(good_file, "wb") as f:
+            f.write(b"%PDF-1.4\n" + b"y" * 300)
+        doc_crawler_mod.wait_for_download = lambda before, timeout=30: good_file
+
+        driver2 = _FakeSpecViewerDriver()
+        result2 = doc_crawler_mod.collect_spec(driver2, court, case_no, item_no, "btn-id")
+
+        check("진짜 PDF는 success=True", result2["success"], True)
+        check_true("진짜 PDF는 목적지에 저장된다", os.path.isfile(dest_path))
+        check("저장된 내용이 실제 다운로드 내용과 일치",
+              open(dest_path, "rb").read(), b"%PDF-1.4\n" + b"y" * 300)
+    finally:
+        doc_crawler_mod.wait_for_download = orig_wait
+        doc_crawler_mod.DOWNLOAD_DIR = orig_download_dir
+        doc_paths_mod.DOCUMENT_ROOT = orig_document_root
+        shutil.rmtree(docs_root, ignore_errors=True)
+        if download_dir:
+            shutil.rmtree(download_dir, ignore_errors=True)
+
+
 def test_wait_for_download_completion_rules():
     """다운로드 완료 판정 규칙 (2026-08-13 Sprint 85 신설).
 
@@ -724,6 +867,8 @@ def run():
         test_collect_documents_saves_where_viewer_serves()
         test_finalize_download_moves_file()
         test_document_hash_functions_agree()
+        test_looks_like_pdf_rejects_non_pdf_bytes()
+        test_collect_spec_refuses_non_pdf_download()
         test_wait_for_download_completion_rules()
         test_wait_for_download_callers_check_the_result()
     finally:

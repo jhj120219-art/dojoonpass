@@ -6817,3 +6817,110 @@ API/화면        상세 API가 auction_image 를 그대로 반환, 브라우저
 법원은 사진을 **base64 data URI로 DOM에 심어** 준다 — URL이 없다. 식별자는 alt 텍스트
 (`전경도_1`)에서 뽑은 순번뿐이다. 따라서 "URL이 바뀌었는지"로는 변경을 알 수 없고,
 **바이트 지문이 유일한 근거**다. 이번 #113 수정이 그 근거를 실제로 사용 가능하게 만들었다.
+
+### Sprint 187 — 문서 파이프라인 전수 추적 + 매일 갱신 체인 감사 (법원 원천 → 상세페이지)
+
+Sprint 186과 같은 깊이로, 이번에는 **문서**(명세서/현황조사서/감정평가서) 쪽을 법원
+원천부터 상세페이지까지 실제 호출부·저장 결과까지 추적했다. 목표(goal)의 4대 축
+(물건 기본정보 / 사진 / 문서 / 매일 스케줄러) 전체를 실측으로 다시 확인했다.
+
+**이미 정상이던 것**
+
+```
+변경 감지 사슬     collect_spec/status/appraisal 전부 previous_hash(기존 dest_path) ->
+                   new_hash(다운로드분)를 계산해 mark_queue_done에 넘긴다 — 이미지가
+                   Sprint 186 전까지 빠뜨렸던 그 계산을 문서는 원래부터 하고 있었다
+                   (crawler/doc_crawler.py:198 등)
+document_version_log  previous_hash != new_hash 조건으로 정확히 개정만 기록 (Sprint 78 §8)
+물건 기본정보 최신화  upsert_batch()(auction 테이블) + migrate_execute()(auction_item)가
+                   재크롤 때마다 무조건 UPDATE — 최저가/기일/상태/유찰횟수 전부 반영되고
+                   Sprint 185의 변경 관측(field_changes)까지 이미 있다. 실제로 매일 도는
+                   DOJOONPASS_DAILY 작업이 오늘도(2026-08-17 03:00:01) 성공했다(exit 0).
+```
+
+**이번에 고친 결함 2건 (같은 계열 전수 검색으로 발견)**
+
+- **BUGS #115 — `doc_raw.doc_version`이 내용 변경 여부와 무관하게 재수집마다 증가.**
+  `document_version_log`는 `previous_hash != new_hash`로 이미 구분하는데, 같은 함수
+  (`mark_queue_done`)가 여는 같은 트랜잭션의 `doc_raw` 삽입은 그 판단이 없었다 —
+  이미지 BUGS #113("계약은 같은데 한쪽만 실제로 구현돼 있다")과 완전히 같은 모양의
+  결함이 **한 함수 안의 두 기록 대상 사이**에서 다시 나왔다. `api/v1/item.py`가
+  `doc_version`을 그대로 사용자 응답에 싣는다.
+- **BUGS #116 — spec/appraisal PDF가 내용 검증 없이 저장됐다.** `wait_for_download()`는
+  크기만 보고 PDF인지는 안 본다. 이미지의 `sniff_image_ext`(매직 바이트 판정)와 같은
+  수준의 방어가 문서 쪽에는 없었다. `_looks_like_pdf()` 신설 + 두 수집기에 배선.
+
+**신규 회귀**: `test_asset_pipeline.py` +1검사, `test_doc_storage_atomicity.py` +2검사.
+관련 전체 스위트(`test_asset_pipeline.py`/`test_collect_documents.py`/
+`test_document_status_sync.py`/`test_doc_storage_atomicity.py`/`test_doc_worker_recovery.py`/
+`test_race_conditions.py`/`test_false_success.py`) 재실행 — 전체 PASS(회귀 없음).
+
+**★★ 이번 감사에서 나온 가장 큰 발견 — "매일 갱신 체인"이 절반만 서 있다**
+
+법원 원천 → 상세페이지 전체 사슬을 실제로 두드려 봤다(`api_server.py`를 띄우고
+`curl`로 직접 호출). 결과:
+
+```
+GET /api/v1/search?limit=3   -> 500  {"detail":"검색 처리 중 오류가 발생했습니다"}
+GET /api/v1/item/58          -> 500  Internal Server Error
+```
+
+원인은 이 환경의 `auction.db`에 **마이그레이션 020(`auction_image` 테이블)이 적용되지
+않아서**다(`migration_history` 마지막 기록이 019, 2026-08-13). `api/v1/search.py`/
+`api/v1/item.py`가 이 테이블을 try/except 없이 직접 조회해 **검색/상세 API 전체가 500이다**
+(BUGS #117, Release Blocker, 승인 필요).
+
+더 근본적인 원인은 스케줄러다. `Get-ScheduledTask`로 직접 확인한 결과:
+
+```
+DOJOONPASS_DAILY (수동 등록, register_scheduler_tasks.ps1이 모르는 이름)
+  매일 03:00, run_daily.bat(mvp_scraper.py + migrate_execute.py) — 정상 동작 중(오늘도 성공)
+
+run_doc_worker.bat(사진/문서 수집)      -> 등록된 작업 없음
+run_priority_refresh.bat(우선순위 재계산) -> 등록된 작업 없음
+```
+
+즉 **"물건 기본정보"만 실제로 매일 갱신되고, 사진/문서는 자동으로 전혀 수집되지 않는다.**
+Sprint 144~186이 완성하고 검증한 이미지/문서 파이프라인 전체가 **트리거될 기회 자체가
+없다.** 실측이 이 결론과 정확히 맞아떨어진다 — `doc_raw` 0행, `document_status` COLLECTING
+6,180 / READY 555(과거 1회성 수동 실행분), `document_queue` pending 4,008행(매일 쌓이기만
+하고 안 빠짐).
+
+`register_scheduler_tasks.ps1`을 그대로 `-Apply`하면 `run_daily.bat`을 06:00에 **또**
+등록해 하루 두 번 도는 중복이 생긴다는 것도 이번에 발견해, 스크립트에 기존 작업
+자동 탐지+경고를 추가했다(자동 삭제는 하지 않는다 — 사용자 판단 영역).
+
+**승인 필요 (SKIP, 상세는 `docs/roadmap.md` Sprint 187 정정 / `docs/BUGS.md` #117 참고)**
+```
+1. python -m storage.migrations.run_migrations   (마이그레이션 020 적용 - DB 스키마 변경)
+2. .\register_scheduler_tasks.ps1 -Apply          (DocWorker/PriorityRefresh 등록 - Task Scheduler)
+```
+이 두 가지만 승인되면, 이미 완성/검증된 코드가 그대로 매일 도는 "물건 기본정보 +
+사진 + 문서" 전체 자동 갱신 체인이 된다 — 코드 쪽에서 추가로 할 일은 없다.
+
+### Sprint 188 — Failure Recovery 감사: 관측 가능성 결함 + 실 데이터 드리프트로 드러난 테스트 결함
+
+BUGS #117을 서버 로그로 재확인하려다 두 가지를 더 찾았다.
+
+**BUGS #118 — 검색 API 오류가 로그에 원인을 안 남겼다.** `api/v1/search.py`의
+`search()`/`get_regions()`가 `except Exception as e: raise HTTPException(...) from e`로
+곧바로 바꿔 던져, FastAPI가 트레이스백을 안 찍는 바람에 진짜 원인(예: 테이블 누락)이
+로그 어디에도 안 남았다. `payments.py`는 같은 자리에서 이미 `logger.exception()`을
+쓰고 있어 라우터마다 관례가 갈려 있었다. 두 핸들러에 로그 호출을 추가했다(응답 불변).
+신규 `test_error_logging.py`가 (1) 실제 HTTP 요청으로 재현하고 (2) `api/` 전체를
+AST로 훑어 같은 패턴이 다른 곳에 없는지 전수 검색한다 — 결과는 2곳(둘 다 search.py)
+뿐이었고 둘 다 고쳤다.
+
+**BUGS #119 — 하드코딩된 doc_type 목록이 실 데이터 변화에 거짓 FAIL을 냈다.**
+Sprint 187 때는 PASS했던 `test_document_queue.py`/`test_pipeline_integrity.py`가
+하루 사이(매일 도는 `enqueue_documents()`가 쌓아 온 `document_queue.doc_type='image'`)
+새로 FAIL했다 — 제품 결함이 아니라 정상 상태(`image`는 Sprint 144부터 있던 정상
+doc_type)를 하드코딩 목록이 결함으로 오판한 것이다. `test_pipeline_integrity.py`는
+`storage.database.QUEUE_TO_DOC_STATUS_TYPE`(단일 소스)을 참조하도록 고쳐 앞으로 같은
+드리프트에 흔들리지 않는다.
+
+**교훈**: 실 DB에 대고 도는 회귀는 데이터가 자라면서 전에 안 드러났던 가정을 드러낸다
+— 이번 것은 무해했지만, 하드코딩 목록은 "결함 없음"과 "아직 그 값이 안 나타났을 뿐"을
+구분하지 못한다.
+
+관련 스위트 전체 재실행 — `test_schema_hygiene.py` §3(BUGS #117, 승인 대기) 제외 전부 PASS.

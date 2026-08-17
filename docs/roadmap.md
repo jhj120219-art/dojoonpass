@@ -1660,6 +1660,39 @@ init_db / checkpoint / 상태조회  완료  BUGS #89  "조용한 실패"에 근
   선택지 A(기일 임박 강제 재수집) / B(해시 비교) / C(현행 유지)와 구현 범위·테스트
   방법을 Sprint 145 §6에 정리.
 
+**2026-08-17 Sprint 187 정정 — "등록 0건"은 더 이상 사실이 아니다(부분적으로).**
+이 절의 "예약 작업 249개 중 이 저장소를 가리키는 것 0개"는 그 시점(Sprint 145) 실측이었다.
+지금 다시 확인하면 **`DOJOONPASS_DAILY`라는 작업이 실제로 등록돼 매일 03:00에 성공적으로
+돌고 있다**(`Get-ScheduledTask` 실측, `LastRunTime 2026-08-17 03:00:01`, `LastTaskResult 0`).
+단, 이 이름은 `register_scheduler_tasks.ps1`이 등록/조회하는 이름(`DojoonPass-DailyCrawl`)과
+**다르다** — 누군가 이 스크립트를 거치지 않고 수동으로 등록한 것으로 보인다(GUI로 보인다).
+
+```
+DOJOONPASS_DAILY (수동 등록, 이 스크립트가 모름)  매일 03:00   run_daily.bat
+                                                              (mvp_scraper.py + migrate_execute.py)
+DojoonPass-DocWorker        (미등록)              02:00 예정   run_doc_worker.bat   <- 사진/문서 수집
+DojoonPass-PriorityRefresh  (미등록)              01:50 예정   run_priority_refresh.bat
+```
+
+즉 **"물건 기본정보"는 실제로 매일 갱신되고 있다**(auction/auction_item UPSERT, Sprint 185
+변경 관측까지 포함). 반면 **사진/문서는 여전히 자동으로 전혀 수집되지 않는다** — Sprint 144~186이
+쌓은 이미지/문서 파이프라인 전체가 트리거될 기회 자체가 없다. 실측 근거(2026-08-17):
+`doc_raw` 0행, `document_status` COLLECTING 6,180 / READY 555(READY는 과거 1회성 수동 실행분),
+`document_queue` pending 4,008행(매일 `enqueue_documents()`로 계속 쌓이기만 하고 안 빠짐),
+`auction_image` 테이블 자체가 이 환경의 `auction.db`에 없음(마이그레이션 020 미적용 — 별도
+Release Blocker, `docs/BUGS.md` #117 / `docs/BETA_RELEASE_CHECKLIST.md` 참고).
+
+`register_scheduler_tasks.ps1`을 그대로 `-Apply`하면 `run_daily.bat`을 06:00에 **또** 등록해
+같은 배치가 하루 두 번(03:00 기존 + 06:00 신규) 돈다 — Sprint 187에서 스크립트에 기존
+작업 자동 탐지+경고를 추가했다(자동 삭제는 하지 않는다, 사용자 승인 판단 영역이므로).
+
+**여전히 사용자 승인/외부 조치 영역이라 SKIP.** 승인 후 실행할 것:
+```powershell
+.\register_scheduler_tasks.ps1           # 계획 확인 (기존 DOJOONPASS_DAILY 경고가 뜨는지 확인)
+# DOJOONPASS_DAILY를 남길지 정리할지 판단한 뒤:
+.\register_scheduler_tasks.ps1 -Apply
+```
+
 ---
 
 ## [결정 대기] 문서 재수집 정책 (2026-08-17 Sprint 145 정리 — 정책은 정하지 않았다)

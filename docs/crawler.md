@@ -379,6 +379,28 @@ analyze_docs.py         <- 파이프라인 단계가 **아니다**. 배치에 �
 `load_spec_data.py` / `load_rights_data.py`가 `tenant_rights` / `rights_summary`에
 쓰는 경로뿐이다(2026-08-12 Sprint 63 전수 확인).
 
+**2026-08-17 Sprint 187 정정 — 위 표의 "라이브 경로는 doc_raw를 X(안 씀)"는 더 이상
+사실이 아니다.** Sprint 144(2026-08-17, 이 표보다 나중)에서 `mark_queue_done()`이
+같은 트랜잭션 안에서 `_record_doc_raw()`를 직접 호출하도록 고쳤다
+(`storage/database.py:mark_queue_done()` docstring 참고 — 이 결함을 고친 경위가
+그대로 적혀 있다). 지금은:
+
+```
+crawler/doc_crawler.py:collect_document() -> doc_worker.py -> mark_queue_done()
+    -> document_status / doc_raw(storage_path, file_hash, file_size, page_count,
+       doc_version) 를 **같은 트랜잭션**에서 함께 기록
+```
+
+"읽는 코드 0곳"도 더 이상 사실이 아니다 — `api/v1/item.py`가 `doc_raw`를
+`MAX(doc_version)`로 JOIN해 상세 API 응답의 `doc_version`/`page_count`/`file_size`
+필드로 그대로 노출한다. 다만 **`doc_version` 자체는 Sprint 187 전까지 내용 변경
+여부와 무관하게 재수집마다 증가하는 결함이 있었다** — `docs/BUGS.md` #115에서 고쳤다.
+
+이 정정은 코드 변화가 아니라 **문서가 그 사이 벌어진 Sprint 144를 반영하지 못하고
+있었던 것**을 바로잡는 것이다 — 이 절 자체가 "실제 코드/테스트/데이터 상태가 MD와
+다르면 MD를 함께 고친다"는 원칙의 예시로 남긴다. `collect_documents.py`는 여전히
+스케줄러 미도달 상태이므로 위 표의 아래쪽 행("O/O/O/O, 연결 안 됨")은 그대로 유효하다.
+
 ## 파이프라인 정합 현황 (2026-08-11)
 
 Sprint 55의 수정 이후 단계 간 불일치가 0이 됐고, `test_pipeline_integrity.py`가 이를

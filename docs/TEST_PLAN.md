@@ -1661,3 +1661,60 @@ filter/scoring_engine.py, report_generator.py  0%  ← 의도적(docs/CLAUDE.md)
 **모듈명 grep으로 커버리지를 판정하지 말 것.** Sprint 148이 그렇게 해서
 `api/http_cache.py`(실제 98%)와 `api/v1/doc_stats.py`(실제 100%)를 "미커버"로 분류했다.
 엔드포인트로 동작을 검증하는 테스트는 모듈 이름을 쓰지 않는다.
+
+## Sprint 187 (2026-08-17) — 문서 파이프라인 전수 추적 (`docs/SPRINT187_DOCUMENT_PIPELINE_AUDIT.md`)
+
+### test_asset_pipeline.py — `test_doc_raw_version_does_not_bump_on_unchanged_content`
+
+BUGS #115. `doc_raw.doc_version`이 `document_version_log`와 달리 내용 변경 여부를
+안 보고 재수집마다 무조건 증가했다. 같은 파일 내용으로 두 번째 `mark_queue_done()`을
+불러 버전이 그대로임을(시나리오 B), 이어서 내용을 실제로 바꿔 세 번째로 불러 버전이
+오름을(시나리오 C) **한 검사 안에서** 확인한다 — 반대 상황을 구분하므로 공허할 수 없다.
+기존 `test_mark_queue_done_records_doc_raw`의 "재수집 시 버전 증가" 픽스처는
+previous_hash/new_hash 문자열만 다르고 파일 내용은 그대로였다 — 새 판정 기준(파일
+내용 자체)에서는 오히려 **버전이 안 올라야 맞는** 픽스처였으므로, 실제로 내용을
+바꾸도록 함께 고쳤다.
+
+### test_doc_storage_atomicity.py — `test_looks_like_pdf_rejects_non_pdf_bytes` / `test_collect_spec_refuses_non_pdf_download`
+
+BUGS #116. `wait_for_download()`는 크기만 보고 PDF 내용은 확인하지 않는다.
+전자는 `_looks_like_pdf()` 판정 함수를 실제 PDF/HTML 오류 페이지/빈 파일/헤더 없는
+바이너리/존재하지 않는 파일 5가지로 단위 고정. 후자는 `wait_for_download()`를
+몽키패치해 "다운로드는 끝났다고 보고하되 내용은 HTML"인 상황을 만들어 `collect_spec()`이
+**실제 호출 경로**에서 저장을 거부하는 것을(목적지 미생성 + 다운로드 폴더 정리까지),
+대조군으로 진짜 PDF는 정상 저장되는 것을 함께 고정한다.
+
+### 운영 환경 실측 — 회귀는 아니지만 배포 전 반드시 재확인할 것
+
+`api_server.py`를 띄우고 실제로 호출한 결과 `/api/v1/search`와 `/api/v1/item/<id>`가
+**500**이었다(원인: `auction.db`에 마이그레이션 020 미적용, BUGS #117). 마이그레이션
+적용 후 재확인 절차:
+
+```bash
+python -m storage.migrations.run_migrations
+python test_schema_hygiene.py          # §3 통과 확인
+python api_server.py &
+curl http://127.0.0.1:8000/api/v1/search?limit=3
+curl http://127.0.0.1:8000/api/v1/item/<실제 id>
+```
+
+둘 다 200이 나와야 상세페이지 브라우저 E2E를 다시 시도할 수 있다 — 이번 Sprint는
+API 계층이 죽어 있어 브라우저 검증까지 가지 못했다(정직하게 SKIP으로 남김).
+
+## Sprint 188 (2026-08-18) — 신규 `test_error_logging.py`
+
+BUGS #118. `api/v1/search.py`의 두 핸들러가 예상치 못한 예외를 로그 없이 `HTTPException`
+500으로 바꿔 던지고 있었다(FastAPI는 `HTTPException`에 트레이스백을 안 찍는다). 응답
+내용은 그대로라 `test_api_regression.py` 같은 상태코드/본문 검사로는 절대 못 잡는다 —
+로그 출력 자체를 캡처해야 보인다.
+
+```
+python test_error_logging.py
+```
+
+1~2번: `get_connection()`을 예외를 던지는 가짜로 바꿔치기하고 `TestClient`로 실제
+HTTP 요청 -> 응답은 불변(500 + 같은 문구), 로그에는 원인이 남는지 확인.
+3번: `api/` 전체를 AST로 훑어 "`except Exception`이 `HTTPException`을 새로 던지면서
+로그가 없는 지점"을 목록 의존 없이 동적으로 찾는다 — 검사 로직 자체가 결함
+있는/정상 샘플을 구분하는지 먼저 확인한 뒤 전수 검사하므로, 새 라우터가 같은 실수를
+반복해도 이 검사가 잡는다.

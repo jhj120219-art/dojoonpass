@@ -1149,10 +1149,15 @@ def test_mark_queue_done_records_doc_raw():
                    rows[0]["storage_path"])
         check("document_status도 READY", env.status_of(1, "SPEC"), "READY")
 
-        # 두 번째 수집이면 버전이 올라간다.
+        # 두 번째 수집이면 버전이 올라간다 — 단, **내용이 실제로 바뀌어야** 한다
+        # (Sprint 187 이후: 판정 근거는 이 함수에 넘어온 hash 인자가 아니라 저장된
+        # 파일 자체의 sha256이다 — 아래에서 파일 내용을 실제로 바꾼다).
+        # "내용이 같으면 버전이 그대로인가"는 별도 검사(12b)가 전담한다.
         # 큐 행은 새로 만들지 않는다 — 018 마이그레이션의 UNIQUE(법원,사건,물건,종류)
         # 때문에 애초에 만들 수 없고, 운영에서도 재수집은 `reset_stale_queue()`가
         # **같은 행**을 pending으로 되살리는 방식이다.
+        with open(spec, "wb") as f:
+            f.write(b"%PDF-1.4 " + b"z" * 900)
         mark_queue_done(qid, court, case_no, item_no, "spec", "h1", "h2", files_saved=[spec])
         c = env.conn()
         try:
@@ -1161,6 +1166,72 @@ def test_mark_queue_done_records_doc_raw():
         finally:
             c.close()
         check("재수집 시 버전 증가", vs, [1, 2])
+    finally:
+        env.close()
+
+
+def test_doc_raw_version_does_not_bump_on_unchanged_content():
+    """★ Sprint 187이 고친 결함: 내용이 같아도 재수집마다 doc_raw 버전이 올랐다.
+
+    `document_version_log`는 `previous_hash != new_hash`로 이미 변경 여부를 가리는데,
+    같은 함수(`mark_queue_done`)가 여는 같은 트랜잭션에서 `doc_raw`는 그 판단 없이
+    항상 새 행을 쌓았다 — `api/v1/item.py`가 그대로 응답에 싣는 `doc_version`이
+    재수집을 켜는 순간 내용과 무관하게 매일 올라가게 된다(이미지 BUGS #113과 같은 계열).
+
+    파일 내용을 실제로 바꾸지 않고 두 번째 `mark_queue_done()`을 부른다(재수집 시나리오 B) —
+    버전이 그대로여야 한다. 이어서 내용을 실제로 바꿔 세 번째로 부른다(시나리오 C) —
+    이번에는 버전이 올라야 한다. 반대 상황을 한 검사 안에서 구분하므로 공허할 수 없다.
+    """
+    print("\n--- 12b. 내용이 같으면 doc_raw 버전이 오르지 않는다 ---")
+    from storage.database import mark_queue_done
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        qid = env.enqueue(court, case_no, item_no, "spec")
+
+        d = os.path.join(env.docs, court, case_no, item_no)
+        os.makedirs(d, exist_ok=True)
+        spec = os.path.join(d, "spec.pdf")
+        with open(spec, "wb") as f:
+            f.write(b"%PDF-1.4 " + b"x" * 500)
+
+        # 시나리오 A: 최초 수집.
+        mark_queue_done(qid, court, case_no, item_no, "spec", "", "h1", files_saved=[spec])
+
+        def versions():
+            c = env.conn()
+            try:
+                return [r["doc_version"] for r in
+                        c.execute("SELECT doc_version FROM doc_raw WHERE item_id=1 "
+                                  "ORDER BY doc_version")]
+            finally:
+                c.close()
+
+        check("최초 수집 - 버전 1", versions(), [1])
+
+        # 시나리오 B: 재수집인데 파일 내용은 그대로다(같은 바이트를 다시 씀 - 법원
+        # 원본이 안 바뀐 정상 재수집을 흉내낸다). previous_hash/new_hash는 doc_crawler가
+        # 계산해 넘기는 값이라 실제 재수집에서도 둘 다 "h1"로 같을 것이다.
+        with open(spec, "wb") as f:
+            f.write(b"%PDF-1.4 " + b"x" * 500)
+        mark_queue_done(qid, court, case_no, item_no, "spec", "h1", "h1", files_saved=[spec])
+        check("내용 불변 재수집 - 버전 그대로", versions(), [1])
+
+        # 시나리오 C: 이번에는 실제로 내용이 바뀐다 - 진짜 개정은 여전히 잡아야 한다.
+        with open(spec, "wb") as f:
+            f.write(b"%PDF-1.4 " + b"y" * 700)
+        mark_queue_done(qid, court, case_no, item_no, "spec", "h1", "h2", files_saved=[spec])
+        check("내용 변경 재수집 - 버전 증가", versions(), [1, 2])
+
+        c = env.conn()
+        try:
+            latest = c.execute(
+                "SELECT file_size, file_hash FROM doc_raw WHERE item_id=1 "
+                "ORDER BY doc_version DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            c.close()
+        check("최신 행이 실제 최신 파일 크기를 가리킨다", latest["file_size"], os.path.getsize(spec))
     finally:
         env.close()
 
@@ -2007,6 +2078,7 @@ if __name__ == "__main__":
     test_save_auction_images_defenses()
     test_partial_collection_does_not_delete_old_photos()
     test_mark_queue_done_records_doc_raw()
+    test_doc_raw_version_does_not_bump_on_unchanged_content()
     test_doc_raw_refuses_to_record_false_success()
     test_mark_queue_done_missing_file_is_not_recorded()
     test_image_queue_type_does_not_crash_legacy_update()

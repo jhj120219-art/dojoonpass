@@ -787,6 +787,16 @@ def test_get_doc_button_id_contract():
                "호출 형태가 바뀌었다면 대소문자 전제를 다시 확인해야 한다")
 
     # 큐에 실제로 들어 있는 doc_type 값이 이 함수가 아는 값과 같은지 확인한다.
+    #
+    # 예외 하나: 'image'는 **버튼이 없어서** 원래부터 None이 정상이다(2026-08-17
+    # Sprint 144). 사진은 클릭할 버튼이 아니라 상세페이지 DOM에 이미 있는 캐러셀을
+    # 읽으므로, `doc_worker.py`가 `needs_button = doc_type != "image"`로 이 종류만
+    # 버튼 id 조회 자체를 건너뛴다. 목록에서 빼는 게 아니라 **왜 아는 값인데도
+    # None이 맞는지**를 이 함수 자체가 구분 못 하므로, 여기서만 걸러낸다.
+    #
+    # 2026-08-18 Sprint 188 실측: 이 검사가 원래 `image`도 "모르는 값"으로 잡아 FAIL했다
+    # — `document_queue`에 `image` 행이 실제로 생긴 것을 이 검사가 처음 마주친 것이다
+    # (교훈은 test_pipeline_integrity.py의 같은 원인 수정과 동일).
     db = os.path.join(ROOT, "auction.db")
     if os.path.exists(db):
         c = sqlite3.connect("file:%s?mode=ro" % db.replace("?", "%3f"), uri=True)
@@ -794,8 +804,9 @@ def test_get_doc_button_id_contract():
             types = {r[0] for r in c.execute("SELECT DISTINCT doc_type FROM document_queue")}
         finally:
             c.close()
-        unknown = sorted(t for t in types if get_doc_button_id(t, "1") is None)
-        check("큐의 doc_type 중 이 함수가 모르는 값 없음", unknown, [])
+        BUTTONLESS_DOC_TYPES = {"image"}
+        unknown = sorted(t for t in types - BUTTONLESS_DOC_TYPES if get_doc_button_id(t, "1") is None)
+        check("큐의 doc_type 중 이 함수가 모르는 값 없음 (버튼 없는 종류 제외)", unknown, [])
     else:
         print("[SKIP] auction.db 없음 (fresh clone)")
 

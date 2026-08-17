@@ -981,11 +981,40 @@ def _record_doc_raw(conn, court_code: str, case_no: str, item_no: str, doc_type:
         logger.warning("doc_raw 기록 생략: 0바이트 파일 (%s)", primary)
         return
 
-    row = conn.execute(
-        "SELECT MAX(doc_version) AS v FROM doc_raw WHERE item_id=? AND doc_type=?",
+    new_hash = _sha256_file(primary)
+
+    latest = conn.execute(
+        "SELECT doc_version, file_hash FROM doc_raw WHERE item_id=? AND doc_type=?"
+        " ORDER BY doc_version DESC LIMIT 1",
         (item_id, ds_type)
     ).fetchone()
-    version = (row["v"] or 0) + 1 if row else 1
+
+    # 내용이 바뀌지 않았으면 새 행을 쌓지 않는다 (2026-08-17 Sprint 187).
+    #
+    # 재수집을 켜면(overwrite=True) `mark_queue_done()`이 매번 성공으로 호출되고, 그때마다
+    # 여기가 무조건 새 doc_raw 행을 만들며 doc_version을 1씩 올렸다 — 내용이 한 글자도
+    # 안 바뀌어도 그랬다. `document_version_log`는 `previous_hash != new_hash`로 이미
+    # 이 구분을 하는데(storage/database.py:mark_queue_done), 같은 함수가 여는 같은
+    # 트랜잭션 안에서 `doc_raw`만 무조건 증가시켰다 — 이미지의 BUGS #113과 같은 계열:
+    # "계약은 같은데 한쪽만 변경 감지를 실제로 하지 않는다."
+    #
+    # `api/v1/item.py`가 MAX(doc_version)을 그대로 `doc_version`으로 응답에 실어 사용자에게
+    # 노출하므로, 이 결함은 잠재 상태로 있다가 문서 재수집이 켜지는 순간 "매일 밤 버전이
+    # 오르는" 형태로 사용자에게 드러난다 — 아직 아무도 `overwrite=True`를 넘기지 않아
+    # 지금은 첫 수집(행 없음 -> 항상 삽입)만 일어나므로 도달하지 않았다.
+    #
+    # 비교는 이 함수가 방금 계산한 `new_hash`(저장할 파일의 sha256) 대 직전 doc_raw 행의
+    # `file_hash`로 한다 — `mark_queue_done()`이 받는 `previous_hash`/`new_hash` 인자에
+    # 기대지 않는다. 그 인자들은 크롤러 계층(`crawler/doc_crawler.py`)이 doc_type마다
+    # 각자 계산해 넘기는 값이라 여기 대표 파일과 반드시 같은 파일을 가리킨다는 보장이
+    # 없다(예: status는 html+json 두 파일을 저장하고 대표는 json이다). doc_raw 자기
+    # 행의 file_hash와 비교하면 그 가정이 필요 없다.
+    if latest is not None and latest["file_hash"] and latest["file_hash"] == new_hash:
+        logger.info("doc_raw 기록 생략: 내용 변경 없음 (item_id=%s, doc_type=%s, version=%s 유지)",
+                    item_id, ds_type, latest["doc_version"])
+        return
+
+    version = (latest["doc_version"] + 1) if latest is not None else 1
 
     conn.execute(
         """
@@ -994,7 +1023,7 @@ def _record_doc_raw(conn, court_code: str, case_no: str, item_no: str, doc_type:
              doc_version, page_count, crawl_date, created_at)
         VALUES (?,?,?,?,?,?,?,?,?)
         """,
-        (item_id, ds_type, to_relative_storage_path(primary), _sha256_file(primary),
+        (item_id, ds_type, to_relative_storage_path(primary), new_hash,
          size, version, _pdf_page_count(primary),
          datetime.now().strftime("%Y-%m-%d"), now),
     )

@@ -3475,3 +3475,86 @@ Sprint 148~175 — 자율 감사 사이클 (docs/CURRENT_STATE.md 해당 절)
   낡은 worktree / 빈 디렉터리 1,674개 / 면적·특수조건 필터(스키마 변경) /
   recent·favorites 썸네일(기능 추가) / `storage.database.query()` 죽은 코드(테스트가 참조).
 - 운영 `auction.db` / `documents/` 변경 0건 (3,338 디렉터리 / 767 파일 / 1.29GB 그대로).
+
+---
+
+2026-08-17
+
+Sprint 186 — 이미지 파이프라인 전수 추적 (docs/CURRENT_STATE.md 해당 절)
+
+- **[결함 수정] BUGS #113** `collect_images()`가 `previous_hash`를 끝내 계산하지 않아
+  이미지의 변경 감지가 구조적으로 불가능했다(`mark_queue_done`의 감지 조건이 이미지에서는
+  영원히 거짓). 문서 수집기는 같은 자리를 이미 계산하고 있었다 — 이미지만 빠져 있었다.
+  수집 전 디스크 기존 사진으로 `new_hash`와 같은 공식의 지문을 뜨도록 고쳤다.
+- **[결함 수정] BUGS #114** 부분 수집(법원이 줄인 것 vs 일부만 받아진 것)을 구별하지
+  못해 `save_auction_images()`가 사용자가 보던 사진을 지울 수 있었다. `complete` 플래그를
+  추가해 판단할 수 없을 때는 남기는 쪽으로 바꿨다.
+- **[회귀]** `test_asset_pipeline.py` 5-C(10검사)/7-B(10검사) 신설.
+- **[SKIP]** 재수집 트리거(`overwrite=True`를 아무도 넘기지 않음, 제품 정책 대기).
+
+---
+
+2026-08-17
+
+Sprint 187 — 문서 파이프라인 전수 추적 + 매일 갱신 체인 감사 (docs/CURRENT_STATE.md 해당 절)
+
+- **[결함 수정] BUGS #115** `doc_raw.doc_version`이 내용 변경 여부와 무관하게 재수집마다
+  증가했다 — `document_version_log`는 `previous_hash != new_hash`로 이미 구분하는데,
+  같은 트랜잭션의 `doc_raw` 삽입엔 그 판단이 없었다(BUGS #113과 같은 계열, 이번엔 한
+  함수 안의 두 기록 대상 사이). `api/v1/item.py`가 그대로 응답에 싣는 값이라 재수집을
+  켜는 순간 사용자에게 드러났을 결함이다.
+- **[결함 수정] BUGS #116** spec/appraisal PDF가 내용 검증 없이 저장됐다(`wait_for_download()`는
+  크기만 본다). 이미지의 매직 바이트 판정과 같은 수준으로 `_looks_like_pdf()` 신설 + 배선.
+- **[미해결 · 승인 영역, Release Blocker] BUGS #117** 이 환경의 `auction.db`에 마이그레이션
+  020(`auction_image`)이 적용되지 않아 **검색/상세 API가 전면 500**(`curl`로 직접 확인).
+  DB 스키마 변경이라 여기서 실행하지 않음 — `python -m storage.migrations.run_migrations` 승인 대기.
+- **[운영 실측]** Windows 작업 스케줄러 확인 결과 `run_daily.bat`(물건 기본정보)만 매일
+  도는 중(`DOJOONPASS_DAILY`, 수동 등록으로 보임, 오늘도 성공). `run_doc_worker.bat`/
+  `run_priority_refresh.bat`은 **한 번도 등록된 적이 없다** — 사진/문서 자동 수집이
+  구조적으로 일어나지 않는 근본 원인. `register_scheduler_tasks.ps1`을 그대로 `-Apply`하면
+  `run_daily.bat`이 하루 두 번(기존 03:00 + 신규 06:00) 도는 중복이 생기는 것도 발견해
+  스크립트에 기존 작업 자동 탐지+경고를 추가(자동 삭제는 하지 않음).
+- **[회귀]** `test_asset_pipeline.py` +1검사, `test_doc_storage_atomicity.py` +2검사.
+  관련 스위트 전체 재실행 — 전체 PASS(회귀 없음).
+- **[SKIP]** 마이그레이션 020 적용 / DocWorker·PriorityRefresh 작업 등록 (둘 다 승인 영역,
+  코드 준비는 완료 — 실행만 남았다).
+- 운영 `auction.db` 변경 0건(스키마 변경은 승인 전이라 미적용, 조회는 전부 읽기 전용).
+
+문서 동기화 (BUGS / CURRENT_STATE / roadmap / TEST_PLAN / SPRINT187_DOCUMENT_PIPELINE_AUDIT 신설)
+
+---
+
+2026-08-18
+
+Sprint 188 — Failure Recovery 감사: 검색 API 오류가 로그에 원인을 안 남기던 결함
+
+- **[결함 수정] BUGS #118** BUGS #117을 서버 로그로 재확인하려다 발견 — `api/v1/search.py`의
+  `search()`/`get_regions()`가 `except Exception as e: raise HTTPException(...) from e`로
+  곧바로 바꿔 던져, FastAPI가 트레이스백을 안 찍는 바람에 진짜 원인이 로그 어디에도
+  안 남았다. `api/v1/payments.py`는 같은 자리에서 이미 `logger.exception()`을 쓰고
+  있어 라우터마다 관례가 갈려 있었다. 두 핸들러에 `logger.exception(...)` 추가(응답은
+  불변).
+- **[회귀]** 신규 `test_error_logging.py` — 실제 HTTP 요청으로 재현(응답 불변 + 로그에
+  원인 노출 확인, `git stash`로 결함 재현해 검사가 실제로 FAIL하는 것도 확인) +
+  `api/` 전체를 AST로 훑어 같은 패턴(로그 없이 `except Exception` -> `HTTPException`)이
+  다른 곳에 없는지 전수 검색(목록 의존 없음 — 새 라우터가 같은 실수를 해도 잡힌다).
+- **[전수 검색 결과]** `api/` 전체에서 이 패턴은 2곳(둘 다 `search.py`)뿐이었다 —
+  `admin.py`/`favorites.py`/`registry.py`/`search_presets.py` 등의 `except Exception:`은
+  전부 `raise`(원본 예외를 그대로 다시 던짐, FastAPI 기본 핸들러가 로그를 남김)라 대상이
+  아니었다.
+- TODO/FIXME/HACK 전수 검색 — 신규 결함 없음(기존에 이미 roadmap/BETA_RELEASE_CHECKLIST에
+  등록된 2건뿐: 검색 면적/특수조건 필터 API 미지원, 둘 다 스키마 변경이라 승인 영역).
+- 부수적으로: `crawler/doc_crawler.py`의 기존 PDF 파일 396개를 매직바이트로 전수
+  재검사(BUGS #116 회귀와 별개로 디스크 실측) — 손상/오탐 0건, 소급 정리 불필요.
+- **[결함 수정] BUGS #119** 위 회귀를 재실행하다 `test_document_queue.py`/
+  `test_pipeline_integrity.py`가 **전날엔 PASS였는데 새로 FAIL**했다 — 제품 결함이
+  아니라 실 `auction.db`가 하루 사이 바뀐 것(매일 도는 `enqueue_documents()`가 쌓아
+  온 `document_queue.doc_type='image'`가 처음 이 두 검사의 **하드코딩 목록**과
+  부딪힘). `test_pipeline_integrity.py`는 `storage.database.QUEUE_TO_DOC_STATUS_TYPE`
+  (단일 소스)을 참조하도록, `test_document_queue.py`는 버튼이 구조적으로 없는
+  `image`를 이유와 함께 명시적으로 제외하도록 고쳤다 — 정상 상태를 결함으로
+  오판하던 것을 바로잡았을 뿐, 제품 코드는 변경하지 않았다.
+- 운영 `auction.db`/스케줄러 변경 0건 (`enqueue_documents()`가 매일 03:00에 넣는
+  `image` 큐 행은 이 세션이 만든 게 아니라 Sprint 144부터 있던 정상 동작이다).
+
+문서 동기화 (BUGS / TEST_PLAN)
