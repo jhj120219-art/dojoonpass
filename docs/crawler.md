@@ -81,11 +81,46 @@
   (2026-08-06 수정, 아래 "알려진 문제점" 5번 참고 — 이전 버전은 `mvp_scraper.py`/`migrate_execute.py` 실패 여부와 무관하게 뒤따르는 `echo`가 항상 성공해 배치 전체 종료코드가 0으로 남는 구조였음)
 - `migrate_execute.py` 호출 라인은 원래 없었음. 2026-07-11 이후 자동 실행 기록 없음. 이후 수동 추가됨. 승인 이력: 아직 결정되지 않음
 
+## 물건 사진 수집 (2026-08-17 Sprint 144 신설)
+
+02:00 `doc_worker.py`가 문서와 **같은 큐로** 함께 처리한다(`document_queue.doc_type='image'`,
+`document_status.doc_type='IMAGE'`). 새 큐/워커를 만들지 않았다.
+
+문서 수집과 **근본적으로 다른 점 세 가지** —
+
+1. **버튼이 없다.** 상세페이지에 진입한 순간 캐러셀이 이미 DOM에 있다.
+   그래서 `doc_worker`는 이 종류만 `get_doc_button_id()` 검사를 건너뛴다.
+2. **다운로드할 URL이 없다.** 사진은 `<img src="data:image/png;base64,...">`로 페이지에
+   박혀서 온다 — 디코드하면 그것이 원본 바이트다. **법원 서버에 추가 요청 0회.**
+3. **선언된 MIME을 믿으면 안 된다.** 전부 `image/png`로 선언하지만 실제 바이트는
+   JPEG/GIF다(2026-08-17 표본 45장 중 PNG 0장). 확장자는 **매직 바이트로 판정**한다
+   (`crawler/image_assets.py:sniff_image_ext`).
+
+```
+crawler/image_assets.py    순수 규칙(alt 파싱 / 매직 판정 / data URI 디코드 / 크기 / 경로)
+                           selenium·DB·fastapi 무의존 — doc_paths.py와 같은 이유
+crawler/image_crawler.py   selenium 부분(collect_images) — 원자적 쓰기(os.replace)
+storage/database.py        save_auction_images() -> auction_image (UNIQUE(item_id, seq))
+```
+
+저장 경로는 문서와 같은 물건 디렉터리 아래다:
+`documents/<법원>/<사건>/<물건>/images/01.jpg` (순번 0채움 = 캐러셀 순서).
+
+★ `go_to_case_detail()`에 **`item_no`를 반드시 넘긴다.** 이 함수는 예전에 사건번호만 보고
+목록의 첫 일치 행으로 들어갔다. 문서는 버튼 id에 물건번호가 붙어 있어 영향이 없었지만
+(실측 확인), 사진은 버튼 없이 페이지 DOM을 읽으므로 **잘못된 물건의 페이지에 있으면 그대로
+잘못된 사진을 저장한다.**
+
 ## 예외 처리
 
 아직 결정되지 않음
 
 - `go_to_detail()`: 신선 데이터 10건×3회 100% 성공, 오래된 데이터 간헐적 실패. 원인: 아직 결정되지 않음. 구조 변경 보류 상태
+- `collect_images()`: 사진 요소가 **하나도 없으면** 성공 + `no_asset=True`다(법원이 사진을
+  제공하지 않는 물건이 실재한다 — 실패로 기록하면 영원히 재시도된다). 반대로 사진 요소는
+  있는데 `alt` 규칙(`<종류>_<순번>`)에 맞는 것이 하나도 없으면 **실패로 처리한다** —
+  법원 DOM이 바뀐 신호이고, 조용히 성공으로 넘기면 그날 이후 모든 물건의 사진이 사라진
+  것을 아무도 모르게 된다.
 
 ## 성능 최적화
 
@@ -106,6 +141,39 @@
 아직 결정되지 않음 (상대경로 DB_PATH 설계, auction/auction_item 분리 설계의 의도된 이유는 이 대화에서 확인되지 않음)
 
 ## 알려진 문제점
+
+-1. ~~**현황조사서는 물건번호 1만 수집 가능하다**~~ → **2026-08-17 해결 (Sprint 144+, BUGS #100)**.
+   `get_doc_button_id("status", item_no)`가 물건번호 2 이상에 None을 돌려주고 있었고,
+   그 때문에 `auction_item`의 **33.5%(629/1,876)**가 현황조사서를 영원히 받을 수 없었다
+   (`document_queue`의 status + item_no != 1 중 done이 **0건**이었던 것이 증거).
+   실 브라우저로 물건번호 2인 상세페이지 2건의 DOM을 덤프해 확인한 결과
+   `..._btn_curstExmndcTop`이 **번호 없이 그대로 존재**하고, 오버레이 내용도 사건의 모든
+   물건을 한 문서에 담고 있었다(집행관이 사건 단위로 작성하는 문서다).
+   이제 물건번호와 무관하게 같은 버튼을 쓴다.
+   ★ 부작용과 그 해소 (2026-08-17 Sprint 145에 함께 처리): 한 사건에 물건이 N개면
+   **같은 문서를 N번 받게 된다.** 실측 비용 — 사건 1,384개 / 물건 1,876개이므로 초과
+   수집 492회(35.5%), worker 1건당 약 22초이니 **약 3.0시간**이다(가동 창 02:00~04:00 =
+   2시간을 넘긴다). 용량은 13.4MB로 무의미하니 **비용은 저장이 아니라 시간**이다.
+
+   ★ **2026-08-17 Sprint 147 정정**: 위 "약 3.0시간"은 navigation까지 건너뛴다고 **가정한**
+   값이다. Sprint 145 구현은 `collect_status()` 안에서만 재사용해 물건당 **0.6초(overlay)**만
+   아꼈고 navigation 15.2초는 그대로 들었다 — 실제 절감은 492회 기준 **5분**이었다.
+   Sprint 147이 `doc_worker`의 호출 순서를 바꿔(재사용 가능하면 이동 자체를 생략)
+   실 worker 2건 기준 **41.1초 -> 23.8초**, 492회 기준 **약 130분** 절감으로 실현했다.
+
+   같은 사건의 형제 물건이 방금 받아 둔 것이 있으면 **브라우저를 다시 몰지 않고 복사**한다
+   (`crawler/doc_paths.py:find_sibling_case_document()` +
+    `crawler/doc_crawler.py:_reuse_sibling_status()`).
+   근거: 물건 1과 2에 대해 각각 따로 실제 수집을 돌려 대조한 결과 status.html은 **바이트까지
+   동일**했고, status.json도 `fields` 115개 키가 완전히 일치했다(차이는 우리가 찍는
+   `extracted_at` 하나뿐).
+
+   **저장 구조는 바뀌지 않았다** — 파일은 종전과 같은 경로에 같은 내용으로 놓이고,
+   달라지는 것은 "그 바이트를 어디서 얻는가"뿐이라 API·뷰어·`doc_exists()`는 무영향이다.
+   재사용은 `SIBLING_REUSE_MAX_AGE_SECONDS`(기본 6시간) 안의 형제만 대상으로 한다 —
+   몇 달 전 파일을 복사하면 새로 받았다면 얻었을 최신본 대신 옛것을 주게 되는데,
+   "언제 다시 받을 것인가"는 재수집 정책(미결정)이라 여기서 정하지 않고 보수적으로 좁혔다.
+   형제 파일이 빈 캡처면 복사하지 않고 직접 수집한다(빈 캡처를 퍼뜨리지 않는다).
 
 0. **[2026-08-07 발견, 데이터 소실] `auction` 테이블 UNIQUE 키에 법원이 없다.**
    `UNIQUE(case_no, item_no)`라 서로 다른 법원이 같은 사건번호+물건번호를 쓰면
@@ -369,3 +437,46 @@ crawl_court() 1개 법원        약 168초
 - 사이트 목록은 **시점에 따라 반환 건수가 달라진다**(같은 법원 재실행 시 9건 → 1건 관측).
   수집 건수가 줄었다고 곧바로 결함으로 판단하면 안 된다 — `CrawlOutcome`의 실패 판정이
   "전 법원 실패" 또는 "저장 0건" 기준인 이유다.
+
+---
+
+## 2차 방어선은 큐의 사본이 아니라 실제 기일을 본다 (2026-08-17 Sprint 145, BUGS #101)
+
+`document_queue.auction_date`는 06:00 적재 시점에 `auction_item`에서 **복사해 둔
+비정규화 사본**이다. 유찰 후 재매각으로 기일이 미래로 다시 잡히면 이 사본은 옛 날짜를
+그대로 들고 있을 수 있다.
+
+예전에는 `doc_worker`의 2차 방어선이 그 사본만 보고 `SKIPPED_EXPIRED`로 종결했다.
+`SKIPPED_EXPIRED`는 `reset_stale_queue()`의 부활 대상이 아니므로 **살아 있는 사건의
+문서가 영구히 수집되지 않았다.**
+
+```
+실측 2026-08-17
+  document_queue.auction_date != auction_item.auction_date        36행
+    그중 pending + 큐는 과거 + 실제 기일은 미래                     3행
+      -> item 1533 (2024타경122092-1) spec/status/appraisal 전부
+         큐 2026-07-15  vs  실제 2026-08-19
+```
+
+지금은 종결하기 **직전에** 권위 있는 값과 대조한다:
+
+```python
+# doc_worker.py
+today = datetime.now().strftime("%Y-%m-%d")
+if auction_date and auction_date < today:
+    auction_date = reconcile_queue_auction_date(item["id"], case_no, item_no, auction_date)
+if auction_date and auction_date < today:
+    mark_queue_skipped_expired(...)
+```
+
+`reconcile_queue_auction_date()`(`storage/database.py`)는 `(case_no, item_no)`로
+`auction_item`을 조회해(1,876행에서 유일함을 실측 확인) 값이 다르면 큐 행의
+`auction_date`와 `priority`를 함께 정정하고 권위 있는 값을 돌려준다.
+
+- **정책은 바뀌지 않았다** — "기일 지난 사건은 수집하지 않는다"는 그대로이고,
+  그 판단이 참조하는 값의 출처만 사본에서 원본으로 바뀌었다.
+- `status`는 건드리지 않는다 — 이미 종결된 행을 되살릴지는 재수집 정책이라 제품 판단이다
+  (`enqueue_documents()`의 Sprint 74 주석과 같은 규약).
+- 매칭되는 물건이 없으면 큐 값을 그대로 돌려준다(판단을 바꾸지 않는다).
+- Sprint 74가 `enqueue_documents()`에 넣은 갱신은 **06:00 크롤이 돌 때만** 동작하므로
+  이 검사와 중복이 아니라 보완 관계다(크롤과 크롤 사이의 구멍을 이쪽이 막는다).

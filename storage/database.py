@@ -1,4 +1,4 @@
-import sqlite3
+﻿import sqlite3
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -386,7 +386,11 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                 skipped_expired += 1
                 continue
 
-            for doc_type in ("spec", "status", "appraisal"):
+            # 2026-08-17 Sprint 144: 'image' 추가. 물건 사진도 같은 큐로 수집한다.
+            # 사진은 문서와 달리 **버튼을 누를 필요가 없다** — 상세페이지에 진입하면
+            # 캐러셀이 이미 DOM에 있다(법원 원천 실측). 그래서 doc_worker는 이 종류만
+            # 버튼 id 검사를 건너뛴다.
+            for doc_type in ("spec", "status", "appraisal", "image"):
                 cur = conn.execute("""
                     INSERT OR IGNORE INTO document_queue
                         (court_code, case_no, item_no, doc_type, priority, auction_date, status, retry_count, enqueued_at)
@@ -549,6 +553,97 @@ def reset_stale_queue() -> None:
         conn.close()
 
 
+def reconcile_queue_auction_date(queue_id: int, case_no: str, item_no: str,
+                                  queue_date: str, court_code: str = None) -> str:
+    """큐가 들고 있는 `auction_date`를 **권위 있는 값**(`auction_item`)과 대조해 정정한다.
+
+    ## 왜 필요한가 (2026-08-17 Sprint 145 실측)
+
+    `document_queue.auction_date`는 06:00 적재 시점에 복사해 둔 **비정규화 사본**이다.
+    Sprint 74가 이미 "유찰 후 재매각으로 기일이 미래로 다시 잡히면 큐의 옛 날짜 때문에
+    살아 있는 사건이 수집 대상에서 빠진다"는 것을 찾아 `enqueue_documents()`에 갱신
+    로직을 넣었다. **그런데 그 갱신은 06:00 크롤이 돌 때만 일어난다.**
+
+    실측 결과 그 사이 구멍이 그대로 남아 있었다:
+
+        document_queue.auction_date != auction_item.auction_date   36행
+          그중 pending + 큐 날짜는 과거 + 실제 기일은 미래         3행
+          -> item 1533 (2024타경122092-1, 실제 기일 2026-08-19)
+
+    item 1533은 **지금 검색에 노출되는 진행 중 물건**인데(전체 9건 중 1건), worker의
+    2차 방어선이 큐의 `2026-07-15`를 보고 `SKIPPED_EXPIRED`로 종결시킨다. 즉
+    **사용자가 볼 수 있는 물건의 문서가 영원히 수집되지 않는다.**
+
+    ## 무엇을 고치는가
+
+    "기일 지난 사건은 수집하지 않는다"는 **정책은 그대로 둔다.** 고치는 것은 그 판단이
+    참조하는 **값의 출처**뿐이다 — 사본이 아니라 `auction_item`을 본다. Sprint 74의
+    주석이 같은 말을 한다: *"여기서 고치는 것은 큐가 자기 필드에 사실과 다른 값을 들고
+    있는 것뿐이다."*
+
+    드리프트를 발견하면 큐 행도 함께 정정한다(`refresh_queue_priority()`도 이 값을 보고
+    우선순위를 계산하므로 한 번 고쳐 두면 그쪽 오판도 같이 사라진다).
+    `status`는 건드리지 않는다 — 종결된 행을 되살릴지는 재수집 정책이라 제품 판단이다.
+
+    ## ★ 2026-08-17 Sprint 146 — 식별키에 **법원이 빠져 있었다** (수정)
+
+    이 함수는 처음에 `WHERE case_no=? AND item_no=?` 로만 물건을 찾았다. 근거는
+    *"(case_no, item_no)는 auction_item 1,876행에서 유일하다"* 였는데, 그 확인은
+    **틀린 것을 확인한 것**이다 — `auction_item` 안에서 유일한 것과, **큐 행이 자기
+    법원의 물건과 맺어지는가**는 다른 문제다. 조인 상대는 큐이고 큐에는 법원이 따로 있다.
+
+    법원마다 사건번호를 독립 채번하므로 같은 `2024타경2803`이 여러 법원에 존재한다.
+    실측(2026-08-17): 큐의 (사건,물건)이 **다른 법원의** auction_item과 매칭되는 행이
+    **18행**(그중 pending 12행)이었다.
+
+        q=7204  큐법원=성남지원  vs  물건법원=통영지원   2024타경4973-1
+                -> 통영 물건의 기일(2026-08-10)로 성남 큐를 "정정"하게 된다
+
+    즉 정정하려던 함수가 **엉뚱한 사건의 날짜를 덮어쓸** 수 있었다. 이것은
+    `docs/BUGS.md` #18/#14가 이미 같은 저장소에서 두 번 잡은 "법원 없는 식별키" 함정이
+    새 코드에 다시 들어온 것이다.
+
+    이제 `court_code`를 함께 받아 대조한다. **법원을 못 받으면(하위호환 호출) 정정하지
+    않고 큐 값을 그대로 돌려준다** — 잘못 고치는 것보다 안 고치는 편이 낫다.
+
+    매칭되는 물건이 없어도 큐 값을 그대로 돌려준다(판단을 바꾸지 않는다).
+    """
+    if not court_code:
+        # 법원 없이는 물건을 안전하게 특정할 수 없다. 추측해서 고치지 않는다.
+        logger.warning("큐 기일 정정 생략: court_code 미지정 (queue_id=%s, %s-%s)",
+                       queue_id, case_no, item_no)
+        return queue_date
+
+    conn = get_connection()
+    try:
+        # 식별키는 (법원, 사건번호, 물건번호) 3자다 — 법원을 빼면 다른 법원의 같은
+        # 사건번호에 걸린다(위 주석의 Sprint 146 실측: 18행이 실제로 그랬다).
+        row = conn.execute(
+            "SELECT auction_date FROM auction_item "
+            "WHERE court_name = ? AND case_no = ? AND CAST(item_no AS TEXT) = ?",
+            (court_code, case_no, str(item_no)),
+        ).fetchone()
+        if row is None:
+            return queue_date
+
+        actual = row["auction_date"]
+        if not actual or actual == queue_date:
+            return queue_date
+
+        conn.execute(
+            "UPDATE document_queue SET auction_date = ?, priority = ? WHERE id = ?",
+            (actual, calc_priority(actual), queue_id),
+        )
+        conn.commit()
+        logger.info(
+            "[%s-%s] 큐의 매각기일이 실제와 달라 정정: %s -> %s (queue_id=%s)",
+            case_no, item_no, queue_date, actual, queue_id,
+        )
+        return actual
+    finally:
+        conn.close()
+
+
 def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, item_no: str,
                                 doc_type: str, auction_date: str) -> None:
     """
@@ -668,7 +763,22 @@ def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no
 # 큐의 doc_type(소문자)과 document_status.doc_type(대문자)의 대응.
 # 두 테이블이 다른 표기를 쓰는 것은 기존 상태이며, 여기서 표기를 통일하면
 # 이미 쌓인 5,610행과 어긋나므로 **변환만** 한다.
-QUEUE_TO_DOC_STATUS_TYPE = {"spec": "SPEC", "status": "STATUS", "appraisal": "APPRAISAL"}
+#
+# 2026-08-17 Sprint 144: 물건 사진('image'/'IMAGE')을 넷째 종류로 넣었다. 사진 파일 자체는
+# 개수가 0~N이라 `auction_image` 테이블에 따로 담지만, **"이 물건의 사진을 수집했는가"라는
+# 상태는 문서와 완전히 같은 성질**이라 큐/상태 테이블을 새로 만들지 않고 그대로 쓴다
+# (재시도 횟수·우선순위·stale 회수·동시 실행 잠금이 전부 이미 있고 검증돼 있다).
+QUEUE_TO_DOC_STATUS_TYPE = {"spec": "SPEC", "status": "STATUS", "appraisal": "APPRAISAL",
+                            "image": "IMAGE"}
+
+# `auction`(레거시) 테이블에 "수집됨" 플래그 컬럼이 있는 종류.
+# 사진에는 대응 컬럼이 없다 — 레거시 `auction` 테이블은 변경 금지(docs/backend.md)라
+# `has_images` 같은 컬럼을 새로 만들지 않는다. 사진의 근거는 `auction_image` 행 자체다.
+LEGACY_HAS_COLUMN = {
+    "spec": "has_spec_pdf",
+    "status": "has_status_doc",
+    "appraisal": "has_appraisal_pdf",
+}
 
 
 def _document_status_item_id(conn, court_code: str, case_no: str, item_no: str):
@@ -755,6 +865,245 @@ def _set_document_status(conn, court_code: str, case_no: str, item_no: str,
     return True
 
 
+def _sha256_file(path: str) -> str:
+    """파일 해시. 읽지 못하면 빈 문자열(해시를 못 구한 것이 저장 실패 사유는 아니다)."""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _pdf_page_count(path: str) -> Optional[int]:
+    """PDF 쪽수. PDF가 아니거나 읽지 못하면 None.
+
+    None과 0을 구분한다 — 0은 "0쪽짜리 PDF"라는 거짓말이 되고(뷰어가 페이지 이동을
+    아예 못 그린다), None은 "아직 모른다"이다. `collect_documents.py:save_doc_raw()`의
+    옛 구현은 예외를 0으로 뭉갰는데 같은 실수를 반복하지 않는다.
+    """
+    if not path.lower().endswith(".pdf"):
+        return None
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.debug("pdfplumber 없음 - page_count 생략")
+        return None
+    try:
+        with pdfplumber.open(path) as pdf:
+            return len(pdf.pages)
+    except Exception as e:
+        logger.warning("page_count 계산 실패 (%s): %s", path, str(e))
+        return None
+
+
+def to_relative_storage_path(path: str) -> str:
+    """저장 경로를 **프로젝트 루트 기준 상대경로**로 바꾼다.
+
+    절대경로를 DB에 넣으면 배포 위치가 바뀌는 순간 전 행이 못 쓰게 된다 — 이 저장소는
+    실제로 `.bat`/Task Scheduler가 존재하지 않는 절대경로를 들고 있어 매일 배치가
+    실패한 적이 있다(docs/CLAUDE.md "경로 통합 완료"). 같은 함정을 DB에 옮기지 않는다.
+    루트 밖의 경로면 어쩔 수 없이 원본을 그대로 둔다(추측해서 잘라내지 않는다).
+    """
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    try:
+        rel = _os.path.relpath(path, root)
+    except ValueError:
+        return path
+    if rel.startswith(".."):
+        return path
+    return rel.replace("\\", "/")
+
+
+def _record_doc_raw(conn, court_code: str, case_no: str, item_no: str, doc_type: str,
+                    files_saved: Optional[List[str]], now: str) -> None:
+    """수집에 성공한 문서의 실체 정보를 `doc_raw`에 남긴다.
+
+    `mark_queue_done()`이 여는 트랜잭션 안에서 호출된다(커밋하지 않는다).
+
+    설계상의 선택 두 가지 —
+
+    1. **파일이 실제로 없으면 아무것도 쓰지 않는다.** 이 저장소가 반복해서 잡아 온
+       결함이 정확히 "DB는 완료라는데 파일이 없다"이므로, 기록의 근거를 파일 자체에
+       둔다(`os.path.getsize()`가 성공해야 한다). 파일이 없으면 경고만 남기고
+       `doc_raw` 행을 만들지 않는다 — 큐/상태는 이미 done/READY로 갔지만, 그것은
+       파일이 있는지 아직 안 본 상위 계층의 판단이고 여기서 뒤집지는 않는다
+       (뒤집으려면 `collect_document()`의 성공 판정을 고쳐야 한다).
+    2. **여러 파일 중 대표 하나만 기록한다.** `doc_raw`는 (item, doc_type)당 1행
+       구조다. status는 html+json 두 개를 저장하는데, 그중 완성 판정 기준 파일
+       (`doc_paths._PRIMARY_EXT` = json)이 대표다. 규칙을 여기서 새로 만들지 않고
+       그 모듈의 판정을 그대로 따른다.
+    """
+    import os as _os
+
+    if not files_saved:
+        return
+
+    item_id = _document_status_item_id(conn, court_code, case_no, item_no)
+    if item_id is None:
+        logger.warning("doc_raw 기록 대상 없음 (법원=%s, 사건=%s, 물건=%s)",
+                       court_code, case_no, item_no)
+        return
+
+    ds_type = QUEUE_TO_DOC_STATUS_TYPE.get(doc_type)
+    if not ds_type:
+        logger.warning("doc_raw 기록 생략: 알 수 없는 doc_type=%r", doc_type)
+        return
+
+    # 사진은 `auction_image`가 담당한다 — doc_raw는 (item, doc_type)당 1행이라
+    # 0~N장인 사진을 담을 수 없다(migration 020의 주석 참고).
+    if doc_type == "image":
+        return
+
+    try:
+        from crawler.doc_paths import _PRIMARY_EXT
+        primary_ext = _PRIMARY_EXT.get(doc_type)
+    except Exception:
+        primary_ext = None
+
+    primary = None
+    if primary_ext:
+        primary = next((p for p in files_saved
+                        if p.lower().endswith("." + primary_ext)), None)
+    if primary is None:
+        primary = files_saved[0]
+
+    try:
+        size = _os.path.getsize(primary)
+    except OSError:
+        logger.warning("doc_raw 기록 생략: 저장했다는 파일이 실제로 없다 (%s)", primary)
+        return
+    if size <= 0:
+        logger.warning("doc_raw 기록 생략: 0바이트 파일 (%s)", primary)
+        return
+
+    row = conn.execute(
+        "SELECT MAX(doc_version) AS v FROM doc_raw WHERE item_id=? AND doc_type=?",
+        (item_id, ds_type)
+    ).fetchone()
+    version = (row["v"] or 0) + 1 if row else 1
+
+    conn.execute(
+        """
+        INSERT INTO doc_raw
+            (item_id, doc_type, storage_path, file_hash, file_size,
+             doc_version, page_count, crawl_date, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (item_id, ds_type, to_relative_storage_path(primary), _sha256_file(primary),
+         size, version, _pdf_page_count(primary),
+         datetime.now().strftime("%Y-%m-%d"), now),
+    )
+
+
+def save_auction_images(court_code: str, case_no: str, item_no: str,
+                        images: List[Dict], complete: bool = True) -> Dict:
+    """수집한 물건 사진들을 `auction_image`에 기록한다.
+
+    `images`의 각 항목: {"seq", "kind", "path", "file_size", "file_hash",
+                        "width", "height"}
+
+    - **디스크에 실제로 없는 항목은 기록하지 않는다.** (DB만 앞서가는 것을 막는 이 저장소의 규약)
+    - `INSERT OR REPLACE`로 `UNIQUE(item_id, seq)`에 얹는다 — 같은 물건을 두 번
+      처리해도 사진이 두 벌 쌓이지 않는다(중복 자산 방어).
+    - **이번에 남은 순번보다 큰 옛 행은 지운다.** 법원이 사진을 5장에서 3장으로 줄이면
+      옛 4,5번 행이 남아 화면이 없는 사진을 가리키게 된다.
+    - 단 `complete=False`(부분 수집)면 **지우지 않는다** (2026-08-17 Sprint 186).
+      이 함수만 보면 "법원이 5장에서 3장으로 줄였다"와 "5장 중 3장만 받아졌다"가
+      똑같이 보인다 — 둘 다 순번 3까지만 들어온다. 그런데 결과는 정반대다.
+
+          법원이 줄였다   -> 옛 4,5번을 지우는 것이 맞다(없는 사진을 가리키므로)
+          일부만 받아졌다 -> 지우면 **사용자가 보던 사진 2장이 사라지고**,
+                            그 파일들은 디스크에 고아로 남는다
+
+      구별할 수 있는 것은 호출부다(`collect_images` 가 돌려주는 `partial`).
+      판단할 수 없을 때는 **남기는 쪽**이 안전하다 — 남은 행은 여전히 실제 파일을
+      가리키고 다음 정상 수집에서 정리되지만, 지운 행은 되돌릴 수 없다.
+
+    돌려주는 값: {"saved": n, "skipped_missing": n, "removed_stale": n}
+    """
+    import os as _os
+
+    conn = get_connection()
+    saved = 0
+    skipped = 0
+    removed = 0
+    try:
+        item_id = _document_status_item_id(conn, court_code, case_no, item_no)
+        if item_id is None:
+            logger.warning("auction_image 기록 대상 없음 (법원=%s, 사건=%s, 물건=%s)",
+                           court_code, case_no, item_no)
+            return {"saved": 0, "skipped_missing": len(images or []), "removed_stale": 0}
+
+        now = datetime.now().isoformat()
+        today = datetime.now().strftime("%Y-%m-%d")
+        max_seq = 0
+
+        for img in (images or []):
+            path = img.get("path")
+            seq = img.get("seq")
+            if not path or not isinstance(seq, int):
+                skipped += 1
+                continue
+            try:
+                size = _os.path.getsize(path)
+            except OSError:
+                logger.warning("auction_image 기록 생략: 파일이 없다 (%s)", path)
+                skipped += 1
+                continue
+            if size <= 0:
+                skipped += 1
+                continue
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO auction_image
+                    (item_id, seq, kind, storage_path, file_hash, file_size,
+                     width, height, crawl_date, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (item_id, seq, img.get("kind"), to_relative_storage_path(path),
+                 img.get("file_hash") or "", size,
+                 img.get("width"), img.get("height"), today, now),
+            )
+            saved += 1
+            max_seq = max(max_seq, seq)
+
+        # `complete=False` 면 지우지 않는다 — 위 docstring 참고.
+        # `saved` 가 0일 때도 지우지 않는다(전체 실패로 기존 사진을 잃는 것을 막는다).
+        if saved and complete:
+            cur = conn.execute(
+                "DELETE FROM auction_image WHERE item_id=? AND seq>?", (item_id, max_seq))
+            removed = cur.rowcount or 0
+        elif saved and not complete:
+            logger.warning(
+                "[%s-%s] 부분 수집이라 옛 사진 행을 지우지 않는다 (저장 %d장, 최대 순번 %d)",
+                case_no, item_no, saved, max_seq)
+
+        conn.commit()
+        return {"saved": saved, "skipped_missing": skipped, "removed_stale": removed}
+    finally:
+        conn.close()
+
+
+# 2026-08-17 Sprint 150 (Architecture/Debt Audit): `get_auction_images(item_id)`를 제거했다.
+#
+# Sprint 144에 이미지 계층을 만들면서 "API 전용 조회" 헬퍼로 추가했는데 **끝내 아무도
+# 부르지 않았다**(저장소 전체 참조 0건 — 테스트 포함). 실제로 사진을 읽는 곳은
+# `api/v1/item.py:58`이고, 거기서 같은 SQL을 인라인으로 실행한다.
+#
+# 남겨 둘 이유가 없다. 이 저장소는 리포지토리/서비스 계층 없이 **라우터가
+# get_connection()으로 직접 조회하는 구조**이므로(docs/CLAUDE.md Architecture),
+# 이 헬퍼만 홀로 다른 규칙을 따르고 있었다. 즉 죽은 코드이면서 동시에 구조에서도
+# 이례였다. 남겨 두면 "여기에 조회 계층이 있다"는 잘못된 신호를 준다.
+#
+# 사진 조회 SQL이 여러 곳에 필요해지면 그때 이 규칙 자체를 바꾸는 것이 맞다.
+
+
 def claim_next_queue_item() -> Optional[Dict]:
     """
     status='pending' -> 'in_progress' 원자적 클레임.
@@ -794,21 +1143,65 @@ def claim_next_queue_item() -> Optional[Dict]:
 
 
 def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, doc_type: str,
-                     previous_hash: str, new_hash: str) -> None:
+                     previous_hash: str, new_hash: str, status: str = "READY",
+                     files_saved: Optional[List[str]] = None) -> None:
+    """큐 항목을 성공으로 종결한다.
+
+    2026-08-17 Sprint 144에 **뒤에 두 개의 선택 인자**가 붙었다. 기존 호출부
+    (`doc_worker.py`)는 위치 인자 7개를 그대로 쓰므로 무변경으로 동작한다.
+
+      status       화면(`document_status`)에 쓸 값. 기본 READY.
+                   사진 수집이 성공했는데 **법원에 사진이 한 장도 없는** 경우가 실제로
+                   있고, 그때 READY로 쓰면 "볼 수 있다"는 거짓말이 된다. 그렇다고
+                   FAILED로 쓰면 실패가 아닌 것을 실패로 기록하고 재시도 대상이 된다
+                   (`mark_queue_skipped_expired`가 같은 이유로 상태를 안 건드리는 것과
+                   같은 고민이다). 호출부가 'NO_IMAGE'를 명시적으로 넘길 수 있게 한다.
+      files_saved  이번에 저장한 파일 경로들. `doc_raw`를 채우는 데 쓴다(아래 참고).
+
+    ## `doc_raw`를 여기서 채우는 이유 (Sprint 144에 고친 결함)
+
+    실측: 디스크에 실제 문서가 559개 있고 `document_status` READY가 556행인데
+    **`doc_raw`는 0행**이었다. `doc_raw`에 쓰는 코드는 `collect_documents.py`
+    (`save_doc_raw()`) 한 곳뿐인데, 그 스크립트는 **어떤 스케줄러도 실행하지 않는다** —
+    운영에서 실제로 도는 경로는 `doc_worker.py` -> `collect_document()` -> 이 함수이고,
+    이 경로에는 `doc_raw` 기록이 아예 없었다.
+
+    그 결과 `doc_raw`의 file_size / file_hash / page_count / doc_version이 전부
+    비어 있어서, API가 "이 문서 몇 쪽인가"를 답할 수 없었다(상세페이지 뷰어의 페이지
+    이동이 불가능했던 근본 원인). BUGS #50이 `has_*_pdf`와 `document_status` 사이에서
+    고친 것과 **정확히 같은 모양의 결함**이 한 층 아래에 하나 더 있었던 셈이다.
+
+    같은 트랜잭션 안에서 쓴다 — 세 기록(`document_queue` / `document_status` / `doc_raw`)이
+    갈라질 여지를 남기지 않는다.
+    """
     conn = get_connection()
     try:
         now = datetime.now().isoformat()
         conn.execute("UPDATE document_queue SET status='done' WHERE id=?", (queue_id,))
 
-        col = {"spec": "has_spec_pdf", "status": "has_status_doc", "appraisal": "has_appraisal_pdf"}[doc_type]
-        conn.execute(
-            "UPDATE auction SET " + col + "=1 WHERE court_code=? AND case_no=? AND item_no=?",
-            (court_code, case_no, item_no)
-        )
+        # ★ 알 수 없는 doc_type은 **여전히 예외로 죽어야 한다.**
+        #
+        #   예전 코드는 `{...}[doc_type]`이라 모르는 종류에 KeyError를 냈고, 그 덕분에
+        #   트랜잭션이 통째로 롤백돼 큐가 거짓 'done'이 되지 않았다
+        #   (`test_doc_storage_atomicity.py` §3이 지키는 불변식).
+        #   Sprint 144에 'image'를 넣으면서 이것을 `.get()`으로 바꾸면 **오타 난 doc_type이
+        #   조용히 성공 처리되어** 수집한 적 없는 문서가 done으로 종결된다 — 고치려던 것보다
+        #   나쁜 결함이다. 그래서 "레거시 컬럼이 없는 것"과 "아예 모르는 종류"를 나눈다:
+        #   전자(image)만 건너뛰고 후자는 그대로 죽는다.
+        if doc_type not in QUEUE_TO_DOC_STATUS_TYPE:
+            raise KeyError(doc_type)
+        col = LEGACY_HAS_COLUMN.get(doc_type)
+        if col:
+            conn.execute(
+                "UPDATE auction SET " + col + "=1 WHERE court_code=? AND case_no=? AND item_no=?",
+                (court_code, case_no, item_no)
+            )
 
         # 화면이 읽는 것은 이 테이블이다 — 같은 트랜잭션에서 함께 갱신해야 두 기록이
         # 갈라지지 않는다 (BUGS #50).
-        _set_document_status(conn, court_code, case_no, item_no, doc_type, "READY")
+        _set_document_status(conn, court_code, case_no, item_no, doc_type, status)
+
+        _record_doc_raw(conn, court_code, case_no, item_no, doc_type, files_saved, now)
 
         if previous_hash and previous_hash != new_hash:
             conn.execute("""

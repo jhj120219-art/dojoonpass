@@ -16,6 +16,25 @@ import SiteHeader from '@/components/SiteHeader'
 interface DocumentStatusItem {
   doc_type: string
   status: string
+  // 2026-08-17 Sprint 144에 서버가 추가한 필드들. 예전 응답에는 없으므로 전부 optional로
+  // 둔다 — 백엔드를 먼저 배포하지 않아도 프런트가 깨지지 않아야 한다.
+  available?: boolean
+  page_count?: number | null
+  file_size?: number | null
+  doc_version?: number | null
+  viewer_url?: string | null
+  download_url?: string | null
+}
+
+// 물건 사진 1장. `GET /api/v1/item/{id}`의 `images[]` 항목.
+interface AuctionImage {
+  seq: number
+  kind: string | null
+  url: string
+  thumbnail_url: string
+  width: number | null
+  height: number | null
+  file_size: number | null
 }
 
 interface RightsSummary {
@@ -51,6 +70,11 @@ interface AuctionItemDetail {
   validation_status: string
   crawl_date: string | null
   documents: DocumentStatusItem[]
+  // 사진 관련 필드도 전부 optional이다(위 DocumentStatusItem과 같은 이유).
+  images?: AuctionImage[]
+  image_count?: number
+  representative_image?: AuctionImage | null
+  images_status?: string
   tenants: TenantRow[]
   rights_summary: RightsSummary | null
   case: CaseInfo | null
@@ -67,7 +91,15 @@ const DOC_STATUS_LABEL: Record<string, string> = {
   READY: '수집완료',
   COLLECTING: '수집중',
   FAILED: '수집실패',
+  // 2026-08-17 Sprint 144: 사진 전용 상태. "실패"가 아니라 **법원이 사진을 제공하지
+  // 않는 물건**이라는 뜻이다(재시도해도 결과가 같다). 실패로 보이게 하면 사용자가
+  // 기다리면 생길 것처럼 오해한다.
+  NO_IMAGE: '사진 없음',
 }
+
+// 사진 종류(alt에서 읽은 원문)를 화면에 그대로 쓴다. 법원 표기가 이미 한국어라
+// 다시 번역할 것이 없고, 모르는 종류가 와도 그대로 보여 주면 된다.
+// 실측된 값: 전경도 / 위치도 / 관련사진 / 내부구조도
 
 const VALIDATION_STATUS_LABEL: Record<string, string> = {
   PASS: '검증완료',
@@ -170,6 +202,18 @@ export default function PropertyDetailPage() {
   // 순간 이 화면(구독 전환 퍼널)이 조용히 깨진다(FavoriteButton.tsx에서 이미 겪은 문제와 동일 축).
   const [registryErrorCode, setRegistryErrorCode] = useState<string | null>(null)
   const [viewingDoc, setViewingDoc] = useState<string | null>(null)
+  // 문서 뷰어의 페이지/확대 상태 (2026-08-17 Sprint 144).
+  // 문서를 열 때마다 1쪽·100%로 되돌린다 — 이전 문서의 8쪽을 2쪽짜리 문서에 들고 가면
+  // 빈 화면이 뜬다.
+  const [docPage, setDocPage] = useState(1)
+  const [docZoom, setDocZoom] = useState(100)
+  const [docLoading, setDocLoading] = useState(true)
+  // 사진 라이트박스에서 보고 있는 사진의 seq. null이면 닫힘.
+  const [viewingImageSeq, setViewingImageSeq] = useState<number | null>(null)
+  // 로드에 실패한 사진의 seq 집합. 실패한 자리를 빈 칸으로 두지 않고 안내를 그린다 —
+  // DB에는 있는데 파일이 사라진 경우(이 저장소가 반복해 겪은 결함)를 사용자가
+  // "그냥 안 보인다"로 겪지 않게 한다.
+  const [brokenImages, setBrokenImages] = useState<Record<number, true>>({})
   // 문서 존재 확인(HEAD) 결과를 "물건id:문서종류" 키로 보관하고, 아직 결과가 없으면 렌더
   // 중에 'checking'으로 파생시킨다. effect 안에서 곧바로 setDocAvailable('checking')을
   // 호출하던 기존 구조는 cascading render를 일으켜 react-hooks/set-state-in-effect lint
@@ -207,6 +251,53 @@ export default function PropertyDetailPage() {
   const docCheckKey = viewingDoc ? `${id}:${viewingDoc}` : null
   const docAvailable: 'checking' | 'ok' | 'notfound' =
     docCheckKey ? (docCheckResult[docCheckKey] ?? 'checking') : 'checking'
+
+  // ---- 물건 사진 (2026-08-17 Sprint 144) --------------------------------
+  const images = property?.images ?? []
+  // 서버가 이미 순번으로 정렬해 주지만, 화면이 순서를 스스로 보장하도록 한 번 더 정렬한다
+  // (응답 순서에 의존하는 UI는 백엔드 쿼리가 바뀌는 순간 조용히 어긋난다).
+  const sortedImages = [...images].sort((a, b) => a.seq - b.seq)
+  const viewingImageIndex = viewingImageSeq == null
+    ? -1
+    : sortedImages.findIndex((im) => im.seq === viewingImageSeq)
+  const viewingImage = viewingImageIndex >= 0 ? sortedImages[viewingImageIndex] : null
+
+  function showImageAt(index: number) {
+    if (!sortedImages.length) return
+    // 양끝에서 순환한다 — 법원 사이트의 캐러셀도 같은 동작이다.
+    const next = (index + sortedImages.length) % sortedImages.length
+    setViewingImageSeq(sortedImages[next].seq)
+  }
+
+  // 현재 열려 있는 문서의 메타(쪽수 등). documents[]에서 찾는다.
+  const viewingDocMeta = viewingDoc
+    ? (property?.documents.find((d) => d.doc_type === viewingDoc) ?? null)
+    : null
+  const viewingDocPageCount = viewingDocMeta?.page_count ?? null
+  // 페이지 이동은 **쪽수를 아는 PDF에서만** 그린다. STATUS는 HTML이라 page_count가
+  // null이고(쪽이라는 개념이 없다), 모르는 것을 아는 척해 1/? 같은 UI를 그리지 않는다.
+  const canPageNavigate = typeof viewingDocPageCount === 'number' && viewingDocPageCount > 1
+
+  // 라이트박스/뷰어 키보드 조작. 모달이 열려 있을 때만 리스너를 단다.
+  useEffect(() => {
+    if (viewingImageSeq == null && !viewingDoc) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        if (viewingImageSeq != null) setViewingImageSeq(null)
+        else setViewingDoc(null)
+        return
+      }
+      if (viewingImageSeq != null) {
+        if (e.key === 'ArrowLeft') showImageAt(viewingImageIndex - 1)
+        if (e.key === 'ArrowRight') showImageAt(viewingImageIndex + 1)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // showImageAt은 렌더마다 새로 만들어지지만 sortedImages/index에만 의존하므로
+    // 그 둘을 의존성으로 둔다(함수 자체를 넣으면 매 렌더 재구독한다).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewingImageSeq, viewingDoc, viewingImageIndex, sortedImages.length])
   useEffect(() => {
     if (!docCheckKey || !viewingDoc) return
     // 이미 확인한 문서는 다시 묻지 않는다(같은 페이지 세션 안에서만 유효한 캐시).
@@ -229,6 +320,12 @@ export default function PropertyDetailPage() {
       setRegistryErrorCode(null)
       setRegistryLoading(true)
       setViewingDoc(null)
+      // 이전 물건에서 열려 있던 사진/문서 뷰어 상태도 함께 초기화한다 — 같은 라우트
+      // 파라미터 전환이라 컴포넌트가 재마운트되지 않는다(위 주석과 같은 이유).
+      setViewingImageSeq(null)
+      setBrokenImages({})
+      setDocPage(1)
+      setDocZoom(100)
       setFavError(null)
       // 이전 물건에서 즐겨찾기 요청이 아직 끝나지 않은 채로 넘어온 경우, 그 요청은 위 idRef
       // 가드로 무시되므로 favBusy가 절대 풀리지 않는다 — 새 물건에서는 항상 false로 시작한다.
@@ -643,6 +740,91 @@ export default function PropertyDetailPage() {
             </div>
           </div>
         </div>
+        {/* 물건 사진 (2026-08-17 Sprint 144).
+            법원 원천(courtauction.go.kr 물건상세)의 사진 캐러셀을 그대로 가져온 것이다.
+            대표 이미지 1장 + 썸네일 줄 + 클릭 시 라이트박스(이전/다음) 구성이며,
+            사진이 없는 경우를 **상태별로 다르게** 안내한다 — "수집중"과 "법원에 사진이
+            없음"은 사용자가 취할 행동이 다르기 때문이다(전자는 기다리면 되고 후자는
+            기다려도 생기지 않는다). */}
+        <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-gray-900">물건 사진</h3>
+            {sortedImages.length > 0 && (
+              <span className="text-xs text-gray-400">{sortedImages.length}장</span>
+            )}
+          </div>
+          {sortedImages.length > 0 ? (
+            <div>
+              <button
+                type="button"
+                onClick={() => setViewingImageSeq(sortedImages[0].seq)}
+                className="block w-full rounded-xl overflow-hidden bg-gray-50 border border-gray-100"
+                aria-label="대표 사진 크게 보기"
+              >
+                {brokenImages[sortedImages[0].seq] ? (
+                  <div className="w-full aspect-[4/3] flex items-center justify-center">
+                    <p className="text-sm text-gray-400">사진을 불러오지 못했습니다</p>
+                  </div>
+                ) : (
+                  /* next/image를 쓰지 않는다 — 이 저장소는 이미지 최적화 파이프라인을
+                     쓰지 않기로 되어 있고(docs/SPRINT124), 사진은 이미 법원이 준
+                     700px 안팎의 완성본이라 재가공할 이유가 없다.
+                     width/height를 넣어 로딩 중 레이아웃이 튀지 않게 한다. */
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={`${API_BASE_URL}${sortedImages[0].url}`}
+                    alt={`${sortedImages[0].kind ?? '물건 사진'} 1`}
+                    width={sortedImages[0].width ?? undefined}
+                    height={sortedImages[0].height ?? undefined}
+                    onError={() => setBrokenImages((p) => ({ ...p, [sortedImages[0].seq]: true }))}
+                    className="w-full h-auto max-h-[420px] object-contain bg-white"
+                  />
+                )}
+              </button>
+              {sortedImages.length > 1 && (
+                <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+                  {sortedImages.map((im, i) => (
+                    <button
+                      key={im.seq}
+                      type="button"
+                      onClick={() => setViewingImageSeq(im.seq)}
+                      className="shrink-0 w-20 h-20 rounded-lg overflow-hidden border border-gray-200 bg-gray-50"
+                      aria-label={`${im.kind ?? '사진'} ${i + 1}번 크게 보기`}
+                    >
+                      {brokenImages[im.seq] ? (
+                        <span className="text-[10px] text-gray-400 flex w-full h-full items-center justify-center">없음</span>
+                      ) : (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={`${API_BASE_URL}${im.thumbnail_url}`}
+                          alt={`${im.kind ?? '물건 사진'} ${i + 1}`}
+                          /* 썸네일은 화면에 처음부터 다 보이지 않는 가로 스크롤 줄이라
+                             지연 로딩이 실제로 효과가 있다. 현재 서버 측 축소가 없어
+                             원본을 받으므로(장당 약 40~160KB) 더더욱 필요하다. */
+                          loading="lazy"
+                          onError={() => setBrokenImages((p) => ({ ...p, [im.seq]: true }))}
+                          className="w-full h-full object-cover"
+                        />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : property.images_status === 'NO_IMAGE' ? (
+            <p className="text-sm text-gray-400 text-center py-6">
+              법원이 이 물건의 사진을 제공하지 않습니다
+            </p>
+          ) : property.images_status === 'FAILED' ? (
+            <p className="text-sm text-gray-400 text-center py-6">
+              사진을 가져오지 못했습니다 (다음 수집에서 다시 시도합니다)
+            </p>
+          ) : (
+            <p className="text-sm text-gray-400 text-center py-6">
+              사진 수집 중입니다
+            </p>
+          )}
+        </div>
         {property.rights_summary && (
           <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
             <h3 className="text-sm font-bold text-gray-900 mb-3">권리분석</h3>
@@ -874,18 +1056,65 @@ export default function PropertyDetailPage() {
         )}
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <h3 className="text-sm font-bold text-gray-900 mb-3">관련 문서</h3>
-          <div className="space-y-2">
-            {property.documents.map((doc) => (
-              <button
-                key={doc.doc_type}
-                type="button"
-                onClick={() => setViewingDoc(doc.doc_type)}
-                className="w-full flex justify-between items-center text-left"
-              >
-                <span className="text-sm text-blue-500 underline">{DOC_TYPE_LABEL[doc.doc_type] || doc.doc_type}</span>
-                <span className="text-sm font-medium text-gray-700">{DOC_STATUS_LABEL[doc.status] || doc.status}</span>
-              </button>
-            ))}
+          <div className="space-y-1">
+            {property.documents
+              /* 사진은 바로 위 "물건 사진" 카드가 담당한다. document_status에는
+                 IMAGE 행도 들어 있으므로 이 목록에서는 제외한다 — 그러지 않으면
+                 "IMAGE / 수집완료"라는 열 수 없는 항목이 문서 목록에 끼어든다. */
+              .filter((doc) => doc.doc_type !== 'IMAGE')
+              .map((doc) => {
+                /* 서버가 available을 주면 그대로 쓰고, 옛 응답이면 status로 판단한다. */
+                const ready = doc.available ?? doc.status === 'READY'
+                return (
+                  <div key={doc.doc_type} className="flex justify-between items-center gap-3 py-1.5">
+                    <div className="min-w-0">
+                      {ready ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setViewingDoc(doc.doc_type)
+                            setDocPage(1)
+                            setDocZoom(100)
+                            setDocLoading(true)
+                          }}
+                          className="text-sm text-blue-500 underline text-left"
+                        >
+                          {DOC_TYPE_LABEL[doc.doc_type] || doc.doc_type}
+                        </button>
+                      ) : (
+                        /* 열 수 없는 문서를 링크처럼 보이게 하지 않는다. 예전에는
+                           수집중인 문서도 파란 밑줄 링크였고, 누르면 "문서를 찾을 수
+                           없습니다"만 뜨는 빈 모달이 열렸다. */
+                        <span className="text-sm text-gray-400">
+                          {DOC_TYPE_LABEL[doc.doc_type] || doc.doc_type}
+                        </span>
+                      )}
+                      {ready && typeof doc.page_count === 'number' && (
+                        <span className="ml-2 text-xs text-gray-400">{doc.page_count}쪽</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className={`text-sm font-medium ${ready ? 'text-gray-700' : 'text-gray-400'}`}>
+                        {DOC_STATUS_LABEL[doc.status] || doc.status}
+                      </span>
+                      {ready && (
+                        /* 다운로드는 새 탭으로 연다. 뷰어(모달)와 별개의 경로를 두는
+                           이유는 259쪽/6MB짜리 감정평가서가 실재하기 때문이다 —
+                           브라우저 안에서 다 넘겨 보기보다 받아서 보는 편이 나은
+                           경우가 있다(실측: appraisal 최대 259쪽, 평균 31.6쪽). */
+                        <a
+                          href={`${API_BASE_URL}${doc.download_url ?? `/api/v1/item/${id}/documents/${doc.doc_type}`}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-gray-500 border border-gray-200 rounded-lg px-2 py-1"
+                        >
+                          새 탭
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
           </div>
         </div>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
@@ -1015,21 +1244,164 @@ export default function PropertyDetailPage() {
       </div>
       {viewingDoc && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex flex-col z-50">
-          <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-gray-100">
-            <button onClick={() => setViewingDoc(null)} className="text-gray-500 text-lg">✕</button>
+          <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-gray-100 flex-wrap">
+            <button onClick={() => setViewingDoc(null)} className="text-gray-500 text-lg" aria-label="닫기">✕</button>
             <h2 className="text-sm font-bold text-gray-900">{DOC_TYPE_LABEL[viewingDoc] || viewingDoc}</h2>
+            {docAvailable === 'ok' && (
+              <div className="ml-auto flex items-center gap-3">
+                {canPageNavigate && (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => { setDocPage((p) => Math.max(1, p - 1)); setDocLoading(true) }}
+                      disabled={docPage <= 1}
+                      className="text-xs text-gray-600 border border-gray-200 rounded-lg px-2 py-1 disabled:opacity-40"
+                      aria-label="이전 쪽"
+                    >
+                      ‹
+                    </button>
+                    <span className="text-xs text-gray-500 tabular-nums">
+                      {docPage} / {viewingDocPageCount}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { setDocPage((p) => Math.min(viewingDocPageCount as number, p + 1)); setDocLoading(true) }}
+                      disabled={docPage >= (viewingDocPageCount as number)}
+                      className="text-xs text-gray-600 border border-gray-200 rounded-lg px-2 py-1 disabled:opacity-40"
+                      aria-label="다음 쪽"
+                    >
+                      ›
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setDocZoom((z) => Math.max(50, z - 25))}
+                    disabled={docZoom <= 50}
+                    className="text-xs text-gray-600 border border-gray-200 rounded-lg px-2 py-1 disabled:opacity-40"
+                    aria-label="축소"
+                  >
+                    −
+                  </button>
+                  <span className="text-xs text-gray-500 tabular-nums w-11 text-center">{docZoom}%</span>
+                  <button
+                    type="button"
+                    onClick={() => setDocZoom((z) => Math.min(300, z + 25))}
+                    disabled={docZoom >= 300}
+                    className="text-xs text-gray-600 border border-gray-200 rounded-lg px-2 py-1 disabled:opacity-40"
+                    aria-label="확대"
+                  >
+                    +
+                  </button>
+                </div>
+                <a
+                  href={`${API_BASE_URL}${viewingDocMeta?.download_url ?? `/api/v1/item/${id}/documents/${viewingDoc}`}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-gray-600 border border-gray-200 rounded-lg px-2 py-1"
+                >
+                  새 탭
+                </a>
+              </div>
+            )}
           </div>
-          {docAvailable === 'notfound' ? (
+          {docAvailable === 'checking' ? (
             <div className="flex-1 w-full bg-white flex items-center justify-center">
-              <p className="text-sm text-gray-400">문서를 찾을 수 없습니다.</p>
+              <p className="text-sm text-gray-400">문서를 확인하는 중입니다...</p>
+            </div>
+          ) : docAvailable === 'notfound' ? (
+            <div className="flex-1 w-full bg-white flex flex-col items-center justify-center gap-2">
+              <p className="text-sm text-gray-500">문서를 찾을 수 없습니다.</p>
+              <p className="text-xs text-gray-400">
+                수집 기록은 있으나 원본 파일을 열 수 없습니다. 다음 수집에서 다시 시도합니다.
+              </p>
             </div>
           ) : (
-            <iframe
-              src={`${API_BASE_URL}/api/v1/item/${id}/documents/${viewingDoc}`}
-              className="flex-1 w-full bg-white"
-              title={DOC_TYPE_LABEL[viewingDoc] || viewingDoc}
-            />
+            /* 확대/축소는 iframe **요소 자체**를 CSS로 키운다. 안쪽 문서는 다른
+               origin(포트가 다르다)이라 내용에 직접 손댈 수 없기 때문이고, 이 방식은
+               PDF와 HTML(현황조사서)에 똑같이 통한다.
+               페이지 이동은 PDF 뷰어가 이해하는 `#page=` 프래그먼트로 넘긴다.
+               프래그먼트만 바꾸면 브라우저가 다시 읽지 않는 경우가 있어 `key`로 강제
+               재마운트한다 — 그래서 쪽 이동에는 로딩이 한 번 든다(그 사이를 빈 화면으로
+               두지 않으려고 아래 로딩 안내를 겹쳐 놓는다). */
+            <div className="flex-1 w-full bg-white overflow-auto relative">
+              {docLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-white/80 pointer-events-none">
+                  <p className="text-sm text-gray-400">불러오는 중...</p>
+                </div>
+              )}
+              {/* 200%로 키우려면 iframe을 컨테이너의 **절반 크기**로 만든 뒤 2배로
+                  확대한다(= 10000/zoom %, scale(zoom/100)). 그러면 안쪽 문서는 좁은
+                  뷰포트에 배치된 뒤 2배로 그려져 실제로 커 보이고, 확대된 결과가
+                  컨테이너를 정확히 채운다. 바깥 div가 overflow-auto라 넘치는 만큼
+                  스크롤된다. */}
+              <div
+                style={{
+                  width: `${10000 / docZoom}%`,
+                  height: `${10000 / docZoom}%`,
+                  transform: `scale(${docZoom / 100})`,
+                  transformOrigin: 'top left',
+                }}
+              >
+                <iframe
+                  key={`${viewingDoc}:${docPage}`}
+                  src={`${API_BASE_URL}${viewingDocMeta?.viewer_url ?? `/api/v1/item/${id}/documents/${viewingDoc}`}${canPageNavigate ? `#page=${docPage}` : ''}`}
+                  onLoad={() => setDocLoading(false)}
+                  className="w-full h-full bg-white"
+                  title={DOC_TYPE_LABEL[viewingDoc] || viewingDoc}
+                />
+              </div>
+            </div>
           )}
+        </div>
+      )}
+      {/* 사진 라이트박스 (2026-08-17 Sprint 144).
+          좌우 화살표와 키보드(←/→/Esc)로 넘긴다. */}
+      {viewingImage && (
+        <div className="fixed inset-0 bg-black bg-opacity-90 flex flex-col z-50">
+          <div className="px-4 py-3 flex items-center gap-3 text-white">
+            <button onClick={() => setViewingImageSeq(null)} className="text-lg" aria-label="닫기">✕</button>
+            <h2 className="text-sm font-bold">
+              {viewingImage.kind ?? '물건 사진'}
+            </h2>
+            <span className="ml-auto text-xs text-gray-300 tabular-nums">
+              {viewingImageIndex + 1} / {sortedImages.length}
+            </span>
+          </div>
+          <div className="flex-1 flex items-center justify-center px-2 pb-4 min-h-0">
+            {sortedImages.length > 1 && (
+              <button
+                type="button"
+                onClick={() => showImageAt(viewingImageIndex - 1)}
+                className="text-white text-3xl px-3 shrink-0"
+                aria-label="이전 사진"
+              >
+                ‹
+              </button>
+            )}
+            {brokenImages[viewingImage.seq] ? (
+              <p className="text-sm text-gray-300">사진을 불러오지 못했습니다</p>
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`${API_BASE_URL}${viewingImage.url}`}
+                alt={`${viewingImage.kind ?? '물건 사진'} ${viewingImageIndex + 1}`}
+                onError={() => setBrokenImages((p) => ({ ...p, [viewingImage.seq]: true }))}
+                className="max-h-full max-w-full object-contain"
+              />
+            )}
+            {sortedImages.length > 1 && (
+              <button
+                type="button"
+                onClick={() => showImageAt(viewingImageIndex + 1)}
+                className="text-white text-3xl px-3 shrink-0"
+                aria-label="다음 사진"
+              >
+                ›
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

@@ -3385,3 +3385,93 @@ compileall / tsc / eslint(0) 통과.
 - Sprint 50의 `middleware.ts` → `src/proxy.ts` 전환 후에도 **현재 동작을 서술하며 없어진
   파일명을 가리키던 주석 5곳**을 정정. 과거 이력 서술은 보존
 - `test_api_regression.py` 727 → **735검사**
+
+---
+
+2026-08-17
+
+Sprint 145 — Asset 배달 검증 (docs/SPRINT145_ASSET_DELIVERY_AUDIT.md)
+
+- **[결함 수정] BUGS #101** 진행 중 물건이 큐의 옛 매각기일 때문에 영구 미수집으로
+  종결되는 문제. `storage/database.py::reconcile_queue_auction_date()` 신설,
+  `doc_worker`가 `mark_queue_skipped_expired()` **직전에** 호출해 권위 있는 값
+  (`auction_item.auction_date`)과 대조한다. 정책이 아니라 값의 출처만 바꿨다.
+  실측: 드리프트 36행 / 그중 해로운 것 3행(item 1533 = 당시 검색 노출 9건 중 1건).
+- **[관측] `test_pipeline_integrity.py` §11**에 예약 작업 등록 여부 보고 추가.
+  "확인 순서: 스케줄러 등록 여부 -> ..."라고 안내하면서 정작 확인해 주지 않던 한 줄을
+  채웠다. 실측 결과 **등록 0건**(전체 249개 중 이 저장소를 가리키는 것 0개)이고,
+  이것이 로그가 5일째 없는 이유다. 실패시키지는 않는다(코드로 고칠 수 없는 환경 사안).
+- **[회귀] `test_asset_pipeline.py` §15-B/§15-C** 7단언 신설 + Mutation 검증.
+- **[측정]** 기본 검색에 뜨는 물건 9건 / 사진 9-9(100%) / 문서 3종 완비 2-9.
+  `auction_image` 45행 전수 대조(파일·크기·SHA-256·매직) 불일치 0.
+  상세 API SQL 7문 고정(자산 수 무관, N+1 없음).
+- **[SKIP]** 스케줄러 등록(기한 2026-08-20) / 재수집 정책 / 사진 dedup(이득 0.52% 측정) /
+  상세페이지 브라우저 E2E(Supabase 자격증명).
+- 운영 `auction.db` / `documents/` 변경 0건 (측정은 전부 읽기 전용).
+
+---
+
+2026-08-17
+
+Sprint 148~175 — 자율 감사 사이클 (docs/CURRENT_STATE.md 해당 절)
+
+- **[결함 수정] BUGS #106** 재고가 0일 때 빈 화면 안내가 틀렸고 복구 링크가 막다른 길이었다.
+  `SearchScreen`이 `hasFilters`를 계산해 넘기고 `ResultList`가 두 상태를 가른다
+  (`page`/`size`/`sort_*`는 조건으로 세지 않는다). `/`와 `/search`가 같은 컴포넌트를
+  쓰므로 한 번의 수정으로 둘 다 해소된다. 운영을 건드리지 않고 만료 상태를 재현해
+  (사본 DB + 별도 포트) 렌더된 HTML로 4가지 경우를 전부 확인했다.
+- **[결함 수정] BUGS #107** 법원 없는 식별키가 `repair_empty_status_capture.py`와
+  `unlock_retry.py`에 남아 있었다(#18/#14/#103에 이은 **네 번째**). 개별 수정으로 끝내지
+  않고 `test_auction_identity.py`에 **계열 전체를 막는 검사**를 신설했다 — 추적 프로덕션
+  `.py`의 `UPDATE/DELETE document_queue` 문장 전수를 훑는다. 근거: case_no 3개가 두 법원에
+  걸쳐 있고 물건 22건이 연루된다.
+- **[결함 수정] BUGS #108** 문서 엔드포인트가 대소문자를 가려서, 같은 저장소의 다른 어휘
+  (`document_queue`는 소문자)로 URL을 만들면 400이 났고 그 400이 오타와 구별되지 않았다.
+  경계에서 정규화한다(받는 입력만 넓히므로 기존 동작 불변).
+- **[결함 수정] BUGS #109** `doc_worker`가 실행 창 밖에서도 Selenium을 띄웠고,
+  드라이버 기동 실패 시 락이 남았다(`LOCK_STALE_HOURS=5` 동안 후속 실행이 전부 건너뛰어지고
+  그것이 종료코드 0으로 보고된다). 시간 검사를 락 검사 옆으로 올리고, 드라이버 생성을
+  락 해제 보장 블록 안으로 옮겼다.
+- **[결함 수정] BUGS #110** `build_download_driver()`가 크롬을 띄운 뒤 설정이 실패하면
+  프로세스가 고아로 남았다(호출자는 `driver` 참조조차 못 받는다). #109 계열 전수 검색의 소득.
+- **[결함 수정] BUGS #111** 읽기 전용 dry-run(`repair_empty_status_capture.py`)이
+  `get_doc_dir()`(=`os.makedirs()`)를 물건 전수에 호출해 **디렉터리를 만들고 있었다.**
+  근거가 된 숫자: 빈 물건 디렉터리 1,674 + 파일 있는 202 = 정확히 1,876 = `auction_item` 행수.
+- **[결함 수정] BUGS #112** 경로 규칙 **세 번째 사본**(`repair_document_status.py`).
+  docstring은 "동일한 규칙"이라 주장했지만 그 사이 규칙이 역슬래시·`..` 처리까지 확장돼
+  실제로는 갈라져 있었다. #111의 호출부 전수 검색에서 나왔다.
+- **[미해결 · 승인 영역] BUGS #105** 지금 상태로 `git commit -a` 하면
+  `ModuleNotFoundError`로 **API가 부팅되지 않는다**(추적 파일 297개만 복사해 재현).
+  탐지 가드는 신설했다(`test_schema_hygiene.py` §6-B, import 간선 4개를 자동 재계산).
+  반드시 `git add -A` 후 커밋할 것.
+
+- **[정정] 이 CHANGELOG의 Sprint 145 항목 중 "상세 API SQL 7문 고정"은 과장이었다.**
+  그 시점에 7문임을 **측정**했지만 회귀로 **고정**하지는 않았다(쿼리 수를 세는 검사는
+  검색 쪽 16-B 하나뿐이었다). 상세를 실제로 고정한 것은 Sprint 154에 신설한
+  `test_asset_pipeline.py` 16-C다(사진 1장/8장으로 쿼리 수가 같은지 본다). 결과 본문은
+  동일하고 쿼리 수만 늘어나므로 결과 기반 검사로는 잡히지 않는다.
+
+- **[회귀 신설]** 계열 가드 위주로 추가했고 **전부 "결함을 되돌리면 FAIL하는지"까지 확인**했다:
+  `test_auction_identity.py`(법원 식별키 전수) / `test_doc_path_safety.py` 7 확장·8 신설
+  (규칙 사본 대상 확대, 읽기 전용 조회의 디스크 부작용, DOCUMENT_ROOT 4개 모듈 합치) /
+  `test_doc_worker_recovery.py` 6·7·8(락·실행창·드라이버 고아) /
+  `test_asset_pipeline.py` 1-B(형식 판정 36검사)·6-B(저장 실패 정리)·12-B(doc_raw 거짓 성공)·
+  16-C(상세 N+1) / `test_search.py`(미지원 파라미터를 **동적 집합 차이**로 판정) /
+  `test_api_regression.py` §16(doc_type 대소문자).
+
+- **[측정]** 커버리지 실측 82%(`coverage.py` 33개 테스트). `crawler/image_assets.py`
+  72%→86%, `storage/database.py` 87%→88%. 검색 3.2~5.4ms / 상세 2.9ms.
+  E2E 정합성: READY 556 전건 파일 존재·API 200, `auction_image` 45 전건 일치, 비READY 누출 0.
+  실브라우저로 검색→상세→사진→PDF 뷰어(실제 법원 문서)→인증 3화면 확인, 앱 콘솔 오류 0.
+
+- **[자기 정정]** (1) 테스트 집계를 `종료코드 0 = 통과`로 세어 오보고했다 —
+  `test_filter.py`는 판정문이 0개인 진단 스크립트다. (2) 내 AST 스캐너가 BOM 파일을
+  조용히 건너뛰어 **프로덕션 77개 중 40개(52%)를 검사하지 않았다**(Sprint 149·150이
+  절반만 수행된 상태였다). 고쳐 재실행했고, 저장소의 테스트들은 이미 `utf-8-sig` 규약을
+  지키고 있었다. (3) Test Gap을 모듈명 grep으로 판정해 `http_cache.py`(실제 98%)와
+  `doc_stats.py`(실제 100%)를 "미커버"로 분류했다.
+
+- **[SKIP]** 스케줄러 등록(기한 2026-08-20) / commit·add / `.claude/worktrees` 1.4GB
+  낡은 worktree / 빈 디렉터리 1,674개 / 면적·특수조건 필터(스키마 변경) /
+  recent·favorites 썸네일(기능 추가) / `storage.database.query()` 죽은 코드(테스트가 참조).
+- 운영 `auction.db` / `documents/` 변경 0건 (3,338 디렉터리 / 767 파일 / 1.29GB 그대로).

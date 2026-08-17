@@ -457,6 +457,102 @@ def test_storage_sources_are_tracked():
 
 
 # ---------------------------------------------------------------------------
+# 6-B. 추적 중인 파일이 미추적 파일을 import하지 않는가 (2026-08-17 Sprint 148 신설)
+#
+# 위 6번은 `storage/`만 본다. Sprint 148 감사에서 그 한계가 드러났다 - 신규 실동작
+# 모듈 14개가 미추적이었는데 6번이 잡은 것은 마이그레이션 020 하나뿐이었다(BUGS #105).
+#
+# 진짜 불변식은 "새 파일이 전부 추적된다"가 아니다. 새 문서나 새 테스트가 잠시
+# 미추적인 것은 무해하다. 위험한 것은 **추적 중인 파일이 미추적 파일을 import**하는
+# 경우다. 이때 `git commit -a`(추적 파일만 스테이징)로 커밋하면 작업트리에서는 모든
+# 테스트가 통과하는데 커밋된 트리는 ModuleNotFoundError로 부팅조차 못 한다.
+#
+# Sprint 148 실측: `api/v1/documents.py`(추적) -> `api/http_cache.py`(미추적) 때문에
+# `import api_server`가 죽었고, 검색/상세/문서/이미지 전 기능이 동시에 정지했다.
+#
+# `--exclude-standard`를 쓰므로 .gitignore 대상(산출물, step*.py 등)은 애초에 후보에서
+# 빠진다. 즉 이 검사가 가리키는 파일은 전부 "add하면 되는데 안 한 것"이다.
+# ---------------------------------------------------------------------------
+def test_tracked_sources_do_not_import_untracked():
+    print("\n--- 6-B. 추적 파일이 미추적 파일을 import하지 않는가 ---")
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        try:
+            out = subprocess.run(["git"] + list(args), cwd=root,
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        return [l.strip().replace("\\", "/") for l in out.stdout.splitlines() if l.strip()]
+
+    tracked = git("ls-files")
+    untracked = git("ls-files", "--others", "--exclude-standard")
+    if tracked is None or untracked is None:
+        print("[SKIP] git을 실행할 수 없다 - import 간선 검사 생략")
+        return
+
+    check_true("추적 파일 목록을 읽었다", len(tracked) > 0, len(tracked))
+
+    # 미추적 파일 중 import 대상이 될 수 있는 것만 추린다.
+    py_untracked = [u for u in untracked if u.endswith(".py")]
+    web_untracked = [u for u in untracked if u.endswith((".ts", ".tsx"))]
+
+    # 미추적 파이썬 모듈 -> 검색할 import 패턴
+    patterns = []           # (정규식, 미추적파일, 설명)
+    for u in py_untracked:
+        mod = u[:-3].replace("/", ".")                      # api/http_cache.py -> api.http_cache
+        base = os.path.basename(u)[:-3]                     # -> http_cache
+        pkg = mod.rsplit(".", 1)[0] if "." in mod else ""   # -> api
+        alts = [re.escape(mod)]
+        if pkg:
+            # `from api import http_cache` / `from .http_cache import x` 형태
+            alts.append(re.escape(pkg) + r"\s+import\s+[^\n]*\b" + re.escape(base) + r"\b")
+            alts.append(r"\.\s*" + re.escape(base) + r"\b")
+        rx = re.compile(r"^\s*(?:from|import)\s+[^\n]*(?:%s)" % "|".join(alts), re.M)
+        patterns.append((rx, u, mod))
+    for u in web_untracked:
+        base = os.path.basename(u).rsplit(".", 1)[0]        # ResultThumbnail
+        rx = re.compile(r"""^\s*import[^\n]*from\s+['"][^'"]*/%s['"]""" % re.escape(base), re.M)
+        patterns.append((rx, u, base))
+
+    if not patterns:
+        print("   미추적 소스 파일이 없다 - 검사할 간선 없음")
+        check("추적 파일이 미추적 파일을 import하지 않는다", [], [])
+        return
+
+    scan = [t for t in tracked if t.endswith((".py", ".ts", ".tsx"))]
+    edges = []
+    for t in scan:
+        path = os.path.join(root, t.replace("/", os.sep))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        for rx, target, label in patterns:
+            m = rx.search(body)
+            if m:
+                line = body[:m.start()].count("\n") + 1
+                edges.append("%s:%d -> %s" % (t, line, target))
+
+    if edges:
+        print("   ★ 커밋하면 깨지는 간선 %d개:" % len(edges))
+        for e in edges:
+            print("      %s" % e)
+        print("   해소: `git add -A` 후 커밋. `git commit -a`는 미추적 파일을 빠뜨린다.")
+    check("추적 파일이 미추적 파일을 import하지 않는다", sorted(edges), [])
+
+    print("   미추적 소스 %d개(py %d / web %d) 대상으로 추적 파일 %d개를 검사했다"
+          % (len(py_untracked) + len(web_untracked),
+             len(py_untracked), len(web_untracked), len(scan)))
+
+
+# ---------------------------------------------------------------------------
 # 6-2. `.gitignore`가 무시한다고 적어 둔 파일이 **이미 추적되고 있는가** (2026-08-13 Sprint 99)
 #
 # git의 ignore 규칙은 **추적을 시작한 뒤에는 적용되지 않는다.** 그래서 규칙을 나중에 추가하면
@@ -1181,9 +1277,19 @@ def test_no_confusable_column_misuse():
     import subprocess
 
     root = os.path.dirname(os.path.abspath(__file__))
+
+    # ★ 2026-08-17 Sprint 178: 미추적 파일도 검사한다.
+    #
+    # `git ls-files` 만으로는 아직 add되지 않은 실동작 모듈이 통째로 빠진다. 이 저장소는
+    # 지금 실제로 그런 상태이고(`api/v1/images.py` / `api/http_cache.py` /
+    # `crawler/image_crawler.py` 등이 미추적인데 프로덕션이 import한다), 그 파일들이
+    # 이 검사에서 빠져 있었다. `--exclude-standard`를 함께 주므로 .gitignore 대상
+    # (산출물, step*.py 등)은 여전히 빠진다 — §6-B가 쓰는 방식과 같다.
     p = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
                        capture_output=True, text=True)
-    files = [f for f in p.stdout.split() if f]
+    p2 = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "*.py"],
+                        cwd=root, capture_output=True, text=True)
+    files = sorted({f for f in (p.stdout + "\n" + p2.stdout).split() if f})
     check_true("검사할 파일을 찾았다", len(files) > 10, len(files))
 
     # ★ 범위를 정확히 좁힌다. 처음에는 `status = "PASS"` 를 전부 잡았는데,
@@ -1352,6 +1458,12 @@ ALLOWED_SQL_CONCAT_OPERANDS = {
     # `filter/` 는 어디에도 배선되지 않은 죽은 코드지만(docs/CLAUDE.md), 조각은 상수다.
     ("filter/filter_engine.py", "where"),
     ("filter/filter_engine.py", "' AND '.join(conditions)"),
+    # 2026-08-17 Sprint 178: `unlock_retry.py` 를 인자 기반으로 재작성하면서 추가됐다
+    # (BUGS #107 — 예전에는 사건번호가 소스에 박혀 있었고 법원이 빠져 있었다).
+    # `build_where()` 가 만드는 조각은 전부 상수 리터럴("court_code = ?" 등)이고 값은
+    # 예외 없이 `?` 로 바인딩된다 — 위 `storage/database.py`/`filter_engine.py` 의
+    # `where` 항목과 **같은 패턴**이다. 사용자 입력(argparse)은 조각이 아니라 params 로만 간다.
+    ("unlock_retry.py", "where"),
     # SQL 이 아니다 — 진단 출력 문자열이 "[select ..." 라 키워드 매칭에 걸린다.
     ("verify_courts.py", "sel_id"),
     ("verify_courts.py", "sel_name"),
@@ -1749,6 +1861,72 @@ def test_no_duplicate_config_constants():
           "같은 이름의 상수를 독립적으로 재선언하지 않는다", overlaps, [])
 
 
+
+# ---------------------------------------------------------------------------
+# 14-B. config 상수와 그 "사본"이 어긋나지 않는가 (2026-08-17 Sprint 183 신설)
+#
+# `config/settings.py` 는 두 상수를 정의해 두고 **아무도 import하지 않는다**. 실제 값은
+# 각각 다른 곳에 인라인으로 한 벌 더 적혀 있다:
+#
+#     DOC_TYPE_LIST         -> storage/database.py:enqueue_documents() 의 for 루프 리터럴
+#     PRIORITY_REFRESH_TIME -> register_scheduler_tasks.ps1 의 Time 필드
+#
+# 그 파일의 주석 자신이 이렇게 적고 있다 —
+# "둘 중 하나만 고치면 조용히 어긋나므로 함께 맞춰 둔다."
+#
+# 통합은 사유와 함께 별도 과제로 미뤄져 있다(그 주석 참고). 그렇다면 최소한
+# **"함께 맞춰 둔다"를 사람의 기억이 아니라 검사가 지키게** 해야 한다. 어긋나면
+# 증상이 조용하다 — 새 문서 종류를 config에 추가해도 큐에는 안 들어가고,
+# 우선순위 갱신 시각을 바꿔도 스케줄러는 옛 시각으로 등록된다.
+# ---------------------------------------------------------------------------
+def test_config_constants_match_their_copies():
+    print("\n--- 14-B. config 상수와 사본이 일치하는가 (Sprint 183) ---")
+    import re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def read(rel):
+        path = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.exists(path):
+            return None
+        return open(path, encoding="utf-8-sig", errors="replace").read()
+
+    cfg = read("config/settings.py")
+    check_true("config/settings.py를 읽었다", bool(cfg), cfg is None)
+    if not cfg:
+        return
+
+    # --- (1) DOC_TYPE_LIST vs enqueue_documents() 의 리터럴 --------------------
+    m = re.search(r"^DOC_TYPE_LIST\s*=\s*\[([^\]]*)\]", cfg, re.M)
+    check_true("config에 DOC_TYPE_LIST가 있다", bool(m), None)
+    db = read("storage/database.py")
+    if m and db:
+        cfg_types = [x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()]
+        # `for doc_type in ("spec", "status", ...)` 형태를 찾는다
+        m2 = re.search(r"for\s+doc_type\s+in\s*\(([^)]*)\)", db)
+        check_true("enqueue_documents의 doc_type 루프를 찾았다", bool(m2), None)
+        if m2:
+            copy_types = [x.strip().strip("'\"") for x in m2.group(1).split(",") if x.strip()]
+            check("DOC_TYPE_LIST와 enqueue 루프가 같은 종류를 쓴다",
+                  sorted(copy_types), sorted(cfg_types))
+            check("순서까지 같다(우선순위 의미가 있을 수 있다)", copy_types, cfg_types)
+
+    # --- (2) PRIORITY_REFRESH_TIME vs 등록 스크립트의 Time ---------------------
+    m3 = re.search(r"^PRIORITY_REFRESH_TIME\s*(?::\s*str\s*)?=\s*[\"']([0-9:]+)[\"']", cfg, re.M)
+    check_true("config에 PRIORITY_REFRESH_TIME이 있다", bool(m3), None)
+    ps1 = read("register_scheduler_tasks.ps1")
+    if m3 and ps1:
+        m4 = re.search(r"PriorityRefresh[^\n]*?Time\s*=\s*'([0-9:]+)'", ps1)
+        check_true("등록 스크립트에서 PriorityRefresh 시각을 찾았다", bool(m4), None)
+        if m4:
+            check("PRIORITY_REFRESH_TIME과 스케줄러 등록 시각이 같다",
+                  m4.group(1), m3.group(1))
+
+    # --- (3) 대조군 — 이 검사가 공허하지 않다 ---------------------------------
+    check_true("대조군: 두 사본 파일을 실제로 읽었다",
+               bool(db) and bool(ps1), (bool(db), bool(ps1)))
+
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -1756,6 +1934,7 @@ def run():
     test_requirements_covers_all_imports()
     test_error_codes_defined_documented_emitted()
     test_storage_sources_are_tracked()
+    test_tracked_sources_do_not_import_untracked()
     test_no_new_duplicate_indexes()
     test_no_new_tracked_but_ignored_files()
     test_migration_runner_skip_and_failure()
@@ -1771,6 +1950,7 @@ def run():
     test_init_db_failure_is_loud()
     test_known_dependency_cves_are_tracked()
     test_no_duplicate_config_constants()
+    test_config_constants_match_their_copies()
 
     print("\n" + "=" * 55)
     if failures:

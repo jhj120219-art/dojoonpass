@@ -26,7 +26,14 @@ DB = os.path.join(ROOT, "auction.db")
 
 # api/v1/documents.py:DOC_TYPE_FILES / storage.database:QUEUE_TO_DOC_STATUS_TYPE 와 같아야 한다.
 QUEUE_DOC_FILE = {"spec": "spec.pdf", "status": "status.html", "appraisal": "appraisal.pdf"}
+# **파일 하나로 서빙되는 문서 종류**만 담는다. 이 파일의 경로 기반 검사(파일 존재/불일치
+# 집계)가 전부 이 표를 돈다.
 QUEUE_TO_DS = {"spec": "SPEC", "status": "STATUS", "appraisal": "APPRAISAL"}
+# 2026-08-17 Sprint 144: 큐가 다루는 자산은 문서 3종 + **물건 사진**이다.
+# 사진은 물건당 0~N장이라 `api/v1/documents.py:DOC_TYPE_FILES`(종류당 파일 1개)에
+# 들어가지 않고 `auction_image` + `api/v1/images.py`가 담당한다 — 그래서 위 표와
+# 분리해 둔다. 아래 매핑 검사만 이 전체 표를 쓴다.
+QUEUE_TO_DS_ALL = dict(QUEUE_TO_DS, image="IMAGE")
 
 failures = []
 
@@ -76,9 +83,26 @@ def test_path_rule_matches_api():
           {k: files.get(v) for k, v in QUEUE_TO_DS.items()},
           {k: QUEUE_DOC_FILE[k] for k in QUEUE_TO_DS})
 
-    # 경로 조립 규칙(슬래시 치환 + strip)이 그대로인지
-    check_true("case_no의 '/'를 '_'로 치환한다", 'case_no.replace("/", "_")' in src, src[:0])
+    # 경로 조립 규칙이 그대로인지.
+    #
+    # 2026-08-17 Sprint 146: 예전에는 `'case_no.replace("/", "_")' in src`로 **리터럴**을
+    # 찾았다. 그런데 Sprint 145/146에 그 치환이 `crawler/doc_paths.py:sanitize_path_segment()`
+    # 한 곳으로 모이면서(역슬래시·`..`·빈 값까지 처리) documents.py에서 리터럴이 사라졌다.
+    # 리터럴 검사를 그대로 두면 **규칙이 좋아졌는데 테스트가 실패**한다.
+    #
+    # 지키려는 것은 "이 문자열이 소스에 있다"가 아니라 **쓰는 쪽과 읽는 쪽이 같은 경로를
+    # 본다**는 것이므로, 두 구현의 결과를 직접 대조하는 쪽으로 바꾼다(더 강한 검사다 —
+    # 리터럴이 같아도 결과가 다를 수 있고, 리터럴이 달라도 결과가 같으면 문제없다).
+    check_true("documents.py가 공용 정규화 함수를 쓴다", "sanitize_path_segment" in src, src[:0])
     check_true("item_no 기본값이 '1'이다", '(item_no or "1")' in src)
+
+    from api.v1.documents import get_doc_dir as _api_dir
+    from crawler.doc_paths import _doc_dir_path as _crawler_dir
+    for _court, _case, _item in (("서울중앙지방법원", "2024타경1 / 2024타경2", "1"),
+                                 ("고양지원", "2024\\타경1", "2"),
+                                 ("A법원", "2024타경9", "")):
+        check("쓰는 쪽/읽는 쪽 경로 일치 (case=%r item=%r)" % (_case, _item),
+              _api_dir(_court, _case, _item), _crawler_dir(_court, _case, _item))
 
     # storage.database의 doc_type 매핑과도 같아야 한다
     dbsrc = open(os.path.join(ROOT, "storage", "database.py"), encoding="utf-8-sig").read()
@@ -86,7 +110,10 @@ def test_path_rule_matches_api():
     check_true("QUEUE_TO_DOC_STATUS_TYPE가 존재한다", m is not None)
     if m:
         mapping = dict(re.findall(r'"(\w+)":\s*"(\w+)"', m.group(1)))
-        check("큐->화면 doc_type 매핑이 같다", mapping, QUEUE_TO_DS)
+        check("큐->화면 doc_type 매핑이 같다", mapping, QUEUE_TO_DS_ALL)
+        # 사진은 문서 서빙 표에 **없어야** 한다 — 들어가면 documents.py가 종류당 파일
+        # 하나를 찾으려 들고, 0~N장인 사진에는 그 가정이 성립하지 않는다.
+        check_true("사진은 문서 파일 표에 없다", "IMAGE" not in files, sorted(files))
 
 
 def test_queue_state_machine_invariants():
@@ -656,6 +683,39 @@ def test_data_freshness_runway():
         else:
             print("    %-16s 없음 (배치가 한 번도 돌지 않았거나 logs가 정리됐다)" % name)
 
+    # 2026-08-17 Sprint 145: 위 경고문이 "확인 순서: **스케줄러 등록 여부** -> ..."라고
+    # 안내하면서 정작 그것을 확인해 주지는 않았다. 실측하니 등록 0건이었다 —
+    # 249개 예약 작업 중 이 저장소를 가리키는 것이 하나도 없다(이름·경로·실행 인자
+    # 전부로 검색). 로그가 5일째 없는 이유가 바로 이것이고, 로그 부재만으로는
+    # "배치가 실패했다"와 "배치가 아예 등록되지 않았다"를 구분할 수 없다.
+    #
+    # 실패로 만들지 않는다 — 등록은 사용자 환경 변경이라 코드로 고칠 수 있는 것이
+    # 아니고(Sprint 112가 같은 이유로 SKIP했다), 이 검사 블록의 설계 원칙도
+    # "제품이 실제로 망가진 상태만 실패"다. 보고만 한다.
+    _report_scheduler_registration()
+
+
+def _report_scheduler_registration():
+    """예약 작업에 이 저장소를 가리키는 항목이 있는지 **보고만** 한다(실패시키지 않는다)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["schtasks", "/query", "/fo", "csv"],
+            capture_output=True, timeout=60,
+        ).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        print("    예약 작업          확인 불가 (schtasks 없음: Windows가 아니거나 권한 없음)")
+        return
+
+    hits = [ln for ln in out.splitlines() if "DojoonPass" in ln]
+    if hits:
+        print("    예약 작업          등록 %d건" % len(hits))
+        return
+    print("    예약 작업          ★ 등록 0건. run_daily.bat / run_doc_worker.bat가")
+    print("                       자동 실행되지 않는다. 이것이 로그가 없는 이유다.")
+    print("                       조치: .\\register_scheduler_tasks.ps1 -Apply")
+    print("                       (사용자 환경 변경이라 자동으로 하지 않는다: Sprint 112)")
+
 
 # ---------------------------------------------------------------------------
 # 12. 저장된 정규화 결과가 **지금 코드가 만드는 값**과 같은가 (2026-08-14 신설)
@@ -1038,8 +1098,19 @@ def test_stale_region_contamination_detector():
         live_hits = detector.scan_table(live, "auction_item")
     finally:
         live.close()
-    check_true("실 DB 오염 의심 건수가 §13 상한(sigungu:1)과 일치한다",
-               len(live_hits) == 1, live_hits)
+    # 2026-08-17 Sprint 144: `== 1`이었다. 이름과 주석은 "상한(ceiling)"이라고 말하는데
+    # 비교만 등호라서, **오염이 실제로 사라지자 테스트가 실패했다**(실측 결과 0건 -
+    # 2026-08-14 `backfill_region_normalize.py` 이후로 보인다). 이 파일의 다른 상한
+    # 검사(§8 차량 오분류, §12 정규화 드리프트, §13 SYNC_MISMATCH_CEILING)는 전부
+    # `<= ceiling`이며, 이 줄만 어긋나 있었다. 좋아진 것을 회귀로 보고하는 검사는
+    # 아무도 못 믿게 되므로 같은 규약으로 맞춘다 - 늘어나는 것만 막는다.
+    REGION_CONTAMINATION_CEILING = 1
+    check_true("실 DB 오염 의심 건수가 §13 상한(sigungu:%d)을 넘지 않는다 (현재 %d건)"
+               % (REGION_CONTAMINATION_CEILING, len(live_hits)),
+               len(live_hits) <= REGION_CONTAMINATION_CEILING, live_hits)
+    if len(live_hits) < REGION_CONTAMINATION_CEILING:
+        print("   [정리됨] 오염이 상한보다 줄었다(%d < %d) - 위 상한을 %d으로 낮출 수 있다"
+              % (len(live_hits), REGION_CONTAMINATION_CEILING, len(live_hits)))
 
 
 # ---------------------------------------------------------------------------

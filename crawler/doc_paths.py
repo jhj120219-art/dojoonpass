@@ -12,6 +12,8 @@ selenium을 import하기 때문에, **경로 계산 함수만 쓰고 싶은 쪽*
 기존 `from crawler.doc_crawler import get_doc_dir, ...` 호출부는 변경 없이 동작한다.
 """
 import os
+import time
+from typing import Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOWNLOAD_DIR = os.path.join(PROJECT_ROOT, "downloads")
@@ -30,6 +32,41 @@ DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
 # 인자명을 court_name으로 바꾸지 않은 이유: DB 컬럼명이 `court_code`라서 여기만 바꾸면
 # 호출부(item["court_code"])와 어긋나 혼란이 옮겨갈 뿐이다. 컬럼명 변경은 스키마 변경이라
 # 승인이 필요하다.
+def sanitize_path_segment(value: str) -> str:
+    """경로 한 조각(사건번호·물건번호)을 디렉터리 이름으로 안전하게 만든다.
+
+    ## 왜 함수로 뽑았나 (2026-08-17 Sprint 145)
+
+    같은 치환이 **세 곳에** 각자 적혀 있었다 — 이 파일의 `_doc_dir_path()`와
+    `find_sibling_case_document()`, 그리고 `crawler/image_assets.py:image_path()`.
+    바로 위 `_doc_dir_path()`의 주석이 *"규칙이 두 벌이 되면 쓰는 곳과 읽는 곳이 다른
+    경로를 보는 이 저장소의 단골 결함이 된다"* 고 적어 둔 그 상태다. 한 곳으로 모은다.
+
+    ## `/`만으로는 부족하다 (실측)
+
+    사건번호는 복수 사건이 합쳐질 때 `"2024타경1451 / 2024타경32745"`처럼 들어온다
+    (실 DB 1,876건 중 **425건(22.7%)**이 `/`를 포함한다). 그래서 `/`를 `_`로 바꿔 왔다.
+
+    그런데 **Windows에서는 역슬래시도 경로 구분자**다. 실측:
+
+        case_no = r"..\\..\\evil"  ->  documents/ 를 벗어나 <repo>/evil/1 을 가리킨다
+
+    서빙 쪽은 `realpath`+`commonpath`로 이미 막혀 있어 파일이 새지는 않는다
+    (`api/v1/documents.py`, `api/v1/images.py`). 그러나 **쓰기 쪽**은 `get_doc_dir()`가
+    `os.makedirs()`를 부르므로 저장소 바깥에 디렉터리를 만들 수 있다. 이 저장소는
+    이미 `doc_paths` 때문에 빈 디렉터리 1,674개가 생긴 사고를 겪었다.
+
+    현재 실데이터에 역슬래시·`..`는 **0건**이다(확인함). 즉 지금 터지고 있는 버그가
+    아니라, 원천(법원 사이트 HTML)이 예상 밖 값을 주면 터지는 자리를 미리 막는 것이다.
+    """
+    safe = (value or "").replace("/", "_").replace("\\", "_").strip()
+    # 경로를 거슬러 올라가는 조각은 이름으로 쓰지 않는다. 빈 값도 마찬가지 —
+    # os.path.join에 ""를 주면 조각이 통째로 사라져 상위 디렉터리를 가리킨다.
+    if safe in ("", ".", ".."):
+        return "_"
+    return safe
+
+
 def _doc_dir_path(court_code: str, case_no: str, item_no: str = "1") -> str:
     """경로만 계산한다. **디스크를 건드리지 않는다.**
 
@@ -37,9 +74,9 @@ def _doc_dir_path(court_code: str, case_no: str, item_no: str = "1") -> str:
     디렉터리 생성을 얹는다 — 규칙이 두 벌이 되면 "쓰는 곳과 읽는 곳이 다른 경로를
     보는" 이 저장소의 단골 결함이 된다.
     """
-    safe_case_no = case_no.replace("/", "_").strip()
-    safe_item_no = (item_no or "1").replace("/", "_").strip()
-    return os.path.join(DOCUMENT_ROOT, court_code, safe_case_no, safe_item_no)
+    return os.path.join(DOCUMENT_ROOT, court_code,
+                        sanitize_path_segment(case_no),
+                        sanitize_path_segment(item_no or "1"))
 
 
 def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
@@ -58,6 +95,28 @@ def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
 # status는 json+html 세트가 완성되어야 성공이므로 json을 기준 파일로 삼는다
 # (html만 있고 json이 없는 "partial" 상태는 기존 결과 재사용 대상에서 제외하기 위함).
 _PRIMARY_EXT = {"spec": "pdf", "status": "json", "appraisal": "pdf"}
+
+
+# 사건 단위 문서 — 물건번호와 무관하게 사건 전체에 하나만 존재하는 문서.
+# ---------------------------------------------------------------------------
+# 2026-08-17 Sprint 145 실측으로 확정했다. 같은 사건(2025타경311)의 물건 1과 물건 2에
+# 대해 **각각 따로** 실제 수집을 돌려 바이트를 대조한 결과:
+#
+#     status.html   40,596 B  해시 동일          -> 완전히 같은 파일
+#     status.json   12,014 B  해시 다름          -> 그런데 내용은 같다
+#                             `fields` 115개 키가 완전 일치하고, 차이는 우리가 찍는
+#                             `extracted_at` 타임스탬프 하나뿐이었다
+#
+# 법원 DOM에서도 같은 결론이 나온다 — 현황조사서 버튼(`..._btn_curstExmndcTop`)만
+# 물건번호가 안 붙고, 오버레이 본문이 사건의 모든 물건을 한 문서에 담는다
+# (집행관이 사건 단위로 작성하는 문서다).
+#
+# 왜 이 상수가 필요한가 — 사건에 물건이 N개면 **같은 문서를 N번 받게 된다.**
+# 실측 비용(2026-08-17): 사건 1,384개 / 물건 1,876개이므로 초과 수집 492회(35.5%),
+# worker 1건당 약 22초이니 **약 3.0시간**이다(가동 창 02:00~04:00 = 2시간을 넘는다).
+# (★ 2026-08-17 Sprint 147 정정: 이 '약 3시간'은 navigation까지 건너뛴다고 **가정한** 값이다. Sprint 145 구현은 `collect_status()` 안에서만 재사용해 물건당 0.6초(overlay)만 아꼈고 navigation 15.2초는 그대로 들었다 — 실제 절감 492회 기준 **5분**. Sprint 147이 doc_worker의 호출 순서를 바꿔(재사용 가능하면 이동 자체를 생략) 실 worker 2건 기준 41.1초 -> 23.8초, 492회 기준 **약 130분** 절감으로 실현했다.)
+# 용량은 13.4 MB로 무시할 수준이라, 비용은 저장이 아니라 **시간**이다.
+CASE_LEVEL_DOC_TYPES = ("status",)
 
 
 def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bool:
@@ -162,3 +221,59 @@ def canonical_doc_path(court_name: str, case_no: str, item_no: str, doc_type: st
     """뷰어가 서빙하는 최종 저장 경로. `doc_type`은 대문자(document_status 표기)다."""
     filename = CANONICAL_DOC_FILENAME[doc_type.upper()]
     return os.path.join(get_doc_dir(court_name, case_no, item_no), filename)
+
+
+# 사건 단위 문서를 형제 물건에서 재사용하기 (2026-08-17 Sprint 145)
+# ---------------------------------------------------------------------------
+# 위 `CASE_LEVEL_DOC_TYPES` 주석의 실측이 근거다 — 같은 사건의 다른 물건이 이미 받아 둔
+# 현황조사서는 **바이트까지 같은 문서**이므로, 브라우저를 다시 몰지 않고 복사하면 된다.
+#
+# ★ 이것은 **저장 구조 변경이 아니다.** 파일은 종전과 똑같은 경로
+#   (`documents/<법원>/<사건>/<물건>/status.html`)에 똑같은 내용으로 놓인다.
+#   달라지는 것은 "그 바이트를 어디서 얻는가"뿐이다(법원 재조회 -> 형제 물건 복사).
+#   그래서 API·뷰어·`doc_exists()`·백필 어느 것도 영향을 받지 않는다.
+
+def find_sibling_case_document(court_code: str, case_no: str, item_no: str,
+                               doc_type: str, max_age_seconds: Optional[float] = None):
+    """같은 사건의 **다른 물건**이 이미 받아 둔 사건 단위 문서를 찾는다. 없으면 None.
+
+    돌려주는 값: 그 형제 물건의 디렉터리 경로.
+
+    `max_age_seconds`가 주어지면 기준 파일이 그보다 오래된 형제는 **쓰지 않는다.**
+    호출부(`collect_status`)가 "같은 실행에서 방금 받은 것만 재사용"하도록 좁히는 데 쓴다 —
+    몇 달 전에 받은 문서를 새 물건에 복사하면, 새로 받았다면 얻었을 최신본 대신 옛것을
+    주게 된다. 재수집 정책이 아직 미결정이라(`docs/roadmap.md`) 그 판단을 여기서
+    내리지 않고, **보수적으로 좁힐 수 있는 손잡이만** 둔다.
+
+    디스크를 건드리지 않는다(읽기만 한다) — `doc_exists()`와 같은 규약이다.
+    """
+    key = (doc_type or "").lower()
+    if key not in CASE_LEVEL_DOC_TYPES:
+        return None
+    ext = _PRIMARY_EXT.get(key)
+    if not ext:
+        return None
+
+    safe_case_no = sanitize_path_segment(case_no)
+    safe_item_no = sanitize_path_segment(item_no or "1")
+    case_dir = os.path.join(DOCUMENT_ROOT, court_code, safe_case_no)
+    if not os.path.isdir(case_dir):
+        return None
+
+    now = time.time()
+    for sibling in sorted(os.listdir(case_dir)):
+        if sibling == safe_item_no:
+            continue
+        sib_dir = os.path.join(case_dir, sibling)
+        if not os.path.isdir(sib_dir):
+            continue
+        primary = os.path.join(sib_dir, key + "." + ext)
+        try:
+            if os.path.getsize(primary) <= 0:
+                continue
+            if max_age_seconds is not None and (now - os.path.getmtime(primary)) > max_age_seconds:
+                continue
+        except OSError:
+            continue
+        return sib_dir
+    return None

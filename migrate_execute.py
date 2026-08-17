@@ -13,6 +13,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# 마지막 execute() 가 관측한 필드별 변경 건수. 테스트와 운영 점검이 읽는다
+# (로그만 남기면 자동 검증이 불가능하다).
+LAST_FIELD_CHANGES = {}
+
 def extract_fail_count(status: str) -> int:
     if not status:
         return 0
@@ -97,6 +102,8 @@ def execute():
         item_count = 0
         item_inserted = 0
         item_updated = 0
+        field_changes = {}    # 필드명 -> 실제로 값이 바뀐 행 수
+        changed_samples = []  # 로그에 남길 예시(최대 10건)
         # (case_id, item_no) -> auction_item.id. §3 document_status 루프가 다시 JOIN으로
         # 같은 item_id를 조회하던 것을 대신한다(아래 §3 주석 참고).
         item_id_by_key = {}
@@ -129,6 +136,31 @@ def execute():
                 crawl_date = row["crawl_date"] or existing["crawl_date"]
                 fail_count = extract_fail_count(status)
                 bid_rate = calc_bid_rate(appraisal_price, minimum_bid_price)
+
+                # ── 변경 관측 (2026-08-17 Sprint 185) ─────────────────────────
+                # UPDATE 자체는 그대로 두고, **무엇이 바뀌었는지만** 기록한다.
+                #
+                # 이 UPDATE는 값이 같아도 매번 실행된다. 그래서 `updated_at`이 전부 같은
+                # 값이 되고(실측: 1,876행 100%가 2026-08-12), 물건 단위 변경 이력 테이블도
+                # 없다. 결과적으로 "오늘 어떤 물건의 기일/최저가/상태가 바뀌었나"를 아무도
+                # 답할 수 없었다. 법원 자료는 절차 진행에 따라 계속 바뀌므로 그 답이 곧
+                # 제품 가치다(유찰 -> 재매각 시 기일과 최저가가 함께 움직인다).
+                #
+                # 스키마도 UPDATE 조건도 건드리지 않는다 — 이미 손에 있는 `existing`과
+                # 새 값을 비교해 집계만 한다. 관측이 먼저 있어야 재수집/알림 정책을
+                # 숫자로 정할 수 있다(docs/roadmap.md 재수집 정책 항목).
+                for _f, _old, _new in (
+                    ("auction_date", existing["auction_date"], auction_date),
+                    ("minimum_bid_price", existing["minimum_bid_price"], minimum_bid_price),
+                    ("status", existing["status"], status),
+                    ("appraisal_price", existing["appraisal_price"], appraisal_price),
+                ):
+                    if (_old or "") != (_new or ""):
+                        field_changes[_f] = field_changes.get(_f, 0) + 1
+                        if len(changed_samples) < 10:
+                            changed_samples.append(
+                                "%s-%s %s: %s -> %s"
+                                % (row["case_no"], row["item_no"], _f, _old, _new))
 
                 conn.execute("""
                     UPDATE auction_item SET
@@ -277,6 +309,23 @@ def execute():
         else:
             problems.append(f"document_status 불일치: {ds} != {orig * 3}")
             print(f"  [FAIL] {problems[-1]}")
+
+        global LAST_FIELD_CHANGES
+        LAST_FIELD_CHANGES = dict(field_changes)
+
+        # 변경 관측 결과. 0건이면 "바뀐 것이 없다"가 사실이고, 그것도 정보다.
+        print("")
+        print("=== 이번 실행에서 실제로 값이 바뀐 항목 ===")
+        if field_changes:
+            for _f in sorted(field_changes):
+                print("  %-20s %d건" % (_f, field_changes[_f]))
+            for _s in changed_samples:
+                print("     %s" % _s)
+            logger.info("auction_item 변경 관측: %s",
+                        ", ".join("%s %d건" % (k, field_changes[k])
+                                  for k in sorted(field_changes)))
+        else:
+            print("  없음 (기일/최저가/상태/감정가 모두 이전과 동일)")
 
         print("")
         print("=== 샘플 확인 ===")

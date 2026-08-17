@@ -37,10 +37,16 @@ SIDO_LIST = [
 
 # ===== 02:00 PDF 수집 Worker 관련 설정 =====
 
-DOC_TYPE_LIST = ["spec", "status", "appraisal"]
+# 2026-08-17 Sprint 144: 'image'(물건 사진) 추가.
+# 주의 — 이 상수는 **실제 적재에 쓰이지 않는다.** `storage/database.py:enqueue_documents()`가
+# 자기 안에 같은 목록을 튜플로 들고 있고 그쪽이 실동작 경로다(grep 확인: 이 이름을
+# import하는 곳이 없다). 둘 중 하나만 고치면 조용히 어긋나므로 함께 맞춰 둔다.
+# 어느 한쪽으로 합치는 것은 `test_schema_hygiene.py`가 소스 텍스트를 직접 대조하는
+# 방식과 얽혀 있어 별도 정리 과제로 둔다(docs/SPRINT144_ASSET_PIPELINE.md 참고).
+DOC_TYPE_LIST = ["spec", "status", "appraisal", "image"]
 
-# item_no=1일 때의 버튼 id (매각물건명세서/감정평가서는 item_no별로 규칙적으로
-# 숫자가 붙는 것을 확인했으나, 현황조사서는 item_no=1(Top)만 확인된 상태다.
+# 매각물건명세서/감정평가서는 물건번호가 뒤에 붙는다(`..._btn_aeeWevl2`).
+# 현황조사서는 **번호가 붙지 않는다** — 아래 함수의 주석 참고(2026-08-17 DOM 실측).
 _BASE_BTN_ID = {
     "spec": "mf_wfm_mainFrame_btn_dspslGdsSpcfc",
     "status": "mf_wfm_mainFrame_btn_curstExmndcTop",
@@ -49,16 +55,46 @@ _BASE_BTN_ID = {
 
 
 def get_doc_button_id(doc_type: str, item_no: str) -> str:
-    """
-    문서 종류 + 물건번호(item_no) -> 버튼 id.
-    현황조사서는 item_no=1 이외의 버튼 id가 DOM 분석으로 확인된 적이 없으므로,
-    item_no != '1' 이면 None을 반환해 명시적으로 "미지원"을 알린다.
-    (추측으로 셀렉터를 만들지 않는다 - 잘못된 id로 엉뚱한 버튼을 누르는 것을 방지)
+    """문서 종류 + 물건번호(item_no) -> 상세페이지의 수집 버튼 id. 모르면 None.
+
+    ## 현황조사서(status)는 물건번호와 무관하다 (2026-08-17 Sprint 144+ DOM 실측으로 확정)
+
+    예전에는 `item_no != '1'`이면 **None을 돌려 "미지원"으로 처리**했다. 그 판단의 근거는
+    "물건번호가 2 이상일 때의 버튼 id가 DOM 분석으로 확인된 적이 없다"였고,
+    추측으로 셀렉터를 만들지 않는다는 방침에 따른 **의도적인 보수적 선택**이었다
+    (`repair_unsupported_status_docs.py`가 그 한계를 문서화하면서 "나중에 버튼 id가
+    확보되면 대상이 저절로 줄어든다"고 후속 조치까지 적어 두었다).
+
+    이제 실제로 확인했다. 실 브라우저로 물건번호 2인 상세페이지 **2건**을 열어 DOM을
+    직접 덤프했다(서울중앙 2025타경311 물건2, 2023타경2726 물건2):
+
+        mf_wfm_mainFrame_btn_dspslGdsSpcfc1   매각물건명세서   (물건1)
+        mf_wfm_mainFrame_btn_dspslGdsSpcfc2   매각물건명세서   (물건2)
+        mf_wfm_mainFrame_btn_aeeWevl1         감정평가서       (물건1)
+        mf_wfm_mainFrame_btn_aeeWevl2         감정평가서       (물건2)
+        mf_wfm_mainFrame_btn_curstExmndcTop   현황조사서       <- 번호 없음, 단 하나
+                                                                 (물건2 페이지에서도 표시됨)
+
+    **번호가 붙은 변형(`...Top2` 등)은 존재하지 않는다.** 명세서·평가서만 번호가 붙고
+    현황조사서만 안 붙는다는 것 자체가 "이 문서는 물건 단위가 아니다"라는 신호다.
+
+    내용으로도 확인했다. 물건2 페이지에서 그 버튼을 눌러 오버레이를 읽으니 **한 문서가
+    사건의 모든 물건을 담고 있었다** — 부동산임대차정보 표에 번호 1(지2층비201호)과
+    번호 2(2층202호)가 나란히 들어 있다. 현황조사서는 집행관이 **사건 단위**로 작성하는
+    문서다.
+
+    즉 예전 동작은 "안전한 미지원"이 아니라 **틀린 전제**였다. 그 대가가 컸다 —
+    2026-08-17 실측으로 `auction_item` 1,876건 중 물건번호가 1이 아닌 것이 **629건(33.5%)**
+    이고, 그 전부가 현황조사서를 **영원히** 받을 수 없는 상태였다(이미 물건1이 같은
+    문서를 갖고 있는데도).
+
+    이제 물건번호와 무관하게 같은 버튼 id를 돌려준다. 추측이 아니라 실측이다.
     """
     item_no = (item_no or "1").strip()
 
     if doc_type == "status":
-        return _BASE_BTN_ID["status"] if item_no == "1" else None
+        # 물건번호를 붙이지 않는다 — 사건 단위 문서이고 버튼도 하나뿐이다.
+        return _BASE_BTN_ID["status"]
 
     if doc_type in ("spec", "appraisal"):
         return _BASE_BTN_ID[doc_type] + item_no

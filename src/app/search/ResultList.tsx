@@ -2,6 +2,7 @@ import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 import FavoriteButton from './FavoriteButton'
 import { formatPrice } from '@/lib/format'
+import ResultThumbnail from './ResultThumbnail'
 
 function formatBidRate(bidRate: number) {
   if (bidRate === null || bidRate === undefined) return '-'
@@ -61,9 +62,22 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
     <Link href={`/properties/${item.id}?${navQuery}`} className="block">
     <div className="bg-white rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow border border-gray-100">
       {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적.
-          대표 이미지는 넣지 않는다 — auction_item에 이미지 컬럼이 없어 항상 빈 placeholder만
-          차지하므로, 그 공간을 텍스트 정보가 쓰도록 비워둔다. */}
-      <div className="min-w-0">
+
+          대표 이미지 (2026-08-17 Sprint 145):
+          예전 주석은 "auction_item에 이미지 컬럼이 없어 항상 빈 placeholder만 차지하므로
+          넣지 않는다"였다. **그 전제가 바뀌었다** — Sprint 144에 `auction_image`와
+          사진 서빙 엔드포인트가 생겼고, 검색 API가 대표 사진 URL을 함께 준다.
+
+          다만 그 주석의 판단 자체는 여전히 옳다: 사진이 없는 물건에 빈 자리를 만들면
+          안 된다(현재 사진 보유 물건은 전체의 극히 일부다). 그래서 **`thumbnail_url`이
+          있을 때만** 썸네일을 그리고, 없으면 종전과 완전히 같은 텍스트 전용 레이아웃을
+          유지한다. 사진이 채워질수록 자연스럽게 카드가 풍부해진다. */}
+      <div className="min-w-0 flex gap-3">
+        {/* 이 파일은 **서버 컴포넌트**라 이벤트 핸들러를 붙일 수 없다. 사진이 깨졌을 때
+            자리를 숨기려면 onError가 필요하므로 썸네일만 클라이언트 섬으로 떼어냈다
+            (같은 카드의 FavoriteButton과 같은 방식). 자세한 사유는 ResultThumbnail.tsx. */}
+        {item.thumbnail_url && <ResultThumbnail url={item.thumbnail_url} />}
+        <div className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2 mb-1">
           <span className="text-sm font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg">
             {item.property_type || '-'}
@@ -82,6 +96,7 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
         </p>
         <p className="text-xs text-gray-400 line-clamp-2 break-all">{location || '-'}</p>
         {area && <p className="text-xs text-gray-400 mt-0.5">{formatArea(area)}</p>}
+        </div>
       </div>
 
       {/* 가격 그룹: 실입찰 기준가인 최저입찰가를 가장 크게, 감정가는 대비용으로 보조 표시 */}
@@ -125,14 +140,19 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
 //
 // firstPageHref: 현재 검색조건은 그대로 두고 page만 뗀 URL. 아래 "페이지 범위 초과" 안내의
 // 복구 동선으로 쓴다.
+//
+// hasFilters: 지금 검색조건이 하나라도 걸려 있는가(page/size/정렬은 조건으로 세지 않는다).
+// 결과 0건일 때 "조건이 좁아서"인지 "살아있는 물건이 아예 없어서"인지 가르는 데 쓴다.
 export default function ResultList({
   data,
   basePath,
   firstPageHref,
+  hasFilters = true,
 }: {
   data: SearchResponse
   basePath: string
   firstPageHref: string
+  hasFilters?: boolean
 }) {
   if (data.items.length === 0) {
     // 결과가 0건인 것과 **페이지 번호가 범위를 벗어난 것**은 원인도 해결책도 다르다.
@@ -155,6 +175,22 @@ export default function ResultList({
           >
             검색조건 유지하고 1페이지로 이동
           </Link>
+        </div>
+      )
+    }
+    // 조건이 하나도 없는데 0건이면 원인은 사용자가 아니라 **데이터**다. 이때 "조건을
+    // 줄여보세요"는 틀린 안내이고, "조건 없이 전체 물건 보기"는 이미 조건 없는 화면이라
+    // 같은 빈 화면으로 되돌아오는 막다른 링크가 된다. 그래서 문구도 동선도 갈라 놓는다.
+    // (기본 필터가 `auction_date >= 오늘`이라, 크롤이 멈추면 도달하는 상태다.)
+    if (!hasFilters) {
+      return (
+        <div className="text-center py-20">
+          <p className="text-gray-500 font-medium">현재 공개된 경매 물건이 없습니다</p>
+          <p className="mt-1 text-sm text-gray-400">
+            검색조건 때문이 아닙니다 — 매각기일이 남은 물건이 아직 등록되지 않았습니다.
+            <br />
+            새 물건은 법원 공고에 맞춰 갱신되니 잠시 후 다시 확인해 주세요
+          </p>
         </div>
       )
     }

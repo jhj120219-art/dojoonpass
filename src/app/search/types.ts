@@ -59,6 +59,9 @@ export type SearchResultItem = {
   validation_status: string | null
   crawl_date: string | null
   is_favorited: boolean
+  // 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없는 물건은 null이다.
+  // 2026-08-17 Sprint 145 추가 — optional로 두어 백엔드를 먼저 배포하지 않아도 깨지지 않는다.
+  thumbnail_url?: string | null
 }
 
 export type SearchResponse = {

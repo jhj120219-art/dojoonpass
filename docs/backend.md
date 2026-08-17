@@ -107,6 +107,7 @@ backend.md
 | GET | /api/v1/search | 검색 |
 | GET | /api/v1/item/{item_id} | JWT 있으면 최근조회 자동 기록. Premium 접근제어 없음(설계만, 미구현) |
 | GET/HEAD | /api/v1/item/{item_id}/documents/{doc_type} | 문서 실파일(PDF/HTML) 서빙. 인증/Premium 게이트 없음 |
+| GET/HEAD | /api/v1/item/{item_id}/images/{seq} | 물건 사진 실파일 서빙(2026-08-17 Sprint 144). 문서 뷰어와 같은 판단으로 공개 — 상세 화면이 공개인데 그 화면의 사진만 인증을 요구하면 화면이 깨진다. 경로는 `auction_image.storage_path`에서 읽고, **DB가 가리키는 파일이 실제로 있는지 반드시 다시 확인**한다(없으면 404) |
 
 ### 인증 필요 (Supabase JWT)
 | 메서드 | 경로 |
@@ -423,7 +424,12 @@ Task Scheduler (매일 06:00)
   `docs/BUGS.md` #18 — 법원 구분이 없어 다른 법원 물건이 소실되고 있었음). 컬럼은 그대로다
 - `auction_item.id` (프론트 라우팅 /auction/{itemId} 기준 PK, 정수형)
 - GET /api/v1/search 응답 필드명 (프론트 연동 완료)
-- GET /api/v1/item/{item_id} 응답 필드명 (프론트 연동 완료)
+- GET /api/v1/item/{item_id} 응답 필드명 (프론트 연동 완료).
+  2026-08-17 Sprint 144에 키를 **추가만** 했다 — `images` / `image_count` /
+  `representative_image` / `images_status`, 그리고 `documents[]` 항목에
+  `available` / `page_count` / `file_size` / `doc_version` / `viewer_url` / `download_url`.
+  **기존 키(`doc_type`/`status` 포함)는 하나도 바뀌거나 사라지지 않았고**, 회귀 테스트가
+  그것을 고정한다(`test_asset_pipeline.py` §16의 "기존 키 유지" 검사)
 - 공통 응답 형식 `{"success", "data", "message"}`
 - 인증 방식: Supabase JWT (NEXTAUTH_SECRET 사용 금지). 단 `/api/v1/admin/*`만 예외로 `X-Admin-Key` 사용(위 참고)
 - `python -m storage.migrations.run_migrations` 실행 방식

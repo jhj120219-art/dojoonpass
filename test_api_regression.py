@@ -2381,6 +2381,8 @@ EXPECTED_ENDPOINTS = {
     ("GET", "/api/v1/search/regions"),
     ("GET", "/api/v1/item/{item_id}"),
     ("GET", "/api/v1/item/{item_id}/documents/{doc_type}"),
+    # 2026-08-17 Sprint 144: 물건 사진 서빙. 문서 뷰어와 같은 계열(공개 GET + 존재확인 HEAD)이다.
+    ("GET", "/api/v1/item/{item_id}/images/{seq}"),
     ("GET", "/api/v1/favorites"),
     ("POST", "/api/v1/favorites"),
     ("DELETE", "/api/v1/favorites/{item_id}"),
@@ -2453,6 +2455,25 @@ def test_api_surface():
     check("HEAD rejects unknown doc_type",
           client.request("HEAD", "/api/v1/item/%d/documents/BOGUS" % item_id).status_code, 400)
 
+    # doc_type은 대소문자를 가리지 않는다 (2026-08-17 Sprint 148, BUGS #108).
+    # 이 저장소는 같은 개념을 두 벌 어휘로 저장한다 — document_status는 대문자,
+    # document_queue는 소문자다. 큐 쪽 값으로 URL을 만들면 400이 났고, 그 400이
+    # 오타로 넣은 값과 구별되지 않아 원인을 찾기 어려웠다.
+    #
+    # 알 수 없는 종류는 **여전히 400**이어야 한다 — 넓힌 것은 대소문자뿐이다.
+    lower = client.get("/api/v1/item/%d/documents/spec" % item_id)
+    upper = client.get(path)
+    check("소문자 doc_type이 대문자와 같은 상태를 준다", lower.status_code, upper.status_code)
+    if upper.status_code == 200:
+        check("소문자 doc_type이 같은 본문을 준다", len(lower.content), len(upper.content))
+    check("섞인 대소문자도 같다",
+          client.get("/api/v1/item/%d/documents/sPeC" % item_id).status_code, upper.status_code)
+    check("모르는 종류는 그대로 400",
+          client.get("/api/v1/item/%d/documents/bogus" % item_id).status_code, 400)
+    check("HEAD도 같은 규칙",
+          client.request("HEAD", "/api/v1/item/%d/documents/spec" % item_id).status_code,
+          client.request("HEAD", path).status_code)
+
 
 # ---------------------------------------------------------------------------
 # 17. 공통 응답 envelope — 인증 필요 라우트는 {success, data, message} 형태를 유지해야 한다.
@@ -2477,6 +2498,57 @@ def test_response_envelope():
                        json={"payment_type": "GIFT", "amount": 1}, headers=h).json()
     check("fail carries error code", body["error"], ErrorCode.PAY_INVALID_TYPE.value)
     check("fail success is False", body["success"], False)
+
+    # ------------------------------------------------------------------
+    # ★ 전수 검사 — 위 5개는 **손으로 적은 목록**이라 새 엔드포인트를 영원히 못 본다
+    #   (2026-08-17 Sprint 165 신설).
+    #
+    #   실측: 이 목록은 5개인데 실제로 envelope 를 쓰는 GET 엔드포인트는 **14개**였다.
+    #   admin 7개 전부와 `/api/v1/plans`, `/api/v1/subscriptions/me` 가 검사 밖에 있었다.
+    #   같은 "목록 기반이라 빠뜨린다" 실패를 Sprint 161 이 경로 규칙 검사에서 이미
+    #   겪었다(세 번 반복됐다). 그래서 여기도 OpenAPI 에서 라우트를 뽑아 전부 두드린다.
+    #
+    #   제외는 **포함 목록이 아니라 예외 목록**이다 — 새 엔드포인트는 기본적으로 검사
+    #   대상이 되고(fail-safe), 빼려면 이유를 여기에 적어야 한다.
+    # ------------------------------------------------------------------
+    RAW_BY_DESIGN = {
+        # api/v1/search.py:436 — "인증 불필요 라우트라 envelope 를 쓰지 않는다"
+        "/api/v1/search": "인증 불필요 라우트(소스에 근거 주석 있음)",
+        "/api/v1/search/regions": "위와 같은 모듈·같은 근거",
+        # api_server.py:92 — 레거시 3키 {success, data, message}. 헬스체크용.
+        "/": "레거시 3키 헬스체크 응답",
+        "/api/v1/stats": "레거시 3키 운영 통계 응답",
+        # api/v1/doc_stats.py — 순수 dict. 소스에 명시적 근거 주석은 없다(확인함).
+        "/api/v1/document-stats": "운영 진단용 raw dict(소스에 근거 주석 없음)",
+    }
+
+    spec = api_server.app.openapi()
+    admin_h = {"X-Admin-Key": TEST_ADMIN_KEY}
+    checked = 0
+    offenders = []
+    for path, ops in sorted(spec.get("paths", {}).items()):
+        if "get" not in ops or "{" in path:
+            continue
+        if path in RAW_BY_DESIGN:
+            continue
+        hdr = admin_h if "/admin/" in path else h
+        resp = client.get(path, headers=hdr)
+        if resp.status_code >= 400:
+            # 이 검사의 관심사는 **성공 응답의 형태**다. 권한/검증 실패는 여기서 보지 않는다.
+            continue
+        try:
+            got = resp.json()
+        except Exception:  # noqa: BLE001
+            offenders.append("%s: JSON 아님" % path)
+            continue
+        checked += 1
+        if not isinstance(got, dict) or set(got) != ENVELOPE_KEYS:
+            offenders.append("%s: %s" % (path, sorted(got) if isinstance(got, dict) else type(got).__name__))
+
+    check_true("전수 검사 대상이 실제로 모였다(0이면 검사가 비어 있다)", checked >= 10, checked)
+    check_true("★ 모든 GET 엔드포인트가 envelope 계약을 지킨다 "
+               "(raw 로 두려면 RAW_BY_DESIGN 에 이유와 함께 등록할 것)",
+               not offenders, offenders)
     check_true("fail keeps message", isinstance(body["message"], str))
 
     # 반대로 비인증 공개 라우트(search/item)는 envelope를 쓰지 않는다 — 기존 계약 유지
@@ -4973,6 +5045,10 @@ PUBLIC_ENDPOINTS = {
     "/api/v1/search/regions",
     "/api/v1/item/{item_id}",
     "/api/v1/item/{item_id}/documents/{doc_type}",
+    # 물건 사진은 법원이 공개하는 경매 정보이고, 상세 화면(`/api/v1/item/{item_id}`)이
+    # 이미 공개인데 그 화면에 그려질 사진만 인증을 요구하면 화면이 깨진다.
+    # 문서 뷰어와 같은 판단이다.
+    "/api/v1/item/{item_id}/images/{seq}",
     "/api/v1/plans",
 }
 # 사용자 인증은 없지만 다른 수단(서명)으로 보호되는 경로.
@@ -4981,7 +5057,7 @@ SIGNATURE_PROTECTED_ENDPOINTS = {"/api/v1/payments/webhook/{provider_name}"}
 _PATH_SAMPLE = {
     "{item_id}": "1", "{payment_id}": "1", "{preset_id}": "1", "{request_id}": "1",
     "{doc_type}": "SPEC", "{user_id}": "qa-authz-probe", "{subscription_id}": "1",
-    "{webhook_id}": "1", "{provider_name}": "mock",
+    "{webhook_id}": "1", "{provider_name}": "mock", "{seq}": "1",
 }
 
 
@@ -5060,8 +5136,13 @@ def test_authz_coverage():
     structural = {(m, p) for m, p in structural
                   if p not in docs_paths and m != "OPTIONS"}
     spec_pairs = {(m.upper(), p) for p, ops in spec["paths"].items() for m in ops}
-    # 스펙 밖에 있어도 되는 것: 문서 뷰어가 존재만 확인하는 HEAD 하나.
-    ALLOWED_UNSPECED = {("HEAD", "/api/v1/item/{item_id}/documents/{doc_type}")}
+    # 스펙 밖에 있어도 되는 것: 프런트가 **존재만 확인**하는 HEAD 둘.
+    # 둘 다 같은 이유로 스펙에서 뺐다 — GET과 operationId가 겹치면 /openapi.json 생성이
+    # 깨진다(각 라우터의 include_in_schema=False 주석 참고).
+    ALLOWED_UNSPECED = {
+        ("HEAD", "/api/v1/item/{item_id}/documents/{doc_type}"),
+        ("HEAD", "/api/v1/item/{item_id}/images/{seq}"),
+    }
     unspeced = structural - spec_pairs - ALLOWED_UNSPECED
     check_true("스펙에 없어 전수에서 빠지는 라우트 없음", not unspeced,
                "이 라우트들은 위 인가 전수를 통과한 적이 없다: %s" % sorted(unspeced))

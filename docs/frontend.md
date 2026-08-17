@@ -12,7 +12,14 @@
   Sprint 44에서 redirect를 제거했는데 이 절만 갱신되지 않아, 같은 문서의 아래 "페이지 구조" 표와 서로 모순되던 stale 기록이다.)
 - `/login`: 로그인/회원가입 통합 폼(클라이언트 컴포넌트, `useActionState`로 모드 전환)
 - `/properties`: 매물 목록(서버 컴포넌트). Supabase `properties` 테이블 직접 조회 — FastAPI 백엔드 미사용
-- `/properties/[id]`: 매물 상세(클라이언트 컴포넌트). FastAPI `GET /api/v1/item/{id}`로 물건 데이터 조회 + `POST/GET /api/v1/registry-requests`, `POST /api/v1/payments`로 등기부등본 신청/구독/초과결제 처리 (2026-08-05 연동, 아래 "API 호출 방식" 참고). Supabase `view_counts` 기반 구현은 제거됨(`properties/[id]/actions.ts` 삭제)
+- `/properties/[id]`: 매물 상세(클라이언트 컴포넌트). FastAPI `GET /api/v1/item/{id}`로 물건 데이터 조회 + `POST/GET /api/v1/registry-requests`, `POST /api/v1/payments`로 등기부등본 신청/구독/초과결제 처리 (2026-08-05 연동, 아래 "API 호출 방식" 참고). Supabase `view_counts` 기반 구현은 제거됨(`properties/[id]/actions.ts` 삭제).
+  **2026-08-17 Sprint 144 추가** — 물건 사진 갤러리(대표 이미지 + 썸네일 줄 + 라이트박스)와
+  개선된 문서 뷰어(쪽 이동 / 확대·축소 / 로딩·실패 상태 / 새 탭)를 넣었다.
+  사진 바이트는 `GET /api/v1/item/{id}/images/{seq}`로 받고, 목록·순서·크기는
+  상세 응답의 `images[]`가 준다(`next/image`는 쓰지 않는다 — docs/SPRINT124 참고).
+  **빈 상태를 상태별로 구분한다**: `images_status`가 `COLLECTING`이면 "사진 수집 중",
+  `NO_IMAGE`면 "법원이 사진을 제공하지 않습니다", `FAILED`면 "가져오지 못했습니다" —
+  기다리면 되는 것과 기다려도 소용없는 것을 사용자가 구분할 수 있어야 하기 때문이다
 - `/properties/recent`: 최근조회 목록. FastAPI `GET /api/v1/recent-items` 사용 (Release 완료)
 - `/search`: `/`와 **동일한 `SearchScreen`을 공유**하는 검색 화면(복제 없음). 기존 링크/북마크 호환용으로 유지. FastAPI `GET /api/v1/search` 사용 (Release 완료)
 - `/favorites`: 관심물건 목록. FastAPI `/api/v1/favorites` 사용 (Release 완료)
@@ -171,6 +178,12 @@
   → **해결** (#31 — 두 상태 구분 + 검색조건 유지 1페이지 복귀 링크)
 - ~~`/favorites`·`/properties/recent`에서 상세로 들어가면 "이전/다음 물건" 바가 "1 / 1"로 죽은 채 노출~~
   → **해결** (#32 — `navContext.ts` 순수 함수로 분리 + 빈 세그먼트/`i` 부재 처리)
+- ~~결과 0건일 때 원인을 항상 사용자 조건으로 단정 — 재고가 0이면 "조건 없이 전체 물건 보기"가
+  같은 빈 화면으로 되돌아오는 **막다른 링크**가 됨~~
+  → **해결** (#106 — `SearchScreen`이 `hasFilters`를 계산해 넘기고 `ResultList`가 두 상태를 가름.
+  `page`/`size`/`sort_by`/`sort_order`는 조건으로 세지 않는다. 조건 없이 0건이면 문구를
+  "현재 공개된 경매 물건이 없습니다"로 바꾸고 막다른 링크를 제거한다.
+  기본 필터가 `auction_date >= 오늘`이라 크롤이 멈추면 도달하는 **예정된 상태**다)
 - **[미해결 · 결정 필요] 검색 물건종류 69개 중 60개가 항상 0건** (`docs/BUGS.md` #33).
   `PropertyTypeTree`의 어휘는 Tank Auction HTML 전수 복사인데 DB는 크롤러 수집 원문 18종이고
   백엔드는 `LIKE %값%` 매칭이라, `다세대`(246) `근린시설`(164) `상가,오피스텔,근린시설`(202)

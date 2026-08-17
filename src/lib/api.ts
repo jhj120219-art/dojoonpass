@@ -6,9 +6,32 @@ export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://loca
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  // 서버가 준 사람이 읽을 수 있는 사유(`{"detail": "..."}`). 없으면 undefined.
+  //
+  // ★ 2026-08-17 Sprint 162: 예전에는 응답 본문을 **통째로 버렸다.** 백엔드는
+  //   `허용되지 않는 sort_by 값입니다: BOGUS` 처럼 정확한 사유를 주는데, 화면은 그걸 못 받아
+  //   고정 문구만 띄웠다(실측). 그 고정 문구가 하필 페이지/개수만 언급해서, sort_by가 틀린
+  //   사용자는 **엉뚱한 곳을 고치라는 안내**를 받았다.
+  //
+  //   문자열일 때만 담는다 — FastAPI 검증 오류(`page=0`, `size=99999`)의 `detail`은
+  //   영어 객체 **배열**이라 사용자에게 보여줄 것이 못 된다. 그때는 undefined로 두고
+  //   호출부의 기존 안내 문구로 떨어진다.
+  detail?: string
+  constructor(status: number, message: string, detail?: string) {
     super(message)
     this.status = status
+    this.detail = detail
+  }
+}
+
+// 실패 응답에서 사람이 읽을 수 있는 사유만 뽑는다. 본문이 JSON이 아니거나
+// `detail`이 문자열이 아니면 undefined(= 호출부가 기존 문구를 쓴다).
+async function readDetail(res: Response): Promise<string | undefined> {
+  try {
+    const body = await res.json()
+    return typeof body?.detail === 'string' ? body.detail : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -37,7 +60,7 @@ export async function fetchJSON<T>(path: string, token?: string): Promise<T> {
   const headers: HeadersInit | undefined = token ? { Authorization: `Bearer ${token}` } : undefined
   const res = await fetch(`${API_BASE_URL}${path}`, { cache: 'no-store', headers })
   if (!res.ok) {
-    throw new ApiError(res.status, `API 요청 실패 (${res.status}): ${path}`)
+    throw new ApiError(res.status, `API 요청 실패 (${res.status}): ${path}`, await readDetail(res))
   }
   return res.json() as Promise<T>
 }

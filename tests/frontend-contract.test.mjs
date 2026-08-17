@@ -535,6 +535,59 @@ describe('잘못된 검색 파라미터 처리 (Sprint 51)', () => {
     }
   })
 
+  // Sprint 162 — 서버가 준 정확한 사유를 그대로 보여 준다.
+  //
+  // 예전에는 400을 받으면 **응답 본문을 통째로 버리고** 고정 안내만 띄웠다. 그 고정 문구가
+  // 하필 "(페이지 번호는 1 이상, 한 페이지 개수는 1~100)"이라 페이지/개수만 언급해서,
+  // `sort_by`나 `min_appraisal`이 틀린 사용자는 **엉뚱한 곳을 고치라는 안내**를 받았다.
+  // 백엔드는 `{"detail": "허용되지 않는 sort_by 값입니다: BOGUS"}`처럼 정확히 알려 준다.
+  test('서버가 사유를 문자열로 주면 그것을 보여 준다', async () => {
+    // ★ 필드명만 찾으면 안 된다 — `sort_by`/`min_appraisal` 은 정렬 링크와 검색 Form에도
+    //   문자열로 들어 있어 **사유를 버려도 통과한다**(실제로 mutation 이 살아남아서 고쳤다).
+    //   서버 문구 자체를 찾고, 동시에 기본 안내가 **사라졌는지**까지 확인한다.
+    const cases = [
+      ['?sort_by=BOGUS', '허용되지 않는 sort_by 값입니다'],
+      ['?min_appraisal=99999999999999999999999', 'min_appraisal 값이 허용 범위를 벗어났습니다'],
+    ]
+    for (const [qs, serverMessage] of cases) {
+      const { res, body } = await getText(`/search${qs}`)
+      assert.equal(res.status, 200, `${qs}: 화면 자체가 실패했습니다`)
+      assert.ok(
+        body.includes('검색조건에 잘못된 값이 있습니다'),
+        `${qs}: 잘못된 파라미터 전용 안내가 없습니다`
+      )
+      assert.ok(
+        body.includes(serverMessage),
+        `${qs}: 서버가 준 사유("${serverMessage}")가 화면에 없습니다 — 응답 본문이 버려졌습니다`
+      )
+      // 사유를 보여 줄 때는 페이지/개수만 언급하는 기본 안내가 **대체돼야** 한다.
+      // (둘 다 나오면 여전히 엉뚱한 곳을 고치라고 안내하는 셈이다)
+      assert.ok(
+        !body.includes('주소창의 검색조건 중 일부가 허용되지 않는 값입니다'),
+        `${qs}: 정확한 사유가 있는데 페이지/개수 안내가 함께 나옵니다`
+      )
+      // 사유를 보여 줄 때도 되돌아갈 동선은 남아야 한다.
+      assert.ok(body.includes('검색조건 초기화'), `${qs}: 복구 링크가 사라졌습니다`)
+    }
+  })
+
+  // 사유가 **문자열이 아닐 때**는 기존 안내로 떨어져야 한다.
+  // FastAPI 검증 오류(`page=0`, `size=99999`)의 `detail`은 영어 객체 배열이라
+  // 사용자에게 보여줄 것이 못 된다. 넓게 보여 주려다 이런 것까지 노출하면 안 된다.
+  test('사유가 객체 배열이면 기존 안내로 떨어진다', async () => {
+    for (const qs of ['?page=0', '?size=99999']) {
+      const { body } = await getText(`/search${qs}`)
+      assert.ok(
+        body.includes('주소창의 검색조건 중 일부가 허용되지 않는 값입니다'),
+        `${qs}: 기본 안내가 없습니다`
+      )
+      // 내부 표현이 새어 나오면 안 된다.
+      for (const bad of ['greater_than_equal', 'less_than_equal', 'Input should be', '"loc"']) {
+        assert.ok(!body.includes(bad), `${qs}: 내부 검증 표현 ${bad} 이(가) 노출됐습니다`)
+      }
+    }
+  })
+
   test('복구 링크가 현재 화면(basePath)을 유지한다', async () => {
     for (const [path, expected] of [['/', '/'], ['/search', '/search']]) {
       const { body } = await getText(`${path}?size=500`)

@@ -84,7 +84,9 @@ def test_driver_restart_failure_stops_run_instead_of_burning_retry_budget():
             return item
         return None
 
-    def fake_go_to_case_detail(driver, court_code, case_no):
+    # 2026-08-17 Sprint 144: doc_worker가 item_no까지 넘긴다(물건 사진은 버튼 없이
+    # 상세 DOM을 읽으므로 **어느 물건의 페이지인지가 곧 결과**다). 스텁도 받아야 한다.
+    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None):
         raise Exception("qa-simulated-browser-crash")
 
     def fake_restart_download_driver(driver):
@@ -142,8 +144,11 @@ def test_driver_restart_success_continues_processing():
             return item
         return None
 
-    def fake_go_to_case_detail(driver, court_code, case_no):
+    seen_item_nos = []
+
+    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None):
         call_count["go_to_case_detail"] += 1
+        seen_item_nos.append(item_no)
         if call_count["go_to_case_detail"] == 1:
             raise Exception("qa-simulated-one-off-crash")
         return True
@@ -183,6 +188,9 @@ def test_driver_restart_success_continues_processing():
         _restore_all(originals)
         doc_worker.time_module.sleep = orig_sleep
 
+    # 물건번호를 실제로 넘기는지 고정한다 — 넘기지 않으면 다중물건 사건에서 첫 물건의
+    # 상세페이지에 들어가 **다른 물건의 사진**을 저장하게 된다 (Sprint 144).
+    check("go_to_case_detail에 물건번호를 넘긴다", seen_item_nos, ["1", "1"])
     check("두 항목 다 claim됐다(재시작 성공 후 계속 진행)", claimed_calls, [100, 101])
     check("재시작은 1번만 일어났다", len(restart_calls), 1)
     check("첫 항목만 실패로 기록된다", failed_calls, [100])
@@ -267,12 +275,159 @@ def test_lock_released_after_normal_run():
     check("실행 종료 후 락 파일이 남지 않는다", os.path.exists(doc_worker.LOCK_PATH), False)
 
 
+def test_driver_startup_failure_releases_lock():
+    """드라이버 **기동** 실패도 락을 남기면 안 된다 (2026-08-17 Sprint 148, BUGS #109).
+
+    5번은 "정상 종료"를 본다. 그런데 예전에는 `build_download_driver()` 호출이 락을
+    해제하는 두 구간 사이에 끼어 있었다 — 위쪽 try/except(init_db/reset_stale_queue용)
+    **밖**이고, 아래쪽 while의 try/finally **앞**이었다. 그래서 기동이 실패하면 락이
+    그대로 남았다(실측 재현: logs/doc_worker.lock에 죽은 PID가 남음).
+
+    `LOCK_STALE_HOURS=5`가 있어 영구 정지는 아니지만, 하필 곧바로 재시도하고 싶은 5시간
+    동안 후속 실행이 "다른 인스턴스 실행 중"으로 건너뛴다. 드라이버 기동 실패는 크롬
+    업데이트 같은 일시적 원인이 많아 재시도 가치가 큰데, 그 창을 스스로 막고 있었다.
+
+    예외는 그대로 전파돼야 한다 — 스케줄러가 실패를 인지해야 하므로 삼키면 안 된다.
+    """
+    print("\n--- 6. 드라이버 기동 실패도 락을 해제한다 (Sprint 148) ---")
+    if os.path.exists(doc_worker.LOCK_PATH):
+        os.remove(doc_worker.LOCK_PATH)
+
+    class _StartupBoom(Exception):
+        pass
+
+    def _boom():
+        raise _StartupBoom("드라이버 기동 실패 모사")
+
+    originals = _patch_all({
+        "init_db": lambda: None,
+        "reset_stale_queue": lambda: None,
+        "build_download_driver": _boom,
+        "claim_next_queue_item": lambda: None,
+    })
+    raised = None
+    try:
+        doc_worker.main()
+    except _StartupBoom as exc:
+        raised = exc
+    except Exception as exc:            # noqa: BLE001 - 어떤 예외인지 그대로 보고한다
+        raised = exc
+    finally:
+        _restore_all(originals)
+
+    check_true("기동 실패 예외가 전파된다(스케줄러가 실패로 인지)",
+               isinstance(raised, _StartupBoom), repr(raised))
+    check("기동 실패 후에도 락 파일이 남지 않는다",
+          os.path.exists(doc_worker.LOCK_PATH), False)
+
+
+def test_out_of_window_run_does_not_start_browser():
+    """실행 창이 지났으면 브라우저를 띄우지 않고 끝나야 한다 (Sprint 148).
+
+    예전에는 시간 검사가 `while not is_time_up()` 루프 조건에만 있어서, 창 밖에서
+    기동하면 Selenium을 **띄운 뒤** 첫 조건에서 곧바로 빠져나왔다. 스케줄러 실행이
+    밀렸거나 수동으로 돌릴 때 실제로 도달한다(2026-08-17 14:22 실측).
+    """
+    print("\n--- 7. 실행 창 밖에서는 브라우저를 띄우지 않는다 (Sprint 148) ---")
+    if os.path.exists(doc_worker.LOCK_PATH):
+        os.remove(doc_worker.LOCK_PATH)
+
+    started = {"driver": False, "reset": False}
+
+    def _spy_driver():
+        started["driver"] = True
+        return _FakeDriver("should-not-happen")
+
+    def _spy_reset():
+        started["reset"] = True
+
+    # is_time_up()이 True가 되도록 테스트 모드를 끄고 종료시각을 지난 값으로 만든다.
+    prev_mode = os.environ.pop("DOC_WORKER_TEST_MODE", None)
+    prev_end = doc_worker.DOC_WORKER_END_TIME
+    doc_worker.DOC_WORKER_END_TIME = "00:00"      # 항상 지난 시각
+    originals = _patch_all({
+        "init_db": lambda: None,
+        "reset_stale_queue": _spy_reset,
+        "build_download_driver": _spy_driver,
+        "claim_next_queue_item": lambda: None,
+    })
+    try:
+        rc = doc_worker.main()
+    finally:
+        _restore_all(originals)
+        doc_worker.DOC_WORKER_END_TIME = prev_end
+        if prev_mode is not None:
+            os.environ["DOC_WORKER_TEST_MODE"] = prev_mode
+
+    check("창 밖 실행도 성공 종료코드", rc, 0)
+    check("브라우저를 띄우지 않는다", started["driver"], False)
+    check("큐 상태도 건드리지 않는다", started["reset"], False)
+    check("창 밖 실행 후 락이 남지 않는다",
+          os.path.exists(doc_worker.LOCK_PATH), False)
+
+
+def test_driver_setup_failure_does_not_orphan_browser():
+    """드라이버 생성 후 설정이 실패하면 브라우저를 닫아야 한다 (Sprint 149, BUGS #110).
+
+    `build_download_driver()`는 `webdriver.Chrome(...)`으로 **프로세스를 이미 띄운 뒤**
+    `set_page_load_timeout(30)`을 부른다. 예전에는 이 설정이 실패하면 예외만 나가고
+    프로세스는 고아로 남았다 — 호출자는 `driver` 참조를 받지 못했으니 quit()을 부를
+    방법도 없다.
+
+    BUGS #109와 같은 계열이고 실제로 맞물린다. #109 수정으로 기동 실패 시 락은 풀리지만,
+    실패 지점이 여기라면 좀비 크롬이 남는다. 재시도마다 하나씩 쌓인다.
+
+    `crawler/doc_crawler.py`는 실브라우저 의존이라 커버리지가 0%지만, 이 함수만은
+    selenium 진입점을 갈아끼워 실제 브라우저 없이 검증할 수 있다.
+    """
+    print("\n--- 8. 드라이버 설정 실패가 브라우저를 고아로 남기지 않는다 (Sprint 149) ---")
+    import selenium.webdriver as wd
+    import selenium.webdriver.chrome.service as svcmod
+    import webdriver_manager.chrome as wdm
+    import crawler.doc_crawler as dc
+
+    state = {"quit": 0}
+
+    class _FakeChrome:
+        def __init__(self, *a, **kw):
+            pass
+
+        def set_page_load_timeout(self, _t):
+            raise RuntimeError("설정 중 브라우저 사망 모사")
+
+        def quit(self):
+            state["quit"] += 1
+
+    class _FakeManager:
+        def install(self):
+            return "fake-driver-path"
+
+    orig = (wd.Chrome, svcmod.Service, wdm.ChromeDriverManager)
+    wd.Chrome = _FakeChrome
+    svcmod.Service = lambda *a, **kw: None
+    wdm.ChromeDriverManager = _FakeManager
+    raised = None
+    try:
+        dc.build_download_driver()
+    except Exception as exc:            # noqa: BLE001 - 어떤 예외인지 그대로 본다
+        raised = exc
+    finally:
+        wd.Chrome, svcmod.Service, wdm.ChromeDriverManager = orig
+
+    check_true("설정 실패 예외가 전파된다(호출자가 기동 실패를 인지)",
+               isinstance(raised, RuntimeError), repr(raised))
+    check("실패 시 브라우저를 닫는다(좀비 프로세스 없음)", state["quit"], 1)
+
+
 def run():
     test_driver_restart_failure_stops_run_instead_of_burning_retry_budget()
     test_driver_restart_success_continues_processing()
     test_lock_prevents_concurrent_run()
     test_stale_lock_is_taken_over()
     test_lock_released_after_normal_run()
+    test_driver_startup_failure_releases_lock()
+    test_out_of_window_run_does_not_start_browser()
+    test_driver_setup_failure_does_not_orphan_browser()
 
     print("\n" + "=" * 55)
     if failures:

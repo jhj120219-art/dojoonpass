@@ -510,19 +510,24 @@ def test_relisted_auction_date_is_refreshed():
         # (30일로 두면 계산값도 3이라 갱신 누락을 놓친다 - 변이 시험에서 실제로 놓쳤다).
         new_date = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d")
 
+        # 2026-08-17 Sprint 144: 'image'(물건 사진)가 넷째 종류로 추가됐다. 이 시드는
+        # 아래 주석대로 **모든 종류를 다 넣어야** "신규 적재 0건"이 성립하므로 함께 넣는다.
         _seed_queue(conn, [
-            # 세 문서종류를 모두 시드한다 - 그래야 "신규 적재 0건"이 성립해
+            # 네 문서종류를 모두 시드한다 - 그래야 "신규 적재 0건"이 성립해
             # 이 검사가 오직 **기존 행의 갱신**만 보게 된다.
             ("2024타경1533", "1", "spec", "pending", 3, old_date, 0, None),
             ("2024타경1533", "1", "status", "pending", 3, old_date, 0, None),
             ("2024타경1533", "1", "appraisal", "pending", 3, old_date, 0, None),
+            ("2024타경1533", "1", "image", "pending", 3, old_date, 0, None),
             # 이미 수집이 끝난 행과 기일경과로 종료된 행도 함께 둔다.
             ("2024타경502", "1", "spec", "done", 3, old_date, 0, None),
             ("2024타경502", "1", "status", "done", 3, old_date, 0, None),
             ("2024타경502", "1", "appraisal", "done", 3, old_date, 0, None),
+            ("2024타경502", "1", "image", "done", 3, old_date, 0, None),
             ("2024타경505", "1", "spec", "SKIPPED_EXPIRED", 3, old_date, 0, None),
             ("2024타경505", "1", "status", "SKIPPED_EXPIRED", 3, old_date, 0, None),
             ("2024타경505", "1", "appraisal", "SKIPPED_EXPIRED", 3, old_date, 0, None),
+            ("2024타경505", "1", "image", "SKIPPED_EXPIRED", 3, old_date, 0, None),
         ])
         conn.close()
         dbmod.DB_PATH = os.path.join(d, "t.db")
@@ -548,7 +553,7 @@ def test_relisted_auction_date_is_refreshed():
         # 중복 적재는 여전히 일어나지 않는다(기존 계약 - BUGS #48).
         check("이미 있는 행을 새로 만들지 않는다",
               c.execute("SELECT COUNT(*) FROM document_queue WHERE case_no='2024타경1533'"
-                        ).fetchone()[0], 3)
+                        ).fetchone()[0], 4)
 
         # ★ 핵심: 기일이 최신 값으로 갱신된다.
         check("pending 행의 기일이 새 기일로 갱신된다", row("2024타경1533")["auction_date"], new_date)
@@ -572,7 +577,8 @@ def test_relisted_auction_date_is_refreshed():
 
         # 갱신 건수를 호출부가 알 수 있어야 한다(로그로 추적 가능해야 조용한 실패가 안 된다).
         check_true("반환값에 갱신 건수가 있다", "refreshed" in result, result)
-        check("갱신 건수", result.get("refreshed"), 9)
+        # 사건 3건 x 문서종류 4개 = 12행이 전부 갱신 대상이다(Sprint 144에 image 추가).
+        check("갱신 건수", result.get("refreshed"), 12)
         check("신규 적재는 0건", result["added"], 0)
 
         # ★ 결과 확인: 이제 doc_worker의 2차 방어선이 이 행을 죽이지 않는다.
@@ -637,7 +643,8 @@ def test_expired_items_are_not_enqueued():
         check("만료 사건은 큐에 없다", cases, ["future", "today"])
         # 오늘이 기일인 사건은 **넣어야 한다** — 아직 매각 전이다(D7 경계와 같은 규칙).
         check_true("오늘이 기일인 사건은 큐에 들어간다", "today" in cases, cases)
-        check("적재는 2건 x 3문서 = 6", result["added"], 6)
+        # 2026-08-17 Sprint 144: 문서 종류가 3개 -> 4개(spec/status/appraisal/image).
+        check("적재는 2건 x 4자산 = 8", result["added"], 8)
         # 몇 건을 걸렀는지 호출부가 알 수 있어야 한다 — 조용히 사라지면 큐가 비어 있는
         # 이유를 나중에 추적할 수 없다(Sprint 54가 없앤 "실패 은폐"와 같은 이유).
         check("걸러낸 건수를 보고한다", result["skipped_expired"], 1)
@@ -648,7 +655,7 @@ def test_expired_items_are_not_enqueued():
              "auction_date": ""},
         ])
         check("기일이 없으면 거르지 않는다", result2["skipped_expired"], 0)
-        check("기일 없는 사건도 적재된다", result2["added"], 3)
+        check("기일 없는 사건도 적재된다", result2["added"], 4)
     finally:
         dbmod.DB_PATH = real_path
         shutil.rmtree(d, ignore_errors=True)
@@ -737,11 +744,23 @@ def test_get_doc_button_id_contract():
     check_true("spec과 appraisal의 버튼이 다르다",
                get_doc_button_id("spec", "1") != get_doc_button_id("appraisal", "1"))
 
-    # 현황조사서: item_no=1만 지원, 나머지는 명시적 None.
+    # 현황조사서: **물건번호와 무관하게 같은 버튼**이다 (2026-08-17 Sprint 144+ DOM 실측).
+    #
+    # 예전 규약은 "item_no != '1'이면 None(미지원)"이었고, 그 근거는 "물건번호가 2 이상일
+    # 때의 버튼 id를 DOM으로 확인한 적이 없다"였다. 이제 확인했다 — 물건번호 2인 상세페이지
+    # 2건(2025타경311, 2023타경2726)에서 `..._btn_curstExmndcTop`이 **번호 없이 그대로**
+    # 존재하고 표시된다. 명세서/평가서만 번호가 붙는다(`...Spcfc2`, `...aeeWevl2`).
+    # 오버레이 내용도 사건의 모든 물건을 한 문서에 담고 있다(집행관이 사건 단위로 작성).
+    #
+    # 왜 중요한가 — 옛 규약은 `auction_item` 1,876건 중 물건번호가 1이 아닌 **629건(33.5%)**
+    # 의 현황조사서를 영구히 수집 불가로 만들고 있었다.
     check_true("status/item_no=1 은 지원", bool(get_doc_button_id("status", "1")))
     for item_no in ("2", "3", "7", "12"):
-        check("status/item_no=%s 는 미지원(None)" % item_no,
-              get_doc_button_id("status", item_no), None)
+        check("status/item_no=%s 도 같은 버튼(사건 단위 문서)" % item_no,
+              get_doc_button_id("status", item_no), get_doc_button_id("status", "1"))
+    check_true("status 버튼 id에는 물건번호가 붙지 않는다",
+               not get_doc_button_id("status", "2").endswith("2"),
+               get_doc_button_id("status", "2"))
 
     # 물건번호 미지정은 "1"로 본다(큐에 item_no가 비어 들어오는 경우 대비).
     for doc_type in ("spec", "status", "appraisal"):
@@ -986,13 +1005,25 @@ def test_unsupported_item_does_not_retry_forever():
             INSERT INTO document_status (item_id,doc_type,status,updated_at)
                 VALUES (1,'STATUS','COLLECTING','2026-08-01T00:00:00');
         """)
-        # 영구 미지원 조합: 현황조사서 + item_no=7. 기일은 미래라 기일 방어선에 걸리지 않는다.
+        # 2026-08-17 Sprint 144+: 예전에는 여기 시드가 ("status", item_no=7) — 즉 "현황조사서
+        # + 물건번호 2 이상"이었다. 그 조합이 **더 이상 미지원이 아니다**(DOM 실측으로 버튼
+        # id를 확정했다 — §14 참고). 그래서 시드를 그대로 두면 이 검사는 "미지원 항목"이
+        # 아닌 것을 대상으로 삼아 **공허해진다.**
+        #
+        # 이 검사가 지키려는 것은 특정 조합이 아니라 **저장 계층의 불변식**이다:
+        # `mark_queue_unsupported()`로 종결된 행이 `reset_stale_queue()`에 되살아나
+        # 영원히 재시도되지 않는가. 그래서 시드는 `document_status`에 매핑되는 종류
+        # (status)로 두되, "버튼 id가 없다"는 상황은 아래 루프가 직접 재현한다.
         _seed_queue(conn, [("2026타경1", "7", "status", "pending", 1, "2099-01-01", 0, None)])
         conn.close()
         dbmod.DB_PATH = path
 
-        # 전제 확인 — 이 조합이 정말 "버튼 id 없음"인가. 아니면 이 검사는 공허하다.
-        check("전제: 이 조합은 버튼 id가 없다", get_doc_button_id("status", "7"), None)
+        # 지금 실제로 버튼 id가 없는 것은 **알 수 없는 doc_type**뿐이다.
+        # (현황조사서 + 물건번호 2 이상은 2026-08-17에 지원 대상이 됐다 — §14)
+        check("남아 있는 영구 미지원 사유는 '모르는 doc_type'이다",
+              get_doc_button_id("registry", "1"), None)
+        check_true("현황조사서 + 물건번호 7은 이제 지원된다(옛 전제가 뒤집혔다)",
+                   bool(get_doc_button_id("status", "7")))
 
         def snapshot():
             c = sqlite3.connect(path)
@@ -1021,9 +1052,9 @@ def test_unsupported_item_does_not_retry_forever():
                 if not item:
                     break
                 attempts += 1
-                if get_doc_button_id(item["doc_type"], item["item_no"]):
-                    raise AssertionError("이 행은 미지원이어야 한다")
-                # doc_worker.py의 `if not btn_id:` 분기와 같은 호출
+                # doc_worker.py의 `if needs_button and not btn_id:` 분기와 같은 호출.
+                # (버튼 id가 없는 상황 자체를 재현한다 — 어떤 조합이 그 상황을 만드는지는
+                #  §14가 따로 고정한다. 여기서 보는 것은 종결 뒤 되살아나지 않는가다.)
                 dbmod.mark_queue_unsupported(item["id"], item["court_code"], item["case_no"],
                                              item["item_no"], item["doc_type"])
             seen_ds.add(snapshot()[2])
@@ -1043,7 +1074,14 @@ def test_unsupported_item_does_not_retry_forever():
         #   그래서 호출부 자체를 소스로 고정한다(§14가 doc_worker 호출 형태를 고정한 것과
         #   같은 방식).
         src = open(os.path.join(ROOT, "doc_worker.py"), encoding="utf-8-sig").read()
-        branch = src[src.index("if not btn_id:"):]
+        # 2026-08-17 Sprint 144: 분기 조건이 `if not btn_id:` -> `if needs_button and not btn_id:`
+        # 로 바뀌었다(물건 사진은 버튼 없이 상세 DOM에서 읽으므로 버튼 검사 대상이 아니다).
+        # 이 검사가 지키려는 것은 **조건문의 글자**가 아니라 "버튼 id가 없을 때
+        # mark_queue_unsupported로 종결한다"는 동작이므로, 앵커만 새 조건에 맞춘다.
+        anchor = "if needs_button and not btn_id:"
+        check_true("doc_worker에 '버튼 id 없음' 분기가 있다", anchor in src,
+                   "분기 형태가 또 바뀌었다면 이 앵커를 갱신하되 아래 검사는 유지할 것")
+        branch = src[src.index(anchor):]
         branch = branch[:branch.index("continue")]
         check_true("doc_worker의 '버튼 id 없음' 분기는 mark_queue_unsupported를 부른다",
                    "mark_queue_unsupported(" in branch,

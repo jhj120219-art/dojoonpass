@@ -265,9 +265,29 @@ def collect_list_items(driver: webdriver.Chrome, max_items: int) -> List[dict]:
     return list_items
 
 
-def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str) -> bool:
+def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str,
+                      item_no: Optional[str] = None) -> bool:
     """
     02:00 PDF 수집 Worker 전용 진입 함수.
+
+    ## `item_no` (2026-08-17 Sprint 144에 추가, 기본값 None = 종전 동작)
+
+    이 함수는 사건번호만 보고 목록의 **첫 번째로 일치하는 행**으로 들어갔다. 한 사건에
+    물건이 여러 개면(예: 2025타경311의 물건 1·2) 언제나 첫 물건의 상세페이지가 열린다.
+
+    문서(spec/appraisal)는 이것이 문제가 되지 않았다 — 버튼 id에 물건번호가 붙어 있어
+    (`config/settings.py:get_doc_button_id()` -> `..._btn_dspslGdsSpcfc2`) 어느 물건의
+    페이지에서 눌러도 **그 물건의 문서**가 나오기 때문이다. 실측으로도 확인했다:
+    파일이 있는 다중물건 사건 22건에서 서로 다른 물건이 같은 바이트를 가진 경우 0건.
+
+    그런데 **물건 사진에는 버튼이 없다.** 상세페이지에 이미 그려져 있는 캐러셀을 읽는
+    방식이라, 잘못된 물건의 페이지에 있으면 그대로 잘못된 사진을 저장한다.
+    (2026-08-17 실측: 2025타경311은 물건 1과 2의 사진이 실제로 동일했다 — 같은 건물이라
+     법원이 같은 전경도/위치도를 준다. 즉 **이번 표본에서는 결과가 우연히 같았다.**
+     우연에 기대지 않도록 물건번호를 넘길 수 있게 한다.)
+
+    물건번호가 일치하는 행을 우선 고르고, 없으면 종전처럼 사건번호만으로 고른다
+    (목록의 물건번호 표기가 다른 경우에 수집을 아예 못 하게 만들지 않기 위해서다).
 
     주의: 이 사이트(WebSquare)는 court_code+case_no를 URL 파라미터로 넘겨
     사건 상세로 직접 이동하는 방식을 지원하지 않는다 (Step 2 DOM 분석에서 확인된
@@ -288,7 +308,7 @@ def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str) -
         return False
 
     list_items = collect_list_items(driver, MAX_ITEMS)
-    target = None
+    matches = []
     for item in list_items:
         # 2026-08-15 Sprint 121: `case_no in item["case_no"]`(부분 문자열 포함)이던
         # 것을 정확 비교로 고쳤다(crawler/resume.py:case_no_matches_list_entry 참고 —
@@ -298,8 +318,21 @@ def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str) -
         # 같은 무관한 항목에 먼저 걸려 타임아웃 후 실패하므로 그 사건의 문서 수집이
         # 재시도해도 계속 실패했다.
         if case_no_matches_list_entry(case_no, item["case_no"]):
-            target = item
-            break
+            matches.append(item)
+
+    target = None
+    if item_no is not None and matches:
+        # 목록의 물건번호(`collect_list_items()`의 `obj_no` = 행의 3번째 칸)와 정확 비교.
+        want = str(item_no).strip()
+        target = next((m for m in matches if (m.get("obj_no") or "").strip() == want), None)
+        if target is None:
+            # 못 찾으면 종전 동작(첫 일치)으로 떨어진다. 다만 **조용히** 떨어지지는
+            # 않는다 — 사진처럼 물건별로 달라야 하는 자산이 엉뚱한 물건 것으로
+            # 저장될 수 있는 상황이므로 흔적을 남긴다.
+            logger.warning("[%s] %s 물건 %s 행을 목록에서 못 찾았다(후보 %d개) - "
+                           "첫 일치 항목으로 진행한다", court.name, case_no, want, len(matches))
+    if target is None and matches:
+        target = matches[0]
 
     if not target or target["dtl_idx"] is None:
         logger.warning("[%s] 사건 매칭 실패: %s", court.name, case_no)

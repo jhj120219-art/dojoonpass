@@ -4,9 +4,19 @@ import logging
 from datetime import datetime
 from typing import List, Dict
 from models.auction_item import AuctionItem
-# normalizer.py의 SIDO_PATTERNS와 이 모듈의 (구)SIDO_MAP은 완전히 동일한 내용의 별도
-# 정의였다(Duplicate Code) — 한쪽만 남기고 재사용한다. 값/동작은 그대로 유지.
-from normalizer.normalizer import SIDO_PATTERNS as SIDO_MAP
+# 시도(sido) 데이터 중복 제거 이력 — 2026-08-17 Sprint 167에 import까지 정리했다.
+#
+# 원래 이 파일에는 `SIDO_MAP`이라는, `normalizer.py:SIDO_PATTERNS`와 **바이트 단위로
+# 동일한** 별도 정의가 있었다(Duplicate Code). 먼저 그것을 지우고
+# `from normalizer.normalizer import SIDO_PATTERNS as SIDO_MAP` 으로 바꿨다.
+#
+# 그 뒤 Sprint 78이 아래 `extract_sido`까지 normalizer 것을 쓰도록 바꾸면서, **그 데이터를
+# 직접 읽던 이 파일의 함수가 사라졌다.** 그래서 별칭 import만 남고 쓰는 곳은 0곳이 됐다
+# (2026-08-17 전수 확인: 이 파일 주석 2곳 외에 참조 없음, 다른 모듈의 재수출 사용도 없음).
+# 재노출 의도였다면 아래 `extract_sido`처럼 `# noqa: F401`이 붙었을 텐데 그것도 없었다.
+#
+# 데이터는 `normalizer.SIDO_PATTERNS` 한 곳에만 있고, 이 파일은 그것을 해석하는
+# `extract_sido()`만 가져다 쓴다. 필요해지면 그때 다시 import하면 된다.
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +41,7 @@ PRICE_TOLERANCE = 1000
 # extract_sido는 normalizer의 것을 그대로 쓴다 (2026-08-13 Sprint 78).
 #
 # 예전에는 이 파일에 **바이트 단위로 동일한 복사본**이 따로 있었다. 위 SIDO_MAP 주석이
-# "한쪽만 남기고 재사용한다"며 데이터(SIDO_PATTERNS)는 이미 합쳐 뒀는데, **그 데이터를
+# 위 중복 제거 이력 주석대로 데이터(SIDO_PATTERNS)는 이미 합쳐 뒀는데, **그 데이터를
 # 해석하는 함수는 합쳐지지 않은 채 남아 있었다.**
 #
 # 같은 판정을 하는 함수가 두 벌이면 한쪽만 고쳐질 수 있다. 실제로 Sprint 78에

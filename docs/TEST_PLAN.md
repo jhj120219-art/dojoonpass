@@ -32,6 +32,26 @@ API 서버 내린 뒤 28/28 PASS (2회 연속 확인)
 증상이 **매번 다른 파일에서 나기 때문에** 원인을 코드에서 찾게 되기 쉽다. 순서는
 "프런트 계약 테스트(서버 필요) -> 서버 종료 -> Python 회귀"가 안전하다.
 
+**API 서버를 재시작해도 응답이 안 바뀌면 고아 reloader 자식을 의심한다** (2026-08-17 Sprint 145 실측).
+`python api_server.py`는 `uvicorn.run(..., reload=True)`라 `multiprocessing.spawn` 자식을 만든다.
+부모만 죽이면 **자식이 살아남아 8000 포트를 계속 들고 옛 코드로 응답한다.** 이번 세션에서
+그런 고아가 4개까지 쌓였고, 코드를 고쳐도 반영되지 않아 원인을 한참 헤맸다.
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000 -State Listen   # OwningProcess 가 <gone> 이면 고아
+Get-Process python | ForEach-Object { taskkill /PID $_.Id /T /F }   # 트리째 종료
+```
+
+함정이 둘이다 — (a) 자식의 명령줄은 `multiprocessing.spawn`이라 `*api_server*`/`*uvicorn*`
+필터에 **걸리지 않는다**, (b) `netstat`에는 LISTENING으로 보이는데 프로세스는 이미 없다.
+검증용으로는 `python -m uvicorn api_server:app --port <다른포트>`(reload 없음)로 띄우면
+이 문제를 통째로 피할 수 있다.
+
+**프런트 변경은 반드시 실제로 렌더해 본다** (2026-08-17 Sprint 145).
+`tsc` / `eslint` / `next build`가 **셋 다 통과하는데 화면이 죽는** 결함이 있다 —
+서버 컴포넌트에 이벤트 핸들러를 넘기면(`<img onError={...}>`) 런타임에만 터진다
+(`Event handlers cannot be passed to Client Component props`). 정적 게이트만 믿으면 놓친다.
+
 **`npm run build` 직후 `npm run dev`를 띄우면 첫 화면이 500이 난다** (2026-08-13 Sprint 79 확인).
 production 빌드 산출물과 dev 서버가 같은 `.next`를 공유해 충돌한다. 이것도 제품 결함이 아니다 —
 `.next`를 지우고 dev를 다시 띄우면 정상이다. **프런트 계약 테스트를 돌리기 전에는 build를
@@ -201,6 +221,7 @@ python test_crawler_parsing.py      # 크롤러 파싱 로직 순수 함수(Sele
 python test_rights_data_load.py     # 권리분석 데이터 적재 로직
 python test_false_success.py        # 0바이트/orphan 문서가 "성공"으로 보이지 않는지 전수(Sprint 98 계열과 연결)
 python test_doc_worker_recovery.py  # doc_worker.py 드라이버 크래시/재시작 복구(Sprint 137 신설) — 재시작 자체가 실패하면 남은 큐를 갉아먹지 않고 이번 실행을 중단하는지 검증
+python test_asset_pipeline.py       # 물건 사진 + 문서 실체(doc_raw) 전 계층(Sprint 144 신설, Sprint 145에 24그룹) — alt 파싱/매직 판정/경로/수집/DB 기록/API 계약/경로탈출/프런트 계약. selenium 없이 가짜 드라이버로 실행
 ```
 
 **2026-08-10(Sprint 45) 주의 — `test_search.py`의 3건 실패는 회귀가 아니다**:
@@ -335,7 +356,15 @@ npm run build       # Next.js 빌드 — 통과해야 함
 
 이전 버전 문서가 "완료"로 표시했던 항목의 실제 상태다.
 
-- **이미지**: 물건 사진/이미지 기능이 코드에 존재하지 않는다
+- ~~**이미지**: 물건 사진/이미지 기능이 코드에 존재하지 않는다~~ →
+  **2026-08-17 Sprint 144에 구현됨.** 이 서술은 그때까지 정확했다(수집·저장·API·화면
+  어디에도 없었다). 지금은 `crawler/image_assets.py`(순수 규칙) +
+  `crawler/image_crawler.py`(수집) + `auction_image` 테이블(migration 020) +
+  `api/v1/images.py`(서빙) + 상세페이지 갤러리까지 연결돼 있고,
+  **`test_asset_pipeline.py`(20개 그룹)가 회귀를 막는다.**
+  실 법원 E2E 검증: 9물건 45장 수집 성공(2026-08-17). 자세한 내용은
+  `docs/SPRINT144_ASSET_PIPELINE.md` 참고.
+  아직 없는 것은 **서버 측 썸네일 생성**뿐이다(Pillow 선언이 승인 사항 — 같은 문서 §9).
 - **권리분석**: `src/app/properties/[id]/rightsAnalysis.ts`는 REGISTRY 소스를
   `available:false`로 하드코딩한 스텁이다. 등기부 파싱 테이블/파이프라인 자체가 없다
   (`docs/roadmap.md` "In Progress > Frontend" 참고)
@@ -1474,3 +1503,161 @@ payments 연결       2종 전부 검출
 ```
 
 결론은 모두 그대로였다. 다만 **그것을 확인하기 전까지는 알 수 없었다**는 것이 요점이다.
+
+---
+
+## Sprint 145 추가 (2026-08-17)
+
+### `test_asset_pipeline.py` §15-B / §15-C — 큐 매각기일 정정 (신규 7검사)
+
+BUGS #101 회귀. `document_queue.auction_date`는 06:00 적재 시점의 사본이라 실제
+기일과 어긋날 수 있고, 그 상태로 종결하면 **진행 중 물건이 영구 미수집**이 된다.
+
+| # | 검사 | 잡아내는 회귀 |
+|---|---|---|
+| 15-B-1 | 권위 있는 값(`auction_item`)을 돌려준다 | 사본을 계속 신뢰하는 회귀 |
+| 15-B-2 | 큐 행도 함께 정정된다 | 판단만 고치고 데이터를 남겨 두는 회귀(우선순위가 계속 틀린다) |
+| 15-B-3 | `status`는 건드리지 않는다 | 종결 행을 임의로 되살리는 회귀(재수집은 제품 판단) |
+| 15-B-4 | 실제로 지난 기일은 그대로 과거 | **과잉 구제** — 만료 사건까지 되살려 크롤을 낭비하는 회귀 |
+| 15-B-5 | 매칭되는 물건이 없으면 큐 값 유지 | 조인 실패를 "미래"로 오판하는 회귀 |
+| 15-C-1 | `doc_worker`가 import한다 | 함수만 만들고 배선하지 않는 회귀 |
+| 15-C-2 | 종결 호출보다 **먼저** 호출된다 | 순서가 뒤집혀 검사가 무의미해지는 회귀 |
+
+Mutation 검증: `doc_worker`에서 reconcile 호출을 제거하면 15-C-2가 `rec=-1`로 실패한다.
+
+### `test_pipeline_integrity.py` §11 — 예약 작업 등록 여부 보고 (보고 전용)
+
+기존 신선도 검사는 "검색 0건"만 실패로 두고 남은 기간을 크게 출력한다(의도된 설계 —
+코드로 고칠 수 없는 것을 실패시키면 곧 무시하게 된다). 그 경고문이 *"확인 순서:
+스케줄러 등록 여부 -> logs/daily_run.log -> run_daily.bat"* 라고 안내하면서 정작
+등록 여부를 확인해 주지 않았다.
+
+`schtasks /query`로 조회해 **보고만** 한다. 등록 0건이면 조치 명령까지 함께 출력한다.
+**단언하지 않는다** — 등록은 사용자 환경 변경이고(Sprint 112가 같은 이유로 SKIP),
+로그 파일 존재 보고와 같은 취급이다. 비-Windows/권한 없음이면 "확인 불가"로 넘어간다.
+
+> 이 두 가지가 함께 있어야 진단이 닫힌다: 신선도 검사는 **언제 망가지는지**를,
+> 등록 보고는 **왜 안 채워지는지**를 답한다.
+
+---
+
+## test_schema_hygiene.py §6-B — 추적 파일이 미추적 파일을 import하지 않는가 (2026-08-17 Sprint 148 신설)
+
+기존 §6은 `storage/`만 본다. Sprint 148 릴리스 감사에서 그 한계가 드러났다 —
+신규 실동작 모듈 14개가 미추적이었는데 §6이 잡은 것은 마이그레이션 020 하나뿐이었다.
+나머지 13개는 **어떤 테스트도 잡지 못했다**(BUGS #105).
+
+§6-B가 고정하는 불변식은 "새 파일이 전부 추적된다"가 아니다. 새 문서나 새 테스트가
+잠시 미추적인 것은 무해하므로 그것까지 실패로 만들면 잡음만 는다. 위험한 것은
+**추적 중인 파일이 미추적 파일을 import**하는 간선이다. 그 상태에서 `git commit -a`로
+커밋하면 작업트리에서는 전 테스트가 통과하는데 커밋된 트리는 부팅조차 못 한다.
+
+검사 방식 — 하드코딩된 파일 목록이 없다:
+
+```
+git ls-files                          -> 추적 집합
+git ls-files --others --exclude-standard -> 미추적이지만 무시 대상도 아닌 집합
+  (=.gitignore 대상인 산출물/step*.py 등은 애초에 후보에서 빠진다)
+
+미추적 .py  -> `from a.b import` / `import a.b` / `from a import b` 패턴 생성
+미추적 .tsx -> `import X from './Base'` 패턴 생성
+추적 중인 .py/.ts/.tsx 전부를 훑어 간선을 찾는다
+```
+
+2026-08-17 실행 결과 — 미추적 소스 10개를 대상으로 추적 파일 143개를 검사해 간선 4개
+검출(오탐 0, 4개 전부 실제 import 문임을 육안 확인):
+
+```
+api/v1/documents.py:6            -> api/http_cache.py
+api_server.py:32                 -> api/v1/images.py
+crawler/doc_crawler.py:619       -> crawler/image_crawler.py
+src/app/search/ResultList.tsx:5  -> src/app/search/ResultThumbnail.tsx
+```
+
+**이 검사는 현재 의도적으로 FAIL이다.** Commit/add 금지가 상시 제약이라 미추적
+상태 자체를 해소할 수 없기 때문이다. 사용자가 `git add -A` 후 커밋하면 테스트 수정
+없이 PASS로 돌아온다. `git commit -a`는 쓰면 안 된다 — 그것이 바로 이 검사가 막는 상황이다.
+
+실패 시 출력이 간선 목록과 해소 방법을 그대로 찍으므로 별도 조사가 필요 없다.
+
+---
+
+## Sprint 148~157에 신설된 회귀 (2026-08-17)
+
+이 세션에서 찾은 결함마다 회귀를 남겼다. **모두 "결함을 일부러 되돌리면 FAIL하는지"를
+확인**했다 — 통과하는 검사가 실제로 무언가를 지키고 있는지는 그렇게만 알 수 있다.
+
+### test_auction_identity.py — `document_queue` 쓰기 SQL이 법원으로 좁혀지는가
+
+BUGS #107. 사건번호는 법원마다 독립 채번이라 전국적으로 유일하지 않다(실측: case_no
+3개가 두 법원에 걸쳐 있고 물건 22건 연루). 같은 계열이 #18/#14/#103으로 세 번
+반복됐는데 매번 그 인스턴스만 고쳐서 네 번째가 남아 있었다.
+
+git이 추적하는 프로덕션 `.py`에서 `UPDATE/DELETE document_queue` 문장을 찾아,
+`case_no`로 좁히면서 법원이 없으면 실패시킨다. 검사 대상은 목록이 아니라 **전수**다.
+
+오탐을 먼저 없앴다 — 고정 길이 창으로 SQL을 읽으면 `storage/database.py`의
+`WHERE id = ?`(정확한 문장)가 7줄 뒤 `logger.info`의 `case_no` 때문에 위반으로 잡힌다.
+파이썬 문자열 리터럴만 정확히 읽는 `_sql_literal_at()`으로 해결했다(인접 리터럴 연결 포함).
+
+### test_api_regression.py §16 — 문서 `doc_type` 대소문자 무관
+
+BUGS #108. `document_status`는 대문자, `document_queue`는 소문자로 같은 개념을 저장한다.
+API가 대문자만 받아서 큐 쪽 값으로 URL을 만들면 400이 났고, 그 400이 오타와 구별되지
+않았다. 소문자/혼합 대소문자가 대문자와 **같은 상태·같은 본문**을 주고, 모르는 종류는
+**여전히 400**이며, HEAD도 같은 규칙을 따르는 것을 고정한다.
+
+### test_doc_worker_recovery.py 6·7·8 — 자원 수명
+
+- **6. 드라이버 기동 실패도 락을 해제한다** (BUGS #109). `build_download_driver()`가
+  락 해제를 보장하는 두 구간 **사이**에 있어서 기동 실패 시 락이 남았다. `LOCK_STALE_HOURS=5`
+  덕에 영구 정지는 아니지만, 하필 곧바로 재시도해야 할 5시간 동안 후속 실행이 전부
+  "이미 실행 중"으로 건너뛰어지고 그것이 **종료코드 0(성공)으로 보고**된다.
+- **7. 실행 창 밖에서는 브라우저를 띄우지 않는다**. 시간 검사가 `while` 조건에만 있어
+  창 밖에서도 Selenium을 띄운 뒤 첫 조건에서 빠져나왔다.
+- **8. 드라이버 설정 실패가 브라우저를 고아로 남기지 않는다** (BUGS #110).
+  `webdriver.Chrome(...)`으로 프로세스를 띄운 **뒤** `set_page_load_timeout()`이 실패하면
+  호출자는 `driver` 참조조차 못 받아 `quit()`을 부를 수 없다. `crawler/doc_crawler.py`는
+  커버리지 0%지만 이 함수만은 selenium 진입점을 갈아끼워 실브라우저 없이 검증한다.
+
+### test_doc_path_safety.py 7(확장)·8 — 경로 규칙과 디스크 부작용
+
+- **8. 읽기 전용 조회가 디렉터리를 만들지 않는다** (BUGS #111). `get_doc_dir()`은
+  `os.makedirs()`를 부르는데 `repair_empty_status_capture.py`가 **읽기 전용 전수 스캔**에서
+  그것을 물건마다 불렀다. 빈 물건 디렉터리 1,674 + 파일 있는 202 = 정확히 1,876
+  (= `auction_item` 행수)이 그 증거였다. **대조군으로 `get_doc_dir()`은 실제로 만든다는
+  것까지 확인**해, 두 함수가 정말 다르다는 것을 검사 자신이 증명하게 했다.
+- **7(확장)**. 규칙 사본 검사 대상에 `repair_document_status.py`를 추가했다(BUGS #112).
+  그 파일은 `/`만 치환하는 옛 규칙을 갖고 있으면서 docstring은 "동일한 규칙"이라
+  주장하고 있었다. 추가하자 곧바로 오탐이 났다 — **왜 고쳤는지 보이려고 옛 코드를 주석에
+  인용**했는데 검사가 그 인용문을 잡았다. 줄 번호는 유지한 채 주석만 비우도록 고쳤다.
+
+### test_asset_pipeline.py 1-B·12-B·16-C
+
+- **1-B. 형식 판정/크기 읽기 경계값** (36검사). 커버리지 실측에서
+  `crawler/image_assets.py`가 72%였고 **webp 크기 읽기(VP8/VP8L/VP8X)는 통째로 0%**였다.
+  법원이 선언 MIME으로 거짓말하므로(image/png인데 실제로는 JPEG/GIF) 매직 바이트 판정의
+  경계값이 중요하다. 72% -> 86%.
+- **12-B. doc_raw가 거짓 성공을 기록하지 않는다** (7검사). 파일 없음 / 0바이트 /
+  빈 목록 / 사진은 제외 — **대조군(실물이 있으면 1행 + 크기 일치)을 함께** 둬서 네 검사가
+  "항상 0"이어도 통과하는 것을 막는다.
+- **16-C. 상세 응답이 N+1이 아니다**. 검색에는 쿼리 수 가드가 있었지만 상세에는 없었다.
+  사진 1장과 8장으로 각각 호출해 쿼리 수가 같은지 본다(사진 수가 실제로 다른지도 함께
+  검사). **결과 본문은 완전히 같고 쿼리 수만 늘어나므로 결과 기반 검사로는 절대 잡히지
+  않는다** — BUGS #104에서 겪은 함정과 같은 계열이다.
+
+### 커버리지 실측 (2026-08-17, coverage.py, 33개 테스트)
+
+```
+TOTAL 4,001문장 중 739 미커버  ->  82%
+api/v1/*            대부분 95~100%   (item/documents/images/doc_stats/registry 등 100%)
+api/http_cache.py   98%
+storage/database.py 88%
+crawler/image_assets.py 86%   (이 세션에 72%에서 올림)
+crawler/*(selenium)  24~45%   실브라우저 없이는 올릴 수 없다
+filter/scoring_engine.py, report_generator.py  0%  ← 의도적(docs/CLAUDE.md)
+```
+
+**모듈명 grep으로 커버리지를 판정하지 말 것.** Sprint 148이 그렇게 해서
+`api/http_cache.py`(실제 98%)와 `api/v1/doc_stats.py`(실제 100%)를 "미커버"로 분류했다.
+엔드포인트로 동작을 검증하는 테스트는 모듈 이름을 쓰지 않는다.

@@ -37,7 +37,16 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from storage.database import get_connection
-from crawler.doc_paths import get_doc_dir, status_overlay_has_data
+# ★ `get_doc_dir()`이 아니라 `_doc_dir_path()`를 쓴다 (2026-08-17 Sprint 153, BUGS #111).
+#
+# `get_doc_dir()`은 `os.makedirs()`를 부른다. 아래 `find_empty_captures()`는 **읽기 전용
+# 스캔**인데 물건 1,876건 전부에 대해 그 함수를 불렀다 — 즉 "이 문서 있어요?"라고 묻기만
+# 해도 디렉터리가 생겼다. 실측상 `documents/` 아래 빈 물건 디렉터리가 1,674개이고,
+# 여기에 파일이 있는 202개를 더하면 정확히 1,876 = `auction_item` 행수다.
+#
+# 이 저장소는 같은 사고를 이미 겪고 `_doc_dir_path()`(계산만)와 `get_doc_dir()`(생성까지)로
+# 분리해 `doc_exists()`를 고쳤다(2026-08-14). 그런데 이 스크립트에만 적용이 빠져 있었다.
+from crawler.doc_paths import _doc_dir_path, status_overlay_has_data
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 QUARANTINE_ROOT = os.path.join(PROJECT_ROOT, "documents_quarantine")
@@ -56,7 +65,7 @@ def find_empty_captures(conn):
 
     empty, ok = [], 0
     for r in rows:
-        d = get_doc_dir(r["court_name"], r["case_no"], r["item_no"])
+        d = _doc_dir_path(r["court_name"], r["case_no"], r["item_no"])
         path = os.path.join(d, "status.html")
         if not os.path.exists(path):
             continue
@@ -117,10 +126,19 @@ def repair(apply: bool) -> int:
                 "UPDATE document_status SET status='COLLECTING' "
                 "WHERE item_id=? AND doc_type='STATUS'", (e["item_id"],)).rowcount
             # 큐도 다시 집도록 되돌린다(재시도 횟수도 초기화 — 실패가 아니라 잘못 저장된 것이므로).
+            #
+            # 식별키에 반드시 법원을 넣는다. 사건번호는 법원마다 독립적으로 매겨져서
+            # 전국적으로 유일하지 않다 — 실측상 case_no 3개가 서로 다른 두 법원에 걸쳐
+            # 있고 물건 22건이 연루된다(2026-08-17). 법원을 빼면 A법원 물건을 고치면서
+            # 같은 사건번호를 가진 **B법원의 정상 수집분까지 pending으로 되돌려** 멀쩡한
+            # 문서를 다시 받게 만든다. `document_queue.court_code`와
+            # `auction_item.court_name`은 같은 60종 어휘를 쓴다(차집합 0, 실측 확인).
+            # 같은 계열의 사고가 BUGS #18 / #14 / #103으로 반복됐다.
             requeued += conn.execute(
                 "UPDATE document_queue SET status='pending', retry_count=0, last_attempt_at=NULL "
-                "WHERE case_no=? AND item_no=? AND doc_type='status' AND status='done'",
-                (e["case_no"], e["item_no"])).rowcount
+                "WHERE court_code=? AND case_no=? AND item_no=? "
+                "AND doc_type='status' AND status='done'",
+                (e["court_name"], e["case_no"], e["item_no"])).rowcount
         conn.commit()
 
         print("\n적용 완료")

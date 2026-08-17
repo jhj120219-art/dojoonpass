@@ -469,14 +469,221 @@ def test_get_stats_contract():
         (v >= 0) for v in stats.values() if isinstance(v, (int, float))), stats)
 
 
+# ---------------------------------------------------------------------------
+# document_queue 를 쓰는 SQL은 반드시 법원으로 좁혀야 한다 (2026-08-17 Sprint 148 신설)
+#
+# 사건번호는 법원마다 독립적으로 매겨진다. 전국적으로 유일하지 않으므로 큐의 식별키는
+# (court_code, case_no, item_no) 셋 전부다. 하나라도 빠지면 다른 법원의 행을 건드린다.
+#
+# 이 계열의 사고가 반복됐다 — BUGS #18, #14, #103, 그리고 Sprint 148에서 발견한
+# `repair_empty_status_capture.py`의 재큐잉 UPDATE(법원 누락으로 다른 법원의 정상
+# 수집분까지 pending으로 되돌림)까지 네 번째다. 개별 수정만으로는 다섯 번째가 또 나온다.
+#
+# 실측 근거(2026-08-17): case_no 3개가 서로 다른 두 법원에 걸쳐 있고 물건 22건이 연루된다.
+# 0.2%라 눈에 잘 안 띄지만 0이 아니므로 "실무상 유일하다"는 가정은 성립하지 않는다.
+#
+# 검사 대상은 **git이 추적하는 프로덕션 .py**로 한정한다. `check_*.py`/`step*.py` 같은
+# 일회성 조사 스크립트는 gitignore 대상이라 애초에 빠지고, 테스트 자신은 합성 case_no를
+# 쓰므로 제외한다.
+# ---------------------------------------------------------------------------
+def _sql_literal_at(src, pos):
+    """`pos`가 들어 있는 파이썬 문자열 리터럴의 내용을 돌려준다.
+
+    인접한 리터럴이 이어 붙어 있으면(이 저장소에서 긴 SQL을 쓰는 방식) 함께 잇는다.
+    리터럴 밖으로는 절대 넘어가지 않으므로, 뒤따르는 파라미터 튜플이나 다음 문장이
+    검사 대상에 섞이지 않는다.
+    """
+    import re as _re
+
+    i = pos
+    while i > 0 and src[i - 1] not in "\"'":
+        i -= 1
+    if i == 0:
+        return src[pos:pos + 200]
+    q = src[i - 1]
+    if i >= 3 and src[i - 3:i] == q * 3:          # 삼중 따옴표
+        j = src.find(q * 3, pos)
+        return src[pos:j if j > 0 else pos + 500]
+
+    parts = []
+    k = pos
+    for _ in range(20):                            # 인접 연결은 현실적으로 몇 개뿐이다
+        j = k
+        while j < len(src) and src[j] != q:
+            if src[j] == "\\":
+                j += 1
+            j += 1
+        parts.append(src[k:j])
+        nxt = _re.match(r"\s*([\"'])", src[j + 1:j + 120])
+        if not nxt:
+            break
+        q = nxt.group(1)
+        k = j + 1 + nxt.end()
+    return " ".join(parts)
+
+
+def test_document_queue_writes_are_court_scoped():
+    print("\n--- document_queue 쓰기 SQL이 법원으로 좁혀지는가 ---")
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    # ★ 2026-08-17 Sprint 178: **미추적 파일도 검사한다.**
+    #
+    # 예전에는 `git ls-files`만 썼다. 그런데 이 저장소는 지금 실동작 모듈 여러 개가
+    # 아직 add되지 않은 상태이고(`api/v1/images.py` / `api/http_cache.py` /
+    # `crawler/image_crawler.py` 등, 프로덕션이 실제로 import한다), 그것들이 검사에서
+    # 통째로 빠져 있었다. 즉 **"검사했다"고 말하면서 실동작 코드를 건너뛰고 있었다.**
+    #
+    # `--exclude-standard`를 함께 주므로 .gitignore 대상(산출물, step*.py 등)은 여전히
+    # 빠진다. `test_schema_hygiene.py` §6-B가 쓰는 방식과 같다.
+    def _git(*args):
+        try:
+            r = subprocess.run(["git"] + list(args), cwd=root,
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        return [l.strip().replace("\\", "/") for l in r.stdout.splitlines() if l.strip()]
+
+    tracked = _git("ls-files", "*.py")
+    untracked = _git("ls-files", "--others", "--exclude-standard", "*.py")
+    if tracked is None or untracked is None:
+        print("[SKIP] git을 실행할 수 없거나 저장소가 아니다")
+        return
+
+    files = sorted(set(tracked) | set(untracked))
+    files = [f for f in files if not os.path.basename(f).startswith("test_")]
+
+    # `UPDATE document_queue` / `DELETE FROM document_queue` 로 시작하는 문장을 잡는다.
+    # 인접 문자열 리터럴로 쪼개져 있어도 원본 소스를 그대로 읽으므로 이어서 보인다.
+    START = re.compile(r'(?is)\b(UPDATE\s+document_queue|DELETE\s+FROM\s+document_queue)\b')
+
+    violations = []
+    scanned = 0
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            # utf-8-sig로 읽는다 — 이 저장소의 소스 68개에 UTF-8 BOM이 있고, `utf-8`로
+            # 읽으면 BOM이 U+FEFF로 남는다. 지금은 정규식 기반이라 깨지지 않지만,
+            # 나중에 이 검사를 AST로 바꾸면 `ast.parse()`가 SyntaxError를 내고 **검사한
+            # 척하면서 절반을 빼먹는다**(2026-08-17 Sprint 167에 내 감사 스크립트가 실제로
+            # 프로덕션 77개 중 40개를 그렇게 건너뛰고 있었다). 저장소 규약은 utf-8-sig다
+            # (`test_console_encoding.py` / `test_crawl_exit_code.py` 등 전부 그렇다).
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        for m in START.finditer(src):
+            scanned += 1
+            # SQL 문장 **자체**만 본다. 고정 길이 창으로 자르면 뒤따르는 파라미터나
+            # logger 호출까지 딸려 들어와 오탐이 난다(실제로 `storage/database.py`의
+            # `WHERE id = ?` 문장이 7줄 뒤 logger의 case_no 때문에 위반으로 잡혔다).
+            window = _sql_literal_at(src, m.start())
+            if "case_no" not in window:
+                continue          # id 등 다른 키로 좁힌 문장은 대상이 아니다
+            if re.search(r"court_code|court_name", window):
+                continue          # 법원이 들어 있으면 정상
+            line = src[:m.start()].count("\n") + 1
+            violations.append("%s:%d  %s" % (rel, line, " ".join(window.split())[:90]))
+
+    if violations:
+        print("   ★ 법원 없이 case_no로 document_queue를 쓰는 곳:")
+        for v in violations:
+            print("      %s" % v)
+        print("   사건번호는 법원마다 독립이다. court_code를 WHERE에 추가하라")
+    check("document_queue 쓰기 SQL에 법원이 빠진 곳", sorted(violations), [])
+    print("   프로덕션 .py %d개(추적+미추적)에서 document_queue 쓰기 문장 %d개 검사"
+          % (len(files), scanned))
+
+
+
+def test_migrate_reports_actual_changes():
+    """법원 값이 바뀌면 `migrate_execute` 가 **무엇이 바뀌었는지** 집계하는가 (Sprint 185).
+
+    ## 왜 필요한가
+
+    `migrate_execute` 의 UPDATE 는 값이 같아도 매번 실행된다. 그래서 `updated_at` 은
+    전 행이 같은 값이 되고(2026-08-17 실측: auction_item 1,876행 100%가 2026-08-12),
+    물건 단위 변경 이력 테이블도 없다. 결과적으로 **"오늘 어떤 물건의 기일/최저가/상태가
+    바뀌었나"를 아무도 답할 수 없었다.**
+
+    법원 자료는 절차 진행에 따라 계속 바뀐다 — 유찰되면 기일이 다시 잡히고 최저가가
+    내려간다. 그 사실을 관측하지 못하면 재수집도 알림도 숫자로 정할 수 없다.
+
+    Sprint 185가 **UPDATE 동작은 그대로 두고 집계만** 추가했다. 이 검사는 그 관측이
+    (a) 실제 변경을 잡고 (b) 변경이 없을 때 0을 보고하는지 고정한다. 둘 다 필요하다 —
+    항상 0이면 관측이 죽은 것이고, 항상 N이면 "매번 다 바뀐다"는 잘못된 신호다.
+
+    실제 auction.db 는 쓰지 않는다 — 임시 사본에서만 돌린다.
+    """
+    print("\n--- 8. migrate_execute 가 실제 변경을 관측하는가 (Sprint 185) ---")
+    import sqlite3
+    import importlib
+    import migrate_execute
+
+    real_path = dbmod.DB_PATH
+    tmp_dir = tempfile.mkdtemp(prefix="kokchal_chg_")
+    tmp_db = os.path.join(tmp_dir, "scratch.db")
+    shutil.copy2(real_path, tmp_db)
+    dbmod.DB_PATH = tmp_db
+    try:
+        importlib.reload(migrate_execute)
+
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        target = conn.execute(
+            "SELECT court_code, case_no, item_no, auction_date, minimum_bid_price, status"
+            " FROM auction LIMIT 1").fetchone()
+        _check_true("대조 대상 물건을 찾았다", target is not None, None)
+        if target is None:
+            return
+
+        # (1) 아무것도 바꾸지 않고 한 번 돌린다 -> 변경 0건이어야 한다.
+        migrate_execute.execute()
+        base = dict(migrate_execute.LAST_FIELD_CHANGES)
+        check("변경이 없으면 관측도 0건", base, {})
+
+        # (2) 크롤러 원본(auction)의 값을 바꾼다 = 법원에서 기일/최저가가 움직인 상황.
+        new_date, new_price = "2099-12-31", 12345
+        conn.execute(
+            "UPDATE auction SET auction_date=?, minimum_bid_price=?"
+            " WHERE court_code=? AND case_no=? AND item_no=?",
+            (new_date, new_price, target["court_code"], target["case_no"], target["item_no"]))
+        conn.commit()
+
+        migrate_execute.execute()
+        seen = dict(migrate_execute.LAST_FIELD_CHANGES)
+        check("기일 변경을 잡는다", seen.get("auction_date"), 1)
+        check("최저가 변경을 잡는다", seen.get("minimum_bid_price"), 1)
+        _check_true("바뀌지 않은 필드는 세지 않는다", "appraisal_price" not in seen, seen)
+
+        # (3) 변경이 auction_item 까지 전파됐는가 — 관측만 하고 반영이 안 되면 무의미하다.
+        after = conn.execute("""
+            SELECT ai.auction_date, ai.minimum_bid_price FROM auction_item ai
+            JOIN auction_case ac ON ac.id = ai.case_id
+            WHERE ac.court_code=? AND ai.case_no=? AND ai.item_no=?""",
+            (target["court_code"], target["case_no"], target["item_no"])).fetchone()
+        check("전파: 기일", after["auction_date"], new_date)
+        check("전파: 최저가", int(after["minimum_bid_price"]), new_price)
+        conn.close()
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def run():
     test_real_db_integrity_invariants()
+    test_document_queue_writes_are_court_scoped()
     test_cross_court_upsert_safety()
     test_upsert_partial_failure_isolation()
     test_get_stats_contract()
     test_cross_court_migrate_safety()
     test_migrate_exit_code_contract()
     test_dryrun_predicts_what_execute_does()
+    test_migrate_reports_actual_changes()
 
     print("\n" + "=" * 55)
     if failures:

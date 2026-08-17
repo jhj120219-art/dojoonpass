@@ -251,3 +251,33 @@ ERROR_CODE_DOMAINS = {
     "ITEM": "물건 공통",
     "INTERNAL": "서버 내부 오류",
 }
+
+
+# ---------------------------------------------------------------------------
+# SQLite INTEGER 범위 (2026-08-17 Sprint 144)
+#
+# 왜 필요한가 — 파이썬 int는 무한 정밀도인데 SQLite INTEGER는 64비트다.
+# FastAPI의 `item_id: int` 경로 파라미터는 자릿수를 제한하지 않으므로
+# `/api/v1/item/999999999999999999999` 같은 요청이 그대로 통과해 sqlite3에서
+# `OverflowError: Python int too large to convert to SQLite INTEGER`로 터진다.
+#
+# 실측 2026-08-17 — **인증 없이** 다음 세 공개 엔드포인트가 전부 500을 냈다:
+#     GET /api/v1/item/{item_id}
+#     GET /api/v1/item/{item_id}/documents/{doc_type}
+#     GET /api/v1/item/{item_id}/images/{seq}
+#
+# 데이터가 새지는 않지만 **없는 물건을 물었을 때 404가 아니라 500이 나가고**
+# 서버 로그에 스택 트레이스가 쌓인다(운영 알림을 만드는 순간 노이즈가 된다).
+# 이 저장소가 반복해서 지켜 온 원칙 — "모르는 것에 그럴듯한 답을 지어내지 않되,
+# 실패는 정직한 상태 코드로 말한다" — 에 어긋나는 자리다.
+#
+# 범위를 벗어난 id는 **어떤 행도 될 수 없으므로 404가 정확한 답이다**(422가 아니다:
+# 형식은 올바른 정수이고, 다만 존재할 수 없는 값일 뿐이다. 음수 id가 이미 404인 것과
+# 같은 취급이라 기존 동작과도 일관된다).
+SQLITE_MAX_INT = 2 ** 63 - 1
+SQLITE_MIN_INT = -(2 ** 63)
+
+
+def is_sqlite_int(value: int) -> bool:
+    """SQLite INTEGER로 바인딩할 수 있는 값인가."""
+    return SQLITE_MIN_INT <= value <= SQLITE_MAX_INT

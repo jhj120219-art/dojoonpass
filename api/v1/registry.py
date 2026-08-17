@@ -8,6 +8,7 @@ from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import (
     ErrorCode, RegistryRequestStatus, RegistryCreditReason, SubscriptionStatus,
+    is_sqlite_int,
 )
 from api.v1.registry_credits import log_credit_event
 
@@ -126,6 +127,12 @@ def has_active_subscription(conn, user_id: str) -> bool:
 
 @router.post("/registry-requests")
 def create_registry_request(req: RegistryRequest, user_id: str = Depends(get_current_user)):
+    # SQLite INTEGER 범위 밖의 id는 어떤 물건도 될 수 없다 — 그대로 넘기면 sqlite3이
+    # OverflowError를 던져 **로그인한 사용자가 500을 만들 수 있다**
+    # (2026-08-17 Sprint 154 실측). 아래 "물건 존재 확인"과 같은 결론이므로 404로 끊는다.
+    # get_connection() 앞에 두어 커넥션을 열지 않고 끝낸다.
+    if not is_sqlite_int(req.item_id):
+        raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
     conn = get_connection()
     # 무료횟수 COUNT는 api/v1/payments.py의 OVERAGE_USAGE처럼 "row 하나를 조건부로 잠그는"
     # 방식으로는 막을 수 없는 집계 값이라, 이 커넥션의 트랜잭션을 직접 제어해(BEGIN IMMEDIATE로
@@ -293,6 +300,9 @@ def get_registry_requests(user_id: str = Depends(get_current_user)):
 
 @router.get("/registry-requests/{request_id}")
 def get_registry_request(request_id: int, user_id: str = Depends(get_current_user)):
+    # 범위 밖 id는 어떤 신청도 될 수 없다(OverflowError -> 500 방지, Sprint 154).
+    if not is_sqlite_int(request_id):
+        raise HTTPException(status_code=404, detail="신청을 찾을 수 없습니다")
     conn = get_connection()
     try:
         # LEFT JOIN 이유는 위 목록(`get_registry_requests()`)과 같다 (Sprint 98).
@@ -321,6 +331,10 @@ def get_registry_request(request_id: int, user_id: str = Depends(get_current_use
 
 @router.get("/registry-requests/{request_id}/download")
 def download_registry(request_id: int, user_id: str = Depends(get_current_user)):
+    # 범위 밖 id는 어떤 신청도 될 수 없다(OverflowError -> 500 방지, Sprint 154).
+    # 소유권 확인과 같은 이유로 존재 자체를 노출하지 않는 404를 그대로 쓴다.
+    if not is_sqlite_int(request_id):
+        raise HTTPException(status_code=404, detail="신청을 찾을 수 없습니다")
     conn = get_connection()
     try:
         # 본인 신청만 조회 가능(WHERE user_id=?로 소유권 확인) — 다른 유저의 request_id를

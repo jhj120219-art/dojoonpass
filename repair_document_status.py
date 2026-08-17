@@ -43,11 +43,33 @@ DOC_TYPE_FILES = {
 }
 
 
+# 2026-08-17 Sprint 153 (BUGS #111 계열 전수 검색): 조각 정규화를 **크롤러와 같은 함수**로
+# 맞췄다. 예전에는 여기에 규칙 사본이 있었고, 그 사본은 `/`만 치환했다:
+#
+#     safe_case_no = (case_no or "").replace("/", "_").strip()
+#
+# 크롤러가 쓰는 `sanitize_path_segment()`는 그 사이 **역슬래시도 치환**하고
+# `""`/`"."`/`".."`를 `"_"`로 바꾸도록 바뀌었다(Sprint 145~146). 규칙이 갈라진 채로
+# 두면 사건번호에 역슬래시가 섞였을 때 크롤러는 `a_b`에 쓰고 이 스크립트는 `a\b`를 찾아
+# **같은 문서를 서로 다른 경로로 보게 된다** — 이 저장소가 BUGS #50/#64로 반복해 겪은
+# 어긋남이고, `crawler/doc_paths.py`의 주석이 "규칙이 두 벌이 되면"이라고 경고하는 바로
+# 그것이다. 이 스크립트는 그 판정으로 `document_status`를 READY로 바꾸므로, 어긋나면
+# **화면만 '수집완료'이고 서빙은 404**인 상태를 만든다.
+#
+# 현재 실데이터에 역슬래시는 0건이라 지금 터지는 버그는 아니다. 규칙이 세 벌인 상태를 없앤다.
+# `crawler.doc_paths`는 selenium/DB/fastapi 무의존이라 여기서 import해도 안전하다.
+from crawler.doc_paths import sanitize_path_segment  # noqa: E402
+
+
 def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
-    """api/v1/documents.py:get_doc_dir() 와 동일한 규칙."""
-    safe_case_no = (case_no or "").replace("/", "_").strip()
-    safe_item_no = (item_no or "1").replace("/", "_").strip()
-    return os.path.join(DOCUMENT_ROOT, court_name or "", safe_case_no, safe_item_no)
+    """api/v1/documents.py:get_doc_dir() 와 동일한 규칙(둘 다 크롤러 함수를 그대로 쓴다).
+
+    **디렉터리를 만들지 않는다** — 이 스크립트는 존재 여부만 판정하는 읽기 전용 도구다
+    (BUGS #111: 조회 함수가 `os.makedirs()`를 불러 빈 디렉터리 1,674개가 생긴 사고).
+    """
+    return os.path.join(DOCUMENT_ROOT, court_name or "",
+                        sanitize_path_segment(case_no),
+                        sanitize_path_segment(item_no or "1"))
 
 
 def document_exists(court_name: str, case_no: str, item_no: str, doc_type: str) -> bool:

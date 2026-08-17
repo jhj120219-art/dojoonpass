@@ -319,6 +319,46 @@ def run():
     #     기대값을 옮기라는 신호다. 조용히 어긋난 상태로 남지 않게 한다.
     UNSUPPORTED = ("min_building_area", "max_building_area", "min_land_area", "max_land_area",
                    "special_conditions")
+
+    # ★ 2026-08-17 Sprint 163: 이 목록이 **최신인지 자체를 검사**한다.
+    #
+    # 위 UNSUPPORTED는 하드코딩된 목록이다. 그래서 프런트가 **여섯 번째** 미지원
+    # 파라미터를 추가하면 아래 검사들은 전부 통과하면서 그 하나를 영원히 놓친다.
+    # 같은 한계로 `test_doc_path_safety.py`의 규칙 사본 검사가 파일 하나를 놓쳤고,
+    # 그것이 BUGS #112였다("목록 기반 검사는 목록에서 빠진 것을 못 본다").
+    #
+    # 그래서 목록을 **계산해서 대조**한다.
+    #   프런트가 URL에 싣는 키  -  백엔드가 선언한 쿼리 파라미터  =  무시되는 키
+    # 이 차집합이 UNSUPPORTED와 정확히 같아야 한다. 새 미지원 파라미터가 생기면
+    # 그 순간 이 검사가 실패하며 이름을 그대로 알려 준다.
+    import re as _re
+    _form_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "src", "app", "search", "SearchForm.tsx")
+    if os.path.exists(_form_path):
+        _form = open(_form_path, encoding="utf-8-sig").read()
+        _sent = set(_re.findall(r"\bquery\.([A-Za-z_][A-Za-z0-9_]*)\s*=", _form))
+        _sent |= set(_re.findall(r"\bquery\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]", _form))
+
+        _declared = set()
+        for _p, _ops in app.openapi()["paths"].items():
+            if _p != "/api/v1/search":
+                continue
+            for _op in _ops.values():
+                for _prm in _op.get("parameters", []):
+                    if _prm.get("in") == "query":
+                        _declared.add(_prm["name"])
+
+        check("대조군: 프런트/백엔드 키를 실제로 읽어냈다",
+              len(_sent) > 5 and len(_declared) > 5,
+              "-> 보냄 %d개 / 선언 %d개" % (len(_sent), len(_declared)))
+
+        _ignored = _sent - _declared
+        _new = sorted(_ignored - set(UNSUPPORTED))
+        _gone = sorted(set(UNSUPPORTED) - _ignored)
+        check("새로 조용히 무시되는 파라미터가 없다", not _new,
+              "-> %r 이 UNSUPPORTED에 없다. 프런트가 보내는데 백엔드가 안 읽는다" % (_new,))
+        check("UNSUPPORTED에 죽은 항목이 없다", not _gone,
+              "-> %r 은 더 이상 무시되지 않는다(구현됐거나 프런트가 안 보낸다)" % (_gone,))
     baseline = total(sido="서울")
     check("대조군: 기준 검색이 0건이 아니다(검사가 공허하지 않다)", baseline > 0,
           "-> baseline=%d" % baseline)
@@ -350,6 +390,91 @@ def run():
               "-> 더 이상 보내지 않는 것: %r" % (unmarked,))
     else:
         check("SearchForm.tsx 경로 확인", False, "-> 경로가 바뀌었다: %s" % form_path)
+
+    # -----------------------------------------------------------------------
+    # 숫자 파라미터의 SQLite INTEGER 범위 (2026-08-17 Sprint 146)
+    #
+    # 파이썬 int는 무한 정밀도인데 SQLite INTEGER는 64비트다. 상한 없는 숫자 파라미터를
+    # 그대로 바인딩하면 `OverflowError`로 터진다 — **인증 없이 500을 만들 수 있었다.**
+    #
+    #   실측(수정 전, 전부 토큰 불필요):
+    #     ?min_appraisal=9999999999999999999999999   500
+    #     ?max_appraisal= / ?min_bid_price= / ?max_bid_price=   500
+    #     ?min_fail_count= / ?max_fail_count=                   500
+    #     ?page=9999999999999999999999999                       500
+    #
+    # `size`만 무사했다 — `Query(20, ge=1, le=100)`이 이미 막고 있었기 때문이다.
+    # Sprint 144가 `item_id`에 쓴 `is_sqlite_int()`를 그대로 재사용해 400으로 거절한다
+    # (이 엔드포인트가 sort_by/property_type에 이미 쓰는 규약과 같은 방식).
+    # -----------------------------------------------------------------------
+    HUGE = int("9" * 25)
+    OVERFLOW_PARAMS = ("min_appraisal", "max_appraisal", "min_bid_price",
+                       "max_bid_price", "min_fail_count", "max_fail_count")
+    for name in OVERFLOW_PARAMS:
+        r = client.get("/api/v1/search", params={name: HUGE})
+        check("%s 초대형 값은 400 (500 아님)" % name, r.status_code == 400,
+              "-> %d" % r.status_code)
+
+    r = client.get("/api/v1/search", params={"page": HUGE})
+    check("page 초대형 값은 400 (500 아님)", r.status_code == 400, "-> %d" % r.status_code)
+
+    # page는 값 자체가 아니라 (page-1)*size가 넘친다 — 값만 검사하면 이 케이스를 놓친다.
+    r = client.get("/api/v1/search", params={"page": 2 ** 63 - 1})
+    check("page=2^63-1도 400 (OFFSET 곱셈이 넘친다)", r.status_code == 400,
+          "-> %d" % r.status_code)
+
+    # 과잉 차단 방지 — 경계 안의 값과 정상 사용은 그대로 동작해야 한다.
+    r = client.get("/api/v1/search", params={"min_appraisal": 2 ** 63 - 1})
+    check("min_appraisal=2^63-1은 정상 처리(200)", r.status_code == 200,
+          "-> %d" % r.status_code)
+    for page in (1, 2):
+        r = client.get("/api/v1/search", params={"page": page})
+        check("page=%d 정상 동작" % page, r.status_code == 200, "-> %d" % r.status_code)
+    r = client.get("/api/v1/search", params={"min_appraisal": 100000000})
+    check("정상 범위 필터는 그대로 200", r.status_code == 200, "-> %d" % r.status_code)
+
+    # ------------------------------------------------------------------
+    # sido 정규화가 /search 와 /search/regions 에서 **같아야** 한다
+    #   (2026-08-17 Sprint 156 신설)
+    #
+    # `/search`는 `extract_sido(sido) or sido`로 정규화하는데 `/search/regions`만
+    # 원본을 그대로 WHERE에 넣고 있었다. auction_item.sido는 축약형("서울")으로
+    # 저장되므로 실측상 이렇게 갈렸다:
+    #
+    #     sido=서울        regions 26건   search.total 9
+    #     sido=서울특별시   regions  0건   search.total 9    <- 어긋남
+    #
+    # 화면은 SIDO_LIST가 축약형을 보내 드러나지 않지만, 검색 화면은 **URL 파라미터로
+    # 상태를 복원한다**(`SearchForm.tsx:190` -> 277행에서 그 값으로 regions 조회).
+    # 그래서 `?sido=서울특별시` 링크를 열면 결과는 나오는데 시/군/구만 비어 지역을
+    # 좁힐 수 없다.
+    # ------------------------------------------------------------------
+    print("\n--- sido 표기 정규화: /search 와 /search/regions 일치 ---")
+    base = client.get("/api/v1/search/regions", params={"sido": "서울"})
+    check("regions?sido=서울 200", base.status_code == 200, "-> %d" % base.status_code)
+    canonical = base.json().get("sigungu", []) if base.status_code == 200 else []
+    check("축약형이 시/군/구를 실제로 돌려준다", len(canonical) > 0, "-> %d건" % len(canonical))
+
+    for variant in ("서울특별시", "서울시"):
+        r = client.get("/api/v1/search/regions", params={"sido": variant})
+        got = r.json().get("sigungu", []) if r.status_code == 200 else []
+        check("★ regions?sido=%s 가 축약형과 같은 목록" % variant, got == canonical,
+              "-> %d건 (축약형 %d건)" % (len(got), len(canonical)))
+        # 응답의 sido는 **요청값 그대로** 돌려준다(정규화값이 아니다) — 기존 응답 계약 유지.
+        if r.status_code == 200:
+            check("regions 응답 sido는 요청값 그대로", r.json().get("sido") == variant,
+                  "-> %r" % r.json().get("sido"))
+
+    # /search 쪽도 같은 값을 봐야 한다(두 엔드포인트가 어긋나지 않는다).
+    t_short = client.get("/api/v1/search", params={"sido": "서울"}).json()["total"]
+    t_long = client.get("/api/v1/search", params={"sido": "서울특별시"}).json()["total"]
+    check("★ search 총건수도 표기와 무관하게 같다", t_short == t_long,
+          "-> 축약 %s / 정식 %s" % (t_short, t_long))
+
+    # 알 수 없는 값은 빈 목록(500이 아니다) — fallback이 원본을 그대로 쓰는 경로.
+    r = client.get("/api/v1/search/regions", params={"sido": "없는지역명"})
+    check("알 수 없는 sido -> 200 + 빈 목록", r.status_code == 200 and r.json()["sigungu"] == [],
+          "-> %d %s" % (r.status_code, r.text[:60]))
 
     print()
     if FAILURES:

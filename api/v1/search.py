@@ -6,6 +6,7 @@ from typing import Optional
 from datetime import date
 from storage.database import get_connection
 from api.auth import decode_supabase_jwt
+from api.constants import is_sqlite_int
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
     analyze_intent,
@@ -68,7 +69,17 @@ def _address_detail_condition(address_detail: str):
     # UNKNOWN(건물명/도로명 등) — 기존 방식 그대로 유지
     return "full_address LIKE ?", [f"%{address_detail}%"]
 
-def row_to_item(row, favorited_ids=frozenset()) -> dict:
+def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
+    """검색 결과 1건.
+
+    `thumbnails`는 {item_id: seq} 형태로, **대표 사진이 있는 물건만** 담긴다
+    (2026-08-17 Sprint 145). 기본값 None은 종전 동작과 같다 —
+    `thumbnail_url`이 항상 키로는 존재하되 값이 null이 된다.
+
+    ★ 기존 계약을 깨지 않는다: 키를 **추가만** 했고 기존 필드는 이름·의미 모두 그대로다
+      (`docs/backend.md`의 "GET /api/v1/search 응답 필드명" 불변 규칙).
+    """
+    thumb_seq = (thumbnails or {}).get(row["id"])
     return {
         "id": row["id"],
         "case_no": row["case_no"],
@@ -88,6 +99,11 @@ def row_to_item(row, favorited_ids=frozenset()) -> dict:
         "validation_status": row["validation_status"],
         "crawl_date": row["crawl_date"],
         "is_favorited": row["id"] in favorited_ids,
+        # 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없으면 null이다.
+        # 경로 규칙은 `api/v1/item.py:_image_url()` / `api/v1/images.py` 라우트와 같아야
+        # 한다 — 갈라지면 "목록에는 나오는데 열면 404"가 된다.
+        "thumbnail_url": ("/api/v1/item/%d/images/%d" % (row["id"], thumb_seq)
+                          if thumb_seq is not None else None),
     }
 
 # ---------------------------------------------------------------------------
@@ -211,6 +227,41 @@ def search(
             status_code=400,
             detail=f"물건종류는 최대 {MAX_PROPERTY_TYPES}개까지 선택할 수 있습니다",
         )
+
+    # 2026-08-17 Sprint 146: SQLite INTEGER 범위 밖의 숫자 조건은 **인증 없이 500**을
+    # 만들 수 있었다. 파이썬 int는 무한 정밀도인데 SQLite INTEGER는 64비트라, 그대로
+    # 바인딩하면 `OverflowError: Python int too large to convert to SQLite INTEGER`다.
+    #
+    # 실측(수정 전) — 전부 공개 경로, 토큰 불필요:
+    #
+    #     /api/v1/search?min_appraisal=9999999999999999999999999   500
+    #     ?max_appraisal= / ?min_bid_price= / ?max_bid_price=       500
+    #     ?min_fail_count= / ?max_fail_count=                      500
+    #     ?page=9999999999999999999999999                          500
+    #
+    # `size`만 무사했다 — `Query(20, ge=1, le=100)`이 이미 막고 있었다. 나머지 숫자
+    # 파라미터에는 상한이 없었다.
+    #
+    # Sprint 144가 `item_id`에 대해 같은 계열을 고친 `is_sqlite_int()`를 **그대로 쓴다**
+    # (새 헬퍼를 만들지 않는다). 다만 상태 코드는 다르다 — 거기서는 "존재할 수 없는 id"라
+    # 404가 맞았지만, 여기서는 **검색 조건 값**이므로 이 엔드포인트가 이미 쓰고 있는
+    # 400(사유 포함)과 같은 방식으로 거절한다(위 sort_by / property_type과 동일한 규약).
+    for _name, _value in (
+        ("min_appraisal", min_appraisal), ("max_appraisal", max_appraisal),
+        ("min_bid_price", min_bid_price), ("max_bid_price", max_bid_price),
+        ("min_fail_count", min_fail_count), ("max_fail_count", max_fail_count),
+    ):
+        if _value is not None and not is_sqlite_int(_value):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{_name} 값이 허용 범위를 벗어났습니다",
+            )
+
+    # page는 값 자체가 아니라 **곱한 결과**가 넘친다 — OFFSET은 `(page-1)*size`다.
+    # 실측: page=2**63-1은 값으로는 SQLite 범위 안이지만 size를 곱하는 순간 넘쳐 500이었다.
+    # 그래서 page 자체가 아니라 계산된 offset을 검사한다.
+    if not is_sqlite_int((page - 1) * size):
+        raise HTTPException(status_code=400, detail="page 값이 허용 범위를 벗어났습니다")
 
     # item.py와 동일한 선택적 인증: 토큰이 없거나 유효하지 않으면 비로그인으로 취급하고
     # 검색 자체는 그대로 진행한다(검증 실패가 검색 API를 막으면 안 됨).
@@ -346,12 +397,29 @@ def search(
             ).fetchall()
             favorited_ids = {r["item_id"] for r in fav_rows}
 
+        # 이 페이지 물건들의 **대표 사진**을 배치 조회 1회로 가져온다 (2026-08-17 Sprint 145).
+        # 바로 위 favorites 배치 조회와 같은 패턴이다 — 물건마다 따로 물으면 곧바로 N+1이
+        # 되고, 한 페이지가 최대 size건이므로 그 비용이 페이지 크기에 비례해 늘어난다.
+        #
+        # 대표 = 순번이 가장 앞선 사진. `MIN(seq)`로 물건당 한 행만 받는다
+        # (`api/v1/item.py`가 상세에서 `images[0]`을 대표로 쓰는 것과 같은 규칙).
+        thumbnails = {}
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            thumb_rows = conn.execute(
+                f"SELECT item_id, MIN(seq) AS seq FROM auction_image "
+                f"WHERE item_id IN ({placeholders}) GROUP BY item_id",
+                ids
+            ).fetchall()
+            thumbnails = {r["item_id"]: r["seq"] for r in thumb_rows}
+
         return {
             "total": total,
             "page": page,
             "size": size,
             "total_pages": (total + size - 1) // size,
-            "items": [row_to_item(r, favorited_ids) for r in rows],
+            "items": [row_to_item(r, favorited_ids, thumbnails) for r in rows],
         }
     except HTTPException:
         raise
@@ -367,14 +435,39 @@ def get_regions(sido: str = Query(...)):
     선택한 sido에 실제로 존재하는 sigungu 목록을 반환한다 (읽기 전용, 데이터 교정 없음).
     /search와 마찬가지로 인증 불필요 라우트라 {"success","data","message"} envelope를 쓰지 않는다.
     """
+    # ★ 2026-08-17 Sprint 156: `/search`와 **같은 정규화**를 쓴다.
+    #
+    #   `/search`는 위(289~294행)에서 `extract_sido(sido) or sido`로 정규화하는데
+    #   여기만 원본을 그대로 `WHERE sido = ?`에 넣고 있었다. 같은 파라미터를 두 엔드포인트가
+    #   다르게 해석하니 실측상 이렇게 갈렸다:
+    #
+    #       sido=서울        regions 26건   search.total 9     <- 일치
+    #       sido=서울특별시   regions  0건   search.total 9     <- 어긋남
+    #       sido=서울시      regions  0건   search.total 9     <- 어긋남
+    #       sido=경기도      regions  0건   search.total 0
+    #
+    #   지금 화면은 `SIDO_LIST`가 축약형("서울")을 보내므로 드러나지 않는다. 그러나
+    #   검색 화면은 **URL 파라미터로 상태를 복원한다**(`SearchForm.tsx:190`
+    #   `searchParams.get('sido')` -> 277행에서 그 값으로 regions 조회). 따라서
+    #   `?sido=서울특별시`가 담긴 링크를 열면 **결과는 9건 나오는데 시/군/구 목록만 비어**
+    #   지역을 좁힐 수 없다. 사용자에게는 "왜 구가 안 뜨지"로 보인다.
+    #
+    #   새 정책을 만드는 것이 아니다 — 위 주석이 이미 정한 규약을 이 함수에도 적용할 뿐이다.
+    #   `extract_sido`가 못 알아들으면 원본을 그대로 쓰는 fallback도 동일하다.
+    normalized_sido = extract_sido(sido) or sido
     conn = get_connection()
     try:
         rows = conn.execute(
             "SELECT DISTINCT sigungu FROM auction_item "
             "WHERE sido = ? AND sigungu IS NOT NULL AND sigungu != '' "
             "ORDER BY sigungu",
-            (sido,),
+            (normalized_sido,),
         ).fetchall()
+        # 응답의 `sido`는 **요청받은 값 그대로** 돌려준다(정규화한 값이 아니다).
+        # 조회에만 정규화를 쓰고 응답 형태는 건드리지 않는다 — 이 필드를 바꾸는 것은
+        # 별개의 API 계약 변경이고, 이번 수정의 목적(빈 시/군/구 목록)과 무관하다.
+        # 확인: 프런트는 `data.sigungu`만 읽는다. 경합 방지는 응답의 sido 비교가 아니라
+        # 로컬 `sigunguKey` + `cancelled` 플래그로 한다(`SearchForm.tsx:265,274-287`).
         return {"sido": sido, "sigungu": [r["sigungu"] for r in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail="지역 목록 조회 중 오류가 발생했습니다") from e

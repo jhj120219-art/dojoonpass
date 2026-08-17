@@ -1,7 +1,9 @@
 import os
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from storage.database import get_connection
+from api.constants import is_sqlite_int
+from api.http_cache import not_modified
 
 router = APIRouter()
 
@@ -20,16 +22,43 @@ DOC_TYPE_FILES = {
 # 이름만 다를 뿐 **값은 동일한 한글 법원명**이라 두 경로는 일치한다(2026-08-10 Sprint 48
 # DB 실측 확인 — ALL_COURTS의 code == name, 관련 컬럼 전부 한글 법원명).
 # 크롤러가 쓴 문서를 API가 못 찾는 문제는 없다.
+#
+# ★ 2026-08-17 Sprint 146: 조각 정규화를 **크롤러와 같은 함수**로 맞췄다.
+#   Sprint 145에 `sanitize_path_segment()`가 신설되면서 쓰는 쪽(`_doc_dir_path`)은
+#   역슬래시까지 치환하게 됐는데, **읽는 쪽인 여기만 옛 규칙(`/`만 치환)으로 남아 있었다.**
+#   사건번호에 역슬래시가 섞이면 크롤러는 `a_b`에 쓰고 API는 `a\b`를 찾아 **같은 문서를
+#   두 경로로 보게 된다**(이 저장소가 BUGS #50/#64로 반복해 겪은 바로 그 어긋남).
+#   현재 실데이터에 역슬래시는 0건이라 지금 터지는 버그는 아니지만, 규칙이 두 벌인 상태
+#   자체를 없앤다. `crawler.doc_paths`는 selenium/DB/fastapi 무의존이라 여기서 import해도
+#   안전하다(`api/v1/images.py`가 `crawler.image_assets`를 쓰는 것과 같은 방식).
+from crawler.doc_paths import sanitize_path_segment  # noqa: E402
+
+
 def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
-    safe_case_no = case_no.replace("/", "_").strip()
-    safe_item_no = (item_no or "1").replace("/", "_").strip()
-    return os.path.join(DOCUMENT_ROOT, court_name, safe_case_no, safe_item_no)
+    return os.path.join(DOCUMENT_ROOT, court_name,
+                        sanitize_path_segment(case_no),
+                        sanitize_path_segment(item_no or "1"))
 
 
 @router.get("/item/{item_id}/documents/{doc_type}")
-def get_document(item_id: int, doc_type: str):
+def get_document(item_id: int, doc_type: str, request: Request):
+    # 대소문자를 가리지 않는다. 이 저장소는 **같은 개념을 두 벌 어휘로** 저장한다 —
+    # `document_status.doc_type`은 대문자(SPEC/STATUS/APPRAISAL), `document_queue.doc_type`은
+    # 소문자(spec/status/appraisal)다. 화면은 `document_status`에서 값을 받아 오므로 지금
+    # 깨지지 않지만, 큐 쪽 값으로 URL을 만드는 코드(복구 스크립트·운영 도구·향후 기능)는
+    # 400을 받는다. 게다가 그 400 메시지가 오타로 넣은 값과 **구별되지 않아** 원인을 찾기
+    # 어렵다(2026-08-17 Sprint 148 Performance 감사 중 실측 발견).
+    #
+    # 받아들이는 입력만 넓히는 변경이라 기존 대문자 호출의 동작은 그대로다.
+    # 값은 `DOC_TYPE_FILES`의 키로만 쓰이므로(파일명은 상수에서 온다) 경로 조작 위험은 없다.
+    doc_type = (doc_type or "").upper()
     if doc_type not in DOC_TYPE_FILES:
         raise HTTPException(status_code=400, detail="지원하지 않는 문서 종류입니다")
+
+    # SQLite INTEGER 범위 밖의 id는 어떤 행도 될 수 없다 — 그대로 넘기면 sqlite3이
+    # OverflowError를 던져 **인증 없이 500을 만들 수 있다**(2026-08-17 Sprint 144 실측).
+    if not is_sqlite_int(item_id):
+        raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
 
     conn = get_connection()
     try:
@@ -76,12 +105,21 @@ def get_document(item_id: int, doc_type: str):
     if not os.path.isfile(real_file_path) or os.path.getsize(real_file_path) == 0:
         raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
 
-    return FileResponse(
+    response = FileResponse(
         real_file_path,
         media_type=media_type,
         filename=filename,
         content_disposition_type="inline",
+        # stat_result를 넘겨야 생성 시점에 etag/last-modified가 채워진다 —
+        # 넘기지 않으면 Starlette가 전송 시점에 stat하므로 아래 조건부 검사가
+        # 검증자를 보지 못해 항상 200이 된다(images.py의 같은 주석 참고).
+        stat_result=os.stat(real_file_path),
     )
+    # 브라우저가 되보낸 검증자가 현재 파일의 것과 같으면 본문을 다시 보내지 않는다
+    # (2026-08-17 Sprint 146). `FileResponse`는 etag/last-modified를 붙여 주지만
+    # 조건부 요청을 해석하지는 않아, 실측상 2.5MB 감정평가서가 매번 전부 재전송됐다.
+    # 신선도 판단은 바꾸지 않는다 — 클라이언트는 여전히 매번 서버에 물어본다.
+    return not_modified(request, response) or response
 
 
 # HEAD는 프론트(`properties/[id]/page.tsx`)가 문서 뷰어를 열기 전에 "파일이 실제로 있는지"만
@@ -91,5 +129,5 @@ def get_document(item_id: int, doc_type: str):
 # GET/HEAD를 별도 라우트로 나누고 HEAD는 스키마에서 제외해 중복을 없앤다 —
 # 동작은 동일하다(Starlette가 HEAD 응답의 본문을 자동으로 버린다).
 @router.head("/item/{item_id}/documents/{doc_type}", include_in_schema=False)
-def head_document(item_id: int, doc_type: str):
-    return get_document(item_id, doc_type)
+def head_document(item_id: int, doc_type: str, request: Request):
+    return get_document(item_id, doc_type, request)

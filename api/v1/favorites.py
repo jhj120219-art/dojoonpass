@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
-from api.constants import ErrorCode
+from api.constants import ErrorCode, is_sqlite_int
 
 router = APIRouter()
 
@@ -12,6 +12,12 @@ class FavoriteRequest(BaseModel):
     item_id: int
 
 def get_item_summary(conn, item_id: int) -> dict:
+    # SQLite INTEGER 범위 밖의 id는 어떤 행도 될 수 없다 — 그대로 넘기면 sqlite3이
+    # OverflowError를 던져 **로그인한 사용자가 500을 만들 수 있다**
+    # (2026-08-17 Sprint 154 실측: POST /favorites {"item_id": 2**63} -> 500).
+    # "없음"과 같은 뜻이므로 None을 돌려주고, 호출부의 기존 404 경로를 그대로 탄다.
+    if not is_sqlite_int(item_id):
+        return None
     row = conn.execute(
         "SELECT * FROM auction_item WHERE id = ?", (item_id,)
     ).fetchone()
@@ -63,6 +69,10 @@ def add_favorite(req: FavoriteRequest, user_id: str = Depends(get_current_user))
 
 @router.delete("/favorites/{item_id}")
 def remove_favorite(item_id: int, user_id: str = Depends(get_current_user)):
+    # 범위 밖 id는 DELETE의 WHERE에도 바인딩할 수 없다(OverflowError -> 500).
+    # 그런 즐겨찾기는 존재할 수 없으므로 rowcount=0일 때와 **같은 응답**을 준다.
+    if not is_sqlite_int(item_id):
+        return error_response(ErrorCode.FAVORITE_NOT_FOUND, "등록된 관심물건이 없습니다")
     conn = get_connection()
     try:
         result = conn.execute(

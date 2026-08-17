@@ -27,12 +27,21 @@ from crawler.doc_paths import (  # noqa: F401  (하위 호환 재노출)
     get_doc_dir,
     doc_exists,
     status_overlay_has_data,
+    find_sibling_case_document,
+    CASE_LEVEL_DOC_TYPES,
     _PRIMARY_EXT,
 )
 
 KAPANET_BASE = "https://ca.kapanet.or.kr"
 OVERLAY_TIMEOUT = 15
 NEW_WINDOW_TIMEOUT = 15
+
+# 형제 물건의 사건 단위 문서를 재사용할 수 있는 최대 나이(초). 기본 6시간.
+# doc_worker 가동 창(02:00~04:00, `DOC_WORKER_END_TIME`)보다 넉넉히 길고, 하루보다는
+# 짧다 — "같은 실행/같은 밤에 받은 것"까지만 재사용하고 어제 것은 다시 받는다는 뜻이다.
+# 같은 사건의 물건들은 auction_date와 priority가 같아 큐에서 인접해 처리되므로,
+# 이 정도로도 초과 수집의 대부분이 사라진다(실측 근거는 crawler/doc_paths.py 주석).
+SIBLING_REUSE_MAX_AGE_SECONDS = 6 * 3600
 
 
 def get_download_driver_options():
@@ -67,7 +76,23 @@ def build_download_driver():
     opts = get_download_driver_options()
     svc = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=svc, options=opts)
-    driver.set_page_load_timeout(30)
+    # 이 시점에 Chrome 프로세스는 **이미 떠 있다.** 뒤이은 설정이 실패하면(브라우저가
+    # 기동 직후 죽음, 연결 거부 등) 예전에는 그대로 예외가 나가면서 프로세스가 고아로
+    # 남았다 — 호출자는 `driver` 참조를 받지 못했으므로 quit()을 부를 수도 없다.
+    #
+    # BUGS #109와 같은 계열이고 실제로 맞물린다. #109 수정으로 기동 실패 시 락은
+    # 풀리지만, 실패 지점이 여기라면 좀비 크롬이 남는다. 재시도할 때마다 하나씩
+    # 쌓이므로 메모리와 다운로드 폴더를 함께 갉아먹는다.
+    #
+    # 예외는 삼키지 않고 그대로 올린다 — 기동 실패는 호출자(doc_worker)가 인지해야 한다.
+    try:
+        driver.set_page_load_timeout(30)
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        raise
     return driver
 
 
@@ -254,6 +279,60 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
 # StatusCollector (현황조사서) - 오버레이 등장 대기 -> html/json 저장 -> 오버레이 닫기
 # =====================================================================
 
+def _reuse_sibling_status(sib_dir: str, html_path: str, json_path: str,
+                          court_code: str, case_no: str, item_no: str) -> Optional[Dict]:
+    """형제 물건의 현황조사서를 이 물건 자리로 **복사**한다. 실패하면 None(정상 수집으로 진행).
+
+    복사 전에 **내용을 다시 검증한다** — `status_overlay_has_data()`로 빈 캡처가 아닌지
+    확인한다. 형제 파일이 어떤 이유로 비어 있다면 그것을 퍼뜨리는 것이 가장 나쁘다
+    (한 번 저장되면 `doc_exists()`가 완료로 판정해 영구히 재수집에서 빠진다 — BUGS #22/#50).
+
+    쓰기는 `os.replace()`로 원자적으로 한다 — 이 파일의 다른 저장 경로와 같은 불변식이다.
+    """
+    src_html = os.path.join(sib_dir, "status.html")
+    src_json = os.path.join(sib_dir, "status.json")
+    try:
+        with open(src_html, encoding="utf-8") as f:
+            html = f.read()
+        with open(src_json, encoding="utf-8") as f:
+            raw_json = f.read()
+    except OSError as e:
+        logger.warning("[%s-%s] 형제 물건 현황조사서를 읽지 못했다(%s): %s",
+                       case_no, item_no, sib_dir, str(e))
+        return None
+
+    if not status_overlay_has_data(html):
+        logger.warning("[%s-%s] 형제 물건의 현황조사서가 빈 캡처다. 복사하지 않고 직접 수집한다",
+                       case_no, item_no)
+        return None
+
+    try:
+        get_doc_dir(court_code, case_no, item_no)
+        for tmp_suffix, dest, payload in ((".tmp", html_path, html), (".tmp", json_path, raw_json)):
+            tmp = dest + tmp_suffix
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, dest)
+    except OSError as e:
+        logger.warning("[%s-%s] 현황조사서 복사 실패: %s", case_no, item_no, str(e))
+        for p in (html_path + ".tmp", json_path + ".tmp"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return None
+
+    result = _empty_result()
+    result["storage_type"] = "json+html"
+    result["success"] = True
+    result["files_saved"] = [html_path, json_path]
+    result["new_hash"] = calc_file_hash(json_path)
+    result["reused_from"] = sib_dir
+    logger.info("[%s-%s] 현황조사서는 사건 단위 문서다 - 같은 사건의 %s에서 재사용(브라우저 미사용)",
+                case_no, item_no, os.path.basename(sib_dir))
+    return result
+
+
 def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: str,
                     overwrite: bool = False) -> Dict:
     result = _empty_result()
@@ -266,6 +345,30 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
         logger.info("[%s-%s] status 이미 존재. 스킵", case_no, item_no)
         result["success"] = True
         return result
+
+    # 사건 단위 문서 재사용 (2026-08-17 Sprint 145).
+    #
+    # 현황조사서는 **사건 하나에 문서 하나**다(집행관이 사건 단위로 작성한다).
+    # 그래서 같은 사건의 다른 물건이 방금 받아 둔 것이 있으면 브라우저를 다시 몰 이유가
+    # 없다 — 실측으로 status.html은 바이트까지 같고, status.json도 `fields` 115개 키가
+    # 완전히 일치했다(차이는 우리가 찍는 extracted_at 하나뿐).
+    #
+    # 비용 근거: 사건 1,384개 / 물건 1,876개라 초과 수집이 492회이고, worker 1건이
+    # 약 22초이니 **약 3시간**이다(가동 창 02:00~04:00 = 2시간을 넘긴다).
+    # (★ 2026-08-17 Sprint 147 정정: 이 '약 3시간'은 navigation까지 건너뛴다고 **가정한** 값이다. Sprint 145 구현은 `collect_status()` 안에서만 재사용해 물건당 0.6초(overlay)만 아꼈고 navigation 15.2초는 그대로 들었다 — 실제 절감 492회 기준 **5분**. Sprint 147이 doc_worker의 호출 순서를 바꿔(재사용 가능하면 이동 자체를 생략) 실 worker 2건 기준 41.1초 -> 23.8초, 492회 기준 **약 130분** 절감으로 실현했다.)
+    #
+    # ★ `SIBLING_REUSE_MAX_AGE_SECONDS`로 **같은 실행에서 방금 받은 것만** 재사용한다.
+    #   몇 달 전 파일을 복사하면 새로 받았다면 얻었을 최신본 대신 옛것을 주게 되는데,
+    #   "언제 다시 받을 것인가"는 재수집 정책(미결정, docs/roadmap.md)이라 여기서
+    #   정하지 않는다. 보수적으로 좁혀 두면 정책이 정해질 때 이 값만 조정하면 된다.
+    if not overwrite:
+        sib = find_sibling_case_document(court_code, case_no, item_no, "status",
+                                          max_age_seconds=SIBLING_REUSE_MAX_AGE_SECONDS)
+        if sib:
+            reused = _reuse_sibling_status(sib, html_path, json_path, court_code,
+                                           case_no, item_no)
+            if reused:
+                return reused
 
     previous_hash = calc_file_hash(json_path) if os.path.exists(json_path) else ""
 
@@ -523,6 +626,14 @@ def collect_document(driver, court_code: str, case_no: str, item_no: str, doc_ty
         return collect_status(driver, court_code, case_no, item_no, btn_id, overwrite)
     if doc_type == "appraisal":
         return collect_appraisal(driver, court_code, case_no, item_no, btn_id, overwrite)
+    if doc_type == "image":
+        # 2026-08-17 Sprint 144: 물건 사진. `btn_id`를 쓰지 않는다 — 사진은 버튼을 눌러
+        # 여는 것이 아니라 상세페이지 DOM에 이미 들어 있다(crawler/image_crawler.py 참고).
+        # import를 함수 안에서 하는 이유: 이 모듈은 하위 호환 재노출 창구라
+        # 최상단 import를 늘리면 `from crawler.doc_crawler import get_doc_dir`처럼
+        # 경로 규칙만 쓰는 쪽까지 새 모듈을 끌어가게 된다.
+        from crawler.image_crawler import collect_images
+        return collect_images(driver, court_code, case_no, item_no, overwrite)
 
     logger.error("알 수 없는 doc_type: %s", doc_type)
     return _empty_result()

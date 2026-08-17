@@ -133,6 +133,32 @@ def decode_supabase_jwt(token: str) -> dict:
         raise
     except JOSEError as exc:
         raise JWTError(f"토큰 검증 실패: {type(exc).__name__}") from exc
+    except Exception as exc:
+        # ★ 2026-08-17 Sprint 152: JOSE 계열**이 아닌** 예외도 새어 나왔다.
+        #
+        #   위 `except JOSEError`는 jose가 던지는 예외가 전부 JOSEError 자손이라는 전제인데,
+        #   **키 파싱 단계는 그렇지 않다.** JWKS 캐시에 구조가 깨진 공개키가 들어 있으면
+        #   `jwt.decode()`가 순수 `ValueError`를 던진다(실측: `invalid literal for int()
+        #   with base 16: ''`). ValueError는 JOSEError가 아니라 그대로 통과해 버렸다.
+        #
+        #   그 결과가 이 함수의 docstring이 막겠다고 적어 둔 바로 그 실패다 — 실측:
+        #
+        #       GET /api/v1/search    (선택적 인증)  500   <- 비로그인으로 강등돼야 한다
+        #       GET /api/v1/item/1    (선택적 인증)  500   <- 〃
+        #       GET /api/v1/favorites (인증 필수)    500   <- 401이어야 한다
+        #
+        #   토큰의 `kid`는 **요청자가 고른다.** 따라서 실제 JWKS에 jose가 못 읽는 키가
+        #   하나라도 섞이면(키 회전 중 미지원 kty 등) 그 kid를 지목하는 것만으로 인증 없이
+        #   500을 만들 수 있다. Sprint 144에서 없앤 "인증 없이 만드는 500"과 같은 계열이다.
+        #
+        #   그래서 "검증 실패는 종류를 불문하고 JWTError 하나로 정규화한다"는 이 함수의
+        #   계약을 **예외 계층에 기대지 않고** 지킨다. 같은 함수 안 헤더 파싱(위 101행)이
+        #   이미 `except Exception`으로 같은 일을 하고 있어 방식도 일관된다.
+        #
+        #   삼키기만 하면 진짜 버그가 조용한 인증 실패로 묻히므로 **타입만** 남긴다
+        #   (토큰·키·비밀값은 로그에 넣지 않는다 — `_get_jwk`의 기존 규칙과 동일).
+        logger.warning("토큰 검증 중 JOSE 계열 밖 예외(%s) ― 인증 실패로 처리", type(exc).__name__)
+        raise JWTError(f"토큰 검증 실패: {type(exc).__name__}") from exc
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)) -> str:

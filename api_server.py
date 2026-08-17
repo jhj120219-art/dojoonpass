@@ -29,6 +29,7 @@ from api.v1.recent_items import router as recent_router
 from api.v1.search_presets import router as presets_router
 from api.v1.registry import router as registry_router
 from api.v1.documents import router as documents_router
+from api.v1.images import router as images_router
 from api.v1.payments import router as payments_router
 from api.v1.admin import router as admin_router
 from api.v1.subscriptions import router as subscriptions_router
@@ -81,6 +82,7 @@ app.include_router(recent_router, prefix="/api/v1", tags=["recent"])
 app.include_router(presets_router, prefix="/api/v1", tags=["presets"])
 app.include_router(registry_router, prefix="/api/v1", tags=["registry"])
 app.include_router(documents_router, prefix="/api/v1", tags=["documents"])
+app.include_router(images_router, prefix="/api/v1", tags=["images"])
 app.include_router(payments_router, prefix="/api/v1", tags=["payments"])
 app.include_router(admin_router, prefix="/api/v1", tags=["admin"])
 app.include_router(subscriptions_router, prefix="/api/v1", tags=["subscriptions"])

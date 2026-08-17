@@ -7,7 +7,7 @@ from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import (
     ErrorCode, PaymentType, PaymentStatus, BillingCycle as BillingCycleEnum,
-    SubscriptionStatus, is_paid,
+    SubscriptionStatus, is_paid, is_sqlite_int,
 )
 from api.v1.registry import OVERAGE_FEE, get_entitled_subscription
 from api.v1.payment_providers import get_payment_provider, get_payment_provider_by_name
@@ -17,7 +17,10 @@ from api.v1.payment_logs import (
     record_webhook, mark_webhook_processed, webhook_reprocess_block_reason,
     EVENT_CREATE_ORDER, EVENT_CONFIRM, EVENT_VERIFY, EVENT_CANCEL, EVENT_WEBHOOK,
     LOG_SUCCESS, LOG_PENDING, LOG_FAILED,
-    WEBHOOK_PROCESSED, WEBHOOK_FAILED, WEBHOOK_IGNORED,
+    # WEBHOOK_FAILED는 이 모듈에서 쓰지 않는다(형제 두 상수는 쓴다). 2026-08-17
+    # Sprint 150에서 미사용 import로 확인해 뺐다 — 판정은 `api/v1/payment_logs.py`가
+    # 하고, 여기서 그 상태를 다시 쓰는 코드는 없다.
+    WEBHOOK_PROCESSED, WEBHOOK_IGNORED,
 )
 
 logger = logging.getLogger(__name__)
@@ -835,6 +838,9 @@ def get_payments(user_id: str = Depends(get_current_user)):
 
 @router.get("/payments/{payment_id}")
 def get_payment(payment_id: int, user_id: str = Depends(get_current_user)):
+    # 범위 밖 id는 어떤 결제도 될 수 없다(OverflowError -> 500 방지, Sprint 154).
+    if not is_sqlite_int(payment_id):
+        raise HTTPException(status_code=404, detail="결제 내역을 찾을 수 없습니다")
     conn = get_connection()
     try:
         row = conn.execute(
@@ -855,6 +861,10 @@ def get_payment_log_history(payment_id: int, user_id: str = Depends(get_current_
     본인 결제만 조회 가능하다 — 다른 사용자의 payment_id를 넣으면 404로 응답해
     존재 자체를 노출하지 않는다(registry.py의 다운로드와 동일한 소유권 검사 패턴).
     """
+    # 범위 밖 id는 어떤 결제도 될 수 없다(OverflowError -> 500 방지, Sprint 154).
+    # 소유권 검사와 같은 이유로 존재를 노출하지 않는 404를 그대로 쓴다.
+    if not is_sqlite_int(payment_id):
+        raise HTTPException(status_code=404, detail="결제 내역을 찾을 수 없습니다")
     conn = get_connection()
     try:
         owned = conn.execute(

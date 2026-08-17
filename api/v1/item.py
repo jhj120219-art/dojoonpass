@@ -4,6 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from storage.database import get_connection
 from api.auth import decode_supabase_jwt
+from api.constants import is_sqlite_int
 from api.v1.recent_items import record_view
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,12 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 @router.get("/item/{item_id}")
 def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+    # SQLite INTEGER 범위를 벗어난 id는 어떤 행도 될 수 없다. 그대로 넘기면
+    # sqlite3이 OverflowError를 던져 **인증 없이 500을 만들 수 있다**
+    # (2026-08-17 Sprint 144 실측). 음수 id가 이미 404인 것과 같은 취급을 한다.
+    if not is_sqlite_int(item_id):
+        raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
+
     conn = get_connection()
     try:
         row = conn.execute(
@@ -27,6 +34,29 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
 
         doc_status = conn.execute(
             "SELECT doc_type, status FROM document_status WHERE item_id = ?",
+            (item_id,)
+        ).fetchall()
+
+        # 2026-08-17 Sprint 144 — 자산(문서 실체 + 물건 사진)을 **같은 커넥션에서 한 번씩만**
+        # 읽는다. 물건당 쿼리 2개가 늘 뿐이며 물건 수·사진 수에 비례해 늘지 않는다(N+1 없음).
+        doc_raw = conn.execute(
+            """
+            SELECT doc_type, page_count, file_size, doc_version
+            FROM doc_raw
+            WHERE item_id = ?
+              AND doc_version = (SELECT MAX(d2.doc_version) FROM doc_raw d2
+                                  WHERE d2.item_id = doc_raw.item_id
+                                    AND d2.doc_type = doc_raw.doc_type)
+            """,
+            (item_id,)
+        ).fetchall()
+        doc_raw_by_type = {r["doc_type"]: r for r in doc_raw}
+
+        images = conn.execute(
+            """
+            SELECT seq, kind, file_size, width, height
+            FROM auction_image WHERE item_id = ? ORDER BY seq
+            """,
             (item_id,)
         ).fetchall()
 
@@ -87,10 +117,93 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "validation_status": row["validation_status"],
             "crawl_date": row["crawl_date"],
             "case": dict(case) if case else None,
-            "documents": [{"doc_type": d["doc_type"], "status": d["status"]} for d in doc_status],
+            # ★ 기존 계약 유지: `doc_type`/`status`는 그대로 있고 **키만 늘었다**.
+            #    프런트의 기존 코드(`property.documents.some(d => d.doc_type==='SPEC' ...)`)는
+            #    무변경으로 계속 동작한다.
+            "documents": [_document_entry(item_id, d, doc_raw_by_type) for d in doc_status],
+            "images": [_image_entry(item_id, im) for im in images],
+            "image_count": len(images),
+            # 대표 이미지 = 순번이 가장 앞선 사진. 법원 캐러셀의 첫 장이 곧 대표 전경도다
+            # (실측: 전경도_1이 항상 seq=1). 별도의 "대표" 플래그를 만들지 않는 이유는
+            # 원천에 그런 개념이 없어서 우리가 임의로 정하면 근거 없는 값이 되기 때문이다.
+            "representative_image": (_image_entry(item_id, images[0]) if images else None),
+            "images_status": _images_status(doc_status, len(images)),
             "tenants": [dict(t) for t in tenants],
             "rights_summary": dict(rights) if rights else None,
             "is_favorited": is_favorited,
         }
     finally:
         conn.close()
+
+
+# `documents.py` / `images.py`가 실제로 서빙하는 경로와 **문자열이 같아야** 한다.
+# 여기서 규칙을 새로 만들면 "API는 URL을 주는데 그 URL이 404"가 된다 — 이 저장소가
+# 파일 경로에서 반복해 겪은 어긋남을 URL에서 되풀이하지 않도록 한 곳에 모아 둔다.
+def _document_url(item_id: int, doc_type: str) -> str:
+    return "/api/v1/item/%d/documents/%s" % (item_id, doc_type)
+
+
+def _image_url(item_id: int, seq: int) -> str:
+    return "/api/v1/item/%d/images/%d" % (item_id, seq)
+
+
+def _document_entry(item_id: int, row, doc_raw_by_type) -> dict:
+    """문서 1건의 화면용 정보.
+
+    `page_count`가 None인 것과 0인 것은 다르다 — None은 "아직 모른다"(수집 전이거나
+    PDF가 아니거나 파싱 실패), 0은 있을 수 없는 값이다. 그래서 0으로 뭉개지 않는다.
+    프런트는 None이면 페이지 이동 UI를 아예 그리지 않는다.
+    """
+    doc_type = row["doc_type"]
+    status = row["status"]
+    raw = doc_raw_by_type.get(doc_type)
+    return {
+        "doc_type": doc_type,
+        "status": status,
+        # 화면이 "열람 가능"으로 다룰 수 있는가. 상태 문자열 비교를 프런트마다 따로
+        # 하지 않도록 서버가 한 번만 판단한다.
+        "available": status == "READY",
+        "page_count": raw["page_count"] if raw else None,
+        "file_size": raw["file_size"] if raw else None,
+        "doc_version": raw["doc_version"] if raw else None,
+        # READY가 아니면 URL을 주지 않는다. 열 수 없는 주소를 건네고 프런트가 404를
+        # 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다.
+        "viewer_url": _document_url(item_id, doc_type) if status == "READY" else None,
+        "download_url": _document_url(item_id, doc_type) if status == "READY" else None,
+    }
+
+
+def _image_entry(item_id: int, row) -> dict:
+    return {
+        "seq": row["seq"],
+        "kind": row["kind"],
+        "url": _image_url(item_id, row["seq"]),
+        # 서버 측 썸네일 생성은 아직 없다(Pillow 도입은 승인 사항 —
+        # docs/SPRINT144_ASSET_PIPELINE.md의 SKIP 항목). 원본을 그대로 가리키되
+        # **필드는 지금 만들어 둔다** — 나중에 썸네일이 생겨도 프런트 계약이 바뀌지 않는다.
+        "thumbnail_url": _image_url(item_id, row["seq"]),
+        "width": row["width"],
+        "height": row["height"],
+        "file_size": row["file_size"],
+    }
+
+
+def _images_status(doc_status_rows, image_count: int) -> str:
+    """물건 사진의 수집 상태.
+
+    근거가 둘이라 우선순위를 정해 둔다 —
+      1. `auction_image` 행이 있으면 무조건 READY다(볼 수 있는 사진이 실제로 있다).
+      2. 사진이 없으면 `document_status`의 IMAGE 행을 따른다.
+         - NO_IMAGE : 수집했지만 법원에 사진이 없다(재시도해도 같다, 실패가 아니다)
+         - FAILED   : 재시도가 소진된 진짜 실패
+         - COLLECTING / 행 없음 : 아직 수집 전
+    행이 없을 때 COLLECTING으로 답하는 이유: 사진 수집은 `document_queue`에 적재되지만
+    `document_status`의 IMAGE 행은 worker가 처음 결과를 낼 때 비로소 생긴다. 그 사이의
+    물건에게 "사진 없음"이라고 답하면 아직 안 해 본 것을 없다고 단정하는 것이 된다.
+    """
+    if image_count > 0:
+        return "READY"
+    row = next((d for d in doc_status_rows if d["doc_type"] == "IMAGE"), None)
+    if row is None:
+        return "COLLECTING"
+    return row["status"]

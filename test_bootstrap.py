@@ -347,10 +347,20 @@ def test_bootstrap_matches_live_schema_columns_and_indexes():
     check("새로운 인덱스 드리프트 없음(fresh에만 있는 것)", new_fresh_only_idxs, [])
     check("새로운 인덱스 드리프트 없음(운영에만 있는 것)", new_live_only_idxs, [])
 
+    # 2026-08-17 Sprint 144: `sorted()`를 그냥 부르면 여기서 **테스트가 TypeError로 죽었다.**
+    #   컬럼 항목은 (table, (name, type, notnull, default)) 모양이고 `default`는 값이
+    #   없으면 None, 있으면 문자열이다("'RECEIVED'"). 두 항목의 앞 세 요소가 같으면
+    #   정렬 비교가 네 번째로 내려가 None < str 을 시도하고 그 순간 죽는다.
+    #   실제로 KNOWN_LIVE_ONLY_COLUMNS의 payment_webhooks.processing_status(default=None)와
+    #   KNOWN_FRESH_ONLY_COLUMNS의 같은 컬럼(default="'RECEIVED'")이 정확히 그 쌍이다.
+    #   드리프트가 **해소됐을 때만** 이 줄에 도달하므로, 상황이 좋아진 순간에 테스트가
+    #   죽는 최악의 방향이었다(위 check() 4개는 이미 전부 통과한 뒤다).
+    #   값 자체를 비교하지 않고 문자열로 찍어 정렬한다 - 여기서 필요한 것은 사람이 읽을
+    #   목록의 안정적인 순서뿐이다.
     resolved_cols = sorted((KNOWN_FRESH_ONLY_COLUMNS - fresh_only_cols)
-                            | (KNOWN_LIVE_ONLY_COLUMNS - live_only_cols))
+                            | (KNOWN_LIVE_ONLY_COLUMNS - live_only_cols), key=repr)
     resolved_idxs = sorted((KNOWN_FRESH_ONLY_INDEXES - fresh_only_idxs)
-                            | (KNOWN_LIVE_ONLY_INDEXES - live_only_idxs))
+                            | (KNOWN_LIVE_ONLY_INDEXES - live_only_idxs), key=repr)
     if resolved_cols or resolved_idxs:
         print("   [정리됨] 더 이상 드리프트가 아닌 알려진 항목 - 위 KNOWN_* 상수에서 빼십시오:")
         for c in resolved_cols:

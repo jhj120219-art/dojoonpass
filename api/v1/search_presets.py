@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
-from api.constants import ErrorCode
+from api.constants import ErrorCode, is_sqlite_int
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,10 @@ def get_presets(user_id: str = Depends(get_current_user)):
 
 @router.delete("/search-presets/{preset_id}")
 def delete_preset(preset_id: int, user_id: str = Depends(get_current_user)):
+    # 범위 밖 id는 DELETE의 WHERE에 바인딩할 수 없다(OverflowError -> 500, Sprint 154).
+    # 그런 검색조건은 존재할 수 없으므로 rowcount=0일 때와 **같은 응답**을 준다.
+    if not is_sqlite_int(preset_id):
+        return error_response(ErrorCode.SEARCH_PRESET_NOT_FOUND, "검색조건을 찾을 수 없습니다")
     conn = get_connection()
     try:
         result = conn.execute(

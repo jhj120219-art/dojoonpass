@@ -13,6 +13,7 @@ from api.auth import success
 from api.constants import (
     AuditAction, AuditTargetType, RegistryRequestStatus,
     PaymentStatus, PaymentType, SubscriptionStatus,
+    is_sqlite_int,
 )
 from api.v1.audit import record_audit, get_audit_logs
 
@@ -124,6 +125,50 @@ def require_super_admin(x_admin_key: Optional[str] = Header(None, alias="X-Admin
     return _require_role(x_admin_key, ROLE_SUPER_ADMIN)
 
 
+def _require_sqlite_id(value: int, not_found_detail: str) -> None:
+    """SQLite INTEGER 범위(64비트) 밖의 id를 404로 끊는다 (2026-08-17 Sprint 153).
+
+    파이썬 int는 임의 정밀도라 `2**63` 같은 값이 그대로 쿼리까지 내려가고, sqlite3이
+    `OverflowError: Python int too large to convert to SQLite INTEGER`를 던져 **500**이
+    된다. Sprint 144가 `/api/v1/search`·`item`·`documents`·`images`에서 없앤 것과
+    **같은 계열**인데, `api/v1/admin.py`만 그 정리에서 빠져 있었다
+    (실측: 이 파일의 `is_sqlite_int` 사용 0건, 다른 4개 파일은 전부 사용 중).
+
+    실측으로 확인한 6개 핸들러 전부에서 재현됐다.
+
+        GET   /admin/payments/{id}/logs            2**63 -> 500  (정상 id는 404)
+        GET   /admin/payments/webhooks/{id}        2**63 -> 500  (〃)
+        POST  /admin/payments/webhooks/{id}/reprocess  2**63 -> 500   ← SUPER_ADMIN 필요
+        POST  /admin/payments/{id}/refund          2**63 -> 500   ← 〃
+        PATCH /admin/subscriptions/{id}            2**63 -> 500   ← 〃
+        PATCH /admin/registry-requests/{id}        2**63 -> 500   (status=FAILED/PROCESSING)
+
+    404를 쓰는 이유: 범위 밖 정수는 **어떤 행도 될 수 없으므로** "찾을 수 없다"가
+    정확한 답이다(400 "잘못된 형식"이 아니다 — 형식은 올바른 정수다). 같은 판단을
+    `api/v1/item.py`·`documents.py`·`images.py`가 이미 하고 있어 응답 규약도 일치한다.
+
+    호출 위치는 **각 핸들러의 첫 DB 접근 직전**이다. 앞단 검증(권한·상태값·doc_url)을
+    앞지르지 않게 하려는 것이다 — 그렇게 하면 지금 400/403으로 잘 응답하는 요청의
+    상태 코드까지 바뀐다. 이 수정이 바꾸는 것은 **500이던 경로뿐**이다.
+    """
+    if not is_sqlite_int(value):
+        raise HTTPException(status_code=404, detail=not_found_detail)
+
+
+def _require_sqlite_filter(value, name: str) -> None:
+    """조회 **조건**으로 쓰이는 정수의 범위 검사 (2026-08-17 Sprint 155).
+
+    `_require_sqlite_id()`와 상태 코드가 다르다. 경로변수는 "그 행을 지목"하므로
+    범위 밖이면 404("찾을 수 없다")가 정확하지만, 쿼리 필터는 **조건 값**이라
+    400("허용 범위를 벗어났습니다")이 정확한 설명이다.
+    `api/v1/search.py`가 min/max 필터에 대해 이미 쓰는 규약과 같다.
+
+    None(필터 미지정)은 통과시킨다 — 조건을 걸지 않겠다는 뜻이다.
+    """
+    if value is not None and not is_sqlite_int(value):
+        raise HTTPException(status_code=400, detail=f"{name} 값이 허용 범위를 벗어났습니다")
+
+
 def _require_existing_registry_document(doc_url: str) -> None:
     """COMPLETED로 넘기기 전에 `doc_url`이 **실제로 존재하는 파일**인지 확인한다.
 
@@ -221,6 +266,8 @@ def list_registry_requests(
 ):
     if status is not None and status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"허용되지 않는 status 값입니다: {status}")
+    # 조회 **조건** 값이므로 400이다(식별자가 아니다 — `_offset()` 주석 참고).
+    _require_sqlite_filter(item_id, "item_id")
 
     conn = get_connection()
     try:
@@ -264,7 +311,8 @@ def list_registry_requests(
             params,
         ).fetchone()[0]
 
-        offset = (page - 1) * size
+        # 아래 `_offset()`을 쓴다 — 예전에는 여기만 직접 곱해서 **범위 검사를 비켜 갔다.**
+        offset = _offset(page, size)
         rows = conn.execute(
             f"""
             SELECT rr.*, ai.case_no, ai.full_address
@@ -305,6 +353,7 @@ def update_registry_request_status(
     if req.status == "COMPLETED":
         _require_existing_registry_document(req.doc_url)
 
+    _require_sqlite_id(request_id, "신청을 찾을 수 없습니다")
     conn = get_connection()
     try:
         current = conn.execute(
@@ -544,7 +593,26 @@ def adjust_registry_credit(
 # ---------------------------------------------------------------------------
 
 def _offset(page: int, size: int) -> int:
-    return (page - 1) * size
+    """OFFSET 값. 범위를 벗어나면 400으로 거절한다 (2026-08-17 Sprint 155).
+
+    `page`에는 `ge=1` 하한만 있고 **상한이 없었다.** 그래서 `page=2**63`이 그대로
+    곱해져 OFFSET으로 내려가고 sqlite3이 터졌다.
+
+        GET /api/v1/admin/users?page=9223372036854775808  ->  500
+
+    목록 엔드포인트 6곳이 전부 같은 증상이었다(users / payments / payments-webhooks /
+    subscriptions / audit-logs / registry-requests). **한 곳에서 막는다** — 이 헬퍼를
+    쓰는 모든 호출부가 자동으로 보호되고, 새 목록 엔드포인트도 마찬가지다.
+    (`api/v1/search.py`가 같은 계열을 `(page-1)*size` 검사로 이미 막고 있다.)
+
+    404가 아니라 400인 이유: `page`는 **식별자가 아니라 조회 조건**이다.
+    "그런 행이 없다"가 아니라 "값이 허용 범위 밖"이 정확한 설명이다
+    (`search.py`가 정렬·필터 값에 대해 쓰는 규약과 같다).
+    """
+    offset = (page - 1) * size
+    if not is_sqlite_int(offset):
+        raise HTTPException(status_code=400, detail="page 값이 허용 범위를 벗어났습니다")
+    return offset
 
 
 @router.get("/admin/registry/requests")
@@ -659,6 +727,7 @@ def admin_payment_logs(payment_id: int, admin_role: str = Depends(require_admin)
     """결제 단계별 궤적(payment_logs). 결제 분쟁 대응용."""
     from api.v1.payment_logs import get_payment_logs
 
+    _require_sqlite_id(payment_id, "결제 내역을 찾을 수 없습니다")
     conn = get_connection()
     try:
         exists = conn.execute("SELECT id FROM payments WHERE id=?", (payment_id,)).fetchone()
@@ -704,6 +773,8 @@ def admin_list_webhooks(
             detail=f"허용되지 않는 processing_status입니다: {processing_status} "
                    f"(허용값: {', '.join(VALID_WEBHOOK_STATUSES)})",
         )
+    # 조회 조건 값이므로 400이다(`_require_sqlite_filter()` 주석 참고, Sprint 155).
+    _require_sqlite_filter(payment_id, "payment_id")
     # 2026-08-13 Sprint 78 — Sprint 74가 정리한 규약의 **누락 인스턴스**였다.
     # 바로 위 `processing_status`는 검증되는데 같은 함수의 `provider`는 그대로 SQL 등호로
     # 들어가, 오타를 주면 400이 아니라 200 + 빈 목록이 나왔다(실측).
@@ -762,6 +833,7 @@ def admin_get_webhook(webhook_id: int, admin_role: str = Depends(require_admin))
     """Webhook 수신 1건 상세 — 원문 payload와 실패 사유를 그대로 보여준다."""
     from api.v1.payment_logs import row_to_webhook
 
+    _require_sqlite_id(webhook_id, "Webhook 수신 기록을 찾을 수 없습니다")
     conn = get_connection()
     try:
         row = conn.execute(
@@ -791,6 +863,7 @@ def admin_reprocess_webhook(
     """
     from api.v1.payments import reprocess_webhook, WebhookReprocessError
 
+    _require_sqlite_id(webhook_id, "Webhook 수신 기록을 찾을 수 없습니다")
     conn = get_connection()
     try:
         before = conn.execute(
@@ -858,6 +931,7 @@ def admin_refund_payment(
     if not req.reason or not req.reason.strip():
         raise HTTPException(status_code=400, detail="환불에는 reason이 필요합니다")
 
+    _require_sqlite_id(payment_id, "결제 내역을 찾을 수 없습니다")
     conn = get_connection()
     try:
         before = conn.execute("SELECT status FROM payments WHERE id=?", (payment_id,)).fetchone()
@@ -982,6 +1056,7 @@ def admin_change_subscription_status(
         except ValueError:
             raise HTTPException(status_code=400, detail="expires_at 형식이 올바르지 않습니다(ISO 8601)")
 
+    _require_sqlite_id(subscription_id, "구독을 찾을 수 없습니다")
     conn = get_connection()
     try:
         try:
