@@ -82,6 +82,33 @@ export default async function SearchScreen({ searchParams, basePath }: SearchScr
         <SearchForm />
         <SearchPresets />
         <SortBar />
+        {/* 검색 결과가 바뀌었다는 것을 **스크린리더에게 알리는 한 줄**이다
+            (2026-08-19 Sprint 223, BUGS #152).
+
+            검색은 `router.push()`를 transition 안에서 부르는 **클라이언트 전환**이라
+            페이지가 다시 읽히지 않는다. 그래서 예전에는 검색 버튼을 누르면 목록만
+            조용히 바뀌었다 — 실측한 값으로, 이 화면의 live region 은 **0개**였다.
+            보는 사람은 "총 9건"이 바뀌는 걸 보지만, 듣는 사람은 아무 일도 일어나지
+            않은 것과 구별할 수 없었다(WCAG 4.1.3 Status Messages, AA).
+
+            **항상 존재하는 한 줄**이어야 한다 — live region 은 내용이 바뀌기 **전에**
+            DOM 에 있어야 읽힌다. 결과 목록 자체에 aria-live 를 달면 0건일 때는
+            그 문단이 통째로 사라져 아무것도 알리지 못한다.
+            (이 자리의 노드가 소프트 전환을 건너 살아남는지는 실측했다 — 같은 DOM 노드가
+            유지된다. 그래서 글자만 바뀌고, 그것이 바로 live region 이 요구하는 조건이다.)
+
+            `sr-only` 는 화면에 **보이지 않는다** — 픽셀은 하나도 바뀌지 않는다. */}
+        <p className="sr-only" role="status" aria-live="polite">
+          {errorKind === 'bad_request'
+            ? '검색조건에 잘못된 값이 있습니다'
+            : errorKind === 'unavailable'
+              ? '검색 결과를 불러오지 못했습니다'
+              : data
+                ? data.total > 0
+                  ? `검색 결과 총 ${data.total.toLocaleString()}건, ${data.page} / ${data.total_pages} 페이지`
+                  : '검색 결과가 없습니다'
+                : ''}
+        </p>
         {/* 결과 영역이 실패해도 위의 검색 Form은 그대로 쓸 수 있어야 한다(Master Spec §13 #4) */}
         {errorKind === 'bad_request' && (
           <div className="text-center py-20">

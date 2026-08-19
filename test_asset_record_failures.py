@@ -285,7 +285,11 @@ def test_valid_image_is_recorded():
         tmpdir = tempfile.mkdtemp(prefix="qa_img_ok_")
         good = os.path.join(tmpdir, "good.jpg")
         with open(good, "wb") as f:
-            f.write(b"\xff\xd8\xff" + b"x" * 500)     # 0바이트가 아닌 실제 내용
+            # ★ `MIN_IMAGE_BYTES`(1,024)를 넘겨야 한다 (2026-08-19 Sprint 218, BUGS #148).
+            #   그 아래는 저장 계층이 기록하지 않는다 — 기록하면 화면은 사진이 있다고
+            #   하는데 서빙은 404 가 되기 때문이다. 예전 500바이트 픽스처는
+            #   **실제로는 한 장도 서빙될 수 없는 크기**였다.
+            f.write(b"\xff\xd8\xff" + b"x" * 2048)     # 0바이트가 아닌 실제 내용
 
         result = save_auction_images(court, case_no, item_no, [
             {"seq": 1, "kind": "photo", "path": good},

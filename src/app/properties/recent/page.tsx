@@ -59,17 +59,17 @@ export default function RecentItemsPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-white flex items-center justify-center">
+      <main className="min-h-screen bg-white flex items-center justify-center">
         <p className="text-gray-400">불러오는 중...</p>
-      </div>
+      </main>
     )
   }
 
   return (
     <div className="min-h-screen bg-gray-50">
       <SiteHeader current="recent" title="최근 본 물건" />
-      <div className={`${CONTAINER} py-4`}>
-        {error && <p className="text-sm text-red-500 text-center py-20">{error}</p>}
+      <main className={`${CONTAINER} py-4`}>
+        {error && <p role="alert" className="text-sm text-red-500 text-center py-20">{error}</p>}
         {!error && items && items.length === 0 && (
           <div className="text-center py-20">
             <p className="text-gray-400">최근 본 물건이 없습니다</p>
@@ -93,11 +93,11 @@ export default function RecentItemsPage() {
               </p>
               <div className="mt-3 grid grid-cols-2 gap-2 text-center border-t border-gray-50 pt-3">
                 <div>
-                  <p className="text-[11px] text-gray-400">감정가</p>
+                  <p className="text-[0.6875rem] text-gray-400">감정가</p>
                   <p className="text-sm font-medium text-gray-700">{formatPrice(item.appraisal_price)}</p>
                 </div>
                 <div>
-                  <p className="text-[11px] text-gray-400">최저입찰가</p>
+                  <p className="text-[0.6875rem] text-gray-400">최저입찰가</p>
                   <p className="text-sm font-bold text-blue-500">{formatPrice(item.minimum_bid_price)}</p>
                 </div>
               </div>
@@ -109,7 +109,7 @@ export default function RecentItemsPage() {
           </Link>
         ))}
         </div>
-      </div>
+      </main>
     </div>
   )
 }

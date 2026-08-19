@@ -21,6 +21,34 @@
   `NO_IMAGE`면 "법원이 사진을 제공하지 않습니다", `FAILED`면 "가져오지 못했습니다" —
   기다리면 되는 것과 기다려도 소용없는 것을 사용자가 구분할 수 있어야 하기 때문이다
 - `/properties/recent`: 최근조회 목록. FastAPI `GET /api/v1/recent-items` 사용 (Release 완료)
+
+  **2026-08-19 Sprint 218 — 검색목록 썸네일은 상세와 같은 사진이어야 한다.**
+  검색 결과 카드의 대표 사진은 `src/app/search/ResultThumbnail.tsx`(작은 클라이언트 섬)가
+  그린다. 서버 컴포넌트인 `ResultList.tsx` 안에서는 `onError` 를 쓸 수 없기 때문이다
+  (그 오류는 `tsc`/`eslint`/`build` 셋 다 못 잡고 화면만 죽는다 — 그 파일 주석 참고).
+
+  대표 사진을 고르는 규칙이 **두 곳에 각자** 있다는 점이 이 화면의 위험이다:
+
+  ```
+  검색목록   api/v1/search.py   SELECT item_id, MIN(seq) ... GROUP BY item_id
+  상세페이지 api/v1/item.py     ORDER BY seq 로 읽어 images[0]
+  ```
+
+  한쪽만 바뀌면 **"클릭했더니 다른 집이 나온다"** 가 된다.
+  `test_asset_pipeline.py` 12-N 이 두 응답을 나란히 놓고 **같은 URL·같은 바이트**인지
+  대조한다. 12-O 는 사진이 교체됐을 때 목록도 새 사진을 받는지(ETag)까지 본다.
+
+  **빈 상태**: 사진이 없으면 `thumbnail_url` 이 `null` 이고 `<img>` 를 아예 만들지
+  않는다(깨진 아이콘도, 빈 자리도 남기지 않는다). 서빙이 404 를 내면
+  `ResultThumbnail` 이 `onError` 로 스스로 사라진다 — **목록 전체는 200 그대로**다.
+
+  ★ 한계(2026-08-19 실측): 검색 결과 항목의 이미지 관련 키는 `thumbnail_url` **하나뿐**
+  이라, 목록은 "한 번도 안 해 봄 / 법원에 없음 / 수집 실패"를 **구분하지 못한다**
+  (상세는 `images_status` 로 구분한다). 목록에 상태 배지를 넣을지는 제품 결정이다.
+
+  ★ 비용(2026-08-19 실측): 썸네일 한 장이 평균 **약 101 KB** 다 — 80x80 으로 그리는데
+  **원본을 그대로** 내려 준다. 1페이지(9장) 첫 방문 **0.91 MB**, 재방문은 전부 304 로
+  **0 바이트**. 서버 측 썸네일 생성은 Pillow 의존성이라 승인 영역이다.
 - `/search`: `/`와 **동일한 `SearchScreen`을 공유**하는 검색 화면(복제 없음). 기존 링크/북마크 호환용으로 유지. FastAPI `GET /api/v1/search` 사용 (Release 완료)
 - `/favorites`: 관심물건 목록. FastAPI `/api/v1/favorites` 사용 (Release 완료)
 
@@ -241,3 +269,124 @@
 - **Admin 화면** — 운영자별 신원 체계 선행 필요 (위 참고)
 - 권리분석 전용 화면 — 데이터 커버리지 회복(BUGS #46)이 선행돼야 의미가 있다
 - ~~등기부 다운로드 UI~~ (2026-08-05 완료)
+
+---
+
+## 접근성 / 큰글씨 — 2026-08-19 Sprint 219 실측
+
+**화면은 바꾸지 않았다.** 처음으로 쟀고, 나빠지지 않게 잠갔다
+(`test_frontend_accessibility.py`, 상세는 `docs/SPRINT219_ACCESSIBILITY_AUDIT.md`).
+
+```
+검사한 텍스트 199개 / WCAG AA 대비(4.5:1) 미달 81개 (41%)
+text-gray-400 on white = 2.6:1        기준의 58%
+탭 타깃 53개 중 44px 미만 44개 (83%)   그중 24px 미만 5개 = WCAG 2.5.8 AA 위반
+물건 주소 12px / "최저입찰가"·"감정가 3.8억" 11px
+소스: text-xs 111 / text-gray-400 106 (상세페이지가 각 55 로 가장 심하다)
+```
+
+**확인한 것**: 뷰포트 메타가 올바르다(`width=device-width, initial-scale=1`),
+확대 차단(`user-scalable=no` 등)이 **없다**, 썸네일이 `alt=""`+`aria-hidden`+`onError`
+규약을 지킨다, `alt` 없는 `<img>` 가 **0개**다.
+
+**2026-08-19 Sprint 223에 채운 것** (전부 픽셀 무변경):
+
+```
+모달 포커스 트랩     첫 진입 포커스 / Tab 순환 / 닫을 때 여는 버튼으로 복귀
+                     src/lib/useFocusTrap.ts, 두 모달에 배선 (BUGS #151)
+상태 메시지 알림     동적 안내 13곳에 role=alert|status
+                     검색 결과는 **항상 존재하는 sr-only 한 줄**(role=status) (BUGS #152)
+오류-컨트롤 연결     시/군/구 로드 실패를 aria-describedby 로 그 select 에
+main 랜드마크        화면 6개 전부 보유(로딩·실패 분기 포함) (BUGS #153)
+폼 컨트롤 이름       93/93 (Sprint 222)
+키보드               양수 tabindex 0 / 클릭 전용 div 0 / 이름 없는 대화형 요소 0
+aria 상태값          aria-expanded 가 실제로 토글된다(클릭해서 확인) / aria-current / aria-pressed
+disabled             네이티브 disabled 만 사용(aria-disabled 단독 0)
+heading              /search·/properties 둘 다 건너뜀 0
+```
+
+**확인하지 못한 것**: **모바일 뷰포트(390~412px) 레이아웃.**
+브라우저 자동화의 창 리사이즈가 페이지 뷰포트에 반영되지 않았고
+(`innerWidth` 가 1920 에서 안 바뀐다), 앱이 `X-Frame-Options: DENY` 라
+iframe 으로 좁은 폭을 만드는 우회도 막혔다(그 헤더 자체는 올바른 보안 설정이다).
+2026-08-19 Sprint 223에 `resize_window(390x844)` 로 **재확인했다** — 창은 줄지만
+`innerWidth` 는 여전히 1920 이라 미디어 쿼리가 전환되지 않는다. 여전히 **확인 불가**다.
+**"모바일에서 깨지지 않는다"는 아직 주장할 수 없다** — 사람이 실기기나
+DevTools 디바이스 모드로 한 번 봐야 한다.
+
+**큰글씨 모드의 전제** (2026-08-19 Sprint 220 정정): 처음엔 "대부분 px 고정이라
+루트 글꼴을 키워도 안 커진다"고 적었으나 **빌드 CSS 를 열어 보니 사실이 아니다.**
+Tailwind v4 의 이름 있는 크기는 rem 기반이다(`--text-xs: .75rem`).
+`text-xs`(111곳)는 루트 글꼴을 따라 커진다. 닿지 않는 것은 **대괄호 임의값 8곳**뿐
+(`text-[11px]` 6 + `text-[10px]` 2). **선행 작업은 그 8곳 교체**이고 전면 전환이 아니다.
+
+**(2026-08-19 Sprint 223 — 그 8곳을 교체해 `0곳`이 됐다.)**
+`text-[11px]` -> `text-[0.6875rem]`, `text-[10px]` -> `text-[0.625rem]`.
+16px 기준 **정확히 같은 크기**라 픽셀은 하나도 바뀌지 않고, 이제 루트 글꼴을 따라 커진다.
+
+```
+루트 16px    11px  (수정 전과 동일)
+루트 32px    11px -> **22px**  (전에는 11px 고정)
+2배 확대에서도 가로 오버플로 0
+```
+
+큰글씨의 **기술 기반은 끝났다.** 남은 것은 색·크기·간격을 얼마로 할지라는 제품 결정뿐이다.
+
+---
+
+## 로컬 개발 접속 정보 (2026-08-19 Sprint 221 실측)
+
+```
+WEB   http://localhost:3000/     메인이 곧 검색 화면(SearchScreen). 리다이렉트 없음
+API   http://127.0.0.1:8000      Swagger UI: /docs
+실행  python -m uvicorn api_server:app --host 127.0.0.1 --port 8000
+      npm run dev
+설정  .env.local 의 NEXT_PUBLIC_API_BASE_URL 이 프런트가 부를 API 주소를 정한다
+```
+
+로그인 게이트(`src/proxy.ts`)가 막는 것은 `/properties`, `/favorites`, `/mypage` 뿐이다.
+**검색은 비로그인으로 볼 수 있다.**
+
+★ 긴 개발 세션에서 `node` 프로세스가 누적되면 Turbopack 이 `0xc0000142` 로 죽어
+dev 서버가 **500** 을 낸다(코드 결함 아님). 남은 node 프로세스를 모두 종료하면 정상화된다.
+
+## 화면 간 사진 일관성 — 검색목록에만 썸네일이 있다 (2026-08-19)
+
+`thumbnail_url` 을 주는 API 는 `api/v1/search.py` 하나뿐이다.
+**관심물건·최근 본 물건 화면에는 `<img>` 가 없다.** 사용자는 검색목록에서 사진을 보고
+담았는데 관심물건에서는 사진이 사라진다.
+
+의도된 제외라는 기록이 없어 **미문서화 공백**으로 판단했고, 고치는 것은 제품 결정이라
+`docs/roadmap.md` 에 Backlog 로 등록했다. 그동안 `test_search.py` 가 규칙을 건다 —
+**그리기 시작하면 API 도 주어야 한다.**
+
+## 폼 접근성 — 이름은 `aria-label` 로 준다 (2026-08-19 Sprint 222, BUGS #150)
+
+이 저장소의 검색 폼은 보이는 레이블을 `<span className={labelClass}>` 로 그린다.
+**그것은 컨트롤과 프로그래밍적으로 연결되지 않는다** — 스크린리더는 "콤보박스"라고만
+읽고, 최소/최대가 나란히 둘이라 어느 쪽인지도 알 수 없다.
+
+그래서 **감싸는 `<label>` 로 이름을 줄 수 없는 부류**는 전부 `aria-label` 을 쓴다.
+
+```
+<select>                 `${label} 최소` / `${label} 최대`  (RangeSelect / PriceRangeSelect)
+<input type="date">      "매각기일 시작" / "매각기일 종료"
+placeholder 만 있는 input  placeholder 와 같은 문구를 aria-label 로도 준다
+```
+
+`placeholder` 는 **입력을 시작하면 사라지므로 이름이 아니다**(WCAG 3.3.2).
+체크박스 77개는 `<label>` 로 감싸는 패턴이라 그대로 둔다.
+
+실측(2026-08-19, 아코디언 전부 펼침): **폼 컨트롤 93개 전부 이름 있음**(수정 전 77개).
+`test_frontend_accessibility.py` 10 이 이 규칙을 잠근다.
+
+★ 측정할 때 **아코디언을 펼쳐야 한다.** 접힌 상태만 보면 컨트롤이 5개로 보인다.
+
+## 모달 — `role="dialog"` + `aria-modal` (2026-08-19 Sprint 221, BUGS #149)
+
+상세페이지의 전체 화면 오버레이 둘(문서 뷰어 / 사진 라이트박스)은
+`role="dialog" aria-modal="true" aria-labelledby=<제목 id>` 를 갖는다.
+없으면 스크린리더가 모달임을 알리지 못하고 **뒤의 검색 결과·가격이 계속 읽힌다.**
+
+Escape 닫기와 좌우 화살표 이동은 이미 있었고 함께 회귀로 고정했다.
+**포커스 트랩은 아직 없다** — Tab 이 배경으로 빠져나간다(별도 작업).

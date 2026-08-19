@@ -11,7 +11,9 @@ from storage.database import (
     init_db, reset_stale_queue, claim_next_queue_item,
     mark_queue_done, mark_queue_failed, mark_queue_skipped_expired,
     mark_queue_unsupported, save_auction_images, reconcile_queue_auction_date,
+    clear_images_if_absence_confirmed,
 )
+from crawler.image_assets import remove_stored_image_files
 from crawler.doc_crawler import (
     collect_document, build_download_driver, restart_download_driver,
     SIBLING_REUSE_MAX_AGE_SECONDS,
@@ -19,6 +21,7 @@ from crawler.doc_crawler import (
 from crawler.doc_paths import CASE_LEVEL_DOC_TYPES, find_sibling_case_document
 from crawler.base_crawler import go_to_case_detail
 from models.crawl_outcome import DocWorkerOutcome
+from storage.checkpoint import RunLock
 
 os.makedirs("logs", exist_ok=True)
 
@@ -50,23 +53,34 @@ LOCK_PATH = os.path.join("logs", "doc_worker.lock")
 LOCK_STALE_HOURS = 5
 
 
+def _lock() -> RunLock:
+    """지금의 `LOCK_PATH`/`LOCK_STALE_HOURS` 로 락 객체를 만든다.
+
+    ★ 모듈 로드 시점에 한 번 만들어 두지 **않는다** — 그러면 나중에 누가
+      `LOCK_PATH` 를 바꿔도 락은 옛 경로를 계속 본다(스냅숏 함정).
+      같은 실수를 `audit_asset_integrity.py` 가 `DB_PATH` 에서 한 번 했다(Sprint 193).
+    """
+    return RunLock(LOCK_PATH, LOCK_STALE_HOURS, label="doc_worker")
+
+
 def _acquire_lock() -> bool:
-    """다른 doc_worker.py 인스턴스가 실행 중이 아니면 락을 잡고 True. 이미 실행 중이면 False."""
-    if os.path.exists(LOCK_PATH):
-        age_hours = (time_module.time() - os.path.getmtime(LOCK_PATH)) / 3600
-        if age_hours < LOCK_STALE_HOURS:
-            return False
-        logger.warning("오래된 락 파일 발견(%.1f시간 경과) - 죽은 실행으로 간주하고 회수", age_hours)
-    with open(LOCK_PATH, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()) + " " + datetime.now().isoformat())
-    return True
+    """다른 doc_worker.py 인스턴스가 실행 중이 아니면 락을 잡고 True. 이미 실행 중이면 False.
+
+    2026-08-18 Sprint 194: 구현을 `storage/checkpoint.py:RunLock` 으로 옮겼다.
+    (2026-08-19 Sprint 217 정정: 이 줄은 `storage/runlock.py` 라고 적고 있었는데 **그런
+     파일은 없다.** 처음엔 그 이름으로 새로 만들었다가 "추적 파일이 미추적 파일을
+     import 하지 않는다" 가드에 걸려 이미 추적된 모듈로 옮겼고 — 그 경위는
+     `docs/BUGS.md` #132 에 정확히 남아 있는데 — 여기 주석만 옛 이름 그대로였다.)
+    **동작은 그대로다** —
+    같은 방어가 필요한 배치(`mvp_scraper.py`)가 하나 더 있는데 규칙을 베끼고 싶지 않았다
+    (이 저장소는 "규칙이 두 벌"에서 반복해 사고를 겪었다: BUGS #107/#112/#136/#161).
+    이 함수와 `LOCK_PATH`/`LOCK_STALE_HOURS` 는 회귀가 참조하는 공개 표면이라 유지한다.
+    """
+    return _lock().acquire()
 
 
 def _release_lock() -> None:
-    try:
-        os.remove(LOCK_PATH)
-    except OSError:
-        pass
+    _lock().release()
 
 
 def is_time_up() -> bool:
@@ -144,6 +158,11 @@ def main() -> int:
             item_no = item["item_no"]
             doc_type = item["doc_type"]
             auction_date = item.get("auction_date", "")
+            # 2026-08-18 Sprint 189: 'refresh'로 집어간 항목은 **이미 받아 둔 것이 있는데
+            # 다시 받아야 한다**는 뜻이다. 이 값을 안 넘기면 수집기가 "이미 존재. 스킵"으로
+            # 곧바로 성공 처리해, 큐만 done으로 돌고 파일은 그대로인 헛수집이 된다.
+            # 판단은 `claim_next_queue_item()`이 이미 했다(어휘를 여기서 복제하지 않는다).
+            overwrite = bool(item.get("overwrite"))
 
             # 2차 방어선: 매각기일이 이미 지난 항목은 브라우저 작업 없이 즉시 종료.
             # (1차 방어선은 enqueue_documents에서 애초에 큐에 안 넣는 것이지만,
@@ -210,9 +229,15 @@ def main() -> int:
                 #   비어 돌아오므로 아래에서 정상 경로로 떨어진다 — 브라우저 없이 실패로
                 #   종결시키지 않는다.
                 result = None
-                if doc_type in CASE_LEVEL_DOC_TYPES and find_sibling_case_document(
-                        court_code, case_no, item_no, doc_type,
-                        max_age_seconds=SIBLING_REUSE_MAX_AGE_SECONDS):
+                # ★ 재수집(overwrite)일 때는 형제 복사를 쓰지 않는다 (Sprint 189).
+                #   형제 물건의 사본도 **같은 옛 수집분**이다. 그것을 복사해 오면
+                #   법원이 갱신한 새 문서 대신 옛 내용을 다시 저장하고, 큐는 done이 되어
+                #   재수집 기회가 사라진다 — 재수집을 켠 의미가 정확히 없어진다.
+                #   (최초 수집에서는 여전히 브라우저 navigation 15초를 아끼는 큰 최적화다.)
+                if (not overwrite and doc_type in CASE_LEVEL_DOC_TYPES
+                        and find_sibling_case_document(
+                            court_code, case_no, item_no, doc_type,
+                            max_age_seconds=SIBLING_REUSE_MAX_AGE_SECONDS)):
                     candidate = collect_document(None, court_code, case_no, item_no,
                                                  doc_type, btn_id)
                     if candidate.get("reused_from"):
@@ -226,7 +251,7 @@ def main() -> int:
                         raise Exception("사건 상세 진입 실패")
 
                     result = collect_document(driver, court_code, case_no, item_no,
-                                              doc_type, btn_id)
+                                              doc_type, btn_id, overwrite=overwrite)
 
                 if result["success"]:
                     # 2026-08-17 Sprint 144: 사진은 "성공했는데 저장할 것이 없는" 경우가
@@ -234,14 +259,92 @@ def main() -> int:
                     # 결과가 같은 **정상 종결**이다. 그때 READY로 쓰면 화면이 "볼 수 있다"고
                     # 거짓말하므로 상태를 구분한다(FAILED도 아니다 — 실패가 아니니까).
                     done_status = "NO_IMAGE" if result.get("no_asset") else "READY"
-                    mark_queue_done(
-                        item["id"], court_code, case_no, item_no, doc_type,
-                        result["previous_hash"], result["new_hash"],
-                        status=done_status, files_saved=result.get("files_saved"),
-                    )
+
+                    # ★ 법원이 사진을 **전부** 내린 경우는 여기서만 처리된다
+                    #   (2026-08-18 Sprint 191, BUGS #128).
+                    #   아래 `save_auction_images()` 호출은 `result["images"]` 가 비면
+                    #   건너뛰므로 — 그 가드 자체는 옳다(빈 목록은 전체 실패와 구별되지
+                    #   않는다) — 0장으로 줄어드는 경우만 아무도 정리하지 않았다.
+                    #   `mark_queue_done()` **보다 먼저** 부른다: 그 함수가 상태를
+                    #   NO_IMAGE 로 덮고 나면 1회차인지 2회차인지 알 수 없게 된다.
+                    if doc_type == "image" and result.get("no_asset"):
+                        absent = clear_images_if_absence_confirmed(
+                            court_code, case_no, item_no)
+                        if absent["cleared"]:
+                            gone = remove_stored_image_files(absent["paths"])
+                            logger.info("[%s-%s] 사진 정리: 행 %d / 파일 %d",
+                                        case_no, item_no, absent["cleared"], gone)
 
                     # 사진은 개수가 0~N이라 `doc_raw`(종류당 1행)에 담기지 않는다.
                     # 실체 기록은 `auction_image`가 맡는다(migration 020).
+                    #
+                    # ★ `mark_queue_done()` **보다 먼저** 부른다 (2026-08-18 Sprint 208).
+                    #
+                    #   예전에는 순서가 반대였다 — 성공을 먼저 기록하고 사진을 나중에 적었다.
+                    #   그 사이에서 이 호출이 실패하면(DB 잠금, 파일 접근 실패 등) 바깥
+                    #   `except`가 큐를 되돌려 재시도는 되지만, **`document_status`는 이미
+                    #   READY로 덮여 있다.** 화면은 "사진 있음"이라고 말하는데
+                    #   `auction_image`는 0행이다. 재시도가 소진되면 그 거짓말이 영구가 된다.
+                    #
+                    #   fixture 로 재현했다(Sprint 208):
+                    #       document_status = IMAGE/READY, auction_image = 0행, 큐 = pending(retry 1)
+                    #
+                    #   실체를 먼저 적으면 실패는 그냥 실패로 남는다 — 성공 표시가 없으니
+                    #   화면도 거짓말하지 않고, 큐만 재시도한다. 순서를 바꾸는 것 말고
+                    #   추가로 하는 일은 없다.
+                    # ★ 기록 결과를 **판정에 쓴다** (2026-08-18 Sprint 214).
+                    #
+                    #   Sprint 208 이 순서를 바로잡았지만(실체 -> 성공), 그것만으로는
+                    #   부족했다. `save_auction_images()` 는 **예외를 던지지 않고**
+                    #   0장을 기록할 수 있다 — 디스크에 파일이 없으면 그 항목을 전부
+                    #   건너뛰고 `saved=0, skipped_missing=N` 을 돌려준다(그 가드 자체는
+                    #   옳다: DB 만 앞서가지 않게 하는 이 저장소의 규약이다).
+                    #
+                    #   그런데 호출부가 그 반환값을 **로그로만** 썼다. 그래서
+                    #   수집기가 사진 2장을 줬는데 한 장도 기록되지 못한 실행이
+                    #   `done` + `READY` 로 끝났다. fixture 로 두 경로를 재현했다:
+                    #
+                    #       C 수집기가 준 경로에 파일이 없다   -> done/READY/0행
+                    #       E save 가 saved=0 을 돌려준다      -> done/READY/0행
+                    #
+                    #   "함수를 불렀다"와 "성공했다"는 다르다. 한 장도 남기지 못한 실행은
+                    #   성공이 아니라 **재시도해야 할 실패**다.
+                    #
+                    #   부분 성공(`partial`)은 그대로 성공이다 — 한 장이라도 남았으면
+                    #   사용자가 볼 것이 생긴다. 0장만 실패로 본다.
+                    #   `no_asset`(법원이 사진을 안 준다)은 애초에 이 분기에 오지 않는다.
+                    asset_recorded = True
+
+                    # ★ 문서도 같은 계열이다 (2026-08-18 Sprint 214 §2).
+                    #
+                    #   `_record_doc_raw()` 의 docstring 이 이미 적고 있었다 —
+                    #   "파일이 없으면 ... doc_raw 행을 만들지 않는다 — 큐/상태는
+                    #    **이미 done/READY로 갔지만** ... 여기서 뒤집지는 않는다
+                    #    (뒤집으려면 collect_document() 의 성공 판정을 고쳐야 한다)."
+                    #
+                    #   그 "고쳐야 한다"를 여기서 한다. fixture 로 재현했다:
+                    #   수집기가 `files_saved=[spec.pdf]` 를 돌려줬는데 그 파일이 없으면
+                    #   `queue=done` / `document_status=READY` / `doc_raw=0행` 으로 끝나고,
+                    #   API 는 `available=true` 에 `viewer_url` 까지 준다.
+                    #
+                    #   검사 범위를 좁게 잡는다 — **수집기가 저장했다고 말한 파일만** 본다.
+                    #     - `files_saved` 가 비면 검사하지 않는다: "이미 존재. 스킵" 경로가
+                    #       정상적으로 빈 목록을 돌려준다(그 문서는 이전에 이미 받아 뒀다).
+                    #     - `doc_exists()` 로 완성도를 요구하지 않는다: 문서에도
+                    #       부분 성공(원본만 저장, 구조화 실패)이 계약으로 있어서
+                    #       그것까지 실패로 뒤집으면 정책을 바꾸는 것이 된다.
+                    if doc_type != "image":
+                        claimed = [p for p in (result.get("files_saved") or []) if p]
+                        missing = [p for p in claimed
+                                   if not (os.path.isfile(p) and os.path.getsize(p) > 0)]
+                        if missing:
+                            logger.warning(
+                                "[%s-%s] %s 저장했다는 파일이 실제로 없다 %s "
+                                "- 성공으로 종결하지 않고 재시도한다",
+                                case_no, item_no, doc_type,
+                                [os.path.basename(p) for p in missing])
+                            asset_recorded = False
+
                     if doc_type == "image" and result.get("images"):
                         # 부분 수집이면 옛 행을 지우지 않는다 — 받지 못한 사진이
                         # "법원이 내린 것"인지 "이번에 실패한 것"인지 구별할 수 없고,
@@ -252,14 +355,29 @@ def main() -> int:
                         logger.info("[%s-%s] 사진 DB 기록: 저장 %d / 누락 %d / 오래된 행 정리 %d",
                                     case_no, item_no, stat["saved"],
                                     stat["skipped_missing"], stat["removed_stale"])
+                        asset_recorded = stat["saved"] > 0
 
-                    succeeded += 1
-                    if result.get("no_asset"):
-                        logger.info("[%s-%s] %s 처리 성공(원천에 자산 없음)", case_no, item_no, doc_type)
-                    elif result.get("partial"):
-                        logger.warning("[%s-%s] %s 부분 성공(원본만 저장, 구조화 실패)", case_no, item_no, doc_type)
+                    if not asset_recorded:
+                        logger.warning(
+                            "[%s-%s] 사진 %d장을 받았다고 했으나 **한 장도 기록되지 못했다** "
+                            "- 성공으로 종결하지 않고 재시도한다",
+                            case_no, item_no, len(result.get("images") or ()))
+                        mark_queue_failed(item["id"], item["retry_count"])
                     else:
-                        logger.info("[%s-%s] %s 처리 성공", case_no, item_no, doc_type)
+                        mark_queue_done(
+                            item["id"], court_code, case_no, item_no, doc_type,
+                            result["previous_hash"], result["new_hash"],
+                            status=done_status, files_saved=result.get("files_saved"),
+                        )
+
+                        succeeded += 1
+                        if result.get("no_asset"):
+                            logger.info("[%s-%s] %s 처리 성공(원천에 자산 없음)", case_no, item_no, doc_type)
+                        elif result.get("partial"):
+                            logger.warning("[%s-%s] %s 부분 성공(원본만 저장, 구조화 실패)", case_no, item_no, doc_type)
+                        else:
+                            logger.info("[%s-%s] %s 처리 성공%s", case_no, item_no, doc_type,
+                                        " (재수집)" if overwrite else "")
                 else:
                     mark_queue_failed(item["id"], item["retry_count"])
                     logger.warning("[%s-%s] %s 처리 실패 (retry=%d)", case_no, item_no, doc_type, item["retry_count"] + 1)

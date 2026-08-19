@@ -35,6 +35,7 @@ from crawler.image_assets import (
     image_filename,
     image_path,
     list_stored_images,
+    ALLOWED_IMAGE_EXTS,
     MIN_IMAGE_BYTES,
 )
 
@@ -106,6 +107,23 @@ def _existing_set_hash(court_code: str, case_no: str, item_no: str) -> str:
     rows = list_stored_images(court_code, case_no, item_no)
     if not rows:
         return ""
+    # 같은 순번이 두 파일로 존재하면 비교 자체를 포기한다 (2026-08-18 Sprint 189, BUGS #120).
+    #
+    # 수집 쪽 `new_hash`는 **순번당 한 장**을 전제로 만들어진다(`saved_images`는 seq를
+    # 중복 없이 담는다). 그런데 디스크에는 확장자가 다른 같은 순번 파일이 남을 수 있었다 —
+    # 법원이 사진을 다른 형식으로 바꿔 끼우면 `01.jpg` 옆에 `01.png`가 생겼다. 그 상태로
+    # 이어 붙이면 디스크 쪽은 2개, 수집 쪽은 1개를 해시해 **두 공식이 영원히 갈라진다**
+    # (매 수집이 거짓 개정이 되어 진짜 개정을 찾을 수 없다 — 이 함수 docstring의 바로 그 경고).
+    #
+    # 아래 `_write_image_atomically()`가 이제 그 잔재를 만들지 않지만, 이 함수 자체도
+    # "반쪽 지문으로 비교하지 않는다"는 같은 규칙을 지킨다(OSError 분기와 같은 판단).
+    seqs = [r["seq"] for r in rows]
+    if len(set(seqs)) != len(seqs):
+        dup = sorted({q for q in seqs if seqs.count(q) > 1})
+        logger.warning(
+            "[%s-%s] 같은 순번의 사진 파일이 둘 이상이다(순번 %s) - 지문 비교를 건너뛴다",
+            case_no, item_no, dup)
+        return ""
     digests = []
     for r in rows:
         try:
@@ -116,6 +134,22 @@ def _existing_set_hash(court_code: str, case_no: str, item_no: str) -> str:
             # 비교하면 바뀌지 않았는데 "변경됨"으로 기록된다.
             return ""
     return hashlib.sha256("".join(digests).encode("ascii")).hexdigest()
+
+
+def _same_bytes_on_disk(dest: str, digest: str) -> bool:
+    """목적지 파일의 내용이 `digest`(sha256)와 같으면 True. 읽을 수 없으면 False.
+
+    False는 "다르다"가 아니라 **"같다고 말할 수 없다"**는 뜻이다 — 그때는 호출부가
+    정상 저장 경로로 떨어진다(판단이 안 서면 받은 것을 쓰는 쪽이 안전하다).
+    """
+    try:
+        if not os.path.isfile(dest):
+            return False
+        with open(dest, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest() == digest
+    except OSError:
+        return False
+
 
 
 def collect_images(driver, court_code: str, case_no: str, item_no: str,
@@ -152,6 +186,8 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
     # 어느 사진이 남았는지 알 수 없게 된다.
     seen_seq = set()
     attempted = 0
+    written = 0        # 이번에 **실제로 디스크에 쓴** 장수
+    unchanged = 0      # 바이트가 같아 건드리지 않은 장수
     saved_images: List[Dict] = []
 
     for el in els:
@@ -202,11 +238,34 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
             existing = _describe_existing(dest, seq, kind)
             if existing:
                 saved_images.append(existing)
+                unchanged += 1
             continue
 
-        written = _write_image_atomically(dest, data, court_code, case_no, item_no, seq, ext)
-        if not written:
+        digest = hashlib.sha256(data).hexdigest()
+
+        # ★ 재수집이어도 **바이트가 같으면 쓰지 않는다** (2026-08-18 Sprint 189).
+        #
+        #   법원 사진은 base64로 페이지에 박혀 오므로 "다시 받는 비용"은 0이다. 그런데
+        #   같은 바이트를 다시 쓰면 **mtime이 바뀐다.** 서빙 쪽 ETag는 Starlette가
+        #   (mtime, size)로 만들기 때문에(`api/v1/images.py`), 내용이 그대로여도
+        #   **모든 브라우저 캐시가 무효화되어 물건당 약 1.3~1.9MB를 다시 내려받는다**
+        #   (`api/http_cache.py`가 조건부 요청으로 아끼려던 바로 그 바이트다).
+        #   재수집 대상 물건은 정의상 "사용자가 지금 보고 있는" 물건이라 체감도 크다.
+        #
+        #   그래서 재수집에서도 **실제로 달라진 장만** 쓴다. 판정은 확장자가 아니라
+        #   바이트 지문으로 한다 — 크기만 비교하면 같은 크기의 다른 사진을 놓친다.
+        if overwrite and _same_bytes_on_disk(dest, digest):
+            existing = _describe_existing(dest, seq, kind)
+            if existing:
+                saved_images.append(existing)
+                unchanged += 1
+                continue
+            # 읽지 못했으면 판단 근거가 없다 -> 아래 정상 저장 경로로 떨어진다.
+
+        if not _write_image_atomically(dest, data, court_code, case_no,
+                                       item_no, seq, ext):
             continue
+        written += 1
 
         w, h = read_image_dimensions(data)
         saved_images.append({
@@ -214,7 +273,7 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
             "kind": kind,
             "path": dest,
             "file_size": len(data),
-            "file_hash": hashlib.sha256(data).hexdigest(),
+            "file_hash": digest,
             "width": w,
             "height": h,
         })
@@ -222,6 +281,9 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
     result["images"] = sorted(saved_images, key=lambda r: r["seq"])
     result["files_saved"] = [r["path"] for r in result["images"]]
     result["image_count"] = len(result["images"])
+    # 호출부/회귀가 "실제로 썼는가"를 로그 파싱 없이 확인할 수 있게 한다.
+    result["written"] = written
+    result["unchanged"] = unchanged
 
     if attempted == 0:
         # 사진처럼 보이는 요소는 있었지만 alt 규칙에 맞는 것이 하나도 없었다.
@@ -239,6 +301,25 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
 
     result["success"] = True
     result["partial"] = len(result["images"]) < attempted
+
+    # ★ 법원이 사진 수를 줄였으면 **파일도** 정리한다 (2026-08-18 Sprint 191, BUGS #127).
+    #
+    #   `save_auction_images()`는 DB 행만 지운다. 파일은 아무도 안 지웠다. 그 결과:
+    #
+    #     고아 파일   auction_image 가 가리키지 않는 파일이 디스크에 영원히 남는다
+    #     거짓 개정   `_existing_set_hash()`는 **파일시스템**을 근거로 삼으므로 옛 파일까지
+    #                 세고, 수집 쪽 공식(이번에 받은 것만)과 갈라진다
+    #                 -> 이후 매 수집이 "변경됨" (BUGS #120과 **완전히 같은 실패 방식**)
+    #
+    #   재현(2026-08-18): 5장 -> 3장으로 줄인 뒤 재수집하면 디스크에 5개가 그대로 남고
+    #   previous_hash(5장 기준) != new_hash(3장 기준)가 영구히 성립했다.
+    #
+    #   **부분 수집이면 절대 지우지 않는다** — `save_auction_images(complete=)`가 DB에서
+    #   지키는 것과 같은 규칙이다. "법원이 줄였다"와 "일부만 받아졌다"는 구별할 수 없을 때
+    #   남기는 쪽이 안전하다(지운 파일은 되돌릴 수 없다).
+    if not result["partial"]:
+        _remove_files_not_in(court_code, case_no, item_no,
+                             {r["seq"] for r in result["images"]})
     # 사진 집합 전체의 지문. 개별 파일 해시를 순번 순으로 이어 붙여 다시 해시한다 —
     # 한 장이라도 바뀌면 값이 바뀌므로 `document_version_log`의 변경 감지가 그대로 동작한다.
     result["new_hash"] = hashlib.sha256(
@@ -249,7 +330,12 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
         logger.warning("[%s-%s] 사진 부분 수집: %d/%d장",
                        case_no, item_no, len(result["images"]), attempted)
     else:
-        logger.info("[%s-%s] 사진 %d장 저장 완료", case_no, item_no, len(result["images"]))
+        # ★ 로그가 사실이 아닌 것을 말하지 않게 한다 (2026-08-18 Sprint 190).
+        #   무변경 스킵이 생긴 뒤로는 "5장 저장 완료"가 **한 장도 안 썼을 때도** 찍혔다.
+        #   이 저장소가 BUGS #47(배치가 실패를 성공으로 보고) 이래 반복해 잡아 온
+        #   "로그가 거짓을 말한다" 부류다 — 실측으로 실제 실행에서 확인했다.
+        logger.info("[%s-%s] 사진 %d장 확보 (신규/변경 %d장 기록, 무변경 %d장 그대로)",
+                    case_no, item_no, len(result["images"]), written, unchanged)
     return result
 
 
@@ -273,6 +359,79 @@ def _describe_existing(dest: str, seq: int, kind: str):
     }
 
 
+def _remove_files_not_in(court_code: str, case_no: str, item_no: str,
+                         keep_seqs) -> int:
+    """이번에 확보한 순번에 **없는** 사진 파일을 지운다. 지운 개수를 돌려준다.
+
+    2026-08-18 Sprint 191 (BUGS #127). `_remove_other_ext_for_seq()`가 "같은 순번의
+    다른 확장자"를 맡는다면, 이 함수는 "이제 존재하지 않는 순번"을 맡는다. 둘을 합치면
+    **디스크의 사진 집합 == 이번에 법원이 준 사진 집합**이 되고, 그래야
+    `_existing_set_hash()`(파일시스템 근거)와 수집 쪽 `new_hash`가 같은 것을 센다.
+
+    `seq > max_seq`가 아니라 **집합 차집합**으로 판단한다 — 법원이 가운데 순번을 빼는
+    경우(1,2,4)를 `>` 비교는 못 잡는다. `save_auction_images()`의 DB 행 삭제도 같은
+    기준으로 맞춰 두 근거가 갈라지지 않게 했다.
+
+    호출부가 `partial` 여부를 이미 판단하고 부르므로 여기서는 다시 보지 않는다 —
+    판단이 두 곳에 있으면 갈라진다.
+    """
+    removed = 0
+    for row in list_stored_images(court_code, case_no, item_no):
+        if row["seq"] in keep_seqs:
+            continue
+        try:
+            os.remove(row["path"])
+            removed += 1
+            logger.info("[%s-%s] 사진 %d: 법원 원천에서 사라져 파일 정리(%s)",
+                        case_no, item_no, row["seq"], os.path.basename(row["path"]))
+        except OSError as e:
+            # 지우지 못해도 이번 수집 자체는 성공이다. 다만 다음 지문 비교가 중복/잉여
+            # 순번을 발견해 경고를 남기므로 조용히 묻히지는 않는다.
+            logger.warning("[%s-%s] 사진 %d: 옛 파일 정리 실패(%s): %s",
+                           case_no, item_no, row["seq"], row["path"], str(e))
+    return removed
+
+
+def _remove_other_ext_for_seq(dest: str, court_code: str, case_no: str, item_no: str,
+                              seq: int, ext: str) -> int:
+    """같은 순번의 **다른 확장자** 파일을 지운다. 지운 개수를 돌려준다.
+
+    2026-08-18 Sprint 189 (BUGS #120). 파일 이름이 `<순번>.<확장자>`라 확장자가 곧
+    이름의 일부다. 법원이 같은 자리 사진을 다른 형식으로 바꿔 끼우면
+    (`sniff_image_ext()`는 **선언된 MIME이 아니라 실제 바이트**로 판정하므로 그 변화를
+    그대로 따라간다) 새 파일은 `01.png`에 쓰이고 **옛 `01.jpg`는 그대로 남았다.**
+
+    남는 것만으로 끝나지 않는다:
+
+        auction_image   UNIQUE(item_id, seq)라 DB는 새 경로 한 줄만 갖는다
+                        -> 옛 파일은 아무도 가리키지 않는 고아가 된다
+        지문 비교        `_existing_set_hash()`가 같은 순번을 두 번 세어
+                        수집 쪽 공식과 갈라진다 -> **매 수집이 거짓 개정**
+
+    즉 재수집을 켜는 순간(=이번 Sprint의 목표) 곧바로 도달하는 경로다. 쓰기 성공
+    **직후**에 정리한다 — 먼저 지우면 새 파일 쓰기가 실패했을 때 사용자가 보던 사진이
+    사라진다(부분 수집 보호와 같은 원칙: 판단할 수 없을 때는 남기는 쪽).
+    """
+    removed = 0
+    for other in ALLOWED_IMAGE_EXTS:
+        if other == ext:
+            continue
+        stale = image_path(court_code, case_no, item_no, seq, other)
+        if stale == dest or not os.path.isfile(stale):
+            continue
+        try:
+            os.remove(stale)
+            removed += 1
+            logger.info("[%s-%s] 사진 %d: 형식이 %s -> %s로 바뀌어 옛 파일 정리(%s)",
+                        case_no, item_no, seq, other, ext, os.path.basename(stale))
+        except OSError as e:
+            # 지우지 못해도 새 파일 저장 자체는 성공이다. 다만 위 지문 비교가
+            # 중복 순번을 발견해 경고를 남기므로 조용히 묻히지는 않는다.
+            logger.warning("[%s-%s] 사진 %d: 옛 파일 정리 실패(%s): %s",
+                           case_no, item_no, seq, stale, str(e))
+    return removed
+
+
 def _write_image_atomically(dest: str, data: bytes, court_code: str, case_no: str,
                             item_no: str, seq: int, ext: str) -> bool:
     """임시 파일에 쓰고 `os.replace()`로 원자적 교체.
@@ -290,6 +449,7 @@ def _write_image_atomically(dest: str, data: bytes, court_code: str, case_no: st
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, dest)
+        _remove_other_ext_for_seq(dest, court_code, case_no, item_no, seq, ext)
         return True
     except OSError as e:
         logger.warning("사진 저장 실패 (%s, seq=%d, %s): %s",

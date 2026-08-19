@@ -1,6 +1,6 @@
 ﻿import sys, os, re
 sys.path.insert(0, os.getcwd())
-from storage.database import get_connection
+from storage.database import get_connection, requeue_changed_documents
 from datetime import datetime
 import logging
 
@@ -17,6 +17,21 @@ logger = logging.getLogger(__name__)
 # 마지막 execute() 가 관측한 필드별 변경 건수. 테스트와 운영 점검이 읽는다
 # (로그만 남기면 자동 검증이 불가능하다).
 LAST_FIELD_CHANGES = {}
+
+# 마지막 execute() 가 예약한 재수집 결과(`requeue_changed_documents()` 반환값).
+# 위와 같은 이유로 노출한다 — 배치 로그 한 줄로는 자동 검증이 안 된다.
+LAST_REQUEUE = {}
+
+# 변경 기반 재수집을 끌 수 있는 스위치 (2026-08-18 Sprint 189).
+# 기본은 켬이다 — 이 기능이 없으면 최초 1회 수집으로 끝나는 것이 곧 제품 결함이다.
+# 사고 시 배치 한 줄로 되돌릴 수 있어야 하므로 환경변수로만 끈다(코드 수정 없이).
+REFRESH_ON_CHANGE_ENV = "DOJOONPASS_REFRESH_ON_CHANGE"
+
+
+def refresh_on_change_enabled() -> bool:
+    """환경변수가 '0'/'false'/'no'면 끔. 그 외(미설정 포함)는 켬."""
+    v = (os.environ.get(REFRESH_ON_CHANGE_ENV) or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 def extract_fail_count(status: str) -> int:
     if not status:
@@ -104,6 +119,7 @@ def execute():
         item_updated = 0
         field_changes = {}    # 필드명 -> 실제로 값이 바뀐 행 수
         changed_samples = []  # 로그에 남길 예시(최대 10건)
+        changed_items = []    # 재수집 예약 대상(물건 키 + 바뀐 필드 목록)
         # (case_id, item_no) -> auction_item.id. §3 document_status 루프가 다시 JOIN으로
         # 같은 item_id를 조회하던 것을 대신한다(아래 §3 주석 참고).
         item_id_by_key = {}
@@ -149,6 +165,7 @@ def execute():
                 # 스키마도 UPDATE 조건도 건드리지 않는다 — 이미 손에 있는 `existing`과
                 # 새 값을 비교해 집계만 한다. 관측이 먼저 있어야 재수집/알림 정책을
                 # 숫자로 정할 수 있다(docs/roadmap.md 재수집 정책 항목).
+                changed_fields = []
                 for _f, _old, _new in (
                     ("auction_date", existing["auction_date"], auction_date),
                     ("minimum_bid_price", existing["minimum_bid_price"], minimum_bid_price),
@@ -156,11 +173,25 @@ def execute():
                     ("appraisal_price", existing["appraisal_price"], appraisal_price),
                 ):
                     if (_old or "") != (_new or ""):
+                        changed_fields.append(_f)
                         field_changes[_f] = field_changes.get(_f, 0) + 1
                         if len(changed_samples) < 10:
                             changed_samples.append(
                                 "%s-%s %s: %s -> %s"
                                 % (row["case_no"], row["item_no"], _f, _old, _new))
+
+                # ── 관측에서 행동으로 (2026-08-18 Sprint 189) ─────────────────
+                # Sprint 185는 여기서 **세기만** 했다. 그 숫자만으로는 화면이 최신이 되지
+                # 않는다 — 물건 기본정보(기일/최저가/상태/감정가)는 바로 아래 UPDATE로
+                # 갱신되지만, 그 변경에 딸린 **문서와 사진은 최초 수집분 그대로** 남는다.
+                # 어느 물건이 바뀌었는지를 여기서 모아 두었다가 커밋 뒤에 큐를 되돌린다.
+                if changed_fields:
+                    changed_items.append({
+                        "court_code": row["court_code"],
+                        "case_no": row["case_no"],
+                        "item_no": row["item_no"],
+                        "fields": changed_fields,
+                    })
 
                 conn.execute("""
                     UPDATE auction_item SET
@@ -310,8 +341,28 @@ def execute():
             problems.append(f"document_status 불일치: {ds} != {orig * 3}")
             print(f"  [FAIL] {problems[-1]}")
 
-        global LAST_FIELD_CHANGES
+        global LAST_FIELD_CHANGES, LAST_REQUEUE
         LAST_FIELD_CHANGES = dict(field_changes)
+
+        # ── 변경 기반 재수집 예약 ───────────────────────────────────────────
+        # **커밋 뒤에** 부른다. 이 함수는 자기 커넥션을 따로 열어 쓰므로(SQLite는
+        # 같은 파일에 대한 두 번째 쓰기 커넥션이 미커밋 트랜잭션을 볼 수 없다),
+        # 커밋 전에 부르면 방금 갱신한 값을 못 보거나 락 대기에 걸린다.
+        #
+        # 실패해도 마이그레이션 자체를 실패로 만들지 않는다 — 물건 기본정보 갱신은
+        # 이미 커밋됐고, 재수집 예약은 그 위에 얹는 **다음 주기용 준비 작업**이다.
+        # 여기서 예외를 올리면 이미 성공한 매일 크롤링이 exit 1로 보고된다.
+        LAST_REQUEUE = {}
+        if not changed_items:
+            logger.info("변경된 물건이 없어 재수집 예약을 건너뛴다")
+        elif not refresh_on_change_enabled():
+            logger.warning("변경 기반 재수집이 %s로 꺼져 있다 - 물건 %d건의 문서/사진은 "
+                           "옛 수집분 그대로 남는다", REFRESH_ON_CHANGE_ENV, len(changed_items))
+        else:
+            try:
+                LAST_REQUEUE = requeue_changed_documents(changed_items)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("재수집 예약 실패(물건 기본정보 갱신은 이미 커밋됨): %s", str(exc))
 
         # 변경 관측 결과. 0건이면 "바뀐 것이 없다"가 사실이고, 그것도 정보다.
         print("")
@@ -326,6 +377,19 @@ def execute():
                                   for k in sorted(field_changes)))
         else:
             print("  없음 (기일/최저가/상태/감정가 모두 이전과 동일)")
+
+        print("")
+        print("=== 변경 기반 재수집 예약 ===")
+        if LAST_REQUEUE:
+            print("  대상 물건        %d건" % LAST_REQUEUE.get("items", 0))
+            print("  재수집 예약      %d행 (done -> refresh)" % LAST_REQUEUE.get("refreshed", 0))
+            print("  기일부활         %d행 (SKIPPED_EXPIRED -> pending)"
+                  % LAST_REQUEUE.get("revived_expired", 0))
+            if LAST_REQUEUE.get("skipped_over_cap"):
+                print("  상한으로 미룸    %d건 (다음 실행에서 다시 후보)"
+                      % LAST_REQUEUE["skipped_over_cap"])
+        else:
+            print("  없음")
 
         print("")
         print("=== 샘플 확인 ===")

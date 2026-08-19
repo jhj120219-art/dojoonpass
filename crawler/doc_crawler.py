@@ -26,6 +26,7 @@ from crawler.doc_paths import (  # noqa: F401  (하위 호환 재노출)
     DOCUMENT_ROOT,
     get_doc_dir,
     doc_exists,
+    existing_doc_files,
     status_overlay_has_data,
     find_sibling_case_document,
     CASE_LEVEL_DOC_TYPES,
@@ -201,6 +202,48 @@ def _looks_like_pdf(path: str) -> bool:
     return b"%PDF-" in head
 
 
+def move_into_place(src: str, dest: str) -> None:
+    """다운로드 폴더의 파일을 목적지로 **원자적으로** 옮긴다.
+
+    2026-08-18 Sprint 189 (BUGS #121). 여기는 원래 `shutil.move(src, dest)`였다.
+    목적지가 없을 때는 그것으로 충분했다 — `os.rename()` 한 번이라 원자적이다.
+    문제는 **목적지가 이미 있을 때**다(=재수집). Windows의 `os.rename()`은 기존 파일이
+    있으면 `FileExistsError`를 내고, `shutil.move()`는 그 예외를 잡아 조용히
+    `copy2()` 폴백으로 넘어간다. 실측(2026-08-18, Python 3.12.10):
+
+        목적지 없음 -> RENAME (원자적)
+        목적지 있음 -> COPY   (비원자적)   <- 재수집이 항상 여기로 온다
+
+    비원자적 복사 도중 프로세스가 죽으면(전원 차단·OOM kill 등 except로 잡을 수 없는
+    죽음) **잘린 PDF가 목적지에 남는다.** 그리고 `doc_paths.doc_exists()`는 "존재 +
+    크기 0 초과"만 보므로 그 잘린 파일을 **완성된 문서로 취급**한다 — 다음 수집이
+    "이미 있다"고 건너뛰어 깨진 문서가 영구히 남는다. 이 저장소가 BUGS #22/#50/#61로
+    반복해 겪은 그 함정이고, 같은 동작을 하는 `collect_documents.py:249`는 이미
+    `os.replace()`를 쓰고 있었다 — **두 수집기만 빠져 있었다.**
+
+    `os.replace()`는 기존 파일이 있어도 같은 파일시스템 안에서 원자적이다. 다운로드
+    폴더와 목적지가 다른 드라이브일 수 있으므로 **목적지 옆 임시 이름으로 먼저
+    복사**한 뒤 교체한다(`_write_image_atomically()`와 같은 형태).
+    """
+    tmp = dest + ".tmp"
+    try:
+        os.replace(src, tmp)          # 같은 볼륨이면 이 한 번으로 끝난다
+    except OSError:
+        shutil.copyfile(src, tmp)     # 볼륨이 다르면 복사 후 원본 제거
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+    try:
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # =====================================================================
 # SpecCollector (매각물건명세서) - 새 탭 전환 -> 파일저장 버튼 클릭 -> PDF 다운로드 감지
 # =====================================================================
@@ -215,6 +258,22 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
     if doc_exists(court_code, case_no, item_no, "spec") and not overwrite:
         logger.info("[%s-%s] spec 이미 존재. 스킵", case_no, item_no)
         result["success"] = True
+        # ★ **이미 갖고 있는 파일을 결과에 담는다** (2026-08-19 Sprint 217, BUGS #144).
+        #
+        #   예전에는 `files_saved` 가 빈 채로 성공을 돌려줬다. 그러면
+        #   `mark_queue_done()` -> `_record_doc_raw()` 가 맨 앞에서 그냥 돌아가
+        #   (`if not files_saved: return`) **파일은 있는데 doc_raw 행이 없는 상태**가
+        #   큐 done / 화면 READY 로 굳는다. 그리고 다음 수집도 같은 스킵 경로를 타므로
+        #   그 상태는 **영원히 스스로 회복되지 않는다**(API 의 page_count/file_size/
+        #   doc_version 이 영구 null — 뷰어 페이지 이동이 그려지지 않는 상태).
+        #
+        #   사진 쪽은 같은 자리를 이미 복구한다(`image_crawler._describe_existing()`).
+        #   문서만 없었다. `_record_doc_raw()` 는 내용이 같으면 새 행을 쌓지 않으므로
+        #   (Sprint 187) 반복 실행이 버전을 부풀리지도 않는다.
+        #   `previous_hash`/`new_hash` 는 그대로 비워 둔다 — 바뀐 것이 없으니
+        #   `document_version_log` 에 개정을 남기면 거짓이 된다.
+        result["files_saved"] = existing_doc_files(court_code, case_no,
+                                                  item_no, "spec")
         return result
 
     previous_hash = calc_file_hash(dest_path) if os.path.exists(dest_path) else ""
@@ -243,38 +302,63 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
             new_handle = list(new_handles)[0]
             break
 
+    # ★ 탭이 없다고 곧바로 실패로 끝내지 않는다 (2026-08-18 Sprint 202, BUGS #136).
+    #
+    #   `collect_appraisal()` 에서 고친 것과 **같은 모양**이다(BUGS #135):
+    #   Chrome 은 `plugins.always_open_pdf_externally: True` 로 만들어지므로 PDF 를
+    #   렌더링하지 않고 곧바로 내려받는다. 법원이 명세서를 뷰어 대신 **PDF 로 바로**
+    #   내려 주는 경우, 그릴 것이 없어 탭이 뜨지 않고 파일만 도착한다.
+    #
+    #   증거: `downloads/` 최상위 고아 8개 중 **5개가 매각물건명세서**였다
+    #   (2026-08-18 실측, 14.0MB). 즉 명세서 다운로드가 도착했는데 저장되지 않은
+    #   전례가 실제로 있다.
+    #
+    #   그래서 탭이 없으면 **파일이 왔는지부터 본다.** 왔으면 뷰어 단계를 건너뛰고
+    #   바로 저장으로 간다(뷰어는 다운로드를 얻기 위한 수단이지 목적이 아니다).
+    #   둘 다 없을 때만 실패다. 더하기만 하는 변경이라 지금 성공하는 경로는 그대로다.
+    direct_download = None
     if not new_handle:
-        logger.warning("[%s-%s] spec 새 탭(문서뷰어) 감지 실패", case_no, item_no)
-        return result
+        direct_download = wait_for_download(before_files, timeout=5)
+        if not direct_download:
+            logger.warning("[%s-%s] spec 새 탭(문서뷰어) 감지 실패 (다운로드도 오지 않았다)",
+                           case_no, item_no)
+            return result
+        logger.info("[%s-%s] spec 탭 없이 PDF 가 바로 도착했다 - 뷰어 단계를 건너뛴다",
+                    case_no, item_no)
 
     try:
-        driver.switch_to.window(new_handle)
-        time.sleep(2)
+        if direct_download is None:
+            driver.switch_to.window(new_handle)
+            time.sleep(2)
 
-        # "파일저장" 버튼: 정확한 id가 DOM 검증으로 확인된 적이 없으므로,
-        # 화면에서 실제로 확인된 표시 텍스트("파일저장")로 탐색한다 (id 추정 금지 원칙 준수).
-        save_btn = None
-        for xp in [
-            "//input[@value='파일저장']",
-            "//a[contains(normalize-space(text()),'파일저장')]",
-            "//button[contains(normalize-space(text()),'파일저장')]",
-            "//*[@title='파일저장']",
-        ]:
-            found = driver.find_elements(By.XPATH, xp)
-            if found:
-                save_btn = found[0]
-                break
+        if direct_download is not None:
+            downloaded_path = direct_download
+        else:
+            # "파일저장" 버튼: 정확한 id가 DOM 검증으로 확인된 적이 없으므로,
+            # 화면에서 실제로 확인된 표시 텍스트("파일저장")로 탐색한다 (id 추정 금지 원칙 준수).
+            save_btn = None
+            for xp in [
+                "//input[@value='파일저장']",
+                "//a[contains(normalize-space(text()),'파일저장')]",
+                "//button[contains(normalize-space(text()),'파일저장')]",
+                "//*[@title='파일저장']",
+            ]:
+                found = driver.find_elements(By.XPATH, xp)
+                if found:
+                    save_btn = found[0]
+                    break
 
-        if not save_btn:
-            logger.warning("[%s-%s] spec 문서뷰어 내 '파일저장' 버튼을 찾지 못함", case_no, item_no)
-            return result
+            if not save_btn:
+                logger.warning("[%s-%s] spec 문서뷰어 내 '파일저장' 버튼을 찾지 못함",
+                               case_no, item_no)
+                return result
 
-        driver.execute_script("arguments[0].click();", save_btn)
+            driver.execute_script("arguments[0].click();", save_btn)
 
-        downloaded_path = wait_for_download(before_files, timeout=30)
-        if not downloaded_path:
-            logger.warning("[%s-%s] spec 다운로드 미완료(타임아웃)", case_no, item_no)
-            return result
+            downloaded_path = wait_for_download(before_files, timeout=30)
+            if not downloaded_path:
+                logger.warning("[%s-%s] spec 다운로드 미완료(타임아웃)", case_no, item_no)
+                return result
 
         if not _looks_like_pdf(downloaded_path):
             logger.warning("[%s-%s] spec 다운로드가 PDF가 아니다(오류 페이지/손상 의심) - 저장하지 않음: %s",
@@ -286,7 +370,18 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
             return result
 
         new_hash = calc_file_hash(downloaded_path)
-        shutil.move(downloaded_path, dest_path)
+        # ★ 바이트가 같으면 목적지를 건드리지 않는다 (2026-08-18 Sprint 189).
+        #   같은 PDF를 다시 놓아도 내용은 그대로인데 mtime이 바뀌어 ETag가 달라지고,
+        #   사용자는 수 MB짜리 문서를 이유 없이 다시 내려받는다(감정평가서 실측 3.4MB).
+        if previous_hash and new_hash == previous_hash:
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
+            logger.info("[%s-%s] 내용 무변경 - 기존 파일을 그대로 둔다(브라우저 캐시 보존)",
+                        case_no, item_no)
+        else:
+            move_into_place(downloaded_path, dest_path)
 
         result["success"] = True
         result["files_saved"] = [dest_path]
@@ -309,6 +404,70 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
 # =====================================================================
 # StatusCollector (현황조사서) - 오버레이 등장 대기 -> html/json 저장 -> 오버레이 닫기
 # =====================================================================
+
+def _write_text_if_changed(path: str, text: str) -> bool:
+    """내용이 달라졌을 때만 원자적으로 쓴다. 실제로 썼으면 True.
+
+    2026-08-18 Sprint 189. 같은 내용을 다시 쓰면 **mtime이 바뀌고**, 서빙 쪽 ETag는
+    Starlette가 (mtime, size)로 만들기 때문에 브라우저 캐시가 무의미하게 무효화된다
+    (`api/http_cache.py`가 조건부 요청으로 아끼려던 바로 그 바이트다).
+    재수집 대상은 정의상 "사용자가 지금 보고 있는" 물건이라 체감이 크다.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except (OSError, UnicodeDecodeError):
+        pass   # 못 읽으면 "같다고 말할 수 없다" -> 쓴다
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def _fields_hash(fields) -> str:
+    """현황조사서 **내용**의 지문. 우리가 찍은 메타데이터는 제외한다.
+
+    2026-08-18 Sprint 189 (BUGS #124). 예전에는 `status.json` 파일 전체를
+    `calc_file_hash()`로 떴다. 그런데 그 파일에는 우리가 매 수집마다 새로 찍는
+    `extracted_at`(수집 시각)이 들어 있다. 즉 **법원 자료가 하나도 안 바뀌어도
+    지문이 매번 달라진다.**
+
+    재수집을 켜기 전에는 이 경로에 두 번 오지 않아 드러나지 않았다. 켜는 순간:
+
+        document_version_log   매 수집마다 1행 (전부 거짓 개정)
+        doc_raw.doc_version    매 수집마다 +1  (BUGS #115가 막으려던 바로 그것)
+                               -> `api/v1/item.py`가 그 값을 사용자에게 그대로 싣는다
+
+    이 저장소는 같은 함정을 이미 알고 있었다 — Sprint 145의 형제 재사용 주석이
+    "차이는 우리가 찍는 extracted_at 하나뿐"이라고 실측해 적어 두었다. 그 관찰이
+    변경 감지 쪽으로 연결되지 않았을 뿐이다.
+
+    정렬된 canonical JSON을 쓰는 이유: dict 순회 순서나 들여쓰기 같은 **표현의 차이**가
+    내용의 차이로 둔갑하지 않게 한다.
+    """
+    canon = json.dumps(fields or {}, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def status_content_hash(json_path: str) -> str:
+    """디스크의 `status.json`에서 같은 공식으로 지문을 뜬다. 없거나 못 읽으면 "".
+
+    ★ `_fields_hash()`와 **같은 공식**이어야 한다. 갈라지면 매 수집이 거짓 개정이 되어
+      진짜 개정을 찾을 수 없다 — 이미지 쪽 `_existing_set_hash()`가 지고 있는 것과
+      정확히 같은 책임이다(BUGS #113/#120).
+    """
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return _fields_hash(payload.get("fields"))
+
 
 def _reuse_sibling_status(sib_dir: str, html_path: str, json_path: str,
                           court_code: str, case_no: str, item_no: str) -> Optional[Dict]:
@@ -357,7 +516,9 @@ def _reuse_sibling_status(sib_dir: str, html_path: str, json_path: str,
     result["storage_type"] = "json+html"
     result["success"] = True
     result["files_saved"] = [html_path, json_path]
-    result["new_hash"] = calc_file_hash(json_path)
+    # 파일 전체가 아니라 **내용**의 지문이다(BUGS #124) — 복사해 온 형제 파일의
+    # `extracted_at`은 그 형제를 수집한 시각이라 여기서 비교 근거가 될 수 없다.
+    result["new_hash"] = status_content_hash(json_path)
     result["reused_from"] = sib_dir
     logger.info("[%s-%s] 현황조사서는 사건 단위 문서다 - 같은 사건의 %s에서 재사용(브라우저 미사용)",
                 case_no, item_no, os.path.basename(sib_dir))
@@ -375,6 +536,22 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
     if doc_exists(court_code, case_no, item_no, "status") and not overwrite:
         logger.info("[%s-%s] status 이미 존재. 스킵", case_no, item_no)
         result["success"] = True
+        # ★ **이미 갖고 있는 파일을 결과에 담는다** (2026-08-19 Sprint 217, BUGS #144).
+        #
+        #   예전에는 `files_saved` 가 빈 채로 성공을 돌려줬다. 그러면
+        #   `mark_queue_done()` -> `_record_doc_raw()` 가 맨 앞에서 그냥 돌아가
+        #   (`if not files_saved: return`) **파일은 있는데 doc_raw 행이 없는 상태**가
+        #   큐 done / 화면 READY 로 굳는다. 그리고 다음 수집도 같은 스킵 경로를 타므로
+        #   그 상태는 **영원히 스스로 회복되지 않는다**(API 의 page_count/file_size/
+        #   doc_version 이 영구 null — 뷰어 페이지 이동이 그려지지 않는 상태).
+        #
+        #   사진 쪽은 같은 자리를 이미 복구한다(`image_crawler._describe_existing()`).
+        #   문서만 없었다. `_record_doc_raw()` 는 내용이 같으면 새 행을 쌓지 않으므로
+        #   (Sprint 187) 반복 실행이 버전을 부풀리지도 않는다.
+        #   `previous_hash`/`new_hash` 는 그대로 비워 둔다 — 바뀐 것이 없으니
+        #   `document_version_log` 에 개정을 남기면 거짓이 된다.
+        result["files_saved"] = existing_doc_files(court_code, case_no,
+                                                  item_no, "status")
         return result
 
     # 사건 단위 문서 재사용 (2026-08-17 Sprint 145).
@@ -401,7 +578,10 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
             if reused:
                 return reused
 
-    previous_hash = calc_file_hash(json_path) if os.path.exists(json_path) else ""
+    # ★ 파일 전체 해시가 아니라 **내용** 해시다 (2026-08-18 Sprint 189, BUGS #124).
+    #   status.json 에는 우리가 매번 새로 찍는 `extracted_at`이 들어 있어, 파일을 통째로
+    #   해싱하면 법원 자료가 그대로여도 지문이 매번 달라진다(= 매 수집이 거짓 개정).
+    previous_hash = status_content_hash(json_path)
 
     try:
         btn = driver.find_element(By.ID, btn_id)
@@ -449,10 +629,9 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
         # 손상됐지만 크기는 0이 아닌 파일이 하나라도 생기면 그 물건은 영구히 재수집 대상에서
         # 빠진다 — os.replace()는 같은 파일시스템 안에서 원자적이라 이 중간 상태 자체가
         # 존재할 수 없다(목적지는 항상 이전 내용 그대로이거나 새 내용 그대로만 남는다).
-        html_tmp = html_path + ".tmp"
-        with open(html_tmp, "w", encoding="utf-8") as f:
-            f.write(outer_html)
-        os.replace(html_tmp, html_path)
+        # 내용이 그대로면 쓰지 않는다(위 `_write_text_if_changed()` 참고). 원자성 규약은
+        # 그 헬퍼 안에 그대로 있다 — 임시 파일 + os.replace().
+        _write_text_if_changed(html_path, outer_html)
 
         # 구조화 데이터: 오버레이 내부에서 실제 값을 담고 있는 요소(span.w2span.txt,
         # div.w2textbox 등)를 id-텍스트 쌍으로 그대로 추출한다.
@@ -470,17 +649,33 @@ def collect_status(driver, court_code: str, case_no: str, item_no: str, btn_id: 
             return out;
         """, overlay)
 
+        new_hash = _fields_hash(fields)
+
+        # ★ 내용이 그대로면 **다시 쓰지 않는다** (2026-08-18 Sprint 189).
+        #
+        #   법원 자료가 안 바뀌었는데 파일을 다시 쓰면 mtime이 바뀌고, 서빙 쪽 ETag는
+        #   (mtime, size)로 만들어지므로 **모든 브라우저 캐시가 무의미하게 무효화된다**
+        #   (`api/http_cache.py`가 아끼려던 바로 그 바이트다). 재수집 대상은 정의상
+        #   "사용자가 지금 보고 있는" 물건이라 체감이 크다.
+        #
+        #   `extracted_at`은 옛 값 그대로 남는다 — 이제 그 필드의 뜻은 "이 내용을 처음
+        #   확인한 수집 시각"이다. 매 수집 시각을 남기는 것보다 이쪽이 더 쓸모 있다.
+        if new_hash and new_hash == previous_hash and os.path.exists(html_path):
+            result["success"] = True
+            result["files_saved"] = [html_path, json_path]
+            result["previous_hash"] = previous_hash
+            result["new_hash"] = new_hash
+            logger.info("[%s-%s] status 내용 무변경 - 파일을 다시 쓰지 않는다"
+                        "(브라우저 캐시 보존)", case_no, item_no)
+            return result
+
         json_payload = {
             "extracted_at": datetime.now().isoformat(),
             "fields": fields,
         }
 
-        json_tmp = json_path + ".tmp"
-        with open(json_tmp, "w", encoding="utf-8") as f:
-            json.dump(json_payload, f, ensure_ascii=False, indent=2)
-        os.replace(json_tmp, json_path)
-
-        new_hash = calc_file_hash(json_path)
+        _write_text_if_changed(
+            json_path, json.dumps(json_payload, ensure_ascii=False, indent=2))
 
         result["success"] = True
         result["files_saved"] = [html_path, json_path]
@@ -525,6 +720,22 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
     if doc_exists(court_code, case_no, item_no, "appraisal") and not overwrite:
         logger.info("[%s-%s] appraisal 이미 존재. 스킵", case_no, item_no)
         result["success"] = True
+        # ★ **이미 갖고 있는 파일을 결과에 담는다** (2026-08-19 Sprint 217, BUGS #144).
+        #
+        #   예전에는 `files_saved` 가 빈 채로 성공을 돌려줬다. 그러면
+        #   `mark_queue_done()` -> `_record_doc_raw()` 가 맨 앞에서 그냥 돌아가
+        #   (`if not files_saved: return`) **파일은 있는데 doc_raw 행이 없는 상태**가
+        #   큐 done / 화면 READY 로 굳는다. 그리고 다음 수집도 같은 스킵 경로를 타므로
+        #   그 상태는 **영원히 스스로 회복되지 않는다**(API 의 page_count/file_size/
+        #   doc_version 이 영구 null — 뷰어 페이지 이동이 그려지지 않는 상태).
+        #
+        #   사진 쪽은 같은 자리를 이미 복구한다(`image_crawler._describe_existing()`).
+        #   문서만 없었다. `_record_doc_raw()` 는 내용이 같으면 새 행을 쌓지 않으므로
+        #   (Sprint 187) 반복 실행이 버전을 부풀리지도 않는다.
+        #   `previous_hash`/`new_hash` 는 그대로 비워 둔다 — 바뀐 것이 없으니
+        #   `document_version_log` 에 개정을 남기면 거짓이 된다.
+        result["files_saved"] = existing_doc_files(court_code, case_no,
+                                                  item_no, "appraisal")
         return result
 
     previous_hash = calc_file_hash(dest_path) if os.path.exists(dest_path) else ""
@@ -605,15 +816,37 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
                 new_handle = list(new_handles)[0]
                 break
 
-        if not new_handle:
-            logger.warning("[%s-%s] appraisal PDF 탭 생성 실패", case_no, item_no)
-            return result
-
-        driver.switch_to.window(new_handle)
+        # ★ 탭이 안 생겼다고 실패로 끝내지 않는다 (2026-08-18 Sprint 201, BUGS #135).
+        #
+        #   `get_download_driver_options()` 는 `plugins.always_open_pdf_externally: True`
+        #   를 켠다. 그래서 Chrome 은 PDF 를 **렌더링하지 않고 곧바로 내려받는다** —
+        #   `window.open()` 으로 연 탭은 그리는 것이 없으니 뜨지도 않고 사라진다.
+        #   즉 **다운로드가 성공할수록 탭은 안 생긴다.** 탭을 성공 조건으로 삼은 것이
+        #   구조적으로 틀렸다.
+        #
+        #   실측(2026-08-18): 이 경로가 "탭 생성 실패"로 끝난 실행에서 `downloads/` 에
+        #   2,528,908 바이트 PDF 가 도착해 있었고, 그 물건의 기존 `appraisal.pdf` 와
+        #   **sha256 이 일치**했다. 즉 받아 놓고 버린 것이다. `downloads/` 최상위에
+        #   고아 PDF 8개가 쌓여 있었고 그중 4개는 같은 문서의 Chrome 중복 이름
+        #   (`... (1).pdf` ~ `(3).pdf`)이었다 — **같은 문서를 네 번 받아 네 번 버렸다.**
+        #
+        #   그래서 탭이 없으면 **다운로드가 왔는지부터 확인한다.** 둘 다 없을 때만 실패다.
+        #   (이 변경은 더할 뿐이다 — 지금 성공하는 경로는 그대로 두고, 지금 실패하는
+        #    경로만 성공으로 바뀔 수 있다.)
+        if new_handle:
+            driver.switch_to.window(new_handle)
+        else:
+            logger.info("[%s-%s] appraisal PDF 탭이 뜨지 않았다 "
+                        "(PDF 외부열기 설정이면 정상) - 다운로드 도착 여부로 판단한다",
+                        case_no, item_no)
 
         downloaded_path = wait_for_download(before_files, timeout=30)
         if not downloaded_path:
-            logger.warning("[%s-%s] appraisal 다운로드 미완료(타임아웃)", case_no, item_no)
+            if new_handle:
+                logger.warning("[%s-%s] appraisal 다운로드 미완료(타임아웃)", case_no, item_no)
+            else:
+                logger.warning("[%s-%s] appraisal: 탭도 안 뜨고 다운로드도 오지 않았다",
+                               case_no, item_no)
             return result
 
         if not _looks_like_pdf(downloaded_path):
@@ -626,7 +859,18 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
             return result
 
         new_hash = calc_file_hash(downloaded_path)
-        shutil.move(downloaded_path, dest_path)
+        # ★ 바이트가 같으면 목적지를 건드리지 않는다 (2026-08-18 Sprint 189).
+        #   같은 PDF를 다시 놓아도 내용은 그대로인데 mtime이 바뀌어 ETag가 달라지고,
+        #   사용자는 수 MB짜리 문서를 이유 없이 다시 내려받는다(감정평가서 실측 3.4MB).
+        if previous_hash and new_hash == previous_hash:
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
+            logger.info("[%s-%s] 내용 무변경 - 기존 파일을 그대로 둔다(브라우저 캐시 보존)",
+                        case_no, item_no)
+        else:
+            move_into_place(downloaded_path, dest_path)
 
         result["success"] = True
         result["files_saved"] = [dest_path]

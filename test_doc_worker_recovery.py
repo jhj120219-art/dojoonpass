@@ -10,6 +10,8 @@ go_to_case_detail/collect_document/restart_download_driver/build_download_driver
 
     python test_doc_worker_recovery.py
 """
+import contextlib
+import io
 import sys
 import os
 import time
@@ -146,6 +148,8 @@ def test_driver_restart_success_continues_processing():
 
     seen_item_nos = []
 
+    overwrite_seen = []
+
     def fake_go_to_case_detail(driver, court_code, case_no, item_no=None):
         call_count["go_to_case_detail"] += 1
         seen_item_nos.append(item_no)
@@ -153,7 +157,14 @@ def test_driver_restart_success_continues_processing():
             raise Exception("qa-simulated-one-off-crash")
         return True
 
-    def fake_collect_document(driver, court_code, case_no, item_no, doc_type, btn_id):
+    # ★ 실제 `collect_document()`와 **호출 호환**이어야 한다 (2026-08-18 Sprint 189).
+    #   Sprint 189가 `overwrite=` 인자를 배선하자 이 대역이 TypeError를 냈고, doc_worker의
+    #   except가 그것을 "수집 실패"로 삼켜 이 테스트가 4건 FAIL로 뒤집혔다 — 제품 결함이
+    #   아니라 **대역이 실물보다 좁았던 것**이다. 앞으로 같은 드리프트에 흔들리지 않도록
+    #   키워드를 그대로 받는다(그리고 넘어온 값을 기록해 검증에 쓸 수 있게 한다).
+    def fake_collect_document(driver, court_code, case_no, item_no, doc_type, btn_id,
+                              overwrite=False):
+        overwrite_seen.append(bool(overwrite))
         return {"success": True, "previous_hash": None, "new_hash": "qa-hash", "partial": False}
 
     def fake_restart_download_driver(driver):
@@ -225,13 +236,28 @@ def test_lock_prevents_concurrent_run():
         exit_code = doc_worker.main()
     finally:
         _restore_all(originals)
-        try:
-            os.remove(doc_worker.LOCK_PATH)
-        except OSError:
-            pass
+        _clear_real_lock_files()
 
     check("락 충돌 시 큐/브라우저를 전혀 건드리지 않고 종료 코드 0", exit_code, 0)
 
+
+def _clear_real_lock_files():
+    """운영 `logs/` 에 만든 락 흔적을 지운다 (2026-08-19 Sprint 217).
+
+    이 파일의 락 검사들은 **운영 경로**(`doc_worker.LOCK_PATH` = `logs/doc_worker.lock`)
+    를 그대로 쓴다 — 모듈 상수를 갈아 끼우면 검사 대상이 실물이 아니게 되기 때문이다.
+    대신 값을 치른다: 검사가 중간에 죽어 락이 남으면 **다음 실제 doc_worker 실행이
+    `LOCK_STALE_HOURS`(5시간) 동안 "이미 실행 중"으로 건너뛴다.** 테스트가 운영을
+    멈추는 셈이다.
+
+    회수 토큰(`.reclaim`)도 함께 지운다 — 그것이 남으면 **회수 자체가** 같은 시간만큼
+    막힌다(변이 시험에서 실제로 그 상태를 만들어 확인했다).
+    """
+    for path in (doc_worker.LOCK_PATH, doc_worker.LOCK_PATH + ".reclaim"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 def test_stale_lock_is_taken_over():
     """락 파일이 LOCK_STALE_HOURS보다 오래됐으면 죽은 실행으로 보고 회수해야 한다."""
@@ -242,13 +268,15 @@ def test_stale_lock_is_taken_over():
     stale_time = time.time() - (doc_worker.LOCK_STALE_HOURS + 1) * 3600
     os.utime(doc_worker.LOCK_PATH, (stale_time, stale_time))
 
-    acquired = doc_worker._acquire_lock()
-    check("오래된 락은 회수해 새로 잡을 수 있다", acquired, True)
-
     try:
-        os.remove(doc_worker.LOCK_PATH)
-    except OSError:
-        pass
+        acquired = doc_worker._acquire_lock()
+        check("오래된 락은 회수해 새로 잡을 수 있다", acquired, True)
+        check_true("회수 토큰이 남지 않는다",
+                   not os.path.exists(doc_worker.LOCK_PATH + ".reclaim"))
+    finally:
+        # ★ finally 다. 예전에는 검사가 죽으면 락이 그대로 남아
+        #   **다음 실제 배치가 5시간 막혔다.**
+        _clear_real_lock_files()
 
 
 def test_lock_released_after_normal_run():
@@ -419,6 +447,266 @@ def test_driver_setup_failure_does_not_orphan_browser():
     check("실패 시 브라우저를 닫는다(좀비 프로세스 없음)", state["quit"], 1)
 
 
+def test_runlock_primitive():
+    """공유 잠금(`storage/checkpoint.py:RunLock`) 자체의 계약 (2026-08-18 Sprint 194).
+
+    doc_worker 가 갖고 있던 구현을 그대로 옮긴 것이라 **동작이 바뀌면 안 된다.**
+    위 §3~§5 가 doc_worker 경로로 그것을 확인하고, 여기서는 원시 동작을 직접 고정한다.
+    """
+    import tempfile
+    import shutil
+    from storage.checkpoint import RunLock
+
+    print("\n--- 9. 공유 잠금 RunLock 계약 (Sprint 194) ---")
+    d = tempfile.mkdtemp(prefix="qa_runlock_")
+    try:
+        path = os.path.join(d, "sub", "x.lock")      # 디렉터리가 없어도 만들어야 한다
+        lock = RunLock(path, stale_hours=5, label="qa")
+
+        check("처음에는 잡힌다", lock.acquire(), True)
+        check_true("락 파일이 만들어진다", os.path.isfile(path))
+        check("이미 잡혀 있으면 실패한다", RunLock(path, 5).acquire(), False)
+
+        lock.release()
+        check_true("놓으면 파일이 사라진다", not os.path.exists(path))
+        check("없는 락을 놓아도 예외가 없다", lock.release(), None)
+
+        # 오래된 락은 죽은 실행으로 보고 회수한다
+        lock.acquire()
+        stale = time.time() - (5 + 1) * 3600
+        os.utime(path, (stale, stale))
+        check("오래된 락은 회수된다", RunLock(path, 5).acquire(), True)
+
+        # 락 파일에는 소유자를 알 수 있는 흔적이 남는다(사고 때 추적용)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        check_true("락 파일에 PID 가 남는다", str(os.getpid()) in content, content)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_runlock_is_exclusive_under_concurrency():
+    """★ 락이 **동시에 시작한 실행**을 실제로 막는가 (2026-08-19 Sprint 217, BUGS #145).
+
+    ## 왜 새로 필요한가
+
+    §9 는 이 락을 **순서대로** 시험한다 — 잡고, 또 잡아 보고, 놓고, 오래된 것을 회수한다.
+    그 순서에서는 전부 옳게 동작했다. 그런데 이 락이 막으려는 상황은 순서가 아니다:
+    *"운영자가 수동으로 `python doc_worker.py` 를 실행하는 동안 스케줄된 실행이
+    겹치는 경우"* (`doc_worker.py` 모듈 주석). 그것은 **같은 순간**이다.
+
+    실측(수정 전, 스레드 8 x 200라운드): **200라운드 전부에서 8개가 동시에 성공.**
+    `os.path.exists()` 로 보고 `open(..., "w")` 로 쓰는 사이가 통째로 열려 있었다.
+    즉 이 락은 "몇 초 차이"만 막고 "같은 순간"은 하나도 막지 못했다 —
+    그리고 그것을 검사하는 것이 하나도 없었다.
+
+    ## 두 경우를 나눠 본다
+
+        평범한 경쟁      락이 없는 상태에서 동시에 들어온다
+        회수 경쟁        **오래된 락이 있는 상태**에서 동시에 들어온다
+
+    두 번째가 따로 필요하다. 회수(`지우고 -> 새로 만들기`)는 그 자체가 두 단계라,
+    늦게 온 쪽이 **먼저 회수한 쪽의 새 락을 지우고** 자기 것을 만든다. 세 가지를
+    차례로 재 봤다.
+
+        os.remove 로 회수                1,000라운드 중 4라운드에서 둘이 성공
+        지우기 직전 mtime 재확인 추가     그대로 4/1,000 — 창이 좁아진 게 아니라 종류가 같다
+        os.rename 로 회수 권한 중재       8스레드에서 2/40 — 셋 이상이면 되돌리기가 남을 친다
+
+    지금 구현은 **회수 구역 자체를 배타 토큰(`.reclaim`)으로 감싼다.** 토큰을
+    `O_EXCL` 로 만든 실행만 회수하고 나머지는 조용히 물러난다.
+    실측: 1,000라운드 전부 정확히 하나(로깅을 끈 최악 조건에서도).
+
+    ## 하나도 못 잡는 것도 결함이다
+
+    "둘 다 실패"는 겉보기에 안전해 보이지만 **그날 배치가 통째로 안 도는 것**이다.
+    그래서 라운드마다 성공 수가 **정확히 1** 인지 본다.
+    """
+    import shutil
+    import tempfile
+    import threading
+    from collections import Counter
+    from storage.checkpoint import RunLock
+
+    print(chr(10) + "--- 11. 락은 동시 실행을 막는가 (Sprint 217) ---")
+    ROUNDS, THREADS, STALE_H = 40, 8, 5
+
+    def race(seed_stale):
+        wins = []
+        for _ in range(ROUNDS):
+            d = tempfile.mkdtemp(prefix="qa_runlock_race_")
+            try:
+                path = os.path.join(d, "x.lock")
+                if seed_stale:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("9999 dead")
+                    old = time.time() - (STALE_H + 1) * 3600
+                    os.utime(path, (old, old))
+
+                barrier = threading.Barrier(THREADS)
+                won, guard = [], threading.Lock()
+
+                def worker():
+                    lock = RunLock(path, stale_hours=STALE_H, label="qa")
+                    barrier.wait()          # 최대한 같은 순간에 들어가게 한다
+                    if lock.acquire():
+                        with guard:
+                            won.append(1)
+
+                threads = [threading.Thread(target=worker) for _ in range(THREADS)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                wins.append(len(won))
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        return Counter(wins)
+
+    with contextlib.redirect_stderr(io.StringIO()):   # 회수 경고가 화면을 덮지 않게
+        plain = race(False)
+        stale = race(True)
+
+    check("평범한 경쟁: 라운드마다 정확히 하나만 잡는다",
+          dict(plain), {1: ROUNDS})
+    check("회수 경쟁: 라운드마다 정확히 하나만 잡는다",
+          dict(stale), {1: ROUNDS})
+
+    # ★ 회수 토큰이 **남지 않는가.** 남으면 다음 회수가 "진행 중"으로 오해해
+    #   `stale_hours` 동안 물러난다 — 고치려던 것과 같은 종류의 정지를 만든다.
+    leftovers = []
+    for _ in range(10):
+        d = tempfile.mkdtemp(prefix="qa_runlock_token_")
+        try:
+            path = os.path.join(d, "x.lock")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("9999 dead")
+            old = time.time() - (STALE_H + 1) * 3600
+            os.utime(path, (old, old))
+            barrier = threading.Barrier(THREADS)
+
+            def worker():
+                lock = RunLock(path, stale_hours=STALE_H, label="qa")
+                barrier.wait()
+                lock.acquire()
+
+            threads = [threading.Thread(target=worker) for _ in range(THREADS)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            names = sorted(os.listdir(d))
+            if names != ["x.lock"]:
+                leftovers.append(names)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    check("회수 토큰/임시 파일이 남지 않는다", leftovers, [])
+    print("    스레드 %d x %d라운드 x 2경우 + 잔재 확인 10라운드" % (THREADS, ROUNDS))
+
+
+def test_both_batches_share_the_same_lock_rule():
+    """★ 구조적 가드: **락이 필요한 배치가 전부 같은 구현을 쓴다.**
+
+    2026-08-18 Sprint 194. `doc_worker.py` 는 2026-08-16 부터 락을 갖고 있었는데
+    `mvp_scraper.py` 에는 **없었다.** 이 배치도 공유 자원을 건드린다:
+
+        logs/checkpoint.json   전체를 읽어 고쳐 쓴다 -> 겹치면 진행 상황이 서로 덮인다
+        법원 서버              전체 크롤 약 3.1시간(Sprint 190 실측) -> 겹칠 창이 넓다
+
+    구현을 베끼지 않고 `storage/checkpoint.py` 로 올렸다(2026-08-19 Sprint 217 정정 —
+    옛 주석은 `storage/runlock.py` 라고 적었지만 그런 파일은 없다. 가드에 걸려 이미
+    추적된 모듈로 옮긴 것이다). 이 검사는 **두 배치가 정말로
+    그것을 쓰는지**, 그리고 락 경로가 서로 다른지(같으면 서로를 막는다) 확인한다.
+    """
+    print("\n--- 10. 두 배치가 같은 잠금 구현을 쓴다 (Sprint 194) ---")
+    import inspect
+    import mvp_scraper
+    from storage.checkpoint import RunLock
+
+    for name, mod in (("doc_worker", doc_worker), ("mvp_scraper", mvp_scraper)):
+        check_true("%s 가 LOCK_PATH 를 갖는다" % name, hasattr(mod, "LOCK_PATH"),
+                   dir(mod))
+        check_true("%s 가 공유 RunLock 을 쓴다" % name,
+                   mod._lock().__class__ is RunLock, mod._lock().__class__)
+        check_true("%s 의 락은 호출 시점에 만들어진다(스냅숏 아님)" % name,
+                   mod._lock() is not mod._lock(),
+                   "모듈 로드 때 굳히면 경로를 바꿔도 안 따라온다")
+
+    check_true("두 배치의 락 경로가 다르다",
+               doc_worker.LOCK_PATH != mvp_scraper.LOCK_PATH,
+               (doc_worker.LOCK_PATH, mvp_scraper.LOCK_PATH))
+
+    # 락을 못 잡았을 때 **실패가 아니다** — 다른 실행이 이미 그 일을 하고 있다.
+    src = inspect.getsource(mvp_scraper.main)
+    check_true("mvp_scraper 는 락을 브라우저보다 먼저 확인한다",
+               src.index("lock.acquire()") < src.index("run_courts("), src[:200])
+    check_true("락을 못 잡으면 0으로 끝낸다(실패 아님)",
+               "return 0" in src[:src.index("try:")], src[:400])
+    check_true("finally 에서 반드시 놓는다", "lock.release()" in src, src[-300:])
+
+
+def test_mvp_scraper_lock_flow():
+    """매일 크롤이 **실제로** 락을 잡고/양보하고/놓는가 (2026-08-18 Sprint 194).
+
+    §10 은 소스 수준 계약을 본다. 여기서는 `main()` 을 진짜로 돌린다 —
+    라이브 크롤은 하지 않고(`run_courts` 를 대역으로), DB 도 건드리지 않는다.
+
+    세 경우를 고정한다. 두 번째가 특히 중요하다:
+
+        정상 실행     잡고 -> 돌고 -> **놓는다**
+        락 충돌       아무것도 하지 않고 0 으로 끝낸다.
+                      ★ 그리고 **남의 락을 지우지 않는다** — 이걸 틀리면 잠금이
+                        무의미해지는 정도가 아니라, 먼저 돌던 실행이 무방비가 된다.
+        예외          예외는 그대로 올라가되 **락은 반드시 놓인다**(finally)
+    """
+    import tempfile
+    import shutil
+    import mvp_scraper as m
+
+    print("\n--- 11. 매일 크롤의 락 흐름 (Sprint 194) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_mvp_lock_")
+    saved = (m.LOCK_PATH, m.init_db, m.run_courts, m.enqueue_documents)
+    try:
+        m.LOCK_PATH = os.path.join(tmp, "mvp.lock")
+        calls = []
+        m.init_db = lambda: calls.append("init_db")
+        m.run_courts = lambda courts, outcome=None: (calls.append("run_courts"), [])[1]
+        m.enqueue_documents = lambda rows: calls.append("enqueue")
+
+        # (1) 정상 실행
+        m.main()
+        check("정상 실행은 실제로 수집을 시도한다", calls, ["init_db", "run_courts"])
+        check_true("정상 종료 후 락이 남지 않는다", not os.path.exists(m.LOCK_PATH))
+
+        # (2) 다른 실행이 락을 쥐고 있다
+        with open(m.LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write("other-process")
+        calls.clear()
+        rc = m.main()
+        check("락 충돌이면 아무것도 하지 않는다", calls, [])
+        check("락 충돌은 실패가 아니다(종료 코드 0)", rc, 0)
+        check_true("★ 남의 락을 지우지 않는다", os.path.exists(m.LOCK_PATH))
+        with open(m.LOCK_PATH, encoding="utf-8") as f:
+            check("남의 락 내용도 그대로", f.read(), "other-process")
+        os.remove(m.LOCK_PATH)
+
+        # (3) 도중에 예외가 나도 락은 놓는다
+        def boom(*a, **kw):
+            raise RuntimeError("qa-simulated-crawl-crash")
+
+        m.run_courts = boom
+        raised = False
+        try:
+            m.main()
+        except RuntimeError:
+            raised = True
+        check("예외는 호출자에게 그대로 전달된다", raised, True)
+        check_true("예외가 나도 락은 놓인다", not os.path.exists(m.LOCK_PATH))
+    finally:
+        m.LOCK_PATH, m.init_db, m.run_courts, m.enqueue_documents = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run():
     test_driver_restart_failure_stops_run_instead_of_burning_retry_budget()
     test_driver_restart_success_continues_processing()
@@ -428,6 +716,10 @@ def run():
     test_driver_startup_failure_releases_lock()
     test_out_of_window_run_does_not_start_browser()
     test_driver_setup_failure_does_not_orphan_browser()
+    test_runlock_primitive()
+    test_runlock_is_exclusive_under_concurrency()
+    test_both_batches_share_the_same_lock_rule()
+    test_mvp_scraper_lock_flow()
 
     print("\n" + "=" * 55)
     if failures:
@@ -437,5 +729,16 @@ def run():
     return 0
 
 
+def _final_safety_net():
+    """어느 검사가 죽더라도 운영 락 흔적을 남기지 않는다(마지막 그물)."""
+    _clear_real_lock_files()
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    try:
+        code = run()
+    finally:
+        # ★ 어느 검사가 죽더라도 운영 `logs/` 에 락 흔적을 남기지 않는다.
+        #   남기면 다음 실제 배치가 5시간 막힌다 — 테스트가 운영을 멈추는 셈이다.
+        _final_safety_net()
+    sys.exit(code)

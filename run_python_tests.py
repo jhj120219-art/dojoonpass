@@ -111,6 +111,11 @@ def classify(returncode, out):
     return "NO-VERDICT", asserts
 
 
+# 실패한 파일에서 곧바로 보여 줄 마지막 줄 수. 스크롤을 덮지 않으면서
+# 원인 한 줄(대개 traceback 마지막 줄)은 들어가는 크기다.
+FAIL_TAIL_LINES = 12
+
+
 def run_one(name):
     started = time.time()
     try:
@@ -164,13 +169,35 @@ def main():
     total_asserts = 0
     t0 = time.time()
 
+    exitcodes = {}
     for i, name in enumerate(files, 1):
         status, asserts, out, rc, secs = run_one(name)
         buckets[status].append(name)
         outputs[name] = out
+        exitcodes[name] = rc
         total_asserts += asserts
         emit("[%2d/%2d] %-11s %-38s 단언%-5d %5.1fs" %
              (i, len(files), status, name, asserts, secs))
+
+        # ---------------------------------------------------------------
+        # 실패는 **그 자리에서** 증거를 남긴다 (2026-08-18 Sprint 203).
+        #
+        # 예전에는 실패 출력이 `-v` 를 줬을 때만 나왔다. 그런데 실패를 발견하는
+        # 순간은 대개 `-v` 없이 돌린 순간이고, 다시 돌리면 통과하는 간헐 실패는
+        # **그 한 번이 유일한 기회**다. 실제로 이 자리에서 한 번 놓쳤다 -
+        # `test_doc_storage_atomicity.py` 가 0.1초 만에 25단언에서 죽었는데,
+        # 재현하려고 4번 더 돌렸을 때는 전부 통과해서 원인을 볼 수 없었다.
+        #
+        # 이 저장소가 이미 배운 것과 같은 교훈이다(로그에 안 남아 9일간 크롤
+        # 중단을 몰랐던 일). 실패했는데 아무 흔적이 없으면 실패하지 않은 것과
+        # 구별되지 않는다.
+        # ---------------------------------------------------------------
+        if status in ("FAILED", "TIMEOUT") and not args.verbose:
+            tail = [ln for ln in out.splitlines() if ln.strip()][-FAIL_TAIL_LINES:]
+            emit("        (종료코드 %s - 마지막 %d줄, 전체는 -v)"
+                 % (rc, len(tail)))
+            for ln in tail:
+                emit("        | " + ln[:200])
 
     emit("=" * 72)
     emit(" 통과 %d | 실패 %d | 건너뜀 %d | 판정없음 %d | 시간초과 %d   (단언 %d건, %.1fs)"

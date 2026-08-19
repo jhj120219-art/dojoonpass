@@ -3558,3 +3558,926 @@ Sprint 188 — Failure Recovery 감사: 검색 API 오류가 로그에 원인을
   `image` 큐 행은 이 세션이 만든 게 아니라 Sprint 144부터 있던 정상 동작이다).
 
 문서 동기화 (BUGS / TEST_PLAN)
+
+---
+
+2026-08-18 (Sprint 189) — 변경 기반 재수집 (Change-driven Refresh)
+
+**기능**
+- `storage/database.py`: 큐 상태 어휘 확장(`refresh` / `in_progress_refresh`)과
+  `requeue_changed_documents()` / `doc_types_for_changed_fields()` 신설.
+  스키마 변경 없음(TEXT + CHECK 없는 컬럼의 값 추가).
+- `migrate_execute.py`: Sprint 185의 필드 단위 변경 **관측**을 **행동**으로 연결 —
+  바뀐 물건을 커밋 뒤 `requeue_changed_documents()`에 넘긴다.
+  `DOJOONPASS_REFRESH_ON_CHANGE=0`으로 끌 수 있다(기본 켬).
+  재수집 예약 실패가 이미 성공한 매일 크롤링을 exit 1로 만들지 않도록 격리.
+- `doc_worker.py`: `claim_next_queue_item()`이 계산한 `overwrite`를
+  `collect_document(..., overwrite=)`로 전달. 재수집일 때는 **형제 물건 복사 지름길을
+  쓰지 않는다**(형제 사본도 같은 옛 수집분이라 재수집의 의미가 없어진다).
+- `claim_next_queue_item()` / `mark_queue_failed()` / `reset_stale_queue()` /
+  `refresh_queue_priority()`가 새 어휘를 일관되게 다룬다 — 특히 재시도와 stale 회수가
+  재수집 의도를 **각자 제자리로** 되돌린다.
+- `api/v1/doc_stats.py`: `queue_refresh` 필드 추가, 큐 상태 문자열 하드코딩 제거
+  (단일 소스 참조). `queue_in_progress`는 두 진행 상태의 합.
+- `measure_endless_collecting.py`: 하드코딩 집합(존재하지 않는 `"processing"`을 세고
+  새 어휘를 못 세던 것)을 `QUEUE_ACTIVE_STATUSES` 참조로 교체.
+
+**버그 수정**
+- BUGS #120 — 사진 형식 변경 시 옛 확장자 파일이 고아로 남고 지문 공식이 갈라져
+  **이후 매 수집이 거짓 개정**이 되던 결함. `_remove_other_ext_for_seq()` 신설 +
+  `_existing_set_hash()`가 중복 순번에서 비교를 포기하도록 이중 방어.
+- BUGS #121 — 기존 PDF 덮어쓰기가 Windows에서 `shutil.move()`의 조용한 copy2 폴백으로
+  **비원자적**이 되던 결함. `crawler/doc_crawler.py:move_into_place()` 신설.
+- BUGS #122 — 재수집 최종 실패가 이미 READY인 문서를 FAILED로 뒤집던 결함
+  (이번 Sprint가 도입할 뻔한 것). `DOC_STATUS_HAS_ARTIFACT` 판정으로 차단.
+
+**문서**
+- BUGS #117 해결로 정정(마이그레이션 020은 2026-08-17T09:03:19에 적용됨, API 200 실측).
+- BUGS #123 신규 — **이 저장소를 가리키는 예약 작업이 0개다**(Release Blocker,
+  승인 필요). Sprint 187의 "DOJOONPASS_DAILY 정상 동작 중" 기록을 실측으로 정정.
+
+**테스트**
+- 신규 `test_refresh_trigger.py` (12절 74검사).
+- `test_asset_pipeline.py` +13검사(5-D 형식 교체 / 5-E 중복 순번 / 7-B(5) 사진 추가).
+- `test_doc_storage_atomicity.py` +8검사(7d 원자적 덮어쓰기 / 7e AST 전수 가드).
+- `test_doc_worker_recovery.py` 대역 시그니처 정정(실물보다 좁아 TypeError를 냈다).
+- 전체 40 PASSED / 0 FAILED (단언 4,649 -> 5,038). 프런트 113/113, tsc 0, eslint 0.
+
+
+---
+
+2026-08-18 (Sprint 189 이어서) — 재수집 정확도/비용 하드닝
+
+**버그 수정**
+- BUGS #124 — `status.json` 전체를 해싱해 **수집 시각(`extracted_at`)이 지문을 매번
+  바꾸던** 결함. 재수집을 켜면 `document_version_log`가 거짓 개정으로 차고
+  `doc_raw.doc_version`이 매일 올랐을 것이다. `_fields_hash()` /
+  `status_content_hash()` 신설로 **내용**만 해싱하고, 디스크 쪽·수집 쪽·형제 재사용
+  경로가 전부 같은 공식을 쓴다.
+- BUGS #125 — 내용 무변경 재수집이 파일을 다시 써 **mtime -> ETag -> 브라우저 캐시**를
+  통째로 무효화하던 결함. 사진/status/PDF 세 경로 모두 "바이트 지문이 같으면 쓰지
+  않는다"로 바꿨다(`_same_bytes_on_disk`, `_write_text_if_changed`, PDF 조기 반환).
+- BUGS #126 — `test_doc_storage_atomicity.py`의 cleanup이 자기 디렉터리에는
+  `_force_rmtree()`를 안 써서, 한 번 실패하면 잔해가 남아 **이후 모든 실행이 실패**하던
+  테스트 위생 결함(실측 6벌 누적). 두 호출 지점을 하나로 합쳤다.
+
+**테스트**
+- `test_asset_pipeline.py` 5-F(재수집 캐시 보존, 대조군 포함).
+- `test_doc_storage_atomicity.py` 7f(지문이 수집 시각에 안 흔들린다) /
+  7g(텍스트 무변경 미기록) / 7h(같은 PDF는 목적지 무변경, 대조군 포함).
+- `test_doc_storage_atomicity.py`의 소스 순서 검사가 구현 세부(`html_tmp = html_path`)를
+  찾고 있어 리팩터링에 부러졌다 — 함수 이름 기준으로 바꿔 불변식만 남겼다.
+- 전체 40 PASSED / 0 FAILED, 단언 5,084개. 연속 2회 동일.
+
+
+---
+
+2026-08-18 (Sprint 190) — 매일 갱신 체인 실측 감사
+
+**실측**
+- 라이브 크롤 프로브(한 법원, DB 미기록): 9건 수집 / 검증 100% PASS / 핵심 필드 전부
+  채워짐 — **크롤러가 아직 법원 원천을 읽는다**. 데이터 공급 중단의 원인이 오직
+  예약 작업 미등록(BUGS #123)임을 확정.
+- 전체 크롤 소요 추정 3.1시간(1곳 186초 x 60곳). 법원 변경 -> 문서 반영 지연 약 17시간.
+- `claim_next_queue_item()`: 어휘 확장(`=` -> `IN 2값`) 전후 **0.30 ms 동일**, 계획 동일.
+- `requeue_changed_documents()`: 최악(300물건 x 4종 = UPDATE 2,400회) **0.005초**.
+
+**수정**
+- `docs/BETA_RELEASE_CHECKLIST.md` 43행의 셸 이스케이프 파손 복구
+  (`` `.<개행>egister_scheduler_tasks.ps1` `` -> 정상). 추적 파일 315개 전수 검색, 잔여 0건.
+- 문서 드리프트 정정 4건(스케줄러 상태 2건, BUGS #117 해결, 체크리스트 P0-C 해결).
+
+**신규 문서**
+- `docs/SPRINT190_REFRESH_CHAIN_AUDIT.md`
+
+
+**Sprint 190 추가** — `test_schema_hygiene.py`에 이스케이프 파손 전수 가드 신설(2검사,
+추적 텍스트 315개). 변이 주입으로 헛돌지 않음을 확인한 뒤 복원.
+전체 40 PASSED / 0 FAILED, 단언 **5,086개**.
+
+
+**Sprint 190 추가 2** — 실제 브라우저로 재수집 1건 완주(스크래치 DB + 스크래치 문서 루트):
+큐 refresh -> done, 내용 무변경 판정, `document_version_log` 0->0, `doc_raw` 556->556,
+파일 미기록. 실 데이터 무변경 확인. 회귀 2절 추가(`enqueue` 가 refresh 를 안 덮는다 /
+doc-stats 집계 실호출) + `test_api_regression.py` 의 큐 집계 검사를 단일 소스로 정정
+(새 어휘를 조용히 흘리던 잠재 오통과). 전체 40 PASSED / 0 FAILED, 단언 **5,145개**.
+
+
+**Sprint 190 추가 3** — 사진 재수집을 실제 브라우저로 완주(스크래치 격리):
+5장 무변경 -> 파일 미기록·mtime 보존, `version_log` 0->0, `auction_image` 5->5.
+그 실행에서 **완료 로그가 거짓**(한 장도 안 썼는데 "5장 저장 완료")임을 발견해 정정하고,
+`written`/`unchanged` 를 반환값에 담아 로그 파싱 없이 검증되게 했다.
+전체 40 PASSED / 0 FAILED, 단언 **5,148개**.
+
+
+---
+
+2026-08-18 (Sprint 191) — 자산 3근거 불변식 + 큐 경쟁 정직성
+
+**버그 수정**
+- BUGS #127 — 법원이 사진 수를 줄여도 **파일이 안 지워져** 지문 공식이 영구히 갈라지던
+  결함(#120과 같은 실패 방식). `_remove_files_not_in()` 신설(부분 수집 보호 포함) +
+  `save_auction_images()`의 행 삭제를 `seq > max_seq` -> **집합 차집합**으로
+  (가운데 순번이 빠지는 경우를 `>` 비교가 못 잡았다).
+- BUGS #128 — 법원이 사진을 **전부** 내려도 옛 사진이 영원히 노출되던 결함.
+  `clear_images_if_absence_confirmed()` 신설, **두 번 연속 확인** 후에만 정리
+  (새 컬럼 없이 `document_status`가 1회차를 기억).
+  `crawler/image_assets.py:remove_stored_image_files()` 신설(DB -> 파일 순서 보장).
+- BUGS #129 — 문서 **완료 기준(json)과 서빙 대상(html)이 서로 다른 파일**이던 결함.
+  `DOC_REQUIRED_FILES` 신설, `doc_exists()`가 필요한 파일 전부를 본다.
+- BUGS #130 — 큐 경쟁에서 진 것을 "큐 비었음"으로 오해해 워커 실행이 조기 종료되던 결함.
+  `CLAIM_RACE_MAX_ATTEMPTS = 5`, `None`은 진짜로 가져갈 것이 없을 때만.
+
+**테스트**
+- `test_asset_pipeline.py` 5-G(12) / 5-H(13) / **5-I 세 근거 불변식**(시나리오 8종, 25)
+- `test_doc_storage_atomicity.py` 7i 완료기준==서빙대상 구조적 가드(9)
+- `test_refresh_trigger.py` §15 동시 claim 정직성(스레드 12개, 8)
+- `test_asset_pipeline.py` §11 — 옛 semantics를 굳히던 검사를 정정
+- 전체 40 PASSED / 0 FAILED, 단언 **5,359개**. 신규 가드 2종 전부 변이 확인.
+
+
+---
+
+2026-08-18 (Sprint 192) — 삭제 경로 봉쇄 + 변경 감지 커버리지 증명
+
+**버그 수정**
+- BUGS #131 — `remove_stored_image_files()` 가 DB 값(`storage_path`)으로 파일을 지우면서
+  경로 탈출 봉쇄가 없던 결함. 서빙 쪽에는 이미 있던 방어가 **삭제 쪽에만** 빠져 있었다.
+  `crawler/image_assets.py:is_inside_document_root()` 신설.
+
+**테스트**
+- `test_asset_pipeline.py` 18-B — 봉쇄 판정 + 실제 삭제 동작 + **삭제 지점 AST 전수**(12검사).
+  변이 확인 완료(봉쇄 무력화 시 바깥 파일이 실제로 지워지며 3건 FAIL).
+- `test_refresh_trigger.py` §16 — 사용자에게 보이는 **변동 필드가 전부 관측되거나
+  파생**임을 구조적으로 증명(16검사). 유찰횟수/낙찰가율이 관측 목록에 없는 이유를
+  코드로 고정한다.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,387개**.
+
+
+**Sprint 192 추가** — `audit_asset_integrity.py` 신설(읽기 전용 자산 무결성 감사,
+종료 코드 0/1/2, `--selftest` 포함). 실 DB 전수 감사 결과 **5개 항목 전부 GREEN**
+(사진 45행·문서 556건·doc_raw 556행·큐↔상태 모두 일치).
+BUGS #129 로 엄격해진 STATUS 완료 기준(html+json)에서도 기존 READY 556건이 전부 통과.
+`git add audit_asset_integrity.py` 는 승인 영역이라 SKIP — 그때까지 회귀 스위트는
+이 파일을 참조하지 않는다(미추적 import 금지 규칙, BUGS #105).
+
+
+---
+
+2026-08-18 (Sprint 193) — 운영 데이터 무결성 감사
+
+**신규**
+- `audit_asset_integrity.py` 를 일곱 검사로 완성(양방향: DB->파일, 파일->DB, 큐->물건).
+  읽기 전용, 종료 코드 0/1/2, `--selftest` 로 감사기 자체를 검증.
+- `docs/SPRINT193_ASSET_INTEGRITY_AUDIT.md`
+
+**실측**
+- [1]~[5] GREEN. BUGS #129 로 좁힌 STATUS 완료 기준에서도 기존 READY 556건 전부 통과.
+- [6] 대응 물건 없는 문서 디렉터리 1개 / [7] 고아 큐 18행 — 같은 사건번호가 두 법원에
+  존재하던 잔재(BUGS #14/#18/#103/#107 계열). 새로 생기지 않으며 사용자 피해 없음.
+  정리는 `cleanup_orphans_dryrun.py`(승인 영역).
+
+**감사기 자체의 결함 3건을 만들고 즉시 잡았다**
+- 추적 파일 -> 미추적 파일 import (`test_schema_hygiene.py` 가 검출, 의존 제거로 해결)
+- `DB_PATH` 스냅숏 복사 (자체 검사가 실 DB 를 읽고 있었다)
+- 경로 정규화 누락으로 거짓 경보 36건 (37 -> 1)
+
+
+---
+
+2026-08-18 (Sprint 194) — 매일 크롤 동시 실행 방지
+
+**버그 수정**
+- BUGS #132 — `mvp_scraper.py` 에 동시 실행 방지가 없던 결함(`logs/checkpoint.json`
+  덮어쓰기 + 법원 서버 이중 크롤). `storage/checkpoint.py` 에 `RunLock` 을 두고
+  `doc_worker.py` 의 인라인 구현을 그것으로 교체(동작 불변, 기존 회귀가 보증) 후
+  `mvp_scraper.py` 에 적용.
+
+**테스트**
+- `test_doc_worker_recovery.py` §9 `RunLock` 원시 계약(7) / §10 두 배치가 같은 구현을
+  쓰는지 구조적 확인(10) / §11 `mvp_scraper.main()` 락 흐름 실동작(8).
+- 전체 40 PASSED / 0 FAILED, 단언 **5,404개**.
+
+
+---
+
+2026-08-18 (Sprint 195/196) — 가드 사각지대 + 재수집 처리량 근거
+
+**버그 수정**
+- BUGS #133 — AST 전수 가드 2개가 `encoding="utf-8"` + `except SyntaxError: continue` 로
+  **BOM 파일 16개를 조용히 건너뛰던** 결함. `utf-8-sig` 로 고치고, 못 판 파일이 있으면
+  단언으로 드러나게 했다. 삭제 지점 집계 8곳 -> **12곳**으로 정정.
+- BUGS #134 — `REFRESH_MAX_ITEMS_PER_RUN` 300 -> **60**(실측 근거).
+  `config/settings.py` 에 `DOC_WORKER_START_TIME` / `DOC_COLLECT_SECONDS_PER_ROW` 신설.
+
+**실측**
+- 재수집 상한: 창 7,200초 / 옛 값 최악 28,800초(400%) / 새 값 최악 5,760초(80%).
+- 이미지 트리거: CSV 25개 diff, 공통 4,455건에서 감시 필드 변경 **0건**.
+  원인은 `MAX_ITEMS=10` 로 인한 슬라이스 교체(이탈 163 / 신규 158).
+
+**테스트**
+- `test_refresh_trigger.py` §17 상한 산술 불변식(6검사).
+- `test_asset_pipeline.py` 18-B / `test_doc_storage_atomicity.py` 7e 에
+  "스캔 범위를 전부 읽고 팠다" 단언 추가.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,419**. 변이 검증 3건 전부 FAIL 확인 후 복원.
+
+
+**Sprint 197 실측** — doc_worker 이동 비용 63%(물건 단위 묶기 시 47% 절감 여지, 미착수) /
+`image` 큐 행 0개는 마지막 enqueue(08-12)가 image 추가(08-17)보다 앞선 시간 순서 문제이며
+코드 결함 아님 / 문서의 "원래 없음"은 신뢰할 positive signal 이 없어 **새 상태를 만들지 않음**.
+
+
+---
+
+2026-08-18 (Sprint 198/199) — 관측 설계 정정 + 묶기 실증
+
+**정정**
+- Sprint 196 의 "변경 사실상 없음" 결론을 **실측으로 정정**. 연속 스냅숏 0건은
+  **관측 공백**이었고, 물건별 처음<->마지막으로 재니 **44물건 132건 변경**
+  (저감률 0.7/0.8 = 한국 경매 법정 저감률과 일치). 문서 재수집은 실제로 발동하며
+  하루 약 3행(창의 1%). 사진 재수집만 발동하지 않는다(감정가 0/1,228).
+- 관련 문서(`SPRINT195...md`, `CURRENT_STATE.md`)에 정정 표시 삽입(원문 보존).
+
+**실증**
+- 물건 단위 묶기 **가능**을 호출 그래프 + 실브라우저로 확인(이동 1회 뒤 두 번째 종류
+  정상 수집, 창/URL 보존). 사진 수집 비용은 **0.0초** — 전부 이동 비용이다.
+- 실브라우저 실행에서 **실재하는 spec 이 타임아웃 실패** — "수집 실패 != 원래 없음"의
+  직접 증거이자 BUGS #122 방어의 필요성 실증.
+
+**신규 문서**
+- `docs/SPRINT198_TRIGGER_OBSERVABILITY_CORRECTION.md`
+- `docs/SPRINT199_BATCHING_FEASIBILITY.md`
+
+
+**Sprint 200** — `test_refresh_trigger.py` §18 배선 가드 신설(능력 19개가 실제로
+정의·호출되는지 AST 확인, 진입점은 `run_*.bat` 에서 유도). 작성 중 스캔 범위가 좁아
+`refresh_queue_priority` 를 거짓 경보로 잡은 것을 발견해 진입점 유도 방식으로 정정.
+변이 검증: `overwrite=overwrite` 제거 시 3건 FAIL. 단언 5,419 -> **5,426**.
+
+
+---
+
+2026-08-18 (Sprint 201) — 받아 놓고 버린 문서
+
+**버그 수정**
+- BUGS #135 — `collect_appraisal()` 이 새 탭을 성공 조건으로 삼아, **실제로 내려온 PDF 를
+  확인조차 하지 않고 버리던** 결함. `plugins.always_open_pdf_externally` 때문에
+  다운로드가 성공할수록 탭이 안 생기는 구조였다. 탭이 없으면 다운로드 도착 여부로
+  판단하도록 고쳤다(더하기만 하는 변경). **실환경에서 success=False -> True 확인.**
+
+**탐지 추가**
+- BUGS #136 — 명세서 다운로드 고아(원인 미확정). `audit_asset_integrity.py` [8] 신설.
+  실측 고아 8개 / 14.0MB (감정평가서 3 + 명세서 5).
+
+**테스트**
+- `test_doc_storage_atomicity.py` 7j — 탭을 만들지 않는 가짜 드라이버로 3경우 고정(9검사).
+  대역이 실물보다 좁아 한 번 막힌 것(`default_content`/iframe `src`)도 함께 넓혔다.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,463**.
+
+**실측**
+- 묶기 4종 확장: 절감 **44%**(19.1 + 53.5 = 72.6초 vs 129.7초). 미착수 유지.
+
+
+---
+
+2026-08-18 (Sprint 202) — #135 계열 전수검색
+
+**버그 수정**
+- BUGS #136 — `collect_spec()` 도 탭을 성공 조건으로 삼아 도착한 PDF 를 버리던 결함
+  (#135 와 동일 모양). 탭이 없으면 다운로드 도착을 확인하고, 왔으면 뷰어 단계를
+  건너뛰고 저장한다. 뷰어 경로는 대조군으로 회귀에 고정.
+- BUGS #137 — `wait_for_download` 호출부 가드가 `else:`/`finally:` 를 안 보던 결함.
+  `body` 만 훑던 것을 `body`/`orelse`/`finalbody` 전부로 확장.
+
+**테스트**
+- `test_doc_storage_atomicity.py` 7k(8검사) + §9 가드 확장.
+- `test_schema_hygiene.py` 27 신설 - CRLF 로 커밋된 파일을 LF 로 다시 쓰지 않는지.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,473**. Frontend 113/113, tsc 0, eslint 0.
+
+
+---
+
+2026-08-18 (Sprint 203) - 검색 필터 dependency 감사
+
+**감사 (구현 없음)**
+- 면적 필터: 데이터는 `full_address` 대괄호에 **이미 있다**(1,852/1,876 = 98.7%).
+  막고 있는 것은 의미 정의(제품 결정). 파싱 함정 5종 실측.
+- 특수조건 필터: 소스는 법원 목록 **셀5**. `collect_list_items()` 가 읽지 않는다.
+  재크롤 3.1시간 + 분류 사전(제품 결정)이 필요하다.
+- `crawl_detail()` 의 `property_list`/`schedule`/`nearby_cases` 는 수집만 하고
+  **아무도 읽지 않는다**(`normalize_item()` 이 21필드만 통과).
+
+**가드 추가**
+- `test_normalizer.py` - 주소 끝 대괄호 보존(면적의 유일한 소재지). 사례 4 x 검사 3.
+  변이 2종 확인(대괄호 제거 8 FAIL / 지번 오염 3 FAIL).
+
+**테스트**
+- 전체 40 PASSED / 0 FAILED, 단언 **5,485**.
+
+**러너**
+- `run_python_tests.py` - 실패/시간초과 파일의 마지막 12줄을 `-v` 없이도 즉시 출력.
+  간헐 실패의 증거를 놓치지 않기 위해서다(BUGS #139).
+
+
+---
+
+2026-08-18 (Sprint 204) - 예약 실행 등록 후 검증
+
+**신설**
+- `audit_schedule_health.py` (읽기 전용) - 등록/마지막 실행/저장소 흔적 세 축을 대조해
+  **어긋나는 지점을 지목**한다. `--selftest` 9검사 포함. 미추적(= git add 승인 필요).
+
+**가드 추가**
+- `test_schema_hygiene.py` 14-B - DOC_WORKER_START_TIME vs 등록 스크립트 시각,
+  우선순위/문서수집 실행 순서, ExecutionTimeLimit vs worker 실행 창. 전부 변이 검증.
+
+**문서 정정**
+- `docs/BETA_RELEASE_CHECKLIST.md` - Sprint 187의 "DOJOONPASS_DAILY 정상 동작 중"
+  문단에 재정정 표시(원문 보존). 오늘 세 축 실측이 전부 반대다.
+
+**자기 결함**
+- 새 감사기가 첫 실행에서 249개를 0개로 읽었다(`schtasks /v` 헤더 위치 오독).
+  파싱을 분리해 픽스처로 고정하고, 못 뽑으면 0개가 아니라 조회 실패로 돌려준다.
+
+
+---
+
+2026-08-18 (Sprint 205) - 공허한 가드 전수 감사
+
+**가드 보강**
+- `test_auction_identity.py` 법원 스코프 SQL 스캔 - 하한 추가(파일 40개 / 쓰기문 8개).
+  실측 86개 / 15개. 변이(열거를 2개로 자름) -> FAIL 2건.
+- `test_schema_hygiene.py` .ps1 BOM 스캔 - 하한 추가(비ASCII .ps1 1개 이상).
+  변이(열거를 비움) -> FAIL 1건.
+
+**감사 결과**
+- 테스트 44개에서 "비었음" 단언 115개 -> 스캔 기반만 4개 -> 실제 결함 2개.
+  나머지 2개는 오탐 1(이미 `bool()` 하한 있음) / 하한 불가 1(작업트리가 깨끗하면 0이 정답).
+- 탐지기 자신이 `check_true(..., bool(X), ...)` 형태를 하한으로 못 알아봤다(기록함).
+
+**확인만 한 것**
+- `migrate_execute.refresh_on_change_enabled()` 기본값 ON(미설정 = 켬)이고,
+  사용자/머신 환경변수 어디에도 `DOJOONPASS_REFRESH_ON_CHANGE` 가 설정돼 있지 않다.
+  즉 스케줄러 등록만 되면 변경 기반 재수집은 **별도 설정 없이 발동한다**.
+
+
+---
+
+2026-08-18 (Sprint 206) - 낡은 미구현 주장 감사
+
+**정정**
+- `src/app/search/types.ts` - "DB에 대응 컬럼/데이터가 없어"는 절반만 사실.
+  데이터는 `full_address` 대괄호에 98.7% 있다(Sprint 203 실측). 실제 장애물은 의미 정의.
+
+**확인만 한 것 (전부 여전히 참)**
+- 프로덕션 소스 196개 중 미완/미지원 표시 22건 - 살아 있는 거짓 주장은 위 1건뿐.
+- `api/v1/item.py` 썸네일 미구현(Pillow 부재 확인), `payment_providers.py` PG 미연동,
+  `SearchForm.tsx` TODO 3건 + "준비 중" 2건.
+- `storage/migrations/014_*.sql` 의 낡은 주장은 **적용된 마이그레이션이라 고치지 않는다**
+  (살아 있는 코드에 이미 정정이 있다).
+
+
+---
+
+2026-08-18 (Sprint 207) - 의존성 권고 재실측
+
+**정정**
+- `KNOWN_SAFE_MIN_NEXT_VERSION` 16.2.11 -> **16.3.1**. 취약 범위가
+  `16.3.0-preview.10` 까지 넓어져 옛 안전선으로 올리면 8건이 남는다(npm audit 실측).
+
+**가드 추가**
+- `test_schema_hygiene.py` 8-B - 권고가 걸린 패키지 7개의 설치본이 스냅샷보다
+  낮아지면 실패(오프라인, package-lock.json 기준). 변이 2종 확인.
+
+**문서**
+- `docs/BETA_RELEASE_CHECKLIST.md` P1 신설 - 권고 7건 표(등급/설치본/내용)와
+  `next@16.3.1` 이 메이저가 아니며 postcss/sharp 도 함께 정리된다는 사실.
+
+**SKIP(승인)**: `npm install next@16.3.1` 등 의존성 업그레이드.
+
+
+---
+
+2026-08-18 (Sprint 208) - 이미지 체인 관통 조사
+
+**버그 수정**
+- BUGS #140 - `doc_worker` 가 사진을 적기 전에 성공을 먼저 기록하던 순서 결함.
+  실체(`auction_image`)를 먼저, 성공(`mark_queue_done`)을 나중에.
+- BUGS #141 - `_images_status()` 가 "READY인데 0장"을 그대로 전달하던 결함.
+  READY 만 COLLECTING 으로 낮춘다(NO_IMAGE/FAILED 는 유지).
+
+**테스트**
+- `test_asset_pipeline.py` 12-F 신설 + 17 확장. 변이 2종 확인.
+
+**실측**
+- `appraisal_price` 변경 **0/1,228 (0.0%)** - image 재수집 트리거의 실제 발동 가능 횟수.
+  나머지 3필드는 각 44건(3.6%).
+- 사본 실증: `enqueue_documents(rows)` -> image 10행 생성. 큐 0행은 시점 문제다.
+
+
+---
+
+2026-08-18 (Sprint 209) - 문서 증거 정합성 감사
+
+**정정**
+- "전체 크롤 3.1시간"의 증거 등급을 **실측 -> 파생**으로 고침(4곳).
+  원 측정은 서울중앙 1곳 9건 186.2초이고, `MAX_ITEMS=10` 전제 위에서만 곱셈이 성립한다.
+- `docs/SPRINT190_*` 에 파생 전제를 명시(확인된 것 / 확인 안 된 것 구분).
+- `docs/SPRINT203_*` - "재크롤 3.1시간"은 틀렸다. 기일이 지난 1,867건은
+  **소급 불가**이고 1회 실행 상한은 600건이다. 정정 마커로 원문 보존.
+- `docs/SPRINT199_*` - 4종 주장은 그 시점에 **외삽**이었음을 표시하고
+  Sprint 201 의 4종 실측으로 전방 참조.
+
+**방법 기록**
+- 강한 단정 정규식은 245건(대부분 규칙 문장)을 내 쓸모가 없었다.
+  "결정에 쓰이는 수치 주장"으로 좁혀야 실제 결함 3건이 드러났다.
+
+
+---
+
+2026-08-18 (Sprint 210) - 재수집 의도 보존
+
+**버그 수정**
+- BUGS #142 - 재시도 소진 뒤 `reset_stale_queue()` 가 무조건 `pending` 으로 되돌려
+  재수집 의도가 사라지던 결함. 실체(READY)가 있는 행은 `refresh` 로 되돌린다.
+  상태 어휘는 늘리지 않았다.
+
+**계약 변경**
+- `test_document_status_sync.py` 9-(2) 기대값 `pending` -> `refresh`.
+  회귀가 아니라 의도된 변경이며 사유를 그 자리에 기록했다.
+
+**테스트**
+- `test_refresh_trigger.py` 20 신설(4검사). 변이 -> FAIL 2건.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,553**.
+
+
+---
+
+2026-08-18 (Sprint 211) - 낡은 "도달 불가" 주장 정정
+
+**정정 (4곳)**
+- `api/http_cache.py` / `docs/SPRINT145_*` / `docs/SPRINT146_*` / `docs/roadmap.md`
+  — `document_version_log` 는 Sprint 189 이후 **도달 가능**하다. 0행인 이유는
+  "경로 없음"이 아니라 "아직 안 돌았음"(예약 작업 0개).
+
+**가드 추가**
+- `test_schema_hygiene.py` 28 — 정정 없이 살아 있는 "도달 불가" 주장 검출.
+  취소선 이력은 인정, 스캐너 자기 파일은 제외, 하한/대조군 포함.
+- ★ 이 가드가 처음에 **공허했다**("정정"이라는 흔한 단어를 인정 조건에 넣어
+  마커를 지워도 통과). 조건을 좁히자 낡은 주장 2건이 더 드러났다. 변이 2종 재검증.
+
+
+---
+
+2026-08-18 (Sprint 212) - 문서 계열 확인 + 감사기 출력 구분
+
+**확인만 한 것 (결함 없음)**
+- 문서에는 사진의 순서 결함이 없다 — `_record_doc_raw()` 가 `mark_queue_done()`
+  트랜잭션 안이라 원자적. 실측 READY 556 / doc_raw 없음 0 / 파일 없음 0.
+- 그래서 `_document_entry()` 에 두 번째 방어선을 넣지 않았다(어긋나는 행 0).
+
+**도구 수정**
+- `audit_asset_integrity.py` — `--selftest` 가 심은 결함의 감사 출력에
+  `[selftest 가짜DB]` 접두사. 실제 감사 출력과 구분되지 않아
+  **selftest 결과를 운영 실측으로 오독한 사고**가 실제로 있었다.
+
+
+---
+
+2026-08-18 (Sprint 213) - 죽은 코드 전수 조사
+
+**감사 (구현 없음)**
+- 진입점 유도(`run_*.bat` + `api_server.py` + 회귀 실행기 + 추적 테스트) -> import 그래프.
+  프로덕션 82개 중 도달하지 않는 것 22개. **새 죽은 코드 0건** —
+  20개는 의도된 수동 스크립트, 2개는 이미 기록된 `filter/` 잔재(삭제는 승인).
+- 도구 자기 결함: `__init__.py` 를 도달 불가로 오판(31 -> 22로 정정).
+
+**문서 정밀화**
+- `docs/CLAUDE.md` — `filter_engine.py` "80% 커버리지"는 실행률이며,
+  `test_filter.py` 에 단언이 없어(NO-VERDICT) 세 모듈 모두 미검증임을 명시.
+
+
+---
+
+2026-08-18 (Sprint 214) - 성공판정 A~F 관통
+
+**버그 수정**
+- BUGS #143 - 기록이 0장/0행이어도 큐가 done 으로 끝나던 결함.
+  사진은 `saved>0`, 문서는 `files_saved` 실재를 성공 판정에 쓴다.
+  범위는 좁게(스킵 경로/부분 성공 계약은 건드리지 않는다).
+
+**테스트**
+- `test_asset_pipeline.py` 12-G(A~F x 기존asset 2벌) / 12-H(문서 3경우).
+- 변이 3종 전부 FAIL 확인. 전체 40 PASSED / 0 FAILED, 단언 **5,883**.
+
+
+---
+
+2026-08-18 (Sprint 215) - 이미지 전 구간 관통 fixture
+
+**테스트**
+- `test_refresh_trigger.py` 21 신설 - 원천 변경부터 API 응답까지 8단계를 실함수로 잇는다
+  (대역은 브라우저 한 곳). `document_version_log` 1행까지 확인.
+- 전체 40 PASSED / 0 FAILED, 단언 **5,918**.
+
+
+---
+
+2026-08-18 (Sprint 216) - Cache/성능 확인 + 트리거 매핑 고정
+
+**확인만 한 것**
+- Cache: `not_modified()` 가 문서/사진 두 라우트에서 실제 호출됨(HEAD 는 GET 위임).
+- 성능: `reset_stale_queue()` 2,753행 회수에 **0.034초**(사본 측정, 원본 무변경).
+
+**가드 추가**
+- `test_refresh_trigger.py` 1 — "사진으로 가는 길은 감정가 하나뿐"(실측 0.0%)을 단언.
+  매핑 확대는 제품 결정이므로 조용히 바뀌지 않게 한다. 변이 -> FAIL 3건.
+
+
+---
+
+2026-08-19 (Sprint 217) - 스킵 경로의 실체 기록 (BUGS #144)
+
+**버그 수정**
+- BUGS #144 - `"이미 존재. 스킵"` 이 `files_saved=[]` 로 돌아와 `_record_doc_raw()` 가
+  실체 기록을 통째로 건너뛰던 결함. 파일은 있는데 `doc_raw` 0행 / 큐 done / 화면 READY 가
+  되고, **다음 수집도 같은 분기라 스스로 회복되지 않았다**(API 의 쪽수·크기·버전 영구 null).
+- `crawler/doc_paths.existing_doc_files()` 신설 — `doc_exists()` 와 같은 목록·같은 기준.
+  spec/status/appraisal 세 분기가 이미 가진 파일을 결과에 담는다. 파일은 다시 쓰지 않고
+  (mtime 무변경), 개정 이력도 남기지 않는다.
+- 사진 쪽은 같은 자리를 처음부터 복구하고 있었다(`_describe_existing()`). 문서만 없던 칸이다.
+
+**테스트 자체의 결함 2건 수정**
+- `test_asset_pipeline.py` / `test_collect_documents.py` 가 "다시 쓰지 않는다"의 증거로
+  `files_saved == []` 를 썼다 — **결함을 오히려 고정하고 있었다.** 의도는 그대로 두고
+  증거를 파일 mtime/크기 무변경으로 바꿨다.
+
+**테스트/가드 추가**
+- `test_asset_pipeline.py` 12-I — 스킵 경로가 실체를 기록한다(3종 문서 x 2회 실행 + API).
+- `test_asset_pipeline.py` 12-J — 큐 성공기록 실패 -> 재시도 간격 -> 재시도 성공.
+  (실체 보존 / 거짓 READY 없음 / 중복 행 없음 / 고아 파일 없음 / 거짓 개정 없음)
+- `test_false_success.py` 5 — **구조 검사**: 수집기가 `success=True` 를 쓰는 10곳 전부가
+  같은 분기에서 `files_saved`/`images`/`no_asset` 중 하나를 함께 알리는가.
+- 변이 6종 전부 검출(21 / 7 / 2 / 16 / 7건 FAIL + UNIQUE 위반 종료코드 1).
+- 전체 40 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 **6,075**.
+
+**감사기 보강** (`audit_asset_integrity.py`, 읽기 전용)
+- `[4-b]` READY 인데 `doc_raw` 행이 없다 — BUGS #144 의 모양. 기존 [3]/[4] 는 둘 다
+  통과시킨다. 실 DB 실측 **0건**.
+- `[2-b]` 사진 폴더의 이름 규칙 밖 파일(`.tmp` 잔재). `list_stored_images()` 가 조용히
+  건너뛰므로 [1]/[2] 어디에도 안 보였다 — "없다"가 아니라 **"못 봤다"** 였다. 실측 **0건**.
+- 둘 다 자체 검사(selftest)에 결함을 심어 잡히는 것을 확인.
+
+**실측 (전부 사본/읽기 전용, 원본 무변경 확인)**
+- `claim_next_queue_item()` p50 **3.02ms** / p95 3.38ms (큐 3,498행 · pending 2,753행)
+- `save_auction_images()` 5장 p50 **2.52ms**
+- `GET /api/v1/item/{id}` p50 **2.8ms** (사진 5 + 문서 3) — 자산이 없는 물건과 차이 없음
+- 물건당 수집 비용은 브라우저 navigation 이 지배한다(약 22초). DB 비용은 그 0.03% 수준.
+- 예약 작업 **0개**(249개 중), 기일이 내일 이후인 물건 **0건** — 2026-08-20부터 기본
+  검색 0건이라는 예고가 유효하다. 등록은 승인 영역이라 하지 않았다.
+
+**추가 (같은 스프린트, 실서버 확인 포함)**
+- `collect_documents.py` 의 bare `except:` **4곳** 제거 — `BaseException` 까지 잡아
+  Ctrl-C/SystemExit 를 삼켰다(그중 하나는 30초 대기 안이라 창이 넓었다).
+  `api/v1/item.py` 가 같은 이유로 이미 고친 자리인데 규칙이 `api/` 밖으로 퍼지지 않았다.
+- `test_error_logging.py` 4 신설 — 파이프라인 58개 파일 전수로 bare `except:` 를 막는다.
+  파싱 실패도 `continue` 로 넘기지 않고 **결함으로 보고**한다. 하한(>=40파일) 포함.
+  변이 2종(결함 재주입 / 열거 비우기) 전부 FAIL 확인.
+- `test_error_logging.py` 의 "bare except 는 이 저장소에 없다"는 주석 정정 — **사실이
+  아니었다.** 그 검사가 `api/` 만 훑어서 안 보였을 뿐이다.
+- `audit_asset_integrity.py` `[9]` 신설 — **API 가 광고한 자산 URL 을 그대로 다시
+  요청한다**(전수). 실측: 물건 206개 / 사진 URL 45개 / 문서 URL 556개 **전부 200**,
+  `image_count`·`images_status` 불일치 0건. 서버가 없으면 "이상 없음"이 아니라
+  **"확인하지 못함"** 으로 보고한다(가짜 서버로 두 경로를 따로 자체 검사).
+- 실서버 조건부 캐시 실측 — 사진(70KB)/문서(406KB) 둘 다 `If-None-Match`,
+  `If-Modified-Since` 에 **304 / 0바이트**. `Cache-Control` 부재는 의도된 결정
+  (`api/http_cache.py`: 갱신 주기 근거가 없어 `max-age` 를 임의로 정하지 않는다).
+- 프런트 계약 테스트를 **서버를 띄우고** 돌렸다 — 113/113 PASS, cancelled 0
+  (서버 없이 돌리면 50개가 cancelled 로 빠진다. `pass 63` 을 통과로 읽으면 안 된다).
+- `.bat` 의 `%errorlevel%` 확장이 블록 안에서 옳게 동작하는지 실제로 돌려 확인(7 출력).
+
+**BUGS #145 — 동시 실행 잠금이 동시 실행을 막지 못했다**
+- `RunLock.acquire()` 가 `exists()` 로 보고 `open("w")` 로 썼다. 실측: **스레드 8 x
+  200라운드 전부에서 8개가 동시에 성공** — "몇 초 차이"만 막고 "같은 순간"은 하나도
+  막지 못했다(하필 이 락이 막으려던 것이 후자다). `O_CREAT|O_EXCL` 로 바꿨다.
+- 오래된 락 회수도 두 단계라 같은 문제가 있었다. **세 가지를 차례로 측정**했고
+  중간 시도 둘이 실패한 기록을 그대로 남겼다:
+  `os.remove` 4/1,000 -> mtime 재확인 추가해도 4/1,000 -> `os.rename` 중재 2/40 ->
+  **회수 구역을 배타 토큰으로 감싸 1,000라운드 전부 정확히 하나.**
+- `test_doc_worker_recovery.py` 11 신설 — 두 경우 각각 8스레드 x 40라운드,
+  성공 수가 **정확히 1**(0도 결함이다). 토큰 잔재 0건도 함께 본다.
+  변이 3종 전부 검출. 기존 §9 는 순서대로만 시험해 이 방향을 못 봤다.
+
+**문서 정정**
+- `docs/CLAUDE.md` "No test runner is configured" — `run_python_tests.py`(Sprint 146)가
+  생긴 뒤에도 그대로였다. 실행법과 4상태 집계(SKIPPED/NO-VERDICT는 통과가 아니다)를 적었다.
+- `doc_worker.py` / `test_doc_worker_recovery.py` 의 `storage/runlock.py` 언급 3곳 정정 —
+  **그런 파일은 없다**(가드에 걸려 `storage/checkpoint.py` 로 옮긴 경위가 BUGS #132에 있다).
+
+**감사 도구 자체 감사 (BUGS #146/#147)**
+- #146 `test_schema_hygiene.py` 6-B 가 `utf-8` 로 읽어 **BOM 파일 31개의 1행 import 를
+  못 봤다**(추적 .py 44개가 BOM). 커밋 시 API 부팅을 막는 P0-B 가드다. `utf-8-sig` 로
+  고치고 스캐너를 분리해 탐침 파일로 직접 검증. 못 읽은 파일도 "미확인"으로 보고.
+- #147 `run_python_tests.py` 에 자기 검사가 없었다. `test_runner_contract.py` 신설(33단언):
+  종료코드 1순위 / NO-VERDICT / SKIPPED 구분 / 실제 실행 집계 / discover 범위와 그 맹점.
+  변이 4종 전부 검출.
+- `test_error_logging.py` — `except SyntaxError: continue` 제거(파싱 실패를 결함으로 보고),
+  하드코딩 진입점 목록을 git 목록으로 교체(58 -> **86파일**, 28개가 검사 밖이었다).
+  그 결과 드러난 bare `except:` 4곳(analyze_docs/analyze_hyunhwang/manual_test) 제거.
+- `audit_schedule_health.py` — 칸 수가 어긋난 CSV 행을 조용히 버리던 것을 **보고**하도록.
+  selftest 에 결함 주입 검사 추가.
+- `test_asset_pipeline.py` Env — 문서 서빙 모듈의 `DOCUMENT_ROOT` 를 안 바꿔 뷰어가
+  항상 404 였다. 루트를 들고 있는 모듈 4곳이 같은 값을 보는지 가드로 고정.
+- 문서 부분 수집 계약 12-L 신설(큐 done + doc_exists False 라는 "스스로 끝나지 않는 상태").
+- 실브라우저: `/search` 총 9건 / 대표 이미지 9장 전부 렌더링, 깨짐 0, 콘솔 오류 0.
+  상세페이지는 `record_view()` 운영 쓰기 때문에 열지 않았다.
+- 전체 **41 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,205**.
+
+**추가 (같은 스프린트, 2차)**
+- `test_asset_pipeline.py` 12-M 신설 — 법원이 사진을 전부 내린 경우를 **doc_worker 로
+  관통**(3회 실행). 5-H 는 저장소 함수만 직접 불렀고 호출부의 **순서**는 코드를 읽어서만
+  알 수 있었다. 변이 2종: 정리 호출 제거 -> FAIL 6건, **순서를 뒤집으면 1회차에 사진을
+  전부 지운다** -> FAIL 4건(가장 파괴적인 동작을 실제로 재현해 확인).
+- `test_asset_pipeline.py` 19-B 보강 — `DOCUMENT_ROOT` 4곳 + `PROJECT_ROOT` **6곳**이
+  같은 곳을 가리키는지. 식이 아니라 결과를 대조한다(모듈 깊이가 달라 식은 원래 다르다).
+- `test_doc_worker_recovery.py` — 락 검사가 운영 `logs/` 에 흔적을 남기지 않도록
+  `finally` + 안전망. 중단을 주입해 확인(종료코드 1 로 죽어도 락 없음).
+  회수 토큰(`.reclaim`)도 함께 정리한다.
+- 스위트 전체 실행 전후 파일 대조: **새 파일 0 / 사라진 파일 0**(로그 1개만 증가).
+- 잠금 수정의 비용 실측(개선 전/후): "이미 잡힘" 경로 0.006 -> 0.093ms.
+  **상대 15배지만 실행당 1회 호출이라 22초 대비 0.0000004%** — 숨기지 않고 기록.
+- 전체 **41 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,241**.
+
+
+---
+
+2026-08-19 (Sprint 218) - 검색목록 썸네일까지 하나의 기능으로 (BUGS #148)
+
+**버그 수정**
+- BUGS #148 — `save_auction_images()` 가 `size <= 0` 만 거절해 **서빙 계층이 404 로
+  거절할 크기의 사진을 기록**했다. 241바이트로 재현: DB 1행 / API `image_count=1`,
+  `images_status=READY` / 검색목록 썸네일 URL 제공 / **그 URL 은 404**.
+  `MIN_IMAGE_BYTES` 를 같은 상수로 참조하도록 수정. 운영 영향 실측 **0건**
+  (45행 최소 크기 35,746바이트).
+
+**★ 픽스처가 결함을 가리고 있었다**
+- 이 수정으로 기존 검사 **10건이 깨졌다.** 픽스처가 100~600바이트 사진으로
+  "READY / 2행" 을 단언하고 있었는데 **그 크기는 한 장도 서빙될 수 없다.**
+  `MIN_FIXTURE_PAD` 로 일괄 상향(3파일).
+
+**테스트/가드 추가**
+- 12-N 목록 썸네일 == 상세 대표 사진 — 두 화면이 **서로 다른 코드**로 대표를 고른다
+  (`MIN(seq)` vs `images[0]`). 순번을 어긋나게 한 두 물건으로 ID 혼선·바이트 일치·
+  파일 소실 시 목록 견고성까지 본다.
+- 12-O 사진 교체가 목록에 반영되는가 — **크기가 같은 다른 사진**으로 교체해
+  ETag 변경/200/새 바이트를 확인(크기만 보는 구현을 걸러낸다).
+- 12-P 기록된 사진은 반드시 서빙될 수 있어야 한다(하한 미만/이상 대조군 + API + 목록).
+- 12-Q 판정처 3곳이 **같은 상수**를 보는가 — AST 로 숫자 상수 대입과 단일 소스
+  import 여부를 본다. ★ 문자열 포함만 보던 첫 버전은 변이를 놓쳤다.
+- 변이 4종 전부 검출(11 / 2 / 6 / 4건 FAIL).
+
+**실측**
+- 검색목록 썸네일: 첫 방문 **0.91 MB**(장당 p50 4.1ms), 재방문 전부 **304 / 0바이트**
+  — 조건부 캐시가 바이트를 **100%** 아낀다.
+- 썸네일 한 장 평균 **약 101 KB** — 80x80 으로 그리는데 원본을 그대로 내려 준다.
+  서버 측 썸네일 생성은 Pillow 의존성이라 승인 영역.
+
+**확인했지만 고치지 않음**
+- 검색목록은 "사진 없음"과 "수집 실패"를 구분하지 못한다(이미지 관련 키가
+  `thumbnail_url` 하나뿐). 목록 상태 배지는 제품 결정.
+
+- 전체 **41 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,365**.
+
+
+---
+
+2026-08-19 (Sprint 219) - 큰글씨/접근성 감사 (실측, 화면 변경 없음)
+
+**감사만 한다** — 글자 크기·색·간격 변경은 제품 디자인 결정이고, roadmap 이
+"웹 핵심 기능 안정화 후"로 잡은 항목이다. 재고, 기록하고, 나빠지지 않게 잠갔다.
+
+**실측 (실브라우저 Chrome, `/search`)**
+```
+검사한 텍스트 199개 / WCAG AA 대비(4.5:1) 미달 81개(41%)
+text-gray-400 on white 실제 대비 2.6:1        <- 기준의 58%
+탭 타깃 53개 중 44px 미만 44개(83%), 그중 24px 미만 5개  <- WCAG 2.5.8 AA 위반
+14px 미만 텍스트 111개
+```
+가장 나쁜 것은 **무엇이** 작고 흐린가다 — 물건 주소 12px/2.6:1,
+"최저입찰가" 라벨과 "감정가 3.8억" **11px**/2.6:1. 판단에 쓰는 정보가 가장 안 보인다.
+헤더 내비 5개는 높이 **16px**(WCAG 2.5.8 위반, Apple HIG 44px 의 36%).
+
+**소스 분포** (`src/app/**/*.tsx` 18파일): `text-xs` 111 / `text-gray-400` 106 /
+`text-[11px]` 6 / `text-gray-300` 6 / `text-[10px]` 2.
+가장 심한 화면은 **상세페이지**(text-xs 55 + gray-400 55) — 실제 판단이 일어나는 곳이다.
+
+**★ 측정 도구가 틀렸다(다섯 번째)** — Tailwind v4 는 `oklch()` 로 색을 내는데
+숫자만 뽑아 RGB 로 읽어 **대비 1.06 같은 불가능한 값**이 나왔다. canvas 로 변환을
+브라우저에 맡기고 **알려진 값(흑백 21.0 / #9ca3af 2.54)으로 도구부터 검증**한 뒤 다시 쟀다.
+
+**★ 재지 못한 것도 적는다** — 모바일 뷰포트(390~412px) 레이아웃은 **확인하지 못했다.**
+자동화의 창 리사이즈가 페이지 뷰포트에 반영되지 않고(`innerWidth` 1920 고정),
+앱이 `X-Frame-Options: DENY` 라 iframe 우회도 막혔다(그 헤더는 올바른 설정이다).
+확인한 것은 뷰포트 메타가 올바르고 확대 차단이 없다는 것까지다.
+
+**가드 추가** — `test_frontend_accessibility.py` 신설(21단언, ratchet 방식)
+- 작은 글자/낮은 대비 클래스 사용 횟수를 현재값으로 **상한 고정**(줄면 통과, 늘면 실패)
+- 확대 차단(`user-scalable=no` 등) 부재 고정
+- 썸네일 `alt=""`/`aria-hidden`/`onError` 규약 + **alt 없는 `<img>` 0개**
+- 실측 수치가 Sprint 문서에 남아 있는지(문서가 사라지면 검사가 먼저 운다)
+- 변이 4종 전부 검출(클래스 추가 2 / 확대 차단 2 / alt 없는 img 1 / 열거 비우기 2)
+
+★ 이 가드도 처음엔 오탐을 냈다 — **주석 속 `<img`** 를 실제 요소로 세어
+`ResultThumbnail.tsx` 를 결함으로 보고했다(그 주석은 Next.js 오류 메시지 인용이다).
+주석을 걷어내되 **줄 번호는 보존**하도록 고쳤다.
+
+- 전체 **42 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,386**.
+
+
+---
+
+2026-08-19 (Sprint 220) - 모바일 구조 감사 / 검색목록 계약 / 큰글씨 전제 정정
+
+**모바일 — 재지 못한 것은 재지 못했다고 적는다**
+- 브라우저 자동화의 창 리사이즈가 페이지 뷰포트에 반영되지 않고(`innerWidth` 1920 고정),
+  `X-Frame-Options: DENY` 라 iframe 우회도 막힌다(그 헤더는 올바른 설정이라 낮추지 않았다).
+  **"모바일 정상"이라고 판정하지 않았다.**
+- 대신 가로 넘침의 **구조적 원인**을 전수 확인: 고정 `w-[NNNpx]` / `min-w-[NNNpx]` /
+  `w-screen` / `100vw` / `min-w-max` / 인라인 `width` / `<table>` / 반응형 없는 3열 그리드
+  **전부 0곳**. 컨테이너는 `max-w-[1320px] px-4 md:px-8`(고정 폭이 아니라 상한).
+  `overflow-x-auto` 2곳은 컨테이너 **내부**의 의도된 가로 스크롤.
+
+**검색목록 계약 (신규 가드)**
+- `api/v1/search.py` 19키 / `types.ts` 19필드 / `ResultList.tsx` 17필드 — 어긋남 0.
+  세 파일이 각자 적혀 있는데 대조하는 검사가 없었다. `item.foo` 가 `undefined` 면
+  React 는 **오류 없이 빈칸**을 그린다. 변이 3종 검출(특히 **API 키 이름 변경**).
+
+**데이터 신선도 (신규 가드)**
+- 검색/상세 라우터에 캐시 헤더 **0곳**, `src/lib/api.ts` fetch **5곳 전부 no-store**.
+  stale 이 생길 자리가 없다는 것을 잠갔다. 변이 2종 검출.
+
+**★ 직전 Sprint 의 기록을 정정했다**
+- Sprint 219 의 *"대부분 px 고정이라 루트 글꼴을 키워도 안 커진다"* 는 **틀렸다.**
+  빌드 CSS 확인: `--text-xs: .75rem` — Tailwind v4 의 이름 있는 크기는 **rem 기반**이다.
+  닿지 않는 것은 임의값 **8곳**(`text-[11px]` 6 + `text-[10px]` 2)뿐.
+  **선행 작업은 전면 rem 전환이 아니라 그 8곳 교체.**
+  정정을 `SPRINT219` / `roadmap` / `frontend.md` 세 곳에 원문과 함께 남겼다.
+
+**가드 자신도 두 번 틀렸다**
+- `max-w-[1320px]` 안의 `w-[1` 을 고정 폭으로 오인(토큰 경계) → 수정.
+- 출력 리터럴에 **EM DASH** 를 넣어 `test_console_encoding.py` 에 걸렸다
+  (goal 이 경고한 함정을 그대로 밟았고, 저장소의 기존 가드가 잡았다).
+
+- 전체 **42 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,412**.
+
+
+---
+
+2026-08-19 (Sprint 221) - 접속 정보 확인 / 접근성 구조 / 화면 전체 데이터 계약
+
+**개발 사이트 접속 정보 (실측)**
+```
+WEB   http://localhost:3000/        (메인 = 검색 화면, 총 9건 + 썸네일 렌더링 확인)
+API   http://127.0.0.1:8000         (Swagger /docs 200)
+로그인 검색/로그인 화면은 비로그인 가능, /properties·/favorites·/mypage 는 로그인 필요
+실행  python -m uvicorn api_server:app --host 127.0.0.1 --port 8000  +  npm run dev
+```
+운영/외부 배포 없음. ★ 긴 세션에서 node 프로세스가 누적되면 Turbopack 이 `0xc0000142`
+로 죽어 dev 서버가 500 을 낸다(코드 결함 아님) — 남은 node 종료로 정상화.
+
+**접근성 구조 (색·크기·간격은 건드리지 않음)**
+- 실측: 랜드마크 main/nav/header/h1 각 1 이상, **접근 가능한 이름 없는 요소 0**,
+  **키보드로 갈 수 없는 클릭 요소 0**.
+- 포커스 표시: 전역 리셋 **없음**(빌드 CSS 확인). `outline-none` 5곳은 **전부 대체
+  표시(ring/border)를 함께** 갖는다. 그 규칙을 가드로 잠갔다.
+- ★ 판정에 두 번 실패했다 — 계산된 스타일의 `outline-style: none` 은 **비포커스
+  기본값**이고, `el.focus()` 는 Chrome 에서 `:focus-visible` 을 켜지 않는다.
+  **CSS 규칙 자체**를 읽어야 답이 나왔다.
+
+**화면 전체 데이터 계약 (신규 가드)**
+- 검색목록 19/19/17 · 상세 27/20 · 관심물건 22/12 · 최근본물건 22/12 — **어긋남 0**.
+  관심물건·최근본물건은 `SELECT ai.*` 라 계약이 스키마에 묶여 있어
+  `auction_item` 실제 컬럼을 읽어 대조한다.
+- ★ **발견**: `thumbnail_url` 을 주는 API 는 `search.py` 뿐이고 **관심물건·최근 본
+  물건 화면에는 사진이 아예 없다.** 기존 문서에 언급이 없어 **미문서화 공백**으로 보인다.
+  고치지 않았다(API 필드 + 레이아웃 = 제품 결정). 대신 규칙을 걸었다 —
+  *어느 화면이든 `thumbnail_url` 을 그리면 그 화면 API 도 주어야 한다.*
+
+**가드 자신도 두 번 틀렸다**
+- `REPLACE` 패턴에 `outline-` 를 넣어 **`focus:outline-none` 이 자기 대체로** 잡혔다
+  (무엇을 지워도 통과) → 제거.
+- CSS 정규식이 `@supports` 를 선택자로 오인해 **변이 없이도 항상 실패** →
+  검출기를 **넣기 전에 검증**하는 방식으로 교체(실제 0 / 주입 1 / 유틸리티 0).
+
+- 전체 **42 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,429**.
+
+**BUGS #149 — 전체 화면 모달이 스크린리더에 모달이라고 말하지 않았다 (수정함)**
+- 문서 뷰어 / 사진 라이트박스 둘 다 `role="dialog"`·`aria-modal` 이 **없었다**
+  (저장소 전체 0건). 스크린리더가 모달임을 알리지 못하고 **뒤의 검색 결과·가격이
+  계속 읽힌다.** `role`/`aria-modal`/`aria-labelledby` 는 **픽셀을 바꾸지 않으므로**
+  제품 디자인 결정이 아니라 그대로 고쳤다(제목 h2 에 id 부여).
+- 이미 있던 것도 회귀로 고정: Escape 닫기 / 좌우 화살표 / 닫기 버튼 `aria-label` /
+  고정 height 없음(큰글씨에도 안 깨진다).
+- **포커스 트랩은 여전히 없다**(Tab 이 배경으로 빠져나간다) — 동작 변경 폭이 커서 별도 작업.
+- `test_frontend_accessibility.py` 9 신설, 변이 2종 검출.
+- 전체 **42 PASSED / 0 FAILED, 단언 6,429** (서버 미기동 기준. 기동 시 6,433 —
+  `test_beta_journey` 의 프런트 게이트 4단언이 추가로 실행된다).
+
+
+---
+
+2026-08-19 (Sprint 222) - 폼 접근성 이름 / 모달 시맨틱 후속
+
+**BUGS #150 — 폼 컨트롤 16개에 접근 가능한 이름이 없었다 (수정함)**
+- `/search` 아코디언을 **전부 펼쳐** 실측: 폼 컨트롤 93개 중 **16개 무명**
+  (select 9 / date 2 / placeholder 만 있는 input 5).
+  보이는 레이블이 `<span>` 이라 컨트롤과 연결돼 있지 않고, 최소/최대가 나란히 둘이라
+  **어느 쪽인지도 알 수 없다.** `placeholder` 는 입력 시작과 함께 사라지므로 이름이 아니다.
+- `aria-label` 은 **픽셀을 바꾸지 않고**, 저장소가 이미 그 패턴을 쓰고 있었다
+  (`시/도`·`시/군/구`·`법원`). 빠진 자리에 같은 방식 적용.
+  공용 컴포넌트 2개(`RangeSelect`/`PriceRangeSelect`) 수정으로 select 8개가 한 번에 해결.
+- 재측정 **93/93 이름 있음**(수정 전 77/93).
+- `test_frontend_accessibility.py` 10 신설 — 감싸는 `<label>` 로 이름을 줄 수 없는
+  부류(select / date / placeholder input)만 검사. 변이 3종 전부 검출.
+
+**★ 이 검사의 앞선 판본이 거짓 결과를 냈다**
+- `<select[^>]*>` 가 **`onChange={(e) => f(e)}` 의 `>` 에서 잘려** "select 7개 전부
+  이름 없음"이라고 보고했다(브라우저로는 전부 이름이 있었다).
+  중괄호 깊이를 추적하는 추출기로 교체하고, **추출기 자체를 자기 검증**하도록 했다.
+
+**측정 방법 교정**
+- 접힌 아코디언만 보면 폼 컨트롤이 5개로 보인다. **펼친 뒤 재측정**해야 93개가 나온다
+  — 화면 상태에 따라 달라지는 것은 그 상태를 만들어 놓고 재야 한다.
+
+- 전체 **42 PASSED / 0 FAILED / 3 SKIPPED / 1 NO-VERDICT, 단언 6,440**.
+
+
+---
+
+2026-08-19 (Sprint 223) — 모달 포커스 트랩 · 상태 메시지 알림 · main 랜드마크 · 큰글씨 rem 전환
+
+**BUGS #151 — 모달이 키보드 포커스를 가두지 않았다** (수정)
+- Sprint 221의 `role="dialog"`/`aria-modal`은 **스크린리더에게만** 하는 말이었다.
+  실측(실브라우저 `/properties/505`, 진짜 마우스 클릭·진짜 Tab): 모달을 연 직후 포커스가
+  **모달 뒤 버튼**에 있고, Tab 한 번에 **오버레이에 완전히 가려진 버튼**(top 415, left 346)으로
+  갔으며, Escape 로 닫아도 여는 버튼으로 돌아오지 않았다. 모달 안 포커스 요소는 3개인데
+  화면 전체는 24개 — 21개가 오버레이 뒤에 그대로 살아 있었다.
+- `src/lib/useFocusTrap.ts` 신설: 첫 진입 포커스 / Tab·Shift+Tab 순환 /
+  Tab 이 아닌 경로는 `focusin` 으로 되돌림 / 닫을 때 원래 자리로 복귀. **픽셀 무변경.**
+- 수정 후 실측: 열기 -> '닫기', Tab x3 순환, Shift+Tab 역순환,
+  Escape -> **여는 버튼 바로 그 노드**로 복귀(`===`), 밖으로 강제 포커스 -> 되돌아옴.
+
+**★ 없는 결함을 만들 뻔했다** — 문서 뷰어의 첫 열기만 실패한다는 결과가 반복됐고
+"PDF iframe 이 포커스를 뺏는다"는 설명까지 세웠지만 **틀렸다.** 탭이 보이지 않는 상태
+(`visibilityState: hidden`)에서 `element.focus()` 를 부르면 activeElement 는 바뀌지만
+**focus/focusin 이벤트가 전혀 발생하지 않는다**(직접 단 리스너 0회 호출). 탭을 보이게 하고
+진짜 마우스 클릭으로 재니 첫 열기부터 정상이었다.
+
+**BUGS #152 — 나중에 나타나는 안내가 아무것도 읽히지 않았다** (수정, WCAG 4.1.3)
+- 실측 `/search`: `aria-live`/`role=alert`/`role=status` 요소 **0개**.
+  로그인은 **제출해도 반응이 없는 화면**이었다.
+- 개별 상태 메시지 13곳에 `role="alert"`/`role="status"`(조건이 감싸는 **여는 태그**에).
+- 검색 결과는 `SearchScreen` 의 **항상 존재하는 `sr-only` 한 줄**로 알린다 —
+  결과 목록에 달면 0건일 때 문단이 사라져 아무것도 못 알린다.
+  실측: 소프트 전환 후에도 **같은 DOM 노드 유지, 글자만 변경**(정렬 변경/실제 0건 검색 둘 다).
+- 시/군/구 로드 실패는 `aria-describedby` 로 그 select 에 연결.
+
+**BUGS #153 — 화면 4개에 `main` 랜드마크가 없었다** (수정, WCAG 2.4.1)
+- 기존 가드가 **저장소 전체 합산**으로 `>=1` 만 봐서 못 잡았다.
+  실측: `/properties/{id}`·`/favorites`·`/properties/recent`·`/login` 이 전부 0.
+- 감싸는 `<div>` 의 **태그만** `<main>` 으로 교체(className 동일 = 픽셀 무변경).
+  로딩·실패 분기에도 넣었다. 실측 확인: 상세 grid `622px 622px` / 컨테이너 1320px / 오버플로 0.
+- 가드도 **화면 루트(min-h-screen) 개수만큼 main** 으로 조였다 — 파일 단위 검사는
+  분기 하나가 빠져도 통과했다(변이로 확인).
+
+**BUGS #154 — 검사 도구가 저장소 사본을 검사하고 있었다** (수정)
+- `test_console_encoding.py` 가 `.claude/worktrees/sprint95-...`(Sprint 95 커밋의 저장소
+  통째 사본)까지 훑었다. **스캔 298개 중 101개(34%)가 그 사본.**
+- `.claude` 등 제외 -> 197개. 범위 자체를 잠그는 검사도 넣었다(하한 포함).
+
+**큰글씨 — 고정 px 글자 8곳을 같은 크기의 rem 으로** (BACKLOG 4)
+- `text-[11px]` -> `text-[0.6875rem]`, `text-[10px]` -> `text-[0.625rem]`.
+- 실측: 루트 16px 에서 **11px 그대로**(픽셀 무변경), 루트 32px 에서 11px -> **22px**
+  (전에는 11px 고정), 2배 확대에서도 가로 오버플로 0.
+- 큰글씨가 닿지 않는 자리 **8곳 -> 0곳**. 래칫도 0으로 조였다.
+
+**성능 — 검색 API 의 SQL 횟수를 처음으로 쟀다**
+- `set_trace_callback` 실측: size 1/3/9 전부 **SQL 3회**(COUNT + 페이지 + 썸네일 배치).
+  상세 1건은 7회, 전부 단건. **N+1 아님**을 계측으로 확인하고 회귀로 잠갔다.
+
+**관통 감사**
+- 검색목록 썸네일 체인 9/9: DB MIN(seq) == URL seq, 목록 == 상세 images[0], HTTP 재요청 전부 성공.
+- 관심물건/최근 본 물건 썸네일은 **SKIP** — 제품 결정이고, 최근 본 34개 중 사진이 있는 것은 **4개**뿐이다.
+- API↔UI 대조: 유령 호출 0건. ★ 조사 도구가 먼저 거짓말했다(`app.routes` 만 읽어 "라우트 2개"
+  — 이 FastAPI 는 include_router 를 `_IncludedRouter` 로 지연 보관한다). OpenAPI 로 바꿔 42개.
+  ★ `GET /item/{id}/images/{seq}` 는 소스에 문자열이 없지만 **실제로 쓰인다**(thumbnail_url 경유).
+- 모바일 실뷰포트는 **여전히 확인하지 못했다** — `resize_window(390x844)` 후에도
+  페이지 `innerWidth` 는 1920 그대로다(재확인).
+
+**테스트**
+- 변이 14종 전부 검출(주입 -> FAIL -> 원복 -> PASS). ★ 두 번은 첫 판본이 놓쳐 조였다.
+- Frontend 113/113, tsc 0, eslint 0.
+- Python **41 PASSED / 1 FAILED / 3 SKIPPED / 1 NO-VERDICT**.
+  유일한 FAILED 는 `test_schema_hygiene.py` 의 P0-B 가드가 **옳게** 보고하는 것이다 —
+  새 파일 `src/lib/useFocusTrap.ts` 가 아직 **미추적**인데 추적 파일이 import 한다.
+  해소는 `git add` 뿐이고 그것은 **승인 영역이라 하지 않았다**(커밋 시 함께 add 하면 초록).

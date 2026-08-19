@@ -72,7 +72,12 @@ def wait_loading(driver):
         WebDriverWait(driver, 30).until(
             EC.invisibility_of_element_located((By.ID, "__processbarIFrame"))
         )
-    except:
+    # ★ bare `except:` 가 아니다 (2026-08-19 Sprint 217).
+    #   bare 는 `BaseException` 까지 잡아 **Ctrl-C(KeyboardInterrupt)와 SystemExit 도
+    #   삼킨다.** 이 대기는 최대 30초라 그 창이 실제로 넓다 — 운영자가 멈추려 해도
+    #   멈추지 않는다. `api/v1/item.py` 가 같은 이유로 이미 바꾼 자리다.
+    #   잡으려던 것(로딩 표시가 안 사라짐)은 Exception 이면 충분하다.
+    except Exception:
         pass
     time.sleep(random_delay())
 
@@ -212,7 +217,7 @@ def download_doc(driver, doc_type: str, item_id: int) -> Optional[str]:
             save_btn = driver.find_element(By.ID, "mf_btn_save")
             driver.execute_script("arguments[0].click();", save_btn)
             time.sleep(8)
-        except:
+        except Exception:   # bare 는 Ctrl-C 도 삼킨다 (Sprint 217)
             pass
 
         after = set(glob.glob(save_dir + "\\*"))
@@ -227,7 +232,7 @@ def download_doc(driver, doc_type: str, item_id: int) -> Optional[str]:
         logger.warning("download_doc 실패 [%s]: %s", doc_type, str(e))
         try:
             driver.switch_to.window(main_handle)
-        except:
+        except Exception:   # bare 는 Ctrl-C 도 삼킨다 (Sprint 217)
             pass
         return None
 
@@ -286,7 +291,7 @@ def save_doc_raw(conn, item_id: int, doc_type: str, pdf_path: str) -> bool:
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page_count = len(pdf.pages)
-        except:
+        except Exception:   # bare 는 Ctrl-C 도 삼킨다 (Sprint 217)
             page_count = 0
 
         conn.execute("""

@@ -15,6 +15,7 @@ test_api_regression.py를 정적 감사하며 발견한, 실행 전에는 드러
     python test_schema_hygiene.py
 """
 import sys
+import codecs
 import os
 import sqlite3
 import subprocess
@@ -473,6 +474,40 @@ def test_storage_sources_are_tracked():
 # `--exclude-standard`를 쓰므로 .gitignore 대상(산출물, step*.py 등)은 애초에 후보에서
 # 빠진다. 즉 이 검사가 가리키는 파일은 전부 "add하면 되는데 안 한 것"이다.
 # ---------------------------------------------------------------------------
+def _scan_import_edges(root, rel_files, patterns):
+    r"""추적 파일들에서 `patterns` 에 해당하는 import 간선을 찾는다.
+
+    반환: (간선 목록, 읽지 못한 파일 목록)
+
+    **함수로 뺀 이유** (2026-08-19 Sprint 217, BUGS #146): 이 루프 안에 있던
+    `encoding="utf-8"` 이 **BOM 파일의 1행 import 를 영원히 놓치고 있었다.**
+    본문 맨 앞에 남는 BOM 문자는 공백이 아니라서 `^\s*(?:from|import)` 가
+    매치되지 않는다. 실측: 추적 `.py` 44개가 BOM 이고 **그중 31개는 1행이 import** 다.
+
+    이 가드는 "커밋하면 API 가 부팅되지 않는다"를 막는 P0-B 가드다(BUGS #105).
+    그 가드가 BOM 파일 31개의 1행에 대해 **눈이 멀어 있었다.**
+
+    함수 밖에 두면 회귀가 이 동작을 **직접** 시험할 수 없다 — 인코딩을 되돌려도
+    "간선 0개"라는 **같은 초록**으로 보이기 때문이다. 그래서 분리했다.
+    """
+    edges, unreadable = [], []
+    for rel in rel_files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            # ★ `utf-8` 이 아니라 `utf-8-sig` — 위 docstring 참고.
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                body = fh.read()
+        except OSError as exc:
+            # 조용히 건너뛰지 않는다. 못 읽은 파일은 "간선 없음"이 아니라 "미확인"이다.
+            unreadable.append("%s (%s)" % (rel, exc))
+            continue
+        for rx, target, _label in patterns:
+            m = rx.search(body)
+            if m:
+                line = body[:m.start()].count(chr(10)) + 1
+                edges.append("%s:%d -> %s" % (rel, line, target))
+    return edges, unreadable
+
 def test_tracked_sources_do_not_import_untracked():
     print("\n--- 6-B. 추적 파일이 미추적 파일을 import하지 않는가 ---")
     import re
@@ -526,19 +561,7 @@ def test_tracked_sources_do_not_import_untracked():
         return
 
     scan = [t for t in tracked if t.endswith((".py", ".ts", ".tsx"))]
-    edges = []
-    for t in scan:
-        path = os.path.join(root, t.replace("/", os.sep))
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                body = fh.read()
-        except OSError:
-            continue
-        for rx, target, label in patterns:
-            m = rx.search(body)
-            if m:
-                line = body[:m.start()].count("\n") + 1
-                edges.append("%s:%d -> %s" % (t, line, target))
+    edges, unreadable = _scan_import_edges(root, scan, patterns)
 
     if edges:
         print("   ★ 커밋하면 깨지는 간선 %d개:" % len(edges))
@@ -546,6 +569,88 @@ def test_tracked_sources_do_not_import_untracked():
             print("      %s" % e)
         print("   해소: `git add -A` 후 커밋. `git commit -a`는 미추적 파일을 빠뜨린다.")
     check("추적 파일이 미추적 파일을 import하지 않는다", sorted(edges), [])
+    check("읽지 못해 검사에서 빠진 추적 파일", sorted(unreadable), [])
+
+    # ★ **BOM 파일이 실제로 검사 대상에 들어와 있는가**를 함께 고정한다
+    #   (2026-08-19 Sprint 217). 위 인코딩을 `utf-8` 로 되돌리면 BOM 파일의
+    #   1행 import 를 놓치는데, 그 회귀는 "간선 0개"라는 **같은 초록**으로 보인다.
+    #   그래서 열거가 아니라 **판독 능력**을 직접 검사한다.
+    bom_first_import = 0
+    for t in scan:
+        if not t.endswith(".py"):
+            continue
+        try:
+            with open(os.path.join(root, t.replace("/", os.sep)), "rb") as fh:
+                head = fh.read(300)
+        except OSError:
+            continue
+        if head[:3] != codecs.BOM_UTF8:
+            continue
+        lines = head[3:].splitlines()
+        first = lines[0].decode("utf-8", "replace").strip() if lines else ""
+        if first.startswith(("import ", "from ")):
+            bom_first_import += 1
+    check_true("BOM + 1행 import 인 추적 파일이 실제로 있다(검사가 공허하지 않다)",
+               bom_first_import >= 10, bom_first_import)
+
+    # ★ 열거가 아니라 **판독 능력**을 직접 검사한다. 인코딩을 utf-8 로 되돌리는
+    #   회귀는 "간선 0개"라는 **같은 초록**으로 보이기 때문이다.
+    #   `.` 는 개행에 매치되지 않으므로 `[^개행]*` 와 같다.
+    probe = re.compile("^[ 	]*(?:from|import)[ 	]+.*"
+                       + re.escape("qa.bom.probe"), re.M)
+    probe_path = os.path.join(root, "logs", "_bom_probe.py")
+    with open(probe_path, "w", encoding="utf-8-sig") as fh:
+        fh.write("import qa.bom.probe" + chr(10))
+    try:
+        with open(probe_path, encoding="utf-8-sig", errors="replace") as fh:
+            seen_sig = bool(probe.search(fh.read()))
+        with open(probe_path, encoding="utf-8", errors="replace") as fh:
+            seen_plain = bool(probe.search(fh.read()))
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    check("BOM 파일의 1행 import 를 읽는다(utf-8-sig)", seen_sig, True)
+    check("★ utf-8 로 읽으면 못 본다(이 검사가 지키는 것이 바로 그 차이다)",
+          seen_plain, False)
+    # ★ **스캐너를 직접 시험한다.** 위 두 검사는 "차이가 존재한다"만 보여 줄 뿐,
+    #   스캔 루프가 어느 쪽을 쓰는지는 보지 않는다 — 인코딩을 되돌려도 둘 다 통과한다.
+    #   (그 상태로 두면 이 검사 자체가 "함수가 있다"만 확인하는 부류가 된다.)
+    #   그래서 BOM + 1행 import 인 **가짜 추적 파일**을 만들어 실제 스캐너에 먹인다.
+    probe_dir = os.path.join(root, "logs")
+    probe_rel = "logs/_bom_edge_probe.py"
+    probe_abs = os.path.join(probe_dir, "_bom_edge_probe.py")
+    with open(probe_abs, "w", encoding="utf-8-sig") as fh:
+        fh.write("import qa_bom_probe_module" + chr(10) + "x = 1" + chr(10))
+    try:
+        fake_rx = re.compile("^[ \t]*(?:from|import)[ \t]+.*"
+                             + re.escape("qa_bom_probe_module"), re.M)
+        found, unread = _scan_import_edges(root, [probe_rel],
+                                           [(fake_rx, "qa_bom_probe_module", "probe")])
+    finally:
+        try:
+            os.remove(probe_abs)
+        except OSError:
+            pass
+    check("★ 스캐너가 BOM 파일의 1행 import 를 실제로 잡는다",
+          [e.split(" -> ")[1] for e in found], ["qa_bom_probe_module"])
+    check("탐침 파일을 못 읽은 일은 없다", unread, [])
+
+    # ★ **읽지 못한 파일을 조용히 삼키지 않는가.** 실제 저장소에서는 그런 파일이
+    #   0개라 이 성질은 관측되지 않는다 — 즉 그냥 두면 "구현이 있다"만 확인하는 검사가
+    #   된다(변이로 확인: 삼키게 만들어도 통과했다). 없는 경로를 일부러 먹여서
+    #   **미확인이 미확인으로 보고되는지**를 직접 본다.
+    missing_rel = "logs/_bom_edge_probe_absent.py"
+    found_absent, unread_absent = _scan_import_edges(
+        root, [missing_rel], [(fake_rx, "qa_bom_probe_module", "probe")])
+    check("없는 파일에서 간선을 지어내지 않는다", found_absent, [])
+    check_true("★ 읽지 못한 파일은 '미확인'으로 보고된다(조용히 빠지지 않는다)",
+               len(unread_absent) == 1 and missing_rel in unread_absent[0],
+               unread_absent)
+
+    print("   BOM + 1행 import 인 추적 파일 %d개 / 스캔 대상 %d개"
+          % (bom_first_import, len(scan)))
 
     print("   미추적 소스 %d개(py %d / web %d) 대상으로 추적 파일 %d개를 검사했다"
           % (len(py_untracked) + len(web_untracked),
@@ -875,6 +980,12 @@ def test_powershell_scripts_have_bom():
 
     print("    .ps1 %d개 중 비ASCII 포함 %d개" % (len(scripts), checked))
     check("BOM 없는 비ASCII .ps1", missing, [])
+    # ★ 하한 (2026-08-18 Sprint 205) — os.walk 나 제외 목록이 깨져 **한 개도 못 찾으면**
+    #   missing 은 당연히 비고 이 검사는 조용히 통과한다. 지금 이 저장소에는 한글이 든
+    #   .ps1 이 최소 1개 있다(`register_scheduler_tasks.ps1`). 0개가 되는 것은
+    #   "요건이 사라졌다"가 아니라 "열거가 깨졌다"로 보는 편이 안전하다.
+    check_true("검사 대상(.ps1 중 비ASCII)을 실제로 찾았다 (%d개)" % checked,
+               checked >= 1, (len(scripts), checked))
     if missing:
         print("      PowerShell 5.1 이 cp949 로 읽어 파싱이 깨진다 ― BOM 3바이트를 붙일 것")
 
@@ -1455,6 +1566,17 @@ ALLOWED_SQL_CONCAT_OPERANDS = {
     ("storage/database.py", "col"),                  # 3개 리터럴 dict 조회 (KeyError 로 fail-closed)
     ("storage/database.py", "_NOW_LOCAL"),           # 모듈 상수 "datetime('now','localtime')"
     ("storage/database.py", "str(RETRY_INTERVAL_MINUTES)"),   # 모듈 상수 int
+    # 2026-08-18 Sprint 189: 큐 상태 어휘가 늘어(pending/refresh) `IN (...)` 이 필요해졌다.
+    # 이 상수는 **`?` 반복만** 담는다(`", ".join("?" * len(QUEUE_CLAIMABLE_STATUSES))`) —
+    # 상태 값 자체는 SQL 문자열에 절대 들어가지 않고 예외 없이 바인딩된다.
+    # `api/v1/payments.py`의 `... WHERE id IN (%s)`와 같은 패턴이다.
+    ("storage/database.py", "QUEUE_CLAIMABLE_PLACEHOLDERS"),
+    # 2026-08-18 Sprint 191: `save_auction_images()` 의 옛 행 정리를
+    #   `seq > max_seq` -> `seq NOT IN (...)` 로 바꾸면서 생겼다(BUGS #127 —
+    #   가운데 순번이 빠지는 경우를 `>` 비교가 못 잡았다).
+    #   `placeholders` 는 `", ".join("?" * len(saved_seqs))` 로 **`?` 반복만**
+    #   담는다. seq 값 자체는 SQL 문자열에 들어가지 않고 전부 바인딩된다.
+    ("storage/database.py", "placeholders"),
     # `filter/` 는 어디에도 배선되지 않은 죽은 코드지만(docs/CLAUDE.md), 조각은 상수다.
     ("filter/filter_engine.py", "where"),
     ("filter/filter_engine.py", "' AND '.join(conditions)"),
@@ -1766,7 +1888,33 @@ def test_migration_runner_skip_and_failure():
 # next@16.2.11에서 CVE-2026-64643(Server Function 노출)/CVE-2026-64641(Server
 # Actions DoS, CVSS 8.2)이 고쳐졌다. 16.2.12까지 실재 확인(`npm view next versions`).
 KNOWN_VULNERABLE_NEXT_VERSION = "16.2.9"
-KNOWN_SAFE_MIN_NEXT_VERSION = "16.2.11"
+# 2026-08-18 Sprint 207 정정: 예전 값 "16.2.11" 은 **더 이상 안전선이 아니다.**
+# `npm audit` 실측(같은 날)에서 next 취약 범위가 `9.3.4-canary.0 - 16.3.0-preview.10`
+# 으로 넓어졌고, npm 이 제시하는 수정본은 **16.3.1**(isSemVerMajor=false)이다.
+# 16.2.11 로 올리면 CVE-2026-64641 하나는 벗어나도 나머지 8건이 그대로 남는다.
+# 낡은 안전선을 그대로 두면 "올렸으니 됐다"는 잘못된 종결로 이어진다.
+KNOWN_SAFE_MIN_NEXT_VERSION = "16.3.1"
+
+# ---------------------------------------------------------------------------
+# 2026-08-18 Sprint 207 실측 스냅샷 (`npm audit`, moderate 1 / high 6 / 합계 7).
+#
+# 위 검사는 **next 하나만** 본다. 그것이 이 가드의 사각지대였다 - 나머지 6개는
+# 아무도 보고 있지 않았다. 새 CVE 를 오프라인에서 알아낼 방법은 없지만,
+# **설치본이 조용히 뒤로 가는 것**은 잠글 수 있다(같은 파일 8번 검사가 next 에
+# 대해 이미 쓰는 방식이다).
+#
+# 값은 `package-lock.json` 실측이다. 올리는 것은 자유롭고, 내리면 걸린다.
+# 스냅샷을 갱신할 때는 `docs/BETA_RELEASE_CHECKLIST.md` 의 같은 표도 함께 고칠 것.
+# ---------------------------------------------------------------------------
+ADVISORY_SNAPSHOT_2026_08_18 = {
+    "next": "16.2.9",
+    "sharp": "0.34.5",
+    "postcss": "8.5.15",
+    "nanoid": "3.3.15",
+    "js-yaml": "4.3.0",
+    "brace-expansion": "1.1.15",
+    "@tailwindcss/postcss": "4.3.1",
+}
 
 
 def _parse_version_tuple(v):
@@ -1805,6 +1953,35 @@ def test_known_dependency_cves_are_tracked():
         print("   [정리됨] next=%s는 이미 %s 이상이다 - 위 KNOWN_VULNERABLE_NEXT_VERSION/"
               "KNOWN_SAFE_MIN_NEXT_VERSION 상수와 SPRINT125 문서의 SKIP 항목을 정리하십시오."
               % (next_ver, KNOWN_SAFE_MIN_NEXT_VERSION))
+
+    # --- 8-B. next 말고 나머지도 뒤로 가지 않는가 (2026-08-18 Sprint 207) -------
+    #
+    # 위 검사는 next 하나만 본다. 실측해 보니 권고가 걸린 패키지는 **7개**였고
+    # 나머지 6개는 아무 검사도 받지 않고 있었다. 새 CVE 는 오프라인에서 알 수 없지만,
+    # 설치본이 조용히 낮아지는 것은 여기서 잠근다.
+    lock_path = os.path.join(root, "package-lock.json")
+    check_true("package-lock.json이 존재한다", os.path.exists(lock_path), lock_path)
+    if os.path.exists(lock_path):
+        with open(lock_path, encoding="utf-8-sig") as fh:
+            lock = json.load(fh)
+        packages = lock.get("packages", {})
+        check_true("lock에서 설치 목록을 읽었다 (%d개)" % len(packages),
+                   len(packages) > 50, len(packages))
+
+        regressed, unseen = [], []
+        for pkg, pinned in sorted(ADVISORY_SNAPSHOT_2026_08_18.items()):
+            entry = packages.get("node_modules/" + pkg)
+            if not entry or not entry.get("version"):
+                unseen.append(pkg)
+                continue
+            cur_v = _parse_version_tuple(entry["version"])
+            if cur_v < _parse_version_tuple(pinned):
+                regressed.append("%s: %s -> %s" % (pkg, pinned, entry["version"]))
+
+        check("권고가 걸린 패키지가 스냅샷보다 낮아지지 않았다", sorted(regressed), [])
+        # 사라진 것도 조용히 넘기지 않는다 - 의존성 구조가 바뀌었다는 신호이고,
+        # 그러면 스냅샷 자체를 다시 떠야 한다.
+        check("스냅샷의 패키지가 전부 lock에 있다", sorted(unseen), [])
 
 
 def _module_level_constant_names(path):
@@ -1922,9 +2099,328 @@ def test_config_constants_match_their_copies():
             check("PRIORITY_REFRESH_TIME과 스케줄러 등록 시각이 같다",
                   m4.group(1), m3.group(1))
 
-    # --- (3) 대조군 — 이 검사가 공허하지 않다 ---------------------------------
+    # --- (4) DOC_WORKER_START_TIME vs 등록 스크립트의 DocWorker 시각 -----------
+    #
+    # 2026-08-18 Sprint 204 추가. `config/settings.py` 의 이 상수 주석은 이미
+    # "예약 작업 등록 시각과 같아야 한다 — register_scheduler_tasks.ps1" 이라고
+    # 적고 있었다. **적혀만 있고 지키는 것이 없었다.**
+    #
+    # 어긋나면 조용하다. 이 값은 `DOC_WORKER_END_TIME` 과 함께 **실행 창 길이**를
+    # 만들고, 그 길이가 `REFRESH_MAX_ITEMS_PER_RUN` 상한의 근거다
+    # (`test_refresh_trigger.py` 17번). 스케줄러를 03:00 으로 옮기고 config 를
+    # 그대로 두면, 실제로는 1시간짜리 창인데 산술은 2시간으로 계산한다 —
+    # 큐가 절반만 소진되고 아무도 실패를 보지 않는다.
+    m5 = re.search(r"^DOC_WORKER_START_TIME\s*(?::\s*str\s*)?=\s*[\"']([0-9:]+)[\"']",
+                   cfg, re.M)
+    check_true("config에 DOC_WORKER_START_TIME이 있다", bool(m5), None)
+    if m5 and ps1:
+        m6 = re.search(r"DocWorker[^\n]*?Time\s*=\s*'([0-9:]+)'", ps1)
+        check_true("등록 스크립트에서 DocWorker 시각을 찾았다", bool(m6), None)
+        if m6:
+            check("DOC_WORKER_START_TIME과 스케줄러 등록 시각이 같다",
+                  m6.group(1), m5.group(1))
+
+    # --- (5) 실행 순서: 우선순위 재계산이 문서 수집보다 **먼저** ----------------
+    #
+    # 등록 스크립트 자신이 근거를 적어 두었다 —
+    # "순서가 중요하다: 우선순위가 먼저 갱신돼야 임박 물건이 문서 수집에서 앞으로 온다."
+    #
+    # 두 시각을 뒤바꾸면 그날 우선순위 갱신은 **이미 끝난 수집에** 적용된다.
+    # 오류도 빈 결과도 아니고, 그냥 임박 물건이 뒤로 밀린다. 알아챌 신호가 없다.
+    if ps1:
+        mp = re.search(r"PriorityRefresh[^\n]*?Time\s*=\s*'([0-9:]+)'", ps1)
+        md = re.search(r"DocWorker[^\n]*?Time\s*=\s*'([0-9:]+)'", ps1)
+        check_true("두 시각을 모두 찾았다", bool(mp) and bool(md), (bool(mp), bool(md)))
+        if mp and md:
+            def _mins(hhmm):
+                h, mm = hhmm.split(":")
+                return int(h) * 60 + int(mm)
+            check_true("우선순위 재계산(%s)이 문서 수집(%s)보다 먼저다"
+                       % (mp.group(1), md.group(1)),
+                       _mins(mp.group(1)) < _mins(md.group(1)),
+                       (mp.group(1), md.group(1)))
+
+    # --- (6) 스케줄러 실행시간 한계가 worker 자신의 창보다 짧지 않은가 -----------
+    #
+    # worker 는 `DOC_WORKER_END_TIME` 까지 돌 생각으로 큐를 잡는다. 스케줄러의
+    # `ExecutionTimeLimit` 이 그보다 짧으면 **Windows 가 중간에 죽인다.**
+    # worker 는 자기가 끝냈다고 기록할 기회조차 없고, 잡아 둔 큐 행은
+    # `in_progress` 로 남는다(만료 회수는 되지만 그날 수집은 조용히 잘린다).
+    m7 = re.search(r"^DOC_WORKER_END_TIME\s*(?::\s*str\s*)?=\s*[\"']([0-9:]+)[\"']",
+                   cfg, re.M)
+    if m5 and m7 and ps1:
+        m8 = re.search(r"ExecutionTimeLimit\s*\(New-TimeSpan\s+-Hours\s+(\d+)\)", ps1)
+        check_true("등록 스크립트에서 ExecutionTimeLimit을 찾았다", bool(m8), None)
+        if m8:
+            def _mins2(hhmm):
+                h, mm = hhmm.split(":")
+                return int(h) * 60 + int(mm)
+            window = _mins2(m7.group(1)) - _mins2(m5.group(1))
+            limit = int(m8.group(1)) * 60
+            check_true("스케줄러 실행시간 한계(%d분)가 worker 실행 창(%d분) 이상이다"
+                       % (limit, window), limit >= window, (limit, window))
+
+    # --- (7) 대조군 — 이 검사가 공허하지 않다 ---------------------------------
     check_true("대조군: 두 사본 파일을 실제로 읽었다",
                bool(db) and bool(ps1), (bool(db), bool(ps1)))
+
+
+def test_no_escape_corrupted_text():
+    """추적 파일에 **이스케이프가 해석돼 끊긴 문장**이 남아 있지 않은가 (2026-08-18 Sprint 190).
+
+    ## 왜 이 검사가 생겼나
+
+    셸 heredoc 은 본문의 백슬래시 이스케이프를 해석한다. 그래서 문서를 편집하며
+    `` `.\\register_scheduler_tasks.ps1` `` 를 넣으면 `\\r` 이 **캐리지 리턴**이 되어
+    문장이 두 줄로 쪼개진다. 실제로 `docs/BETA_RELEASE_CHECKLIST.md` 43행이 그렇게
+    깨져 있었다:
+
+        조치는 `.<CR><LF>egister_scheduler_tasks.ps1 -Apply` 한 줄이며 ...
+
+    사람이 읽으면 바로 보이지만 **아무 검사도 이것을 보지 않는다** — 마크다운이라
+    빌드도 린트도 통과하고, 내용이 아니라 표기라 문서 드리프트 감사에도 안 걸린다.
+    그런데 이 문서는 **운영자가 그대로 복사해 실행하는 명령**을 담고 있다.
+
+    같은 사고를 이 저장소는 최소 두 세션에서 겪었다(Sprint 189 작업 중에도 두 번).
+    인스턴스만 고치면 반드시 다음이 남는다.
+
+    ## 무엇을 보는가
+
+    두 가지 표지를 본다. 어느 쪽도 정상 문서에서는 나타나지 않는다.
+
+        (1) 줄 끝이 백틱+점 또는 홑 백슬래시인데 다음 줄이 소문자로 시작
+        (2) 줄이 알려진 파일명의 **첫 글자가 잘린 조각**으로 시작
+            (`\\r`->CR 이면 register 가 egister 로 남는 식)
+    """
+    print("\n--- 이스케이프 해석으로 끊긴 문장 (Sprint 190) ---")
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    EXT = {"md", "py", "ps1", "bat", "ts", "tsx", "mjs", "json", "txt", "sql", "css"}
+    files = [f for f in subprocess.run(
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.split("\n")
+        if f and f.rsplit(".", 1)[-1] in EXT]
+
+    tail_re = re.compile("(`" + re.escape(".") + "|" + re.escape(chr(92)) + ")$")
+    head_re = re.compile("^[a-z]")
+    FRAGMENTS = ("egister_", "un_daily", "un_doc_worker", "un_priority",
+                 "ode_modules", "equirements", "eset_", "efresh_")
+
+    suspects = []
+    for f in files:
+        path = os.path.join(root, f)
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = text.replace("\r\n", "\n").split("\n")
+        for i in range(len(lines) - 1):
+            if tail_re.search(lines[i]) and head_re.match(lines[i + 1]):
+                suspects.append("%s:%d" % (f, i + 1))
+        for i, ln in enumerate(lines):
+            if ln.startswith(FRAGMENTS):
+                suspects.append("%s:%d" % (f, i + 1))
+
+    print("    추적 텍스트 파일 %d개 검사" % len(files))
+    check_true("검사 대상 파일을 실제로 찾았다", len(files) >= 100, len(files))
+    check("이스케이프로 끊긴 문장 없음", sorted(set(suspects)), [])
+
+
+# ---------------------------------------------------------------------------
+# 27. CRLF 로 커밋된 파일을 LF 로 다시 쓰지 않는가 (2026-08-18 Sprint 202 신설)
+#
+# 이 세션에서 같은 사고가 두 번 났다. 파일을 통째로 읽어 고친 뒤 다시 쓰면서 줄끝이
+# 바뀌어, **몇 줄 고친 변경이 전 파일 재작성으로 나타났다.**
+#
+#     docs/CHANGELOG.md    +3854 / -3560   (실제로 늘어난 내용은 294줄)
+#     config/settings.py   +136  / -121    (실제로 늘어난 내용은 15줄)
+#
+# 리뷰가 불가능해지는 것이 피해다. 3,681줄의 가짜 변경 속에 진짜 15줄이 묻힌다.
+#
+# ★ 왜 "모든 파일의 줄끝"이 아니라 **CRLF blob 만** 보는가 (한 번 틀리고 고쳤다)
+#
+#   이 저장소는 `core.autocrlf=true` 다. 그래서 작업본의 CRLF 는 비교 전에 LF 로
+#   정규화된다 - 즉 **LF 로 커밋된 파일은 작업본이 CRLF 든 LF 든 diff 에 나타나지
+#   않는다.** 그것까지 규약 위반으로 잡으면 정상 체크아웃 97개가 걸린다(실제로 걸렸다).
+#
+#   그런데 git 은 **index 의 blob 에 이미 CR 이 있으면 그 경로의 정규화를 끈다**
+#   (이미 CRLF 로 커밋된 파일을 뒤늦게 뒤집지 않으려는 안전장치다).
+#   그래서 이 부류만은 작업본이 **글자 그대로 CRLF 를 유지해야** 한다.
+#   LF 로 다시 쓰는 순간 모든 줄이 달라진다.
+#
+#   이 저장소에는 그런 파일이 많다(CEO/*, config/settings.py, docs/CHANGELOG.md,
+#   doc_worker.py, migrate_execute.py, mvp_scraper.py ...). Windows 에서
+#   autocrlf 없이 커밋되던 시절의 흔적이다.
+#
+# 한계를 밝혀 둔다: 이미 혼재된 blob 에서 **일부만** LF 로 바뀌는 것은 못 잡는다
+# (CR 이 남아 있으면 통과한다). 잡는 것은 "규약이 통째로 뒤집힌 경우"다.
+# ---------------------------------------------------------------------------
+def test_crlf_blobs_are_not_rewritten_as_lf():
+    print()
+    print("--- 27. CRLF 로 커밋된 파일을 LF 로 다시 쓰지 않는가 (Sprint 202) ---")
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    LF = bytes([10])
+    CR = bytes([13])
+    CRLF = bytes([13, 10])
+    NLCH = chr(10)
+
+    def git(*args, **kw):
+        return subprocess.run(["git"] + list(args), cwd=root, capture_output=True, **kw)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        print("[SKIP] git 저장소가 아니다(배포본) - 줄끝 대조 생략")
+        return
+
+    tracked = [q for q in git("ls-files").stdout.decode("utf-8", "replace").split(NLCH)
+               if q.strip()]
+
+    # blob 을 한 번의 배치로 읽는다 (파일당 프로세스를 띄우면 수백 개에 수십 초가 든다)
+    payload = "".join("HEAD:" + rel + NLCH for rel in tracked).encode("utf-8")
+    out = git("cat-file", "--batch", input=payload).stdout
+
+    bad = []
+    crlf_blobs = 0
+    parsed = 0
+    pos = 0
+    for rel in tracked:
+        nl = out.find(LF, pos)
+        if nl < 0:
+            break
+        header = out[pos:nl].decode("utf-8", "replace")
+        pos = nl + 1
+        if header.endswith("missing"):
+            continue
+        parsed += 1
+        size = int(header.split()[2])
+        blob = out[pos:pos + size]
+        pos += size + 1
+
+        blob_cr = blob.count(CR)
+        if blob_cr == 0:
+            continue          # autocrlf 가 정규화한다 - 작업본 줄끝은 자유다
+        if blob.count(bytes([0])):
+            continue          # 바이너리
+        crlf_blobs += 1
+
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            with open(path, "rb") as fh:
+                cur = fh.read()
+        except OSError:
+            continue          # 체크아웃되지 않은 파일
+
+        cur_cr = cur.count(CR)
+        if cur_cr == 0:
+            bad.append("%s: HEAD 는 CRLF(%d줄)인데 작업본이 LF 로 통째로 바뀌었다"
+                       % (rel, blob.count(CRLF)))
+
+    check("CRLF 로 커밋된 파일을 LF 로 다시 쓴 것 없음", bad, [])
+
+    # ★ 이 가드가 **아무것도 안 보는 상태로 통과**하는 것을 막는다.
+    #   배치 파싱이나 경로 인코딩이 깨지면 조용히 0개를 대조하고 초록이 된다.
+    check_true("CRLF blob 을 실제로 찾아냈다 (%d개 / blob %d개 파싱)"
+               % (crlf_blobs, parsed), crlf_blobs >= 50, crlf_blobs)
+
+
+# ---------------------------------------------------------------------------
+# 28. 낡은 "도달 불가" 주장이 정정 없이 살아 있는가 (2026-08-18 Sprint 211 신설)
+#
+# 이 저장소는 낡은 단정 때문에 반복해서 헛돌았다.
+#
+#     CLAUDE.md   "No requirements.txt exists"        -> 이미 있었다
+#     Sprint 187  "DOJOONPASS_DAILY 정상 동작 중"      -> 세 축 실측이 전부 반대였다
+#     Sprint 145  "document_version_log 도달 불가"     -> Sprint 189 가 경로를 열었다
+#
+# 마지막 것이 특히 위험하다. 그 문장은 **"재수집 정책을 정할 수 없다"는 결론의 근거**로
+# 여러 문서에 인용돼 있어서, 낡은 채로 두면 이미 가능해진 일을 계속 불가능하다고
+# 판단하게 만든다.
+#
+# 코드 사실은 이미 다른 곳이 지킨다(`test_refresh_trigger.py` 18 이 재수집 배선을
+# 고정한다). 여기서 지키는 것은 **문서/주석의 주장**이다.
+#
+# ★ 이 저장소의 관례는 낡은 문장을 지우는 대신 **그대로 인용하고 정정을 붙이는** 것이다.
+#   그래서 단순 문자열 검색은 *고쳐 놓은 문서*를 위반으로 잡는다
+#   (`test_bootstrap.py` 의 requirements.txt 검사가 같은 이유로 같은 방식을 쓴다).
+#   주변에 정정 표시가 있으면 살아 있는 주장이 아니라 인용으로 본다.
+# ---------------------------------------------------------------------------
+def test_no_live_unreachable_claim_about_version_log():
+    print()
+    print("--- 28. 낡은 '도달 불가' 주장이 정정 없이 남아 있는가 (Sprint 211) ---")
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        return subprocess.run(["git"] + list(args), cwd=root, capture_output=True)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        print("[SKIP] git 저장소가 아니다(배포본)")
+        return
+
+    NL = chr(10)
+    files = []
+    for args in (("ls-files",), ("ls-files", "--others", "--exclude-standard")):
+        out = git(*args).stdout.decode("utf-8", "replace")
+        files += [f.strip() for f in out.split(NL)
+                  if f.strip().endswith((".py", ".md"))]
+
+    # "document_version_log ... 도달 불가" 를 한 문장 안에서 찾는다.
+    CLAIM = re.compile(r"document_version_log[^" + NL + r"]{0,80}도달\s*불가"
+                       r"|도달\s*불가[^" + NL + r"]{0,80}document_version_log")
+    # ★ 인정 조건을 좁게 잡는다. 처음에는 "정정" / "Sprint 189" 같은 흔한 단어를
+    #   넣었다가 **가드가 공허해졌다** — 이 저장소는 "정정"을 워낙 자주 쓰기 때문에
+    #   정정 마커를 통째로 지워도 주변 900자 안에서 그 단어가 걸렸다(변이 실측:
+    #   마커 제거 -> FAIL 0건). 의도적으로 붙인 마커만 인정한다.
+    CORRECTION = ("[정정", "[재정정", "더 이상 사실이 아니다")
+    WINDOW = 600
+
+    live, scanned = [], 0
+    for rel in files:
+        # 이 검사 자신은 제외한다 — 위 설명 주석이 바로 그 문장을 인용하고 있어
+        # 스캐너가 자기 자신을 위반으로 잡는다(`test_bootstrap.py` 가 같은 부류를
+        # 겪고 같은 판단을 했다). 제외 대상을 목록으로 늘리지 않는다: **자기 파일 하나뿐**이다.
+        if os.path.basename(rel) == os.path.basename(__file__):
+            continue
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        scanned += 1
+        for m in CLAIM.finditer(text):
+            line_start = text.rfind(NL, 0, m.start()) + 1
+            line_end = text.find(NL, m.end())
+            line = text[line_start:line_end if line_end >= 0 else len(text)]
+            # 취소선(`~~...~~`)으로 그어 둔 것은 살아 있는 주장이 아니라 **이력**이다.
+            # 이 저장소의 roadmap 이 완료 항목을 그렇게 표시한다.
+            if "~~" in line:
+                continue
+            around = text[max(0, m.start() - WINDOW):m.end() + WINDOW]
+            if not any(k in around for k in CORRECTION):
+                live.append("%s:%d" % (rel, text[:m.start()].count(NL) + 1))
+
+    check("정정 없이 살아 있는 '도달 불가' 주장 없음", sorted(live), [])
+
+    # ★ 하한 - 파일 열거가 깨지면 조용히 0건을 훑고 통과한다.
+    check_true("훑은 파일이 실제로 있다 (%d개)" % scanned, scanned >= 100, scanned)
+
+    # ★ 대조군 - 이 주장이 문서에 **실제로 존재**해야 검사가 의미를 갖는다.
+    #   전부 지워 버리면 위 검사는 영원히 통과하면서 아무것도 지키지 않는다.
+    total = 0
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                total += len(CLAIM.findall(fh.read()))
+        except OSError:
+            continue
+    check_true("대조군: 정정이 붙은 원문이 남아 있다 (%d곳)" % total, total >= 2, total)
 
 
 def run():
@@ -1951,6 +2447,9 @@ def run():
     test_known_dependency_cves_are_tracked()
     test_no_duplicate_config_constants()
     test_config_constants_match_their_copies()
+    test_no_escape_corrupted_text()
+    test_crlf_blobs_are_not_rewritten_as_lf()
+    test_no_live_unreachable_claim_about_version_log()
 
     print("\n" + "=" * 55)
     if failures:

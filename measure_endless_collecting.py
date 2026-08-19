@@ -35,7 +35,13 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DB_PATH = "auction.db"
-ACTIVE_QUEUE = {"pending", "processing", "in_progress"}
+
+# 2026-08-18 Sprint 189: 여기 있던 하드코딩 집합 {"pending","processing","in_progress"}는
+# (1) 실제로 없는 값("processing")을 세고 (2) 새로 생긴 재수집 어휘를 못 셌다.
+# 큐 상태 어휘의 단일 소스는 `storage/database.py`다 — 거기서 가져온다.
+from storage.database import QUEUE_ACTIVE_STATUSES  # noqa: E402  (sys.path 설정 뒤라야 한다)
+
+ACTIVE_QUEUE = set(QUEUE_ACTIVE_STATUSES)
 
 
 def main() -> int:

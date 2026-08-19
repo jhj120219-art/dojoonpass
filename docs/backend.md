@@ -586,3 +586,42 @@ Task Scheduler (매일 06:00)
 | `/admin/subscriptions` | GET | ADMIN |
 | `/admin/subscriptions/{id}` | PATCH | **SUPER_ADMIN** |
 | `/admin/audit-logs` | GET | ADMIN |
+
+### `GET /api/v1/doc-stats` 응답 필드 (2026-08-18 Sprint 189 갱신)
+
+큐 적체 규모 필드가 하나 늘었다. **기존 필드는 이름도 의미도 그대로다**(순수 추가).
+
+| 필드 | 뜻 |
+|---|---|
+| `queue_pending` | 한 번도 수집한 적 없어 대기 중 |
+| `queue_refresh` | **(신규)** 이미 받았지만 법원 변경으로 다시 받아야 해서 대기 중 |
+| `queue_in_progress` | 지금 작업 중 — `in_progress` + `in_progress_refresh`의 **합** |
+| `queue_failed` | 재시도 소진으로 최종 실패 |
+
+상태 문자열을 이 파일에 하드코딩하지 않는다. 어휘의 단일 소스는
+`storage/database.py`의 `QUEUE_STATUS_*` / `QUEUE_IN_PROGRESS_STATUSES`이고,
+`api/v1/doc_stats.py`가 그것을 import한다 — 하드코딩 목록은 **새 값이 생겨도 조용히
+어느 칸에도 안 잡히는** 문제를 만든다(BUGS #119가 정확히 그 부류였다).
+`test_refresh_trigger.py` §11이 하드코딩이 다시 들어오는 것을 막는다.
+
+
+### `document_queue` claim 의 `None` 은 한 가지 뜻이다 (2026-08-18 Sprint 191, BUGS #130)
+
+`claim_next_queue_item()` 이 `None` 을 돌려주는 것은 **"지금 가져갈 행이 없다"** 하나뿐이다.
+
+예전에는 두 가지가 같은 `None` 이었다:
+
+```
+(a) 조회 결과가 없다                     -> 진짜로 비었다
+(b) 조회는 됐는데 UPDATE 에서 밀렸다      -> 경쟁에서 졌을 뿐, 큐는 안 비었다
+```
+
+`doc_worker.main()` 은 `None` 을 (a)로 읽고 **그 실행 전체를 끝낸다.** 즉 claim 충돌
+한 번이 그날 남은 큐를 통째로 다음 날로 미뤘고, 로그에는 사실이 아닌
+`대기열 비어있음` 이 남았다.
+
+지금은 (b)면 **다른 행으로 다시 시도**한다(`CLAIM_RACE_MAX_ATTEMPTS = 5`).
+상한에 걸리면 `None` 을 주되 **경고를 남긴다** — 그래야 "비었다"와 구별된다.
+
+실측(스레드 12 / 대기 행 4): 중복 claim 은 **원래 0건**이었다(원자적 클레임 정상).
+수정 전 claim 성공 3건 -> 수정 후 4건.

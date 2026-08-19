@@ -440,11 +440,16 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
                   <option key={item} value={item}>{item}</option>
                 ))}
               </select>
+              {/* aria-describedby: 오류 안내를 이 select 와 **연결**한다.
+                  role="alert" 는 나타나는 순간 한 번 읽혀 주지만, 나중에 Tab 으로 이
+                  컨트롤에 도착한 사람은 "왜 목록이 비어 있는지"를 알 길이 없었다.
+                  오류가 없을 때는 undefined 를 줘 **빈 번지를 가리키지 않게** 한다. */}
               <select
                 value={form.sigungu}
                 onChange={(e) => handleSigunguChange(e.target.value)}
                 disabled={!form.sido || sigunguLoading}
                 aria-label="시/군/구"
+                aria-describedby={sigunguError ? 'sigungu-error' : undefined}
                 className={inputClass}
               >
                 <option value="">
@@ -456,7 +461,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
               </select>
             </div>
             {form.sido && sigunguError && (
-              <p className="text-xs text-red-500 flex items-center gap-2">
+              <p id="sigungu-error" role="alert" className="text-xs text-red-500 flex items-center gap-2">
                 시/군/구 목록을 불러오지 못했습니다
                 <button
                   type="button"
@@ -471,6 +476,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
               <input
                 type="text"
                 placeholder="읍/면/동"
+                aria-label="읍/면/동"
                 value={form.dong}
                 onChange={(e) => update('dong', e.target.value)}
                 className={inputClass}
@@ -478,6 +484,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
               <input
                 type="text"
                 placeholder="세부주소 (건물명/지번)"
+                aria-label="세부주소 (건물명/지번)"
                 value={form.addressDetail}
                 onChange={(e) => update('addressDetail', e.target.value)}
                 className={inputClass}
@@ -513,6 +520,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
             <input
               type="text"
               placeholder="연도"
+              aria-label="사건번호 연도"
               value={form.caseYear}
               onChange={(e) => update('caseYear', e.target.value)}
               className={inputClass}
@@ -521,6 +529,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
             <input
               type="text"
               placeholder="번호"
+              aria-label="사건번호 번호"
               value={form.caseNo}
               onChange={(e) => update('caseNo', e.target.value)}
               className={inputClass}
@@ -533,6 +542,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           <input
             type="text"
             placeholder="예: 유찰, 신건"
+            aria-label="진행상태"
             value={form.status}
             onChange={(e) => update('status', e.target.value)}
             className={inputClass}
@@ -583,6 +593,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           <div className="flex items-center gap-2">
             <input
               type="date"
+              aria-label="매각기일 시작"
               value={form.auctionDateFrom}
               onChange={(e) => update('auctionDateFrom', e.target.value)}
               className={inputClass}
@@ -590,6 +601,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
             <span className="text-xs text-gray-400">~</span>
             <input
               type="date"
+              aria-label="매각기일 종료"
               value={form.auctionDateTo}
               onChange={(e) => update('auctionDateTo', e.target.value)}
               className={inputClass}

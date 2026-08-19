@@ -158,9 +158,9 @@ export default function MyPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-white flex items-center justify-center">
+      <main className="min-h-screen bg-white flex items-center justify-center">
         <p className="text-gray-400">불러오는 중...</p>
-      </div>
+      </main>
     )
   }
 
@@ -174,7 +174,7 @@ export default function MyPage() {
         <section className={CARD}>
           <h2 className={SECTION_TITLE}>구독</h2>
           {errors.subscriptions ? (
-            <p className="text-sm text-red-500">구독 정보를 불러오지 못했습니다</p>
+            <p role="alert" className="text-sm text-red-500">구독 정보를 불러오지 못했습니다</p>
           ) : !subscriptions || subscriptions.length === 0 ? (
             <p className="text-sm text-gray-400">구독 내역이 없습니다</p>
           ) : (
@@ -229,7 +229,7 @@ export default function MyPage() {
         <section className={CARD}>
           <h2 className={SECTION_TITLE}>결제 내역</h2>
           {errors.payments ? (
-            <p className="text-sm text-red-500">결제 내역을 불러오지 못했습니다</p>
+            <p role="alert" className="text-sm text-red-500">결제 내역을 불러오지 못했습니다</p>
           ) : !payments || payments.length === 0 ? (
             <p className="text-sm text-gray-400">결제 내역이 없습니다</p>
           ) : (
@@ -256,7 +256,7 @@ export default function MyPage() {
         <section className={CARD}>
           <h2 className={SECTION_TITLE}>등기부 신청</h2>
           {errors.registry ? (
-            <p className="text-sm text-red-500">등기부 신청 내역을 불러오지 못했습니다</p>
+            <p role="alert" className="text-sm text-red-500">등기부 신청 내역을 불러오지 못했습니다</p>
           ) : !registryRequests || registryRequests.length === 0 ? (
             <p className="text-sm text-gray-400">등기부 신청 내역이 없습니다</p>
           ) : (

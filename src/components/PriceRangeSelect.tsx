@@ -96,9 +96,13 @@ export default function PriceRangeSelect({
     <div>
       <span className={labelClassName}>{label}</span>
       <div className="grid grid-cols-2 gap-2">
+        {/* aria-label - 보이는 `<span>` 레이블은 select 와 프로그래밍적으로 연결돼
+            있지 않다. 최소/최대가 나란히 둘이라 스크린리더로는 구분되지 않는다.
+            픽셀은 바뀌지 않는다 (2026-08-19 Sprint 222). */}
         <select
           value={minValue}
           onChange={(e) => onMinChange(e.target.value)}
+          aria-label={`${label} 최소`}
           className={selectClassName}
         >
           {PRICE_OPTIONS.map((opt) => (
@@ -116,6 +120,7 @@ export default function PriceRangeSelect({
         <select
           value={maxValue}
           onChange={(e) => onMaxChange(e.target.value)}
+          aria-label={`${label} 최대`}
           className={selectClassName}
         >
           {PRICE_OPTIONS.map((opt) => (

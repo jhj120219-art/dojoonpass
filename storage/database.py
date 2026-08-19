@@ -1,4 +1,5 @@
-﻿import sqlite3
+﻿import os
+import sqlite3
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -7,8 +8,20 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = "auction.db"
 
+# `auction_image.storage_path` 는 프로젝트 루트 기준 상대경로다
+# (`to_relative_storage_path()` 참고). 절대경로로 되돌릴 때 쓴다 —
+# `api/v1/images.py:resolve_stored_path()` 와 같은 규칙이어야 한다.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(PROJECT_ROOT)
+
 MAX_DOC_RETRY = 3
 RETRY_INTERVAL_MINUTES = 30
+
+# claim 경쟁에서 졌을 때 **다른 행으로** 다시 시도하는 횟수 상한.
+# `claim_next_queue_item()` 참고 — 진 것과 "큐가 비었다"는 완전히 다른 사건인데
+# 예전에는 둘 다 None 이었고, 호출부는 후자로 읽어 실행을 끝냈다(BUGS #130).
+# 상한을 두는 이유는 경쟁자가 계속 이기는 상황에서 여기 영원히 머물지 않기 위해서다.
+CLAIM_RACE_MAX_ATTEMPTS = 5
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS auction (
@@ -431,6 +444,120 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
         conn.close()
 
 
+def doc_types_for_changed_fields(fields) -> tuple:
+    """바뀐 필드 이름들 -> 다시 받아야 할 자산 종류(정렬된 튜플).
+
+    매핑은 `REFRESH_DOC_TYPES_BY_FIELD` 하나뿐이다 — 호출부(`migrate_execute.py`)와
+    회귀 테스트가 이 함수를 통해 같은 표를 본다(어휘를 복제하지 않는다).
+    모르는 필드는 조용히 무시한다(자산과 무관한 필드가 바뀌었을 뿐이다).
+    """
+    out = set()
+    for f in (fields or ()):
+        for t in REFRESH_DOC_TYPES_BY_FIELD.get(f, ()):  # 모르는 필드 -> ()
+            if t in QUEUE_TO_DOC_STATUS_TYPE:            # 큐가 다루는 종류만
+                out.add(t)
+    return tuple(sorted(out))
+
+
+def requeue_changed_documents(changes: List[Dict],
+                              max_items: Optional[int] = None) -> Dict:
+    """법원 원천이 바뀐 물건의 자산을 **다시 받도록** 큐를 되돌린다 (2026-08-18 Sprint 189).
+
+    `changes`의 각 항목: {"court_code", "case_no", "item_no", "fields": [바뀐 필드명, ...]}
+
+    이 함수가 이 저장소에서 **처음으로 `overwrite=True` 경로에 실제로 도달하게 만드는
+    지점**이다. 지금까지 재수집 기계(수집기의 overwrite, 해시 비교, document_version_log,
+    부분수집 보호)는 전부 완성돼 있었지만 트리거가 없어 한 번도 돌지 않았다.
+
+    ## 무엇을 건드리고 무엇을 안 건드리는가
+
+        done                 -> refresh   (다시 받는다. 이 함수의 본래 일.
+                                           단 **매각기일이 지나지 않은 물건만** — 아래 참고)
+        SKIPPED_EXPIRED      -> pending   (기일이 **미래로 다시 잡힌 경우에만**)
+        pending / refresh    그대로       (이미 대기 중 — 굳이 건드릴 이유가 없다)
+        in_progress(_refresh) 그대로      (워커가 소유 중 — 뺏으면 그 실행이 끝나며
+                                           done으로 덮어써 재수집 의도가 사라진다)
+        failed               그대로       (자기 재시도 경로가 따로 있다. 여기서 되살리면
+                                           MAX_DOC_RETRY 예산 계산이 흐트러진다)
+        SKIPPED_UNSUPPORTED  그대로       (성공할 수 없는 항목의 영구 종결 —
+                                           `mark_queue_unsupported()`가 끊은 무한 재시도
+                                           고리를 여기서 다시 이으면 안 된다)
+
+    `SKIPPED_EXPIRED`만 'refresh'가 아니라 'pending'인 이유: 그 행은 **한 번도 받아 본 적이
+    없다.** overwrite로 갈 이유가 없고, 그렇게 두면 수집기가 "이미 존재" 스킵으로 값싸게
+    넘어갈 수 있는 경우(형제 물건 복사 등)를 잃는다.
+
+    돌려주는 값: {"items": 대상 물건 수, "refreshed": done->refresh 행 수,
+                  "revived_expired": 기일부활 행 수, "skipped_over_cap": 상한으로 미룬 물건 수}
+    """
+    if not changes:
+        return {"items": 0, "refreshed": 0, "revived_expired": 0, "skipped_over_cap": 0}
+
+    cap = REFRESH_MAX_ITEMS_PER_RUN if max_items is None else max_items
+    over_cap = 0
+    if cap is not None and cap >= 0 and len(changes) > cap:
+        over_cap = len(changes) - cap
+        # ★ 조용히 자르지 않는다. 잘린 건수를 로그에 남겨야 "전부 처리됐다"로 오독되지 않는다.
+        logger.warning(
+            "재수집 대상 %d건 중 상한(%d)을 넘는 %d건은 이번 실행에서 미룬다"
+            "(큐에 그대로 남아 다음 실행에서 다시 후보가 된다)",
+            len(changes), cap, over_cap)
+        changes = changes[:cap]
+
+    conn = get_connection()
+    refreshed = 0
+    revived = 0
+    items = 0
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        for ch in changes:
+            court_code = ch.get("court_code", "")
+            case_no = ch.get("case_no", "")
+            item_no = str(ch.get("item_no", "") or "1")
+            doc_types = doc_types_for_changed_fields(ch.get("fields"))
+            if not doc_types:
+                continue
+            items += 1
+            for doc_type in doc_types:
+                # ★ 기일이 이미 지난 물건은 되돌리지 않는다 (실측으로 추가한 조건).
+                #   실제 DB 사본으로 돌려 보니 대상이 2026-07-15 기일의 물건이었다. 그대로
+                #   refresh 로 되돌리면 워커가 집어가서 2차 방어선(`auction_date < today`)에
+                #   걸려 곧바로 SKIPPED_EXPIRED 로 종결한다 — 아무 것도 다시 받지 못한 채
+                #   **성공 기록(done)만 잃는다.** 얻는 것이 없고 잃는 것이 있는 왕복이다.
+                #   (빈 기일은 되돌린다 — "지났다"고 단정할 근거가 없다.)
+                cur = conn.execute("""
+                    UPDATE document_queue
+                       SET status=?, retry_count=0, last_attempt_at=NULL
+                     WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
+                       AND status='done'
+                       AND (IFNULL(auction_date, '') = '' OR auction_date >= ?)
+                """, (QUEUE_STATUS_REFRESH, court_code, case_no, item_no, doc_type, today))
+                refreshed += cur.rowcount or 0
+
+                # 기일이 지나 종결됐던 행은, 기일이 **미래로 다시 잡혔을 때만** 되살린다.
+                # (유찰 후 재매각은 한국 경매에서 일상이다 — `enqueue_documents()`가
+                #  이미 큐의 auction_date를 최신값으로 맞춰 두므로 그 값을 그대로 믿는다.)
+                cur = conn.execute("""
+                    UPDATE document_queue
+                       SET status=?, retry_count=0, last_attempt_at=NULL
+                     WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
+                       AND status='SKIPPED_EXPIRED'
+                       AND IFNULL(auction_date, '') >= ?
+                """, (QUEUE_STATUS_PENDING, court_code, case_no, item_no, doc_type, today))
+                revived += cur.rowcount or 0
+        conn.commit()
+        if refreshed or revived:
+            logger.info("변경 기반 재수집 예약: 물건 %d건 / 재수집 %d행 / 기일부활 %d행",
+                        items, refreshed, revived)
+        else:
+            logger.info("변경 기반 재수집 예약: 대상 물건 %d건이지만 되돌릴 큐 행이 없다"
+                        "(아직 수집된 적 없는 물건이거나 이미 대기 중)", items)
+        return {"items": items, "refreshed": refreshed,
+                "revived_expired": revived, "skipped_over_cap": over_cap}
+    finally:
+        conn.close()
+
+
 def refresh_queue_priority() -> int:
     """
     01:50에 별도 스케줄로 실행 (run_priority_refresh.bat -> refresh_priority.py).
@@ -441,8 +568,12 @@ def refresh_queue_priority() -> int:
     changed = 0
     examined = 0
     try:
+        # 'refresh'도 **워커가 집어갈 대기 행**이므로 같이 재계산한다 — 빠지면 재수집
+        # 대기분만 옛 우선순위로 남아 임박 물건이 뒤로 밀린다(2026-08-18 Sprint 189).
         rows = conn.execute(
-            "SELECT id, auction_date FROM document_queue WHERE status='pending'"
+            "SELECT id, auction_date FROM document_queue WHERE status IN ("
+            + QUEUE_CLAIMABLE_PLACEHOLDERS + ")",
+            QUEUE_CLAIMABLE_STATUSES,
         ).fetchall()
         for row in rows:
             new_priority = calc_priority(row["auction_date"])
@@ -514,13 +645,58 @@ def reset_stale_queue() -> None:
               AND last_attempt_at IS NOT NULL
               AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-1 day')
         """)
-        conn.execute("""
-            UPDATE document_queue
-            SET status='pending'
-            WHERE status='in_progress'
-              AND last_attempt_at IS NOT NULL
-              AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-10 minutes')
-        """)
+
+        # ★ 이미 실체를 가진 문서는 'pending' 이 아니라 'refresh' 로 되돌린다
+        #   (2026-08-18 Sprint 210).
+        #
+        #   Sprint 189 는 **중간 재시도**에서 재수집 의도가 사라지는 것을 막았다
+        #   (`QUEUE_RESUME_STATUS`: in_progress_refresh -> refresh). 막지 못한 것은
+        #   **재시도 소진** 경로다. 위 UPDATE 는 무조건 'pending' 으로 되돌린다.
+        #
+        #       refresh -> in_progress_refresh -> 실패 x3 -> failed   (refresh 정보 소실)
+        #               -> 하루 뒤 여기 -> pending
+        #               -> claim(overwrite=False) -> "이미 존재. 스킵" -> done
+        #
+        #   법원이 바꾼 문서가 영원히 옛것으로 남고 큐는 **성공**으로 끝난다.
+        #   오류도 경고도 없다. fixture 로 재현했다(Sprint 210).
+        #
+        #   상태값을 새로 만들지 않는다 — 이미 DB 에 있는 증거로 판정한다.
+        #   `document_status` 가 READY 라는 것은 **볼 수 있는 실체가 있다**는 뜻이고,
+        #   그런 행을 'pending' 으로 되돌리면 수집기가 즉시 "이미 존재. 스킵"으로
+        #   성공 처리하므로 그 재시도는 **구조적으로 아무 일도 하지 않는다.**
+        #   반대로 실체가 없는 행은 'pending' 이 맞다(처음 받는 것이다).
+        promoted = 0
+        for row in recovered:
+            try:
+                if _current_document_status(conn, row["court_code"], row["case_no"],
+                                            row["item_no"], row["doc_type"]) != "READY":
+                    continue
+                cur = conn.execute("""
+                    UPDATE document_queue
+                       SET status=?
+                     WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
+                       AND status=?
+                """, (QUEUE_STATUS_REFRESH, row["court_code"], row["case_no"],
+                      row["item_no"], row["doc_type"], QUEUE_STATUS_PENDING))
+                promoted += cur.rowcount or 0
+            except Exception as exc:  # noqa: BLE001 - 판정 실패로 큐 회수를 잃지 않는다
+                logger.warning(
+                    "재수집 의도 복원 실패 (법원=%s, 사건=%s, 물건=%s, 문서=%s): %s",
+                    row["court_code"], row["case_no"], row["item_no"], row["doc_type"], exc)
+        if promoted:
+            logger.info("이미 실체가 있는 %d행은 pending 이 아니라 refresh 로 되돌렸다"
+                        "(그러지 않으면 '이미 존재. 스킵'으로 헛돈다)", promoted)
+        # 진행 상태는 두 갈래다(`in_progress` / `in_progress_refresh`). **각자 원래 자리로**
+        # 돌려놓는다 — 둘 다 'pending'으로 회수하면 비정상 종료 한 번에 재수집 의도가
+        # 사라진다(위 `mark_queue_failed()`와 같은 이유, 2026-08-18 Sprint 189).
+        for in_progress, back_to in QUEUE_RESUME_STATUS.items():
+            conn.execute("""
+                UPDATE document_queue
+                SET status=?
+                WHERE status=?
+                  AND last_attempt_at IS NOT NULL
+                  AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-10 minutes')
+            """, (back_to, in_progress))
 
         # 큐 변경과 **같은 트랜잭션**에서 화면 상태를 맞춘다(#50).
         #
@@ -770,6 +946,118 @@ def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no
 # (재시도 횟수·우선순위·stale 회수·동시 실행 잠금이 전부 이미 있고 검증돼 있다).
 QUEUE_TO_DOC_STATUS_TYPE = {"spec": "SPEC", "status": "STATUS", "appraisal": "APPRAISAL",
                             "image": "IMAGE"}
+
+# =====================================================================
+# 큐 상태 어휘 (2026-08-18 Sprint 189 — 변경 기반 재수집)
+# =====================================================================
+#
+# 지금까지 `document_queue`는 **한 번 done이 되면 영원히 done**이었다. 그래서 문서·사진은
+# 물건당 딱 한 번만 수집됐고, 법원이 명세서를 다시 올리거나 사진을 바꿔 끼워도 화면은
+# 최초 수집분을 계속 보여 줬다. 수집기에는 `overwrite=True` 경로가 이미 완성돼 있었지만
+# **아무도 그 값을 넘기지 않았다**(Sprint 186/187이 남긴 마지막 공백).
+#
+# 여기서 채우는 것이 그 공백이다. 새 컬럼을 만들지 않고 **status 어휘를 늘린다** —
+# `document_queue.status`는 TEXT에 CHECK 제약이 없어 값 추가는 스키마 변경이 아니다
+# (스키마 변경은 승인 영역, docs/CLAUDE.md).
+#
+#     pending              한 번도 수집한 적 없다        -> overwrite=False
+#     refresh              이미 있지만 다시 받아야 한다  -> overwrite=True
+#     in_progress          pending을 집어간 상태
+#     in_progress_refresh  refresh를 집어간 상태
+#
+# in_progress를 두 갈래로 나누는 이유: 재시도(`mark_queue_failed`)와 stale 회수
+# (`reset_stale_queue`)가 **원래 어느 쪽이었는지 알아야** 제자리로 돌려놓을 수 있다.
+# 하나로 합치면 재수집 의도가 첫 실패에서 조용히 사라진다.
+QUEUE_STATUS_PENDING = "pending"
+QUEUE_STATUS_REFRESH = "refresh"
+QUEUE_STATUS_IN_PROGRESS = "in_progress"
+QUEUE_STATUS_IN_PROGRESS_REFRESH = "in_progress_refresh"
+
+# 워커가 집어갈 수 있는 상태. `claim_next_queue_item()`과 `refresh_queue_priority()`가
+# **같은 목록**을 봐야 한다 — 갈라지면 refresh 행이 우선순위 재계산에서 빠진다.
+QUEUE_CLAIMABLE_STATUSES = (QUEUE_STATUS_PENDING, QUEUE_STATUS_REFRESH)
+
+# `IN (...)` 자리에 넣을 **`?` 반복만** 만든다. 상태 값 자체는 SQL 문자열에 절대 넣지 않고
+# 예외 없이 바인딩한다 — `test_schema_hygiene.py`의 SQL 조립 감사가 허용하는 형태
+# (`api/v1/payments.py`의 `IN (%s)`와 같은 패턴)이고, 어휘가 늘어도 자동으로 따라간다.
+QUEUE_CLAIMABLE_PLACEHOLDERS = ", ".join("?" * len(QUEUE_CLAIMABLE_STATUSES))
+
+# 집어갈 때: 대기 상태 -> 진행 상태
+QUEUE_CLAIM_STATUS = {
+    QUEUE_STATUS_PENDING: QUEUE_STATUS_IN_PROGRESS,
+    QUEUE_STATUS_REFRESH: QUEUE_STATUS_IN_PROGRESS_REFRESH,
+}
+# 되돌릴 때: 진행 상태 -> 원래 대기 상태
+QUEUE_RESUME_STATUS = {v: k for k, v in QUEUE_CLAIM_STATUS.items()}
+
+# 진행 중(=워커가 소유 중)인 상태. 재수집 트리거가 **절대 건드리면 안 되는** 상태다.
+QUEUE_IN_PROGRESS_STATUSES = tuple(QUEUE_CLAIM_STATUS.values())
+
+# 아직 끝나지 않은(대기 또는 진행) 상태 전부. 적체 규모를 세는 쪽이 참조한다.
+QUEUE_ACTIVE_STATUSES = QUEUE_CLAIMABLE_STATUSES + QUEUE_IN_PROGRESS_STATUSES
+
+# `overwrite=True`로 다시 받아야 하는 상태. doc_worker가 이 판단을 복제하지 않도록
+# `claim_next_queue_item()`이 계산해서 `overwrite` 키로 넘겨 준다.
+QUEUE_OVERWRITE_STATUSES = (QUEUE_STATUS_REFRESH, QUEUE_STATUS_IN_PROGRESS_REFRESH)
+
+
+# 어떤 필드가 바뀌면 어떤 자산을 다시 받아야 하는가 (2026-08-18 Sprint 189).
+#
+# 전건 재수집은 실측 약 1.9시간이고 표적 재수집은 84초다(docs/roadmap.md 재수집 정책).
+# 그래서 "바뀐 물건의, 그 변경이 실제로 영향을 주는 자산만" 다시 받는다. 근거:
+#
+#   auction_date       매각기일이 바뀌면 **그 기일 기준으로 매각물건명세서가 새로 게시된다**
+#                      (법원은 기일마다 명세서를 다시 올린다). 현황조사서도 함께 갱신될 수 있다.
+#   minimum_bid_price  최저매각가격 변동은 유찰 저감의 결과이고, 그 값이 명세서에 적혀 있다.
+#   status             유찰/변경/취하/정지 등 사건상태 변화는 명세서·현황조사서 양쪽에 반영된다.
+#   appraisal_price    감정가가 바뀌었다면 **재감정**이다 — 감정평가서가 새로 나오고,
+#                      재감정에는 현장 재촬영이 따르므로 사진도 함께 다시 받는다.
+#
+# 사진(image)을 기일/최저가 변동에 넣지 않는 이유: 사진은 감정 시점에 찍힌 것이라
+# 유찰로 값만 내려갈 때는 바뀌지 않는다. 넣으면 매일 수천 장을 이유 없이 다시 받는다.
+REFRESH_DOC_TYPES_BY_FIELD = {
+    "auction_date": ("spec", "status"),
+    "minimum_bid_price": ("spec",),
+    "status": ("spec", "status"),
+    "appraisal_price": ("appraisal", "image"),
+}
+
+# 한 번 실행에서 재수집으로 되돌릴 **물건 수** 상한.
+#
+# 상한이 없으면 법원이 하루에 수천 건을 한꺼번에 갱신한 날(실측: 2026-08-01 하루 278건
+# 신규) 워커의 실행 창(02:00~04:00)을 재수집이 통째로 차지해 **한 번도 수집된 적 없는
+# 물건이 밀린다.** 아직 아무것도 못 본 사용자가 이미 보고 있는 사용자보다 먼저다.
+# 초과분은 큐에 그대로 남아 다음 실행에서 다시 후보가 된다(유실 아님) — 그리고
+# 잘린 건수는 **반드시 로그에 남긴다**(조용한 절단 금지).
+#
+# ── 값의 근거 (2026-08-18 Sprint 196 실측, BUGS #134) ────────────────────────
+# 처음 값 300 은 **근거 없이 정한 숫자**였고, 재 보니 실행 창을 4배 넘겼다.
+#
+#   실행 창                 02:00~04:00 = 7,200초
+#   기일 경과 적체 소진      2,733행 x 5.1ms = 14초 (브라우저 없이 종결, sleep 도 건너뜀)
+#   한 번도 못 받은 물건     20행 x 24초 = 480초      <- 이쪽이 언제나 우선이다
+#   남는 예산               6,706초
+#   재수집 1물건의 최악      4행 (전 필드가 동시에 바뀌면 spec/status/appraisal/image)
+#   -> 최악 기준 상한        6,706 / (4 x 24) = 69 물건
+#
+#   옛 값 300 의 최악 소요   300 x 4 x 24 = 28,800초 = 8.0시간 (창의 400%)
+#
+# **최악 기준**으로 잡는다 — 어느 필드가 바뀔지 미리 알 수 없으므로, 평균이 아니라
+# 최악에서 안전해야 상한이 상한 노릇을 한다. 69 에서 여유를 두고 60 으로 정한다.
+# (`test_refresh_trigger.py` 가 이 산술을 상수로 검증한다 — 창이나 소요가 바뀌면 실패한다.)
+REFRESH_MAX_ITEMS_PER_RUN = 60
+
+
+# 화면 상태 중 **실제로 보여 줄 자산이 있다**는 뜻인 값들.
+#
+#   READY     문서/사진 파일이 있다
+#   NO_IMAGE  법원이 사진을 제공하지 않는다는 것을 확인했다 — "없음"이 곧 정확한 답이라
+#             재수집이 실패해도 이 답이 틀려지지 않는다("수집 실패"와 "원래 없음"은 다르다)
+#
+# 재수집이 실패했을 때 이 값들을 FAILED로 덮으면, 화면은 "수집실패"인데 파일 서빙은
+# 200을 내는 어긋남이 생긴다(`mark_queue_failed()` 참고).
+DOC_STATUS_HAS_ARTIFACT = ("READY", "NO_IMAGE")
+
 
 # `auction`(레거시) 테이블에 "수집됨" 플래그 컬럼이 있는 종류.
 # 사진에는 대응 컬럼이 없다 — 레거시 `auction` 테이블은 변경 금지(docs/backend.md)라
@@ -1039,8 +1327,10 @@ def save_auction_images(court_code: str, case_no: str, item_no: str,
     - **디스크에 실제로 없는 항목은 기록하지 않는다.** (DB만 앞서가는 것을 막는 이 저장소의 규약)
     - `INSERT OR REPLACE`로 `UNIQUE(item_id, seq)`에 얹는다 — 같은 물건을 두 번
       처리해도 사진이 두 벌 쌓이지 않는다(중복 자산 방어).
-    - **이번에 남은 순번보다 큰 옛 행은 지운다.** 법원이 사진을 5장에서 3장으로 줄이면
+    - **이번에 받지 못한 순번의 옛 행은 지운다.** 법원이 사진을 5장에서 3장으로 줄이면
       옛 4,5번 행이 남아 화면이 없는 사진을 가리키게 된다.
+      (2026-08-18 Sprint 191: `seq > max_seq` 였던 것을 **집합 차집합**으로 바꿨다 —
+       가운데 순번이 빠지는 경우를 `>` 비교는 못 잡았다.)
     - 단 `complete=False`(부분 수집)면 **지우지 않는다** (2026-08-17 Sprint 186).
       이 함수만 보면 "법원이 5장에서 3장으로 줄였다"와 "5장 중 3장만 받아졌다"가
       똑같이 보인다 — 둘 다 순번 3까지만 들어온다. 그런데 결과는 정반대다.
@@ -1071,6 +1361,7 @@ def save_auction_images(court_code: str, case_no: str, item_no: str,
         now = datetime.now().isoformat()
         today = datetime.now().strftime("%Y-%m-%d")
         max_seq = 0
+        saved_seqs = set()   # 이번에 실제로 기록한 순번 — 옛 행 정리의 기준
 
         for img in (images or []):
             path = img.get("path")
@@ -1084,7 +1375,32 @@ def save_auction_images(court_code: str, case_no: str, item_no: str,
                 logger.warning("auction_image 기록 생략: 파일이 없다 (%s)", path)
                 skipped += 1
                 continue
-            if size <= 0:
+            # ★ "있다"의 기준을 **읽는 쪽과 같게** 맞춘다 (2026-08-19 Sprint 218, BUGS #148).
+            #
+            #   예전에는 `size <= 0` 만 봤다. 그런데 이 사진을 실제로 내주는 쪽은
+            #   `MIN_IMAGE_BYTES`(1,024) 미만을 **404 로 거절한다**
+            #   (`api/v1/images.py`, `crawler/image_assets.image_exists()`).
+            #   즉 1~1,023바이트 파일은 이렇게 끝났다:
+            #
+            #       auction_image 에 행이 생긴다
+            #       -> API image_count=1 / images_status=READY / 대표 URL 을 준다
+            #       -> 검색 목록도 그 URL 을 썸네일로 준다
+            #       -> 그 URL 은 404          <- 화면은 있다는데 열면 없다
+            #
+            #   `image_exists()` 의 docstring 이 이미 적어 둔 규약이다 —
+            #   *"쓰는 쪽과 읽는 쪽의 '있다' 정의가 갈라지면 화면은 READY 인데 뷰어는
+            #   404 가 된다"*. 정작 **행을 만드는 이 함수만** 그 규약 밖에 있었다.
+            #
+            #   수집기는 이미 같은 하한으로 걸러내므로(`len(data) < MIN_IMAGE_BYTES`)
+            #   정상 경로의 동작은 바뀌지 않는다. 실측(2026-08-19): 운영 45행의
+            #   최소 크기는 35,746바이트로 **영향받는 행 0건**이다.
+            #   여기서 막는 것은 잘린 파일·수동 조작·옛 backfill 이 남길 수 있는 행이다.
+            from crawler.image_assets import MIN_IMAGE_BYTES as _MIN_IMAGE_BYTES
+            if size < _MIN_IMAGE_BYTES:
+                logger.warning(
+                    "auction_image 기록 생략: 너무 작다 %d바이트 < %d (%s) "
+                    "- 기록하면 화면은 사진이 있다고 하는데 서빙은 404 가 된다",
+                    size, _MIN_IMAGE_BYTES, path)
                 skipped += 1
                 continue
 
@@ -1100,13 +1416,23 @@ def save_auction_images(court_code: str, case_no: str, item_no: str,
                  img.get("width"), img.get("height"), today, now),
             )
             saved += 1
+            saved_seqs.add(seq)
             max_seq = max(max_seq, seq)
 
         # `complete=False` 면 지우지 않는다 — 위 docstring 참고.
         # `saved` 가 0일 때도 지우지 않는다(전체 실패로 기존 사진을 잃는 것을 막는다).
         if saved and complete:
+            # ★ `seq > max_seq` 가 아니라 **집합 차집합**이다 (2026-08-18 Sprint 191).
+            #   법원이 가운데 순번을 빼는 경우(1,2,4 만 제공)를 `>` 비교는 못 잡아
+            #   3번 행이 살아남고, 그 행이 가리키는 파일은 이미 사라져 있다
+            #   (= 화면은 있다는데 열면 404, 이 저장소가 반복해 잡아 온 어긋남).
+            #   `crawler/image_crawler.py:_remove_files_not_in()`이 파일 쪽을 **같은
+            #   기준**으로 정리하므로, 두 근거(DB/파일시스템)가 갈라지지 않는다.
+            placeholders = ", ".join("?" * len(saved_seqs))
             cur = conn.execute(
-                "DELETE FROM auction_image WHERE item_id=? AND seq>?", (item_id, max_seq))
+                "DELETE FROM auction_image WHERE item_id=? AND seq NOT IN ("
+                + placeholders + ")",
+                (item_id,) + tuple(sorted(saved_seqs)))
             removed = cur.rowcount or 0
         elif saved and not complete:
             logger.warning(
@@ -1133,40 +1459,149 @@ def save_auction_images(court_code: str, case_no: str, item_no: str,
 # 사진 조회 SQL이 여러 곳에 필요해지면 그때 이 규칙 자체를 바꾸는 것이 맞다.
 
 
-def claim_next_queue_item() -> Optional[Dict]:
-    """
-    status='pending' -> 'in_progress' 원자적 클레임.
-    UPDATE ... WHERE status='pending' 조건으로 동시성 문제를 방지하고,
-    성공(rowcount>0) 했을 때만 그 항목을 반환한다.
-    커밋 후 즉시 커넥션을 닫아 락을 짧게 유지한다(다운로드 작업 중에는 DB를 잠그지 않음).
+def clear_images_if_absence_confirmed(court_code: str, case_no: str,
+                                      item_no: str) -> Dict:
+    """법원이 사진을 **전부** 내린 것이 확인되면 옛 사진 기록을 정리한다.
+
+    2026-08-18 Sprint 191 (BUGS #128). 사진 감소는 `save_auction_images()`가 처리하는데,
+    **0장으로 줄어드는 경우만 그 함수에 도달하지 않는다** — `doc_worker`가
+    `if result.get("images")` 로 가드하기 때문이다(빈 목록으로 부르면 전체 실패와
+    구별되지 않으니 그 가드 자체는 옳다). 그 결과:
+
+        법원이 사진을 전부 내림
+          -> collect_images: no_asset=True, images=[]
+          -> document_status = NO_IMAGE            (상태만 바뀐다)
+          -> auction_image 행/파일은 **그대로 남는다**
+          -> _images_status() 는 "행이 있으면 무조건 READY" 이므로 **READY** 를 답한다
+          -> 사용자는 법원이 내린 사진을 계속 본다. 영원히.
+
+    ## 한 번 못 봤다고 지우지 않는다
+
+    "법원이 내렸다"와 "이번 관측이 실패했다"는 한 번의 관측으로 구별할 수 없다.
+    그리고 이 파이프라인에서 **가장 파괴적인 동작**이 사용자가 보던 사진을 전부 지우는
+    것이다. 그래서 **두 번 연속 확인**을 요구한다:
+
+        1회차: document_status 가 READY -> NO_IMAGE 로 바뀐다. 사진은 남긴다.
+        2회차: 이미 NO_IMAGE 인데 또 no_asset 이다 -> 그때 정리한다.
+
+    새 컬럼이 필요 없다 — `document_status` 자체가 1회차를 기억한다.
+    (부분 수집 보호가 "판단할 수 없을 때는 남기는 쪽"을 택한 것과 같은 원칙이다.)
+
+    ★ `mark_queue_done()` **보다 먼저** 불러야 한다. 그 함수가 상태를 NO_IMAGE 로
+      덮어쓰고 나면 1회차인지 2회차인지 알 수 없게 된다.
+
+    돌려주는 값:
+        {"cleared": 지운 행 수, "paths": 지워야 할 파일 절대경로들,
+         "first_sighting": 1회차라 이번에는 남겼는가}
     """
     conn = get_connection()
     try:
-        row = conn.execute("""
-            SELECT id, court_code, case_no, item_no, doc_type, retry_count, auction_date
-            FROM document_queue
-            WHERE status='pending'
-              AND (
-                    last_attempt_at IS NULL
-                    OR datetime(last_attempt_at) <= datetime(""" + _NOW_LOCAL + """, '-""" + str(RETRY_INTERVAL_MINUTES) + """ minutes')
-              )
-            ORDER BY priority ASC, auction_date ASC
-            LIMIT 1
-        """).fetchone()
-        if not row:
-            return None
+        item_id = _document_status_item_id(conn, court_code, case_no, item_no)
+        if item_id is None:
+            return {"cleared": 0, "paths": [], "first_sighting": False}
 
-        now = datetime.now().isoformat()
-        cur = conn.execute("""
-            UPDATE document_queue
-            SET status='in_progress', last_attempt_at=?
-            WHERE id=? AND status='pending'
-        """, (now, row["id"]))
+        rows = conn.execute(
+            "SELECT seq, storage_path FROM auction_image WHERE item_id=? ORDER BY seq",
+            (item_id,)).fetchall()
+        if not rows:
+            return {"cleared": 0, "paths": [], "first_sighting": False}
+
+        current = _current_document_status(conn, court_code, case_no, item_no, "image")
+        if current != "NO_IMAGE":
+            # 1회차 — 상태만 바뀌게 두고(호출부의 mark_queue_done 이 한다) 사진은 남긴다.
+            logger.warning(
+                "[%s-%s] 법원 원천에 사진이 없다고 관측됐지만 우리는 %d장을 갖고 있다 "
+                "- 이번에는 지우지 않는다(다음 수집에서 한 번 더 확인되면 정리)",
+                case_no, item_no, len(rows))
+            return {"cleared": 0, "paths": [], "first_sighting": True}
+
+        paths = [os.path.join(PROJECT_ROOT, r["storage_path"])
+                 for r in rows if r["storage_path"]]
+        cur = conn.execute("DELETE FROM auction_image WHERE item_id=?", (item_id,))
         conn.commit()
+        logger.warning("[%s-%s] 법원이 사진을 전부 내린 것이 두 번 연속 확인됐다 "
+                       "- 옛 사진 %d장 정리", case_no, item_no, cur.rowcount or 0)
+        return {"cleared": cur.rowcount or 0, "paths": paths, "first_sighting": False}
+    finally:
+        conn.close()
 
-        if cur.rowcount == 0:
-            return None
-        return dict(row)
+
+def claim_next_queue_item() -> Optional[Dict]:
+    """
+    대기 상태('pending'/'refresh') -> 대응하는 진행 상태 원자적 클레임.
+    UPDATE ... WHERE status=<집어갈 때 본 그 값> 조건으로 동시성 문제를 방지하고,
+    성공(rowcount>0) 했을 때만 그 항목을 반환한다.
+    커밋 후 즉시 커넥션을 닫아 락을 짧게 유지한다(다운로드 작업 중에는 DB를 잠그지 않음).
+
+    ## 돌려주는 `overwrite` (2026-08-18 Sprint 189)
+
+    'refresh'는 **이미 받아 둔 것이 있는데 다시 받아야 한다**는 뜻이다. 그대로 넘기면
+    수집기의 "이미 존재. 스킵" 분기에 걸려 아무 일도 일어나지 않으므로,
+    `collect_document(..., overwrite=True)`로 가야 한다. 그 판단을 doc_worker가 다시
+    하지 않도록(어휘가 두 곳에 복제되는 것을 막는다) 여기서 계산해 키로 넘긴다.
+
+    ★ 정렬은 바꾸지 않는다. 재수집을 먼저 처리하도록 순서를 뒤집고 싶어지지만,
+      `priority`는 매각기일 임박도에서 계산된 값이라 이미 제품이 정한 중요도다.
+      재수집을 앞세우면 **한 번도 수집된 적 없는 임박 물건**이 뒤로 밀린다.
+      재수집 총량은 `REFRESH_MAX_ITEMS_PER_RUN`으로 따로 제한한다.
+    """
+    conn = get_connection()
+    try:
+        for attempt in range(CLAIM_RACE_MAX_ATTEMPTS):
+            row = conn.execute("""
+                SELECT id, court_code, case_no, item_no, doc_type, retry_count, auction_date, status
+                FROM document_queue
+                WHERE status IN (""" + QUEUE_CLAIMABLE_PLACEHOLDERS + """)
+                  AND (
+                        last_attempt_at IS NULL
+                        OR datetime(last_attempt_at) <= datetime(""" + _NOW_LOCAL + """, '-""" + str(RETRY_INTERVAL_MINUTES) + """ minutes')
+                  )
+                ORDER BY priority ASC, auction_date ASC
+                LIMIT 1
+            """, QUEUE_CLAIMABLE_STATUSES).fetchone()
+            if not row:
+                return None           # 진짜로 가져갈 것이 없다
+
+            waiting_status = row["status"]
+            claimed_status = QUEUE_CLAIM_STATUS[waiting_status]
+
+            now = datetime.now().isoformat()
+            cur = conn.execute("""
+                UPDATE document_queue
+                SET status=?, last_attempt_at=?
+                WHERE id=? AND status=?
+            """, (claimed_status, now, row["id"], waiting_status))
+            conn.commit()
+
+            if cur.rowcount:
+                item = dict(row)
+                item["status"] = claimed_status
+                item["overwrite"] = claimed_status in QUEUE_OVERWRITE_STATUSES
+                return item
+
+            # ★ 여기 도달 = **경쟁에서 졌다**. 큐가 빈 것이 아니다
+            #   (2026-08-18 Sprint 191, BUGS #130).
+            #
+            #   예전에는 여기서 곧바로 None 을 돌려줬다. 그런데 호출부(`doc_worker.main()`)는
+            #   None 을 "대기열 비어있음"으로 읽고 **그 실행 전체를 끝낸다.** 즉 claim 충돌
+            #   한 번이 그날 남은 큐를 통째로 다음 날로 미룬다. 로그에도 "대기열 비어있음"
+            #   이라는 **사실이 아닌 문장**이 남는다(BUGS #47 계열).
+            #
+            #   실측(2026-08-18, 스레드 12 / 대기 행 4): 중복 claim 은 0건으로 방어가
+            #   정상 동작했지만, **행이 아직 남아 있는데 None 을 받은 스레드가 9개**였다.
+            #
+            #   진 쪽은 다른 행을 집으면 된다 — 다시 조회한다. 상한을 두는 이유는
+            #   무한 루프를 만들지 않기 위해서다(경쟁자가 계속 이기는 상황에서도 이 실행이
+            #   영원히 여기 머물면 안 된다). 상한에 걸리면 None 을 돌려주되 **왜인지를
+            #   로그에 남긴다** — 그래야 "비었다"와 구별된다.
+            logger.debug("claim 경쟁에서 밀렸다(id=%s) - 다시 시도 %d/%d",
+                         row["id"], attempt + 1, CLAIM_RACE_MAX_ATTEMPTS)
+
+        logger.warning(
+            "claim 을 %d회 시도했지만 매번 다른 실행에 밀렸다 - 이번에는 비우고 돌아간다"
+            "(큐가 빈 것이 아니다. 동시 실행 중인 워커가 있는지 확인할 것)",
+            CLAIM_RACE_MAX_ATTEMPTS)
+        return None
     finally:
         conn.close()
 
@@ -1262,17 +1697,50 @@ def mark_queue_failed(queue_id: int, retry_count: int) -> None:
                 (queue_id,)
             ).fetchone()
             if row:
-                _set_document_status(conn, row["court_code"], row["case_no"],
-                                     row["item_no"], row["doc_type"], "FAILED")
+                # ★ **이미 가지고 있는 것을 실패로 덮지 않는다** (2026-08-18 Sprint 189).
+                #
+                #   재수집을 켜기 전까지 이 자리는 언제나 "한 번도 못 받은 문서"였다.
+                #   이제는 **이미 READY인 문서를 다시 받으려다 실패하는 경우**가 생긴다
+                #   (법원이 그 문서를 내렸거나, 버튼 DOM이 바뀌었거나, 그냥 그날 서버가
+                #   불안정했거나). 그때 FAILED로 쓰면 화면은 "수집실패"라고 말하는데
+                #   `/api/v1/item/{id}/documents/SPEC`은 여전히 200으로 옛 문서를
+                #   내려 준다 — 화면과 실체가 갈라지는, 이 저장소가 BUGS #50 이래
+                #   반복해 잡아 온 바로 그 모양이다. 사용자 입장에서는 **볼 수 있던 것이
+                #   갑자기 "실패"로 보이는** 순수한 퇴행이다.
+                #
+                #   `reset_stale_queue()`가 "파일이 실제로 있는 문서를 COLLECTING으로
+                #   가리지 않는다"고 정한 것과 같은 규칙을 반대 방향에 적용한다.
+                #   큐 행은 그대로 'failed'로 남으므로 실패 사실 자체는 유실되지 않는다
+                #   (로그 + `document_collect_failures` + 큐 상태에 남는다).
+                held = _current_document_status(conn, row["court_code"], row["case_no"],
+                                                row["item_no"], row["doc_type"])
+                if held in DOC_STATUS_HAS_ARTIFACT:
+                    logger.warning(
+                        "[%s-%s] %s 재수집 실패 - 화면 상태는 %s 유지"
+                        "(이미 가진 자산을 실패로 덮지 않는다)",
+                        row["case_no"], row["item_no"], row["doc_type"], held)
+                else:
+                    _set_document_status(conn, row["court_code"], row["case_no"],
+                                         row["item_no"], row["doc_type"], "FAILED")
             logger.warning("document_queue id=%d 최종 실패 처리 (재시도 %d회 소진)", queue_id, new_retry)
         else:
+            # ★ 'pending'으로 고정하지 않는다 (2026-08-18 Sprint 189).
+            #   재수집으로 집어간 항목(`in_progress_refresh`)을 'pending'으로 되돌리면
+            #   **첫 실패에서 재수집 의도가 조용히 사라진다** — 다음 시도는 overwrite=False라
+            #   "이미 존재. 스킵"으로 성공 처리되고, 바뀐 문서는 영원히 옛것으로 남는다.
+            #   원래 어느 쪽이었는지는 진행 상태가 그대로 기억하고 있다.
+            cur_status = conn.execute(
+                "SELECT status FROM document_queue WHERE id=?", (queue_id,)
+            ).fetchone()
+            back_to = QUEUE_RESUME_STATUS.get(
+                cur_status["status"] if cur_status else "", QUEUE_STATUS_PENDING)
             conn.execute("""
                 UPDATE document_queue
-                SET status='pending', retry_count=?, last_attempt_at=?
+                SET status=?, retry_count=?, last_attempt_at=?
                 WHERE id=?
-            """, (new_retry, now, queue_id))
-            logger.info("document_queue id=%d 재시도 대기로 전환 (%d/%d, %d분 후 재시도 가능)",
-                        queue_id, new_retry, MAX_DOC_RETRY, RETRY_INTERVAL_MINUTES)
+            """, (back_to, new_retry, now, queue_id))
+            logger.info("document_queue id=%d 재시도 대기로 전환 (%s, %d/%d, %d분 후 재시도 가능)",
+                        queue_id, back_to, new_retry, MAX_DOC_RETRY, RETRY_INTERVAL_MINUTES)
         conn.commit()
     finally:
         conn.close()

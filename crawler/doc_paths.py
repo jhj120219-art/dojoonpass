@@ -96,6 +96,31 @@ def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
 # (html만 있고 json이 없는 "partial" 상태는 기존 결과 재사용 대상에서 제외하기 위함).
 _PRIMARY_EXT = {"spec": "pdf", "status": "json", "appraisal": "pdf"}
 
+# 이 문서 종류가 "수집 완료"이려면 **디스크에 있어야 하는 파일 전부**.
+# ---------------------------------------------------------------------------
+# 2026-08-18 Sprint 191 (BUGS #129). 예전에는 완료 판정을 `_PRIMARY_EXT` 하나로만 했다 —
+# status 는 `status.json` 만 봤다. 그런데 **뷰어가 서빙하는 파일은 `status.html`** 이다
+# (`api/v1/documents.py:DOC_TYPE_FILES`). 즉 완료 기준과 서빙 대상이 서로 다른 파일이었다.
+#
+#     status.json 만 남은 상태  ->  doc_exists()=True  (영원히 재수집 대상에서 제외)
+#                               ->  뷰어는 404
+#                               = "화면은 READY 인데 열면 없다"
+#
+# 이 저장소가 BUGS #22/#50/#61/#64 로 반복해 잡아 온 바로 그 어긋남이고, 이번에는
+# **두 정의가 다른 파일을 가리키는** 형태였다. 실측(2026-08-18): 현재 실데이터에
+# json-only 는 0건이라 지금 터지는 버그는 아니지만, 정의가 두 벌인 상태 자체를 없앤다.
+#
+# `image_exists()` 가 docstring 에 적어 둔 원칙을 문서에도 적용하는 것이다 —
+# *"쓰는 쪽과 읽는 쪽의 '있다' 정의가 갈라지면 화면은 READY 인데 뷰어는 404 가 된다."*
+#
+# `test_doc_storage_atomicity.py` 가 이 표와 `DOC_TYPE_FILES` 의 정합성을 강제한다
+# (서빙 파일이 필수 파일 목록에 없으면 실패).
+DOC_REQUIRED_FILES = {
+    "spec": ("spec.pdf",),
+    "status": ("status.html", "status.json"),
+    "appraisal": ("appraisal.pdf",),
+}
+
 
 # 사건 단위 문서 — 물건번호와 무관하게 사건 전체에 하나만 존재하는 문서.
 # ---------------------------------------------------------------------------
@@ -148,10 +173,10 @@ def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bo
     답을 지어내지 않는다).
     """
     key = (doc_type or "").lower()
-    if key not in _PRIMARY_EXT:
+    if key not in DOC_REQUIRED_FILES:
         raise ValueError(
             "알 수 없는 doc_type: %r (가능한 값: %s)"
-            % (doc_type, ", ".join(sorted(_PRIMARY_EXT)))
+            % (doc_type, ", ".join(sorted(DOC_REQUIRED_FILES)))
         )
     # ★ `get_doc_dir()` 이 아니라 `_doc_dir_path()` 를 쓴다 (2026-08-14).
     #
@@ -163,9 +188,57 @@ def doc_exists(court_code: str, case_no: str, item_no: str, doc_type: str) -> bo
     #   그 쓰레기가 실제로 남아 있다 — `documents/` 아래 **대응 물건이 없는 빈 디렉터리
     #   5개**가 그렇게 만들어진 것들이다(`A/B/1` 처럼 테스트가 물어본 흔적도 있다).
     #   조회는 조회만 해야 한다. 만드는 것은 쓰기 직전에 `get_doc_dir()` 이 한다.
-    path = os.path.join(_doc_dir_path(court_code, case_no, item_no),
-                        key + "." + _PRIMARY_EXT[key])
-    return os.path.exists(path) and os.path.getsize(path) > 0
+    # ★ 필요한 파일이 **전부** 있어야 완료다 (2026-08-18 Sprint 191, BUGS #129).
+    #   status 는 json(데이터) 과 html(뷰어가 서빙하는 것) 둘 다 필요하다. 하나만 보면
+    #   나머지가 사라졌을 때 "완료됐다"고 답해 영구히 재수집에서 빠진다.
+    d = _doc_dir_path(court_code, case_no, item_no)
+    for name in DOC_REQUIRED_FILES[key]:
+        path = os.path.join(d, name)
+        if not (os.path.exists(path) and os.path.getsize(path) > 0):
+            return False
+    return True
+
+
+def existing_doc_files(court_code: str, case_no: str, item_no: str,
+                       doc_type: str):
+    """이 문서의 **디스크에 실제로 있는** 필수 파일 경로들. 없으면 빈 목록.
+
+    2026-08-19 Sprint 217 (BUGS #144). `doc_exists()` 와 **같은 목록·같은 기준**
+    (`DOC_REQUIRED_FILES`, 존재 + 0바이트 초과)을 쓴다 — 규칙을 베끼지 않는다.
+    그래서 `doc_exists()` 가 True 인 문서에 대해 이 함수는 반드시 전부를 돌려준다.
+
+    ## 왜 필요한가
+
+    `doc_crawler` 의 "이미 존재. 스킵" 경로는 `files_saved=[]` 로 성공을 돌려줬다.
+    그러면 `mark_queue_done()` -> `_record_doc_raw()` 가 **맨 앞에서 그냥 돌아간다**
+    (`if not files_saved: return`). 즉 파일은 있는데 `doc_raw` 행이 없는 상태가
+    큐 done / 화면 READY 로 굳고, **다음 수집도 영원히 같은 스킵 경로를 탄다.**
+    API 는 `available=true` 를 주면서 `page_count`/`file_size`/`doc_version` 만
+    영원히 null 이다(뷰어 페이지 이동이 그려지지 않는 바로 그 상태 —
+    `storage/database.py:mark_queue_done()` 이 "근본 원인"으로 적어 둔 것).
+
+    사진 쪽은 같은 자리를 이미 스스로 복구한다
+    (`crawler/image_crawler.py:_describe_existing()` — "파일은 있는데 auction_image
+    행만 없는 상태를 여기서 스스로 복구한다"). 문서만 그 복구가 없었다.
+    """
+    key = (doc_type or "").lower()
+    if key not in DOC_REQUIRED_FILES:
+        raise ValueError(
+            "알 수 없는 doc_type: %r (가능한 값: %s)"
+            % (doc_type, ", ".join(sorted(DOC_REQUIRED_FILES)))
+        )
+    # `doc_exists()` 와 같은 이유로 `_doc_dir_path()` 를 쓴다 — 조회가 디렉터리를
+    # 만들면 안 된다.
+    d = _doc_dir_path(court_code, case_no, item_no)
+    out = []
+    for name in DOC_REQUIRED_FILES[key]:
+        path = os.path.join(d, name)
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                out.append(path)
+        except OSError:
+            continue
+    return out
 
 
 # 현황조사서 오버레이가 "실제 데이터가 채워진 상태"인지 판정한다 (2026-08-12 Sprint 62).

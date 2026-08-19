@@ -92,7 +92,7 @@ export default function FavoriteButton({ itemId, initialFavorited }: { itemId: n
         {favorited ? '❤️' : '🤍'}
       </button>
       {favError && (
-        <span className="absolute top-full right-0 mt-1 whitespace-nowrap text-[10px] text-red-500 bg-white px-1.5 py-0.5 rounded shadow-sm border border-red-100 z-20">
+        <span role="alert" className="absolute top-full right-0 mt-1 whitespace-nowrap text-[0.625rem] text-red-500 bg-white px-1.5 py-0.5 rounded shadow-sm border border-red-100 z-20">
           {favError}
         </span>
       )}

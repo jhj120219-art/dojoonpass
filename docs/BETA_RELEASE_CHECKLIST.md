@@ -27,21 +27,45 @@ Owner: Project Management
 
 ### P0-A. 데이터 공급이 2026-08-01부터 멈춰 있다 (스케줄러 미등록)
 
+**2026-08-18 재실측 — 여전히 참이다. 그리고 이 항목이 옳았다.**
+`docs/CURRENT_STATE.md`/`docs/roadmap.md`의 Sprint 187 기록이 그 사이 "DOJOONPASS_DAILY가
+매일 03:00에 정상 동작 중"이라고 적어 이 항목과 모순됐는데, 직접 조회한 결과
+**그 작업은 없다.** 249개 중 0개 그대로다(`docs/BUGS.md` #123에 실측 근거 정리).
+서로 다른 세션의 기록이 충돌하면 **다시 재는 쪽**이 답이다.
+
 등록된 예약 작업 249개 중 **이 저장소를 가리키는 항목이 0개**다. `auction.crawl_date`
 이력이 중단 시점을 그대로 보여 준다:
 
 ```
-~08-01 매일 수집(08-01만 278건)  /  08-02~08-11 0건  /  08-12 9건(단발)  /  08-13~17 0건
+~08-01 매일 수집(08-01만 278건)  /  08-02~08-11 0건  /  08-12 9건(단발)  /  08-13~18 0건
 ```
+
+**2026-08-18 추가 — 이제 이것이 막는 것이 하나 더 늘었다.** Sprint 189가 완성한
+변경 기반 재수집(법원이 바꾸면 다음 주기에 문서/사진을 다시 받는 구조)도
+**돌 기회 자체가 없다.** `document_version_log`가 0행인 이유가 이제 "기계가 없어서"가
+아니라 "배치가 안 돌아서"로 바뀌었다.
 
 지금 살아 있는 물건은 **9건뿐이고 전부 매각기일 2026-08-19**다. 즉 **2026-08-20부터
 기본 검색 결과가 0건**이 된다. 이 문서 기준으로 "핵심 동선이 깨진다"에 해당한다.
 
+> **[2026-08-19 Sprint 217 재실측 — 오늘이 그 마지막 날이다]**
+>
+> ```
+> 예약 작업 249개 중 이 저장소를 가리키는 것        0개      (변동 없음)
+> DOJOON* 이름의 작업                               없음     (변동 없음)
+> auction_item.crawl_date 최신값                    2026-08-12
+> 기일이 오늘 이후인 물건                            9건 — 전부 2026-08-19
+> 기일이 **내일 이후**인 물건                        0건
+> ```
+>
+> 즉 이 문단이 예고한 날이 내일이다. `register_scheduler_tasks.ps1` 를 dry-run 으로
+> 다시 돌려 선행 조건도 재확인했다(배치 3개 OK / PATH python 해석 OK /
+> 머신 PATH 불가 -> SYSTEM 계정 등록 금지 그대로). **등록만 남았고 그것은 승인 영역이다.**
+
 배관 자체는 정상이다 — `auction` 1,876 ↔ `auction_item` 1,876, 법원 포함 대조 양방향
 불일치 0건. `migrate_execute.py` 미실행분도 없다. **입력만 없다.**
 
-조치는 `.
-egister_scheduler_tasks.ps1 -Apply` 한 줄이며 운영 환경 변경이라 승인 영역이다.
+조치는 `.\register_scheduler_tasks.ps1 -Apply` 한 줄이며 운영 환경 변경이라 승인 영역이다.
 등록 전 검증은 전부 끝나 있다(인터프리터 폴백·errorlevel·logs 확보·실행창·락·retry·
 예상 처리량 약 7분·이미지 첫 큐잉 동작 실증).
 
@@ -66,6 +90,26 @@ Python이 **사용자 프로필**에 설치돼 있어(`C:\Users\jhj12\AppData\Lo
 어느 쪽을 고를지는 운영 정책이라 임의로 정하지 않는다. 설계 근거와 절전/노트북 대비
 (`-StartWhenAvailable`, `-DontStopIfGoingOnBatteries`, 4시간 제한)는
 `docs/SPRINT112_SCHEDULER_HANDOFF.md` 참고.
+
+> **[재정정 2026-08-18 Sprint 204] 아래 Sprint 187 문단은 더 이상 사실이 아니다.**
+> 원문은 기록으로 남긴다 - 무엇을 근거로 그렇게 판단했는지가 남아야 같은 오독을 피한다.
+>
+> 세 축을 따로 재서 전부 일치했다(`audit_schedule_health.py`).
+>
+> ```
+> 등록   schtasks 전체 249개 중 이 저장소를 가리키는 작업 0개
+> 흔적   logs/daily_run.log 마지막 갱신 2026-08-11 17:05
+>        (마지막 완료 표시는 "Finished at 2026-08-02  6:02:49")
+> 데이터 auction_item.crawl_date 최신값 2026-08-12 (단발 9건)
+> ```
+>
+> `DOJOONPASS_DAILY` 는 **지금 존재하지 않는다.** 그리고 그것이 08-17 에 실제로
+> `run_daily.bat` 을 돌렸다면 `logs/daily_run.log` 가 그날 갱신됐어야 하는데
+> 그렇지 않다. 즉 그 작업이 이 저장소 사본을 가리켰다는 근거가 없다.
+>
+> **교훈**: 작업 스케줄러의 `LastTaskResult 0` 은 "프로세스가 0으로 끝났다"는
+> 뜻이지 "이 저장소에 무엇이 쌓였다"는 뜻이 아니다. 그 둘을 섞은 것이 Sprint 187 의
+> 오독이고, 이제 `audit_schedule_health.py` 가 그 모순을 자동으로 지목한다.
 
 **2026-08-17 Sprint 187 정정 — "등록 0개"는 이제 절반만 사실이다.** 재실측
 (`Get-ScheduledTask`) 결과, **물건 기본정보 수집(`run_daily.bat`)은 실제로 매일
@@ -98,6 +142,20 @@ ModuleNotFoundError: No module named 'api.http_cache'   (api/v1/documents.py:6)
 자동으로 다시 계산한다.
 
 **반드시 `git add -A` 후 커밋할 것. `git commit -a`나 파일을 골라서 하는 커밋은 안 된다.**
+
+### ~~P0-C. 이 환경의 `auction.db`에 마이그레이션 020이 빠져 검색/상세 API가 전면 500~~
+→ **2026-08-17 09:03 적용 확인, 2026-08-18 Sprint 189에 실측 재확인 — 해결**
+
+```
+migration_history 20행 (020_create_auction_image.sql, 2026-08-17T09:03:19)
+GET /api/v1/search?limit=3                 -> 200  total 9
+GET /api/v1/item/505                       -> 200  사진 5장 READY / 문서 3종 READY
+GET /api/v1/item/505/images/1              -> 200  image/jpeg 235,194B  (If-None-Match -> 304)
+GET /api/v1/item/505/documents/APPRAISAL   -> 200  application/pdf 3,416,671B
+test_schema_hygiene.py §3                  -> PASS
+```
+
+아래 원문은 발견 당시 기록이다.
 
 ### P0-C. **[2026-08-17 신규, Sprint 187]** 이 환경의 `auction.db`에 마이그레이션
 020이 빠져 검색/상세 API가 전면 500
@@ -444,3 +502,88 @@ Sprint 26에서 해소되어 **목록에서 내려간 항목**: Lint 오류 2건
 Admin 목록 페이지네이션 비결정성, `layout.tsx` 기본 메타데이터, 문서-코드 불일치 다수,
 **API 서버 로깅 설정 부재**(감사 로그가 전량 유실되던 문제), **OpenAPI Duplicate Operation ID**,
 미사용 import 2건.
+
+
+### 운영 점검 도구: `audit_asset_integrity.py` (2026-08-18 Sprint 192 신설)
+
+배포 전/후에 **DB 기록과 디스크 실체가 일치하는지** 한 번에 확인한다. 읽기 전용이라
+언제 돌려도 안전하고, **종료 코드로 판단**할 수 있다.
+
+```bash
+python audit_asset_integrity.py            # 0=정상 / 1=어긋남 / 2=실행 실패
+python audit_asset_integrity.py --selftest # 감사기가 눈이 멀지 않았는지 확인
+```
+
+2026-08-18 실측: 5개 항목 전부 GREEN(사진 45행 / 문서 556건 / doc_raw 556행 /
+큐↔상태 일치 / 고아 파일 0).
+
+**승인 필요**: 이 파일은 아직 **미추적**이다. `git add` 전까지는 회귀 스위트가 참조하지
+못한다(추적 파일이 미추적 파일을 import하면 커밋 시 부팅이 깨진다 — BUGS #105).
+
+
+---
+
+### P1. 프런트 의존성 권고 7건 (2026-08-18 Sprint 207 실측)
+
+이 문서는 그동안 **`next` 하나만** 다뤘다(SPRINT125). `npm audit` 을 실제로 돌려 보니
+권고가 걸린 패키지는 **7개**이고 나머지 6개는 아무도 보고 있지 않았다.
+
+```
+moderate 1 / high 6 / 합계 7
+```
+
+| 패키지 | 설치본 | 등급 | 비고 |
+|---|---|---|---|
+| next | 16.2.9 | high | 권고 9건(미들웨어 우회, SSRF, 캐시 혼동, 이미지 최적화 DoS 등) |
+| postcss | 8.5.15 | high | sourceMappingURL 경로 순회로 임의 `.map` 파일 노출(CVSS 7.5) |
+| sharp | 0.34.5 | high | libvips 상속 취약점 4건 |
+| nanoid | 3.3.15 | high | 비보안 생성기 무한 루프 2건 |
+| js-yaml | 4.3.0 | high | `!!omap` 이차 CPU 소모(CVSS 7.5) |
+| brace-expansion | 1.1.15 | high | 확장 폭주 OOM 3건(CVSS 7.5) |
+| @tailwindcss/postcss | 4.3.1 | moderate | postcss 경유 |
+
+**★ 낡은 안내를 정정한다.** 기존 가드와 문서는 "`next@16.2.11` 이상으로 올리면
+해소된다"고 적고 있었다. 오늘 실측에서 취약 범위는 `9.3.4-canary.0 ~ 16.3.0-preview.10`
+이고 npm 이 제시하는 수정본은 **`16.3.1`** 이다. 16.2.11 로 올리면 CVE-2026-64641
+하나만 벗어나고 **나머지 8건은 그대로 남는다.**
+
+**좋은 소식**: `next@16.3.1` 은 `isSemVerMajor: false` 이고, postcss/sharp 의
+`fixAvailable` 도 같은 항목을 가리킨다. 즉 **메이저 업그레이드 없이 7건 중 3계열**이
+한 번에 정리된다.
+
+**조치는 승인 영역이다** — 의존성 올리기는 빌드/런타임 동작을 바꾼다.
+승인 후 `npm install next@16.3.1` 그리고 `npm audit` 재실측 -> 남은 항목 재판정.
+
+**지금 걸어 둔 것**: `test_schema_hygiene.py` 8-B 가 위 7개의 설치본이
+**스냅샷보다 낮아지면 실패**한다(오프라인 판정). 새 CVE 는 오프라인으로 알 수 없으므로
+`npm audit` 재실측은 여전히 사람이 주기적으로 해야 한다 - 이 표가 그 기준점이다.
+
+
+---
+
+## 접근성 (2026-08-19 Sprint 223 갱신)
+
+승인 없이 가능한 **기술 항목은 전부 닫혔다.** 남은 것은 제품 결정과 사람 손이 필요한 것뿐이다.
+
+```
+[x] 폼 컨트롤 접근 가능한 이름        93/93            (Sprint 222)
+[x] 모달 시맨틱(role/aria-modal/이름)  2/2              (Sprint 221)
+[x] 모달 포커스 트랩 + 복귀            2/2              (Sprint 223, BUGS #151)
+[x] 동적 상태 메시지 알림              13곳 + 검색 결과  (Sprint 223, BUGS #152)
+[x] 오류 <-> 폼 컨트롤 연결            aria-describedby (Sprint 223)
+[x] main 랜드마크                     화면 6/6         (Sprint 223, BUGS #153)
+[x] 키보드 전체 흐름                   양수 tabindex 0 / 클릭 전용 div 0 / 이름 없는 요소 0
+[x] Escape 탈출구                      모달 2/2
+[x] heading 계층                       건너뜀 0
+[x] disabled 표현                      네이티브 disabled (aria-disabled 단독 0)
+[x] aria 상태값                        aria-expanded 실제 토글 확인 / aria-current / aria-pressed
+[x] 확대 차단 없음                     user-scalable=no 0
+[x] 큰글씨 기술 기반                   닿지 않는 글자 8곳 -> **0곳** (Sprint 223)
+
+[ ] 대비 4.5:1 / 탭 타깃 44px         **제품 결정** — 미달 각각 81개 / 44개(실측 유지)
+[ ] 큰글씨 토글 UI                     **제품 결정**
+[ ] 모바일 실뷰포트 확인               **확인 불가** — 도구가 페이지 뷰포트를 못 바꾼다
+                                       (Sprint 223에 resize_window 로 재확인: innerWidth 1920 그대로)
+```
+
+체크된 항목은 전부 회귀가 잠그고 있고, 변이로 검출을 확인했다.

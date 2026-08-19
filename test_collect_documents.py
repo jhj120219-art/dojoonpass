@@ -370,13 +370,26 @@ def test_queue_converges_after_collect_documents():
         check("claim 직후 in_progress", env.queue_status(qid)[0], "in_progress")
 
         # 3) collect_spec은 파일이 이미 있으므로 **재다운로드 없이** 성공 반환
+        before = os.stat(final)
         result = collect_spec(None, court, case_no, item_no, "btn-id")
         check("이미 있으면 재다운로드 없이 성공", result["success"], True)
-        check("저장한 파일이 없다(재다운로드 안 함)", result["files_saved"], [])
+        # ★ 2026-08-19 Sprint 217 (BUGS #144): 예전에는 `files_saved == []` 로
+        #   "재다운로드 안 함"을 증명했다. 그 빈 목록 때문에 `_record_doc_raw()` 가
+        #   실체 기록을 통째로 건너뛰는 결함이 있었다(파일은 있는데 doc_raw 0행).
+        #   의도는 그대로 두고 증거를 바꾼다 — 다시 받지 않았다는 것은 **파일이
+        #   그대로라는 사실**로 확인한다.
+        after = os.stat(final)
+        check("재다운로드 안 함(mtime/크기 그대로)",
+              (after.st_mtime_ns, after.st_size), (before.st_mtime_ns, before.st_size))
+        check("스킵 경로도 이미 가진 실체를 가리킨다",
+              [os.path.basename(x) for x in result["files_saved"]], ["spec.pdf"])
 
         # 4) mark_queue_done이 큐/상태/플래그를 한 번에 맞춘다
+        #    doc_worker 와 **같은 인자**로 부른다(files_saved 포함) — 여기서만 빼면
+        #    실제 운영 경로와 다른 것을 검사하게 된다.
         env.dbmod.mark_queue_done(qid, court, case_no, item_no, "spec",
-                                  result["previous_hash"], result["new_hash"])
+                                  result["previous_hash"], result["new_hash"],
+                                  files_saved=result["files_saved"])
 
         check("최종 큐 상태 done", env.queue_status(qid)[0], "done")
         check("최종 document_status READY", env.status_of(1, "SPEC"), "READY")

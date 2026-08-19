@@ -206,4 +206,20 @@ def _images_status(doc_status_rows, image_count: int) -> str:
     row = next((d for d in doc_status_rows if d["doc_type"] == "IMAGE"), None)
     if row is None:
         return "COLLECTING"
+
+    # ★ READY 인데 볼 사진이 0장인 것은 **자기모순**이다 (2026-08-18 Sprint 208).
+    #
+    #   그대로 전달하면 화면은 "사진 있음"이라고 말하고 목록은 빈 상태가 된다 —
+    #   오류도 빈 화면도 아니라 사용자가 원인을 알 수 없다.
+    #
+    #   이 상태가 생기는 실제 경로를 확인했다(같은 스프린트):
+    #     - `doc_worker` 가 성공을 먼저 기록하고 사진 기록에서 실패하는 경우
+    #       (그 순서는 이번에 바로잡았지만, 여기는 **두 번째 방어선**이다)
+    #     - `save_auction_images()` 가 디스크에 없는 항목을 전부 건너뛰어 saved=0 이 되는 경우
+    #
+    #   NO_IMAGE / FAILED 는 그대로 전달한다 — 그 둘은 "볼 사진이 없다"와 모순되지 않는다.
+    #   READY 만 COLLECTING 으로 낮춘다. 근거: 실체가 없으므로 아직 끝나지 않은 것이고,
+    #   큐가 재시도 경로를 갖고 있다(행이 없을 때 COLLECTING 이라고 답하는 것과 같은 이유).
+    if row["status"] == "READY":
+        return "COLLECTING"
     return row["status"]

@@ -352,3 +352,56 @@ def list_stored_images(court_code: str, case_no: str, item_no: str) -> List[dict
         out.append({"seq": int(stem), "ext": ext.lower(), "path": full, "file_size": size})
     out.sort(key=lambda r: r["seq"])
     return out
+
+
+def is_inside_document_root(path: str) -> bool:
+    """이 경로가 `documents/` 안인가. 밖이면 False.
+
+    2026-08-18 Sprint 192 (BUGS #131). `api/v1/images.py` 는 **서빙**할 때 이미 같은
+    검사를 한다 — 그 파일의 주석이 이유를 적어 두었다: *"DB 값에서 경로를 만들기 때문에
+    문서 쪽보다 오히려 더 필요하다(관리 도구나 옛 마이그레이션이 넣은 값이 항상
+    얌전하다고 가정하지 않는다)."*
+
+    **지우는 쪽에는 그 검사가 없었다.** 읽기보다 쓰기/삭제가 더 위험한데 방어는 읽기에만
+    있었던 셈이다. `auction_image.storage_path` 가 어떤 이유로든 `..` 를 품으면
+    `remove_stored_image_files()` 가 `documents/` 밖의 파일을 지운다.
+    """
+    try:
+        real_root = os.path.realpath(DOCUMENT_ROOT)
+        real_path = os.path.realpath(path)
+        return os.path.commonpath([real_root, real_path]) == real_root
+    except (OSError, ValueError):
+        # 드라이브가 다르면 commonpath 가 ValueError 를 낸다 — 그것도 "밖"이다.
+        return False
+
+
+def remove_stored_image_files(paths) -> int:
+    """지정한 사진 파일들을 지운다. 실제로 지운 개수를 돌려준다.
+
+    2026-08-18 Sprint 191 (BUGS #128). DB 행을 먼저 지운 **뒤** 그 행이 가리키던 파일을
+    지우는 순서를 지키기 위해 호출부가 경로 목록을 받아 넘긴다 — 반대 순서로 하면
+    "DB 는 있다는데 파일이 없다"는, 이 저장소가 반복해 잡아 온 어긋남이 생긴다.
+
+    ★ `documents/` **밖은 절대 지우지 않는다** (2026-08-18 Sprint 192, BUGS #131).
+      경로의 출처가 DB(`auction_image.storage_path`)라 값이 항상 얌전하다고 가정할 수
+      없다. 서빙 쪽(`api/v1/images.py`)은 이미 같은 검사를 하고 있었고, **더 위험한
+      삭제 쪽에만 없었다.** 밖을 가리키는 값은 지우지 않고 경고만 남긴다.
+
+    지우지 못한 파일이 있어도 예외를 올리지 않는다(정리는 부수 작업이고, 그 실패로
+    수집 결과를 뒤집을 이유가 없다). 대신 경고를 남긴다.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    removed = 0
+    for path in (paths or ()):
+        if not is_inside_document_root(path):
+            log.warning("사진 파일 정리 거부: documents/ 밖을 가리킨다 (%s)", path)
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            pass          # 이미 없다 — 목표 상태와 같다
+        except OSError as e:
+            log.warning("사진 파일 정리 실패 (%s): %s", path, str(e))
+    return removed

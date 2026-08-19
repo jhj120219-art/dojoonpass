@@ -102,9 +102,9 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
       {/* 가격 그룹: 실입찰 기준가인 최저입찰가를 가장 크게, 감정가는 대비용으로 보조 표시 */}
       <div className="mt-3 flex items-end justify-between border-t border-gray-50 pt-3">
         <div>
-          <p className="text-[11px] text-gray-400">최저입찰가</p>
+          <p className="text-[0.6875rem] text-gray-400">최저입찰가</p>
           <p className="text-lg font-bold text-blue-600 leading-tight">{formatPrice(item.minimum_bid_price)}</p>
-          <p className="text-[11px] text-gray-400 mt-0.5">감정가 {formatPrice(item.appraisal_price)}</p>
+          <p className="text-[0.6875rem] text-gray-400 mt-0.5">감정가 {formatPrice(item.appraisal_price)}</p>
         </div>
         <div className="flex gap-1.5 shrink-0">
           <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">

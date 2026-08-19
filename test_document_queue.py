@@ -46,7 +46,7 @@ def queue_schema():
     실제 테이블에는 없었다). 그래서 018 마이그레이션 파일을 읽어 쓴다.
     """
     path = os.path.join(MIGRATIONS, "018_document_queue_item_no_unique.sql")
-    sql = open(path, encoding="utf-8").read()
+    sql = open(path, encoding="utf-8-sig").read()
     start = sql.index("CREATE TABLE IF NOT EXISTS document_queue_new")
     end = sql.index(";", start) + 1
     return sql[start:end].replace("document_queue_new", "document_queue")
@@ -148,7 +148,7 @@ def test_live_schema_matches():
 def test_migration_preserves_rows():
     print("\n--- 5. 018 마이그레이션이 행을 지우지 않는가 (SQL 정적 검사) ---")
     sql = open(os.path.join(MIGRATIONS, "018_document_queue_item_no_unique.sql"),
-               encoding="utf-8").read()
+               encoding="utf-8-sig").read()
     up = sql.upper()
     check_true("DELETE 문이 없다", "DELETE FROM" not in up, "행 삭제가 포함돼 있습니다")
     check_true("기존 행을 새 테이블로 이관한다",

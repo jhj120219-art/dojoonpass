@@ -165,10 +165,24 @@ def test_health_and_stats():
             "SELECT status, COUNT(*) FROM document_queue GROUP BY status")}
     finally:
         conn.close()
+    # ★ 상태 이름을 여기에 베껴 적지 않는다 (2026-08-18 Sprint 190).
+    #   Sprint 189가 큐 어휘를 늘리자(refresh / in_progress_refresh) 이 검사가
+    #   **틀렸는데도 통과하는 상태**가 됐다 — 아직 그 값을 가진 행이 실 DB에 없어서다.
+    #   `queue_in_progress`는 이제 두 진행 상태의 합인데, 여기서는 `in_progress`
+    #   하나만 세고 있었다. 첫 재수집이 도는 날 조용히 어긋난다.
+    #   BUGS #119("하드코딩 목록은 결함 없음과 아직 그 값이 안 나타났을 뿐을
+    #   구분하지 못한다")와 정확히 같은 부류라, 단일 소스에서 가져온다.
+    from storage.database import (
+        QUEUE_STATUS_PENDING, QUEUE_STATUS_REFRESH, QUEUE_IN_PROGRESS_STATUSES,
+    )
+
     check("document-stats queue_pending = document_queue(status=pending) 건수",
-          stats["queue_pending"], queue_pairs.get("pending", 0))
-    check("document-stats queue_in_progress = document_queue(status=in_progress) 건수",
-          stats["queue_in_progress"], queue_pairs.get("in_progress", 0))
+          stats["queue_pending"], queue_pairs.get(QUEUE_STATUS_PENDING, 0))
+    check("document-stats queue_refresh = document_queue(status=refresh) 건수",
+          stats["queue_refresh"], queue_pairs.get(QUEUE_STATUS_REFRESH, 0))
+    check("document-stats queue_in_progress = 진행 상태 두 갈래의 합",
+          stats["queue_in_progress"],
+          sum(queue_pairs.get(v, 0) for v in QUEUE_IN_PROGRESS_STATUSES))
     check("document-stats queue_failed = document_queue(status=failed) 건수",
           stats["queue_failed"], queue_pairs.get("failed", 0))
 
@@ -2361,7 +2375,7 @@ def test_plans_api():
 
     # 프론트에 가격 하드코딩이 되살아나지 않았는지 — 되살아나면 다시 드리프트가 생긴다
     if os.path.exists(DETAIL_PAGE_SOURCE):
-        with open(DETAIL_PAGE_SOURCE, encoding="utf-8") as f:
+        with open(DETAIL_PAGE_SOURCE, encoding="utf-8-sig") as f:
             source = f.read()
         for literal in ("12900", "22900", "154800", "274800", "198000"):
             check_true("no hardcoded price %s in detail page" % literal,

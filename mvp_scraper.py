@@ -15,6 +15,7 @@ from crawler.court_crawler import crawl_court
 from validator.validation_engine import ValidationEngine
 from normalizer.normalizer import normalize_batch
 from storage.database import init_db, upsert_batch, get_stats, enqueue_documents
+from storage.checkpoint import RunLock
 
 os.makedirs("logs", exist_ok=True)
 
@@ -27,6 +28,30 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# 동시 실행 방지 (2026-08-18 Sprint 194).
+# ---------------------------------------------------------------------------
+# `doc_worker.py` 는 2026-08-16 Sprint 142 부터 락을 갖고 있는데 **여기에는 없었다.**
+# 이 배치가 공유하는 변경 가능한 자원이 둘 있다:
+#
+#   logs/checkpoint.json   `CheckpointManager.save()` 가 파일 전체를 읽어 고쳐 쓴다.
+#                          두 실행이 겹치면 서로의 진행 상황을 덮어써, 이어받기가
+#                          엉뚱한 지점부터 시작하거나 통째로 사라진다.
+#   법원 서버              같은 사건을 두 배로 긁는다. 전체 크롤은 실측 약 3.1시간
+#                          (1곳 186초 x 60곳, Sprint 190)이라 겹칠 창이 넓다.
+#
+# 예약 작업끼리는 기본 MultipleInstances=IgnoreNew 로 안 겹치지만, **운영자의 수동
+# 실행이 스케줄 실행과 겹치는 경우**는 막지 못한다 — doc_worker 가 락을 둔 것과 같은 이유다.
+LOCK_PATH = os.path.join("logs", "mvp_scraper.lock")
+# 전체 크롤 실측 3.1시간(Sprint 190)보다 넉넉하게. 이 시간이 지난 락은 죽은 실행으로 보고
+# 회수한다 — 비정상 종료가 다음 날 실행을 영원히 막으면 안 된다.
+LOCK_STALE_HOURS = 6
+
+
+def _lock() -> RunLock:
+    """지금의 `LOCK_PATH`/`LOCK_STALE_HOURS` 로 락 객체를 만든다(스냅숏으로 굳히지 않는다)."""
+    return RunLock(LOCK_PATH, LOCK_STALE_HOURS, label="mvp_scraper")
+
 
 def save_csv_backup(rows: list) -> str:
     df = pd.DataFrame(rows)
@@ -136,32 +161,45 @@ def main() -> int:
     없었다** — 59/60 법원이 실패하고 저장이 0건이어도 배치는 성공으로 끝났다(2026-08-02 실측).
     """
     logger.info("===== 법원경매 사건 수집 시작 =====")
-    init_db()
-    outcome = CrawlOutcome()
-    rows = run_courts(ALL_COURTS, outcome)
 
-    # 06:00 루프는 여기서 끝. PDF 다운로드는 하지 않고,
-    # "아직 문서 없는 사건" 목록만 document_queue에 적재한다.
-    if rows:
-        enqueue_documents(rows)
-    else:
-        # 예전에는 이 분기가 아무 말 없이 지나갔다. 적재를 건너뛴 사실이 로그에 남아야
-        # document_queue가 늘지 않은 이유를 나중에 추적할 수 있다.
-        logger.warning("수집 결과가 비어 document_queue 적재를 건너뜁니다")
+    # 브라우저를 띄우기 전에 먼저 확인한다 — 어차피 실행하지 못할 거라면 비용을 쓰지 않는다
+    # (doc_worker 와 같은 순서). 얻지 못한 것은 **실패가 아니다** — 다른 실행이 이미 그
+    # 일을 하고 있으므로 종료 코드 0 으로 조용히 끝낸다.
+    lock = _lock()
+    if not lock.acquire():
+        logger.info("다른 mvp_scraper.py 실행이 이미 진행 중으로 보임 - 이번 실행은 건너뜀"
+                    "(체크포인트 충돌과 중복 크롤 방지, %s)", LOCK_PATH)
+        return 0
 
-    # 부분 실패는 성공으로 두되 **반드시 눈에 띄게** 남긴다. 이 줄이 없으면
-    # "일부 법원이 계속 실패 중"인 상태가 조용히 굳어진다.
-    if outcome.failed:
-        logger.warning("일부 법원 수집 실패: %d/%d곳 -> %s",
-                       len(outcome.failed), outcome.courts, outcome.failed)
+    try:
+        init_db()
+        outcome = CrawlOutcome()
+        rows = run_courts(ALL_COURTS, outcome)
 
-    reason = outcome.failure_reason()
-    if reason:
-        logger.error("===== 사건 수집 실패: %s =====", reason)
-    else:
-        logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d) =====",
-                    outcome.persisted, outcome.inserted, outcome.updated)
-    return outcome.exit_code()
+        # 06:00 루프는 여기서 끝. PDF 다운로드는 하지 않고,
+        # "아직 문서 없는 사건" 목록만 document_queue에 적재한다.
+        if rows:
+            enqueue_documents(rows)
+        else:
+            # 예전에는 이 분기가 아무 말 없이 지나갔다. 적재를 건너뛴 사실이 로그에 남아야
+            # document_queue가 늘지 않은 이유를 나중에 추적할 수 있다.
+            logger.warning("수집 결과가 비어 document_queue 적재를 건너뜁니다")
+
+        # 부분 실패는 성공으로 두되 **반드시 눈에 띄게** 남긴다. 이 줄이 없으면
+        # "일부 법원이 계속 실패 중"인 상태가 조용히 굳어진다.
+        if outcome.failed:
+            logger.warning("일부 법원 수집 실패: %d/%d곳 -> %s",
+                           len(outcome.failed), outcome.courts, outcome.failed)
+
+        reason = outcome.failure_reason()
+        if reason:
+            logger.error("===== 사건 수집 실패: %s =====", reason)
+        else:
+            logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d) =====",
+                        outcome.persisted, outcome.inserted, outcome.updated)
+        return outcome.exit_code()
+    finally:
+        lock.release()
 
 if __name__ == "__main__":
     sys.exit(main())

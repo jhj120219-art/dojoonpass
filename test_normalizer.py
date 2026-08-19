@@ -369,6 +369,91 @@ def run_sido_position():
     return failures
 
 
+# ---------------------------------------------------------------------------
+# 주소 끝 대괄호는 **면적 데이터의 유일한 소재지**다 (2026-08-18 Sprint 203 신설)
+#
+# 법원 목록의 소재지 칸은 주소 뒤에 물건 표시를 대괄호로 붙여 준다.
+#
+#     서울특별시 종로구 성균관로7길 37(명륜3가) 2층202호 [집합건물 철근콘크리트구조 29.95㎡]
+#     서울특별시 종로구 평창동 445-1 [토지 대 420㎡]
+#
+# `normalize_address()` 는 이 문자열을 **그대로** `full_address` 로 넘긴다. 의도해서
+# 보존한 것이 아니라 손대지 않아서 남아 있는 것에 가깝다. 그런데 실측 결과
+# **auction_item 1,876행 중 1,852행(98.7%)의 면적이 오직 여기에만 있다** —
+# 스키마에 면적 컬럼이 없고, 크롤러의 `property_list`(목록내역)는
+# `normalize_item()` 에서 통째로 버려지기 때문이다(Sprint 203 감사).
+#
+# 즉 누군가 "주소를 깔끔하게" 만들려고 대괄호를 떼는 순간, 이 저장소에서 면적은
+# **완전히 사라진다.** 오류도 빈 값도 아니고 주소가 예뻐질 뿐이라 알아챌 방법이 없다.
+# 그래서 여기에 못을 박는다. 면적 필터를 만들자는 이야기가 아니라, 이미 갖고 있는
+# 데이터를 조용히 잃지 않겠다는 것이다.
+#
+# 두 번째 검사(지번)는 실제 오작동 가능성이 있는 자리다. `lot_number` 정규식은
+# `(?=\s|$|\[)` 로 대괄호 앞에서 멈추는데, 이 lookahead 가 빠지면
+# `[토지 대 420㎡]` 의 **420 을 지번으로 집어간다.**
+# ---------------------------------------------------------------------------
+BRACKET_CASES = [
+    # (설명, 원본 주소, 기대 지번 = **실측한 현재 동작**)
+    #
+    # 지번 기대값은 "이래야 옳다"가 아니라 **지금 이렇게 나온다**를 고정한 것이다.
+    # 첫 사례가 빈 문자열인 것은 도로명주소("...로7길 37(명륜3가)")에서 숫자 뒤에
+    # 곧바로 괄호가 오면 lookahead 가 안 맞기 때문이다 - 별개의 사안이라 여기서
+    # 판단하지 않는다. 이 검사가 지키려는 것은 하나다:
+    # **대괄호 안의 숫자(면적/연식)가 지번으로 새어 나오지 않는다.**
+    ("집합건물 + 전유면적",
+     "서울특별시 종로구 성균관로7길 37(명륜3가) 2층202호 [집합건물 철근콘크리트구조 29.95\u33a1]",
+     ""),
+    ("토지 + 지목/면적",
+     "서울특별시 종로구 평창동 445-1 [토지 대 420\u33a1]",
+     "445-1"),
+    ("다층 건물 (면적이 여러 개)",
+     "서울특별시 중구 신당동 217-91 [건물 철근콘크리트구조 4\uce35 \ub2e4\uac00\uad6c\uc8fc\ud0dd 1\uce35 13.23\u33a1 2\uce35 164.7\u33a1]",
+     "217-91"),
+    ("차량 (면적 개념이 없다)",
+     "\uc0ac\uc6a9\ubcf8\uac70\uc9c0 : \uc778\ucc9c \ub0a8\ub3d9\uad6c \uc778\uc8fc\ub300\ub85c676\ubc88\uae38 19 2\ub3d9 406\ud638 [\uce74\ub2c8\ubc1c 2020\ub144\uc2dd \uc2b9\uc6a9\ucc28]",
+     "19"),
+]
+
+
+def run_bracket_preservation():
+    """주소 끝 대괄호(면적의 유일한 소재지)가 그대로 살아남는가."""
+    failures = []
+    print()
+    print("--- 주소 끝 대괄호 보존 (Sprint 203) ---")
+
+    for name, addr, exp_lot in BRACKET_CASES:
+        result = normalize_address(addr)
+        # 1) full_address 는 입력과 **글자 하나까지 같아야** 한다.
+        same = result["full_address"] == addr
+        print("[%s] %s: full_address 무손실" % ("PASS" if same else "FAIL", name))
+        if not same:
+            failures.append("full_address 무손실: " + name)
+            print("    got      %r" % (result["full_address"],))
+            print("    expected %r" % (addr,))
+
+        # 2) 대괄호가 살아 있고 그 안의 문자열도 그대로여야 한다.
+        opened = addr[addr.rfind("["):] if "[" in addr else ""
+        kept = bool(opened) and opened in result["full_address"]
+        print("[%s] %s: 대괄호 내용 보존" % ("PASS" if kept else "FAIL", name))
+        if not kept:
+            failures.append("대괄호 보존: " + name)
+
+        # 3) 대괄호 안의 숫자가 지번으로 새어 나오면 안 된다.
+        #    실측 고정 + "대괄호 안에서 나온 값이 아니다"를 함께 본다. 후자가 본론이고,
+        #    전자는 지번 규칙이 조용히 바뀌는 것을 알아채기 위한 것이다.
+        inner = addr[addr.rfind("[") + 1:-1] if "[" in addr else ""
+        lot = result["lot_number"]
+        leaked = bool(lot) and lot in inner
+        lot_ok = (lot == exp_lot) and not leaked
+        print("[%s] %s: 지번이 대괄호 숫자가 아니다 (%r)"
+              % ("PASS" if lot_ok else "FAIL", name, lot))
+        if not lot_ok:
+            failures.append("지번 오염: " + name)
+            print("    expected %r / 대괄호에서 샜는가=%s" % (exp_lot, leaked))
+
+    return failures
+
+
 def run():
     failures = []
 
@@ -414,12 +499,13 @@ def run():
     failures += run_value_normalizers()
     failures += run_sido_position()
     failures += run_batch_isolation()
+    failures += run_bracket_preservation()
 
     print()
     if failures:
         print(f"{len(failures)}건 실패: {failures}")
         return 1
-    print(f"전체 {len(CASES) + 3 + len(PRICE_CASES) + len(DATE_CASES) + 6 + len(SIDO_POSITION_CASES) + 3}건 통과")
+    print(f"전체 {len(CASES) + 3 + len(PRICE_CASES) + len(DATE_CASES) + 6 + len(SIDO_POSITION_CASES) + 3 + len(BRACKET_CASES) * 3}건 통과")
     return 0
 
 

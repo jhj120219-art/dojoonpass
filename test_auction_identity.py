@@ -598,6 +598,18 @@ def test_document_queue_writes_are_court_scoped():
     print("   프로덕션 .py %d개(추적+미추적)에서 document_queue 쓰기 문장 %d개 검사"
           % (len(files), scanned))
 
+    # ★ 하한을 함께 고정한다 (2026-08-18 Sprint 205).
+    #
+    #   위 검사는 "나쁜 것이 없다"만 말한다. 파일 열거나 정규식이 깨져 **한 곳도 훑지
+    #   못하면** violations 는 당연히 비고, 이 검사는 조용히 초록이 된다. 그런데 이것이
+    #   지키는 것은 BUGS #18 계열(법원 없이 case_no 로 쓰면 다른 법원 행을 덮는다)이라
+    #   침묵하면 안 되는 자리다.
+    #
+    #   실측(2026-08-18): 프로덕션 .py 86개에서 쓰기 문장 15개.
+    _check_true("훑을 파일을 실제로 찾았다 (%d개)" % len(files), len(files) >= 40, len(files))
+    _check_true("document_queue 쓰기 문장을 실제로 찾았다 (%d개)" % scanned,
+               scanned >= 8, scanned)
+
 
 
 def test_migrate_reports_actual_changes():

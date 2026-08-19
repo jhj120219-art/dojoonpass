@@ -32,9 +32,14 @@ export default function RangeSelect({
     <div>
       <span className={labelClassName}>{label}</span>
       <div className="grid grid-cols-2 gap-2">
+        {/* aria-label 은 **픽셀을 바꾸지 않는다** (2026-08-19 Sprint 222).
+            `<span>` 으로 그린 레이블은 시각적으로만 붙어 있고 select 와 프로그래밍적으로
+            연결돼 있지 않다 - 스크린리더는 "콤보박스"라고만 읽는다. 최소/최대가 나란히
+            둘이라 어느 쪽인지도 알 수 없다. 보이는 레이블을 그대로 이름으로 준다. */}
         <select
           value={minValue}
           onChange={(e) => onMinChange(e.target.value)}
+          aria-label={`${label} 최소`}
           className={selectClassName}
         >
           <option value="">최소 {placeholder}</option>
@@ -53,6 +58,7 @@ export default function RangeSelect({
         <select
           value={maxValue}
           onChange={(e) => onMaxChange(e.target.value)}
+          aria-label={`${label} 최대`}
           className={selectClassName}
         >
           <option value="">최대 {placeholder}</option>

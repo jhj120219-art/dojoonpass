@@ -185,6 +185,7 @@ export default function SearchPresets() {
         <input
           type="text"
           placeholder="검색조건 이름"
+          aria-label="검색조건 이름"
           value={name}
           maxLength={50}
           onChange={(e) => setName(e.target.value)}
@@ -199,14 +200,14 @@ export default function SearchPresets() {
           저장
         </button>
       </div>
-      {saveError && <p className="text-xs text-red-500 mt-2">{saveError}</p>}
+      {saveError && <p role="alert" className="text-xs text-red-500 mt-2">{saveError}</p>}
 
       {!authChecked ? null : !accessToken ? (
         <p className="text-xs text-gray-400 mt-3">로그인하면 검색조건을 저장하고 불러올 수 있습니다</p>
       ) : (
         <div className="mt-3 pt-3 border-t border-gray-50">
           {listLoading && <p className="text-xs text-gray-400">불러오는 중...</p>}
-          {listError && <p className="text-xs text-red-500">{listError}</p>}
+          {listError && <p role="alert" className="text-xs text-red-500">{listError}</p>}
           {!listLoading && !listError && presets.length === 0 && (
             <p className="text-xs text-gray-400">저장된 검색조건이 없습니다</p>
           )}

@@ -64,8 +64,18 @@ HORIZONTAL_BAR = "―"  # 대체 문자 — cp949 0xA1AA, 시각적으로 동일
 # `check_db_path.py`가 "크롤러와 API가 같은 DB를 보는가"라는 답을 출력하는 바로 그 줄에서
 # 죽고 있었다(✅ U+2705). 커밋되지 않는 파일이라도 개발자가 실제로 돌리는 도구다.
 # 신규 클론에 그 파일들이 없으면 검사 대상에서 자연히 빠질 뿐 실패하지 않는다.
+#
+# ★ `.claude` 를 빼야 하는 이유 (2026-08-19 Sprint 223, BUGS #154).
+#   이 저장소에는 `.claude/worktrees/sprint95-false-success-audit/` 가 남아 있다 —
+#   Sprint 95 시점 커밋(c4f74e6)의 **저장소 통째 사본**이다.
+#   제외하기 전 실측: 스캔한 .py 298개 중 **101개(34%)가 그 사본**이었다.
+#   아무도 실행하지 않는 얼린 스냅샷에 규칙을 강제했고, 그 안에 위반이
+#   하나라도 있었으면 **현재 코드가 멀집한데도 빨간불**이 켜졌을 것이다.
+#   형제 검사인 `test_doc_path_safety.py` 는 이미 `.claude` 를 제외하고 있었다 —
+#   둘이 같은 범위를 보도록 맞춘다.
 SKIP_DIRS = {
-    "node_modules", ".next", ".git", "__pycache__",
+    "node_modules", ".next", ".git", "__pycache__", ".claude",
+    "venv", ".venv", "htmlcov",
     "documents", "documents_quarantine", "registry_documents", "downloads",
 }
 
@@ -397,7 +407,23 @@ def test_known_operator_warnings_are_safe():
           EM_DASH in payment_logs_src, True)
 
 
+def test_scan_scope_excludes_snapshots():
+    """스캔 범위가 **지금 돌아가는 코드**만 담고 있는가 (BUGS #154).
+
+    이 검사가 없으면 SKIP_DIRS 가 조용히 있으나 마나 한다 —
+    범위가 넓어져도(사본을 검사) 좁아져도(0개를 검사) 둘 다 초록으로 보인다.
+    """
+    print(chr(10) + "--- 스캔 범위 ---")
+    files = [os.path.relpath(p, ROOT).replace(os.sep, "/") for p in python_files()]
+    leaked = sorted(f for f in files if f.startswith(".claude/") or "/.claude/" in f)
+    check("★ 저장소 사본(.claude/worktrees)을 검사하지 않는다", leaked[:5], [])
+    # 하한 — 제외가 과해서 0개를 훑고 조용히 통과하는 것을 막는다.
+    check("검사 대상 .py 를 실제로 찾았다(검사가 공허하지 않다)", len(files) >= 120, True)
+    print("    검사 대상 .py %d개" % len(files))
+
+
 def run():
+    test_scan_scope_excludes_snapshots()
     test_all_output_literals_are_console_encodable()
     test_replacement_character_is_valid()
     test_print_actually_survives_cp949_stream()

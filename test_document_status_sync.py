@@ -517,9 +517,22 @@ def test_retry_recovery_restores_screen_status():
 
     # (2) 이미 수집 성공한 문서(READY)는 건드리지 않는다 — 가장 중요한 반대 방향이다.
     #     큐가 어떤 이유로 failed였더라도 파일이 있으면 사용자는 그것을 볼 수 있어야 한다.
+    #
+    # ★ 큐 기대값이 'pending' -> 'refresh' 로 바뀌었다 (2026-08-18 Sprint 210).
+    #   **회귀가 아니라 계약 변경이다.** 이 검사의 의도("회수는 그대로 일어난다")는
+    #   그대로이고, 회수 대상 상태만 달라졌다.
+    #
+    #   왜 바꿨나: 실체(READY)가 있는 행을 'pending' 으로 되돌리면 수집기가
+    #   `doc_exists(...) and not overwrite` 에 걸려 즉시 success=True 로 끝낸다 —
+    #   그 재시도는 **구조적으로 아무 일도 하지 않고** 큐만 done 으로 종결시킨다.
+    #   재수집으로 예약됐다가 재시도가 소진된 행이 정확히 이 모양이 되어,
+    #   법원이 바꾼 문서가 영원히 옛것으로 남았다(fixture 재현, BUGS #142).
+    #
+    #   화면 방향(READY 를 COLLECTING 으로 덮지 않는다)은 **그대로 유지**된다 —
+    #   아래 두 번째 단언이 그것을 계속 지킨다.
     with TempDB() as db:
         q, ds = _make_stale(db, "failed", "READY", "-2 days")
-        check("회수는 그대로 일어난다", q, "pending")
+        check("회수는 일어나되 헛돌지 않는 상태로 되돌아온다", q, "refresh")
         check("READY는 COLLECTING으로 덮이지 않는다", ds, "READY")
 
     # (3) in_progress 회수(죽은 Worker)는 화면 상태를 건드릴 이유가 없다.

@@ -24,6 +24,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +51,20 @@ def check_true(name, cond, detail=""):
 # 실제 파일을 저장소에 넣지 않는다 — 테스트가 외부 파일에 의존하면 그 파일이 사라졌을 때
 # 조용히 못 돌게 된다. 대신 각 형식의 **진짜 헤더**를 코드로 만든다(크기 판정까지 검증된다).
 # ---------------------------------------------------------------------------
+
+# 픽스처 사진의 최소 pad (2026-08-19 Sprint 218, BUGS #148).
+# ---------------------------------------------------------------------------
+# 서빙 계층은 `MIN_IMAGE_BYTES`(1,024) 미만을 **404 로 거절한다**
+# (`api/v1/images.py`, `image_exists()`). 그런데 이 파일의 픽스처들은 오랫동안
+# 100~200바이트짜리 사진으로 "auction_image 2행 / images_status=READY" 를
+# 단언하고 있었다 — **그 사진들은 실제로는 한 장도 서빙될 수 없는 크기**다.
+#
+# 즉 픽스처가 파이프라인 전체가 받아들이지 않는 데이터로 "정상"을 그리고 있었다.
+# 저장 계층이 같은 하한을 갖게 되면서(BUGS #148) 그 사실이 드러났다.
+# 여기서 한 번에 올려 둔다 — 개별 pad 는 "서로 다른 바이트"를 만들기 위한 것이므로
+# 하한만 더해 주면 의도는 그대로다.
+MIN_FIXTURE_PAD = 2048
+
 
 def make_jpeg(width=525, height=700, pad=2048):
     """SOI + APP0 + SOF0(크기 포함) + EOI. 실제 JPEG 파서가 크기를 읽을 수 있는 최소 형태."""
@@ -125,14 +140,24 @@ class Env:
         import crawler.doc_paths as dp
         import crawler.image_assets as ia
         import api.v1.images as apiimg
+        # ★ 문서 서빙 모듈도 **자기 DOCUMENT_ROOT 를 따로 들고 있다**
+        #   (2026-08-19 Sprint 217). 이것을 안 바꾸면 픽스처가 임시 루트에 파일을
+        #   써 놓고 API 는 운영 `documents/` 를 뒤져 **항상 404** 가 된다 —
+        #   그리고 그 404 는 "파일이 없다"는 정상 응답과 구별되지 않는다.
+        #   실제로 12-L 을 쓰다가 이 함정에 빠졌다(뷰어가 200 이어야 하는데 404).
+        import api.v1.documents as apidoc
         self.dbmod, self.dp, self.ia, self.apiimg = dbmod, dp, ia, apiimg
+        self.apidoc = apidoc
         self._orig = (dbmod.DB_PATH, dp.DOCUMENT_ROOT, ia.DOCUMENT_ROOT,
-                      apiimg.DOCUMENT_ROOT, apiimg.PROJECT_ROOT)
+                      apiimg.DOCUMENT_ROOT, apiimg.PROJECT_ROOT,
+                      apidoc.DOCUMENT_ROOT, apidoc.PROJECT_ROOT)
         dbmod.DB_PATH = os.path.join(self.dir, "t.db")
         dp.DOCUMENT_ROOT = self.docs
         ia.DOCUMENT_ROOT = self.docs
         apiimg.DOCUMENT_ROOT = self.docs
         apiimg.PROJECT_ROOT = self.dir
+        apidoc.DOCUMENT_ROOT = self.docs
+        apidoc.PROJECT_ROOT = self.dir
 
         # 스키마는 실제 부트스트랩 3단계 그대로(테스트가 스키마를 손으로 베끼지 않는다 —
         # `test_collect_documents.py`가 같은 이유로 같은 방식을 쓴다).
@@ -145,7 +170,8 @@ class Env:
 
     def close(self):
         (self.dbmod.DB_PATH, self.dp.DOCUMENT_ROOT, self.ia.DOCUMENT_ROOT,
-         self.apiimg.DOCUMENT_ROOT, self.apiimg.PROJECT_ROOT) = self._orig
+         self.apiimg.DOCUMENT_ROOT, self.apiimg.PROJECT_ROOT,
+         self.apidoc.DOCUMENT_ROOT, self.apidoc.PROJECT_ROOT) = self._orig
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def conn(self):
@@ -626,6 +652,463 @@ def test_image_change_detection():
         env.close()
 
 
+def test_format_change_leaves_no_ghost_file():
+    """법원이 같은 자리 사진을 **다른 형식**으로 바꿔 끼운 경우 (2026-08-18 Sprint 189, BUGS #120).
+
+    ## 왜 이 검사가 생겼나
+
+    파일 이름이 `<순번>.<확장자>`라 확장자가 곧 이름의 일부다. `sniff_image_ext()`는
+    선언된 MIME이 아니라 **실제 바이트**로 형식을 판정하므로(법원은 JPEG를
+    `image/png`로 선언한다), 원본이 JPEG -> PNG로 바뀌면 저장 경로도 `01.jpg` -> `01.png`로
+    함께 바뀐다. 그런데 **옛 `01.jpg`를 아무도 지우지 않았다.**
+
+    결과가 둘 다 나쁘다:
+
+        고아 파일   `auction_image`는 UNIQUE(item_id, seq)라 새 경로 한 줄만 갖는다
+                    -> 옛 파일은 아무도 가리키지 않은 채 디스크에 영원히 남는다
+        거짓 개정   `_existing_set_hash()`가 같은 순번을 **두 번** 세어, 순번당 한 장을
+                    전제로 만든 수집 쪽 `new_hash`와 공식이 갈라진다
+                    -> 이후 매 수집이 "변경됨"이 되어 **진짜 개정을 찾을 수 없다**
+
+    두 번째가 치명적이다. 바로 위 5-C가 지키는 불변식("내용이 같으면 지문도 같다")을
+    **형식 변경 한 번으로 영구히 깨뜨린다.** 재수집(Sprint 189)을 켜는 순간 도달하는 경로다.
+    """
+    print("\n--- 5-D. 형식이 바뀌어도 같은 순번에 파일이 하나만 남는다 (Sprint 189) ---")
+    from crawler.image_crawler import collect_images, _existing_set_hash
+    from crawler.image_assets import list_stored_images
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+
+        # (1) JPEG로 최초 수집
+        first = collect_images(FakeDriver([img_el("전경도", 1, make_jpeg(525, 700))]),
+                               court, case_no, item_no)
+        check("최초 수집 성공", first["success"], True)
+        check("저장 파일 1개", [os.path.basename(r["path"])
+                                for r in list_stored_images(court, case_no, item_no)],
+              ["01.jpg"])
+
+        # (2) 같은 순번을 PNG로 교체해 재수집
+        second = collect_images(FakeDriver([img_el("전경도", 1, make_png(300, 200))]),
+                                court, case_no, item_no, overwrite=True)
+        check("교체 수집 성공", second["success"], True)
+
+        names = sorted(os.path.basename(r["path"])
+                       for r in list_stored_images(court, case_no, item_no))
+        check("같은 순번에 파일이 하나만 남는다(옛 확장자 정리)", names, ["01.png"])
+
+        # (3) 결정적 검사 — 디스크 공식과 수집 공식이 여전히 일치하는가.
+        #     고아가 남으면 여기서 두 값이 갈라진다(그리고 이후 모든 수집이 거짓 개정이 된다).
+        check("교체 뒤에도 디스크 지문 == 방금 수집한 지문",
+              _existing_set_hash(court, case_no, item_no), second["new_hash"])
+
+        # (4) 같은 PNG로 한 번 더 — 거짓 개정이 생기지 않아야 한다.
+        third = collect_images(FakeDriver([img_el("전경도", 1, make_png(300, 200))]),
+                               court, case_no, item_no, overwrite=True)
+        check("내용이 같으면 지문도 같다(형식 변경 이후에도 유지)",
+              third["previous_hash"], third["new_hash"])
+
+        # (5) DB가 가리키는 경로가 실제 파일이다(고아 경로를 들고 있지 않다).
+        c = env.conn()
+        try:
+            rows = c.execute("SELECT seq, storage_path FROM auction_image"
+                             " WHERE item_id=1 ORDER BY seq").fetchall()
+        finally:
+            c.close()
+        from storage.database import save_auction_images
+        save_auction_images(court, case_no, item_no, third["images"], complete=True)
+        c = env.conn()
+        try:
+            rows = c.execute("SELECT seq, storage_path FROM auction_image"
+                             " WHERE item_id=1 ORDER BY seq").fetchall()
+        finally:
+            c.close()
+        check("DB 행도 순번당 하나", [r["seq"] for r in rows], [1])
+        check_true("DB가 가리키는 파일이 실제로 있다",
+                   all(os.path.isfile(os.path.join(env.dir, r["storage_path"])) for r in rows),
+                   [r["storage_path"] for r in rows])
+    finally:
+        env.close()
+
+
+def test_duplicate_seq_on_disk_refuses_to_fingerprint():
+    """같은 순번 파일이 둘이면 지문 비교를 **포기**한다 (2026-08-18 Sprint 189).
+
+    위 5-D가 이제 그런 잔재를 만들지 않지만, 과거 수집이 남긴 것이 있을 수 있다.
+    반쪽 지문으로 비교하면 바뀌지 않았는데 "변경됨"으로 기록된다 — `OSError` 분기가
+    같은 이유로 이미 `""`를 돌려주는 것과 같은 판단이다.
+    """
+    print("\n--- 5-E. 같은 순번 중복 파일이면 지문을 만들지 않는다 (Sprint 189) ---")
+    from crawler.image_crawler import _existing_set_hash
+    from crawler.image_assets import image_path, ensure_image_dir
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        ensure_image_dir(court, case_no, item_no)
+        with open(image_path(court, case_no, item_no, 1, "jpg"), "wb") as f:
+            f.write(make_jpeg(100, 100))
+        check_true("한 장이면 지문이 나온다",
+                   bool(_existing_set_hash(court, case_no, item_no)))
+
+        with open(image_path(court, case_no, item_no, 1, "png"), "wb") as f:
+            f.write(make_png(100, 100))
+        check("같은 순번이 둘이면 빈 지문(비교 포기)",
+              _existing_set_hash(court, case_no, item_no), "")
+    finally:
+        env.close()
+
+
+def test_refresh_does_not_rewrite_identical_photos():
+    """재수집이어도 **바이트가 같으면 파일을 다시 쓰지 않는다** (2026-08-18 Sprint 189).
+
+    ## 왜 이 검사가 생겼나
+
+    법원 사진은 base64 로 페이지에 박혀 오므로 "다시 받는 비용"은 0이다. 그래서 재수집을
+    켤 때 `overwrite=True` 로 무조건 다시 쓰는 것이 자연스러워 보인다. 그런데 같은 바이트를
+    다시 쓰면 **mtime 이 바뀐다.** 서빙 쪽 ETag 는 Starlette 가 (mtime, size) 로 만들기
+    때문에(`api/v1/images.py` + `api/http_cache.py`), 내용이 그대로여도 **모든 브라우저
+    캐시가 무효화되어 물건당 약 1.3~1.9MB 를 다시 내려받는다.**
+
+    재수집 대상은 정의상 "사용자가 지금 보고 있는" 물건이라 체감이 가장 큰 자리다.
+    목표 문서의 상황 A("이미지가 동일함 -> 재다운로드/불필요한 변경 최소화")가 정확히 이것이다.
+
+    ★ 대조군을 함께 고정한다 — 사진이 **바뀌면** 반드시 쓴다. 구분하지 못하면 이 검사는
+      "아무것도 안 하는 재수집"을 통과시켜 버린다.
+    """
+    print("\n--- 5-F. 재수집이어도 같은 사진은 다시 쓰지 않는다 (Sprint 189) ---")
+    from crawler.image_crawler import collect_images
+    from crawler.image_assets import image_path
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        same_bytes = make_jpeg(525, 700)
+
+        first = collect_images(FakeDriver([img_el("전경도", 1, same_bytes),
+                                          img_el("전경도", 2, same_bytes)]),
+                               court, case_no, item_no)
+        check("최초 수집 성공", first["success"], True)
+
+        p1 = image_path(court, case_no, item_no, 1, "jpg")
+        p2 = image_path(court, case_no, item_no, 2, "jpg")
+        before = (os.stat(p1).st_mtime_ns, os.stat(p2).st_mtime_ns)
+
+        # 같은 사진으로 재수집 — 파일을 건드리면 안 된다.
+        again = collect_images(FakeDriver([img_el("전경도", 1, same_bytes),
+                                          img_el("전경도", 2, same_bytes)]),
+                               court, case_no, item_no, overwrite=True)
+        check("재수집도 성공", again["success"], True)
+        check("지문이 같다(개정 아님)", again["previous_hash"], again["new_hash"])
+        check("mtime 이 그대로다(ETag 보존)",
+              (os.stat(p1).st_mtime_ns, os.stat(p2).st_mtime_ns), before)
+        # DB 갱신에 필요한 정보는 그대로 돌려줘야 한다 — 안 그러면 auction_image 가
+        # "이번에 아무것도 안 왔다"로 오해해 옛 행을 지운다(부분수집 보호와 충돌).
+        check("사진 목록은 그대로 돌려준다", [i["seq"] for i in again["images"]], [1, 2])
+        check("파일 크기도 담겨 있다",
+              [i["file_size"] for i in again["images"]], [len(same_bytes)] * 2)
+
+        # 대조군 — 2번만 바뀌면 2번만 다시 쓴다.
+        other = make_jpeg(300, 400)
+        third = collect_images(FakeDriver([img_el("전경도", 1, same_bytes),
+                                          img_el("전경도", 2, other)]),
+                               court, case_no, item_no, overwrite=True)
+        check("변경 수집 성공", third["success"], True)
+        # ★ 방향에 따라 근거를 다르게 쓴다.
+        #   "안 썼다"는 mtime 으로 확실히 말할 수 있다(쓰지 않았으면 절대 안 바뀐다).
+        #   "썼다"는 mtime 으로 말할 수 없다 — Windows 파일시스템의 타임스탬프 갱신
+        #   간격보다 두 쓰기가 더 가까우면 같은 값이 나온다(실측으로 실제 플레이크를
+        #   겪었다). 그래서 그쪽은 **내용**으로 확인한다.
+        check("바뀌지 않은 1번은 mtime 유지", os.stat(p1).st_mtime_ns, before[0])
+        check("바뀌지 않은 1번은 내용도 그대로",
+              hashlib.sha256(open(p1, "rb").read()).hexdigest(),
+              hashlib.sha256(same_bytes).hexdigest())
+        check("2번 내용이 실제로 교체된다",
+              hashlib.sha256(open(p2, "rb").read()).hexdigest(),
+              hashlib.sha256(other).hexdigest())
+        check_true("집합 지문이 바뀐다(개정 감지)",
+                   third["previous_hash"] != third["new_hash"],
+                   (third["previous_hash"], third["new_hash"]))
+
+        # ★ 로그/반환값이 **사실**을 말하는가 (2026-08-18 Sprint 190).
+        #   무변경 스킵이 생긴 뒤로 완료 로그가 "5장 저장 완료"를 **한 장도 안 썼을 때도**
+        #   찍고 있었다(실 브라우저 실행에서 실측). BUGS #47 이래 이 저장소가 반복해
+        #   잡아 온 "로그가 거짓을 말한다" 부류라, 숫자를 반환값에도 담아 고정한다.
+        check("무변경 재수집: 쓴 장수 0 / 그대로 둔 장수 2",
+              (again["written"], again["unchanged"]), (0, 2))
+        check("1장만 바뀐 재수집: 쓴 장수 1 / 그대로 둔 장수 1",
+              (third["written"], third["unchanged"]), (1, 1))
+        check("최초 수집: 쓴 장수 2 / 그대로 둔 장수 0",
+              (first["written"], first["unchanged"]), (2, 0))
+    finally:
+        env.close()
+
+
+def test_reduced_photo_count_removes_files_too():
+    """법원이 사진 수를 줄이면 **파일까지** 정리되는가 (2026-08-18 Sprint 191, BUGS #127).
+
+    ## 왜 이 검사가 생겼나
+
+    `save_auction_images()`는 DB 행만 지운다. **파일은 아무도 안 지웠다.** 그래서
+    5장 -> 3장으로 줄면 04/05 파일이 디스크에 영원히 남았다. 결과는 둘 다 나쁘다:
+
+        고아 파일   auction_image 가 가리키지 않는 파일이 계속 쌓인다
+        거짓 개정   `_existing_set_hash()`는 **파일시스템**을 근거로 삼으므로 옛 파일까지
+                    세고, 수집 쪽 공식(이번에 받은 것만)과 갈라진다
+                    -> 이후 매 수집이 "변경됨"
+
+    두 번째가 BUGS #120과 **완전히 같은 실패 방식**이다. #120을 고칠 때 "같은 순번의 다른
+    확장자"만 봤고, "이제 존재하지 않는 순번"은 놓쳤다 — 그래서 계열 전수 검색으로 찾았다.
+
+    재현(2026-08-18, 수정 전): 5장 -> 3장 재수집 후 디스크에 5개가 그대로 남고
+    `previous_hash`(5장 기준) != `new_hash`(3장 기준)가 영구히 성립했다.
+
+    ## 대조군이 핵심이다
+
+    "지운다"만 검사하면 **부분 수집에서도 지우는** 구현이 통과한다. 그건 사용자가 보던
+    사진을 잃는, 고치려던 것보다 나쁜 결함이다. 그래서 세 경우를 함께 고정한다.
+    """
+    print("\n--- 5-G. 사진이 줄면 파일도 정리된다 (Sprint 191, BUGS #127) ---")
+    from crawler.image_crawler import collect_images, _existing_set_hash
+    from crawler.image_assets import list_stored_images
+
+    def names(court, case_no, item_no):
+        return sorted(os.path.basename(r["path"])
+                      for r in list_stored_images(court, case_no, item_no))
+
+    # (D) 법원이 실제로 줄였다 -> 파일도 정리된다
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        five = [img_el("전경도", i, make_jpeg(100 + i, 200)) for i in range(1, 6)]
+        first = collect_images(FakeDriver(list(five)), court, case_no, item_no)
+        check("최초 5장", len(first["images"]), 5)
+        check("디스크 5개", names(court, case_no, item_no),
+              ["01.jpg", "02.jpg", "03.jpg", "04.jpg", "05.jpg"])
+
+        three = [img_el("전경도", i, make_jpeg(100 + i, 200)) for i in range(1, 4)]
+        second = collect_images(FakeDriver(list(three)), court, case_no, item_no,
+                                overwrite=True)
+        check("재수집 3장", len(second["images"]), 3)
+        check("부분 수집이 아니다", second["partial"], False)
+        check("디스크도 3개로 줄었다", names(court, case_no, item_no),
+              ["01.jpg", "02.jpg", "03.jpg"])
+        # ★ 결정적 검사 — 두 공식이 다시 일치하는가(고아가 남으면 여기서 갈라진다)
+        check("디스크 지문 == 방금 수집한 지문",
+              _existing_set_hash(court, case_no, item_no), second["new_hash"])
+
+        # 같은 3장으로 한 번 더 — 거짓 개정이 생기지 않아야 한다
+        third = collect_images(FakeDriver(list(three)), court, case_no, item_no,
+                               overwrite=True)
+        check("줄어든 뒤에도 무변경이면 지문이 같다",
+              third["previous_hash"], third["new_hash"])
+    finally:
+        env.close()
+
+    # (B) 부분 수집이면 **절대** 지우지 않는다
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        five = [img_el("전경도", i, make_jpeg(100 + i, 200)) for i in range(1, 6)]
+        collect_images(FakeDriver(list(five)), court, case_no, item_no)
+        check("최초 디스크 5개", len(names(court, case_no, item_no)), 5)
+
+        # 3장은 정상, 2장은 디코드 실패 -> attempted 5 / saved 3 -> partial
+        broken = ([img_el("전경도", i, make_jpeg(100 + i, 200)) for i in range(1, 4)]
+                  + [img_el("전경도", i, b"") for i in (4, 5)])
+        part = collect_images(FakeDriver(broken), court, case_no, item_no, overwrite=True)
+        check("부분 수집으로 판정된다", part["partial"], True)
+        check("부분 수집이면 파일을 지우지 않는다", names(court, case_no, item_no),
+              ["01.jpg", "02.jpg", "03.jpg", "04.jpg", "05.jpg"])
+    finally:
+        env.close()
+
+    # (C) 전체 실패면 아무것도 잃지 않는다
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        five = [img_el("전경도", i, make_jpeg(100 + i, 200)) for i in range(1, 6)]
+        collect_images(FakeDriver(list(five)), court, case_no, item_no)
+
+        allbad = [img_el("전경도", i, b"") for i in range(1, 6)]
+        fail = collect_images(FakeDriver(allbad), court, case_no, item_no, overwrite=True)
+        check("전체 실패는 success=False", fail["success"], False)
+        check("전체 실패에도 기존 사진 전부 보존", names(court, case_no, item_no),
+              ["01.jpg", "02.jpg", "03.jpg", "04.jpg", "05.jpg"])
+    finally:
+        env.close()
+
+
+def test_court_removed_all_photos_needs_two_sightings():
+    """법원이 사진을 **전부** 내렸을 때 (2026-08-18 Sprint 191, BUGS #128).
+
+    ## 왜 이 경로만 빠져 있었나
+
+    사진 감소는 `save_auction_images()`가 처리하는데, `doc_worker` 는
+    `if result.get("images")` 로 가드하므로 **0장으로 줄어드는 경우만 그 함수에 도달하지
+    않는다**(빈 목록은 전체 실패와 구별되지 않으니 그 가드 자체는 옳다). 그래서:
+
+        법원이 전부 내림 -> document_status = NO_IMAGE (상태만 바뀜)
+                        -> auction_image 행/파일은 그대로
+                        -> `_images_status()` 는 "행이 있으면 무조건 READY"
+                        -> **사용자는 법원이 내린 사진을 영원히 본다**
+
+    ## 두 번 확인 규칙
+
+    "법원이 내렸다"와 "이번 관측이 실패했다"는 한 번으로 구별할 수 없고, 사진을 전부
+    지우는 것은 이 파이프라인에서 가장 파괴적인 동작이다. 그래서 1회차는 남기고
+    2회차에 정리한다. 1회차 기억은 `document_status` 자체가 한다(새 컬럼 없음).
+    """
+    print("\n--- 5-H. 법원이 사진을 전부 내렸다: 2회 확인 후 정리 (Sprint 191, BUGS #128) ---")
+    from storage.database import (clear_images_if_absence_confirmed,
+                                  save_auction_images, _set_document_status,
+                                  get_connection)
+    from crawler.image_assets import remove_stored_image_files, image_path, ensure_image_dir
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        ensure_image_dir(court, case_no, item_no)
+        imgs = []
+        for seq in (1, 2, 3):
+            pth = image_path(court, case_no, item_no, seq, "jpg")
+            with open(pth, "wb") as f:
+                f.write(make_jpeg(100 + seq, 200))
+            imgs.append({"seq": seq, "kind": "전경도", "path": pth,
+                         "file_hash": "h%d" % seq, "width": 1, "height": 1})
+        save_auction_images(court, case_no, item_no, imgs)
+        check("사진 3장 기록", len(env.images_of(1)), 3)
+
+        # --- 1회차: 상태가 아직 READY 인데 no_asset 이 관측됐다 -> 남긴다 ---
+        first = clear_images_if_absence_confirmed(court, case_no, item_no)
+        check("1회차는 지우지 않는다", first["cleared"], 0)
+        check("1회차임을 알린다", first["first_sighting"], True)
+        check("사진 3장 그대로", len(env.images_of(1)), 3)
+        check("파일도 그대로", len(os.listdir(os.path.dirname(imgs[0]["path"]))), 3)
+
+        # doc_worker 는 이어서 mark_queue_done(status='NO_IMAGE') 을 부른다 — 그 효과를 재현
+        conn = get_connection()
+        try:
+            _set_document_status(conn, court, case_no, item_no, "image", "NO_IMAGE")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # --- 2회차: 이미 NO_IMAGE 인데 또 no_asset -> 이제 정리한다 ---
+        second = clear_images_if_absence_confirmed(court, case_no, item_no)
+        check("2회차에 정리한다", second["cleared"], 3)
+        check("2회차는 1회차가 아니다", second["first_sighting"], False)
+        check("DB 행이 비었다", len(env.images_of(1)), 0)
+
+        gone = remove_stored_image_files(second["paths"])
+        check("파일도 정리된다", gone, 3)
+        check("디렉터리가 비었다",
+              os.listdir(os.path.dirname(imgs[0]["path"])), [])
+
+        # --- 3회차: 지울 것이 없으면 조용히 0 ---
+        third = clear_images_if_absence_confirmed(court, case_no, item_no)
+        check("이미 비었으면 아무 일도 없다", (third["cleared"], third["first_sighting"]),
+              (0, False))
+
+        # --- 정리 후 화면 상태가 정직해진다 (핵심 사용자 영향) ---
+        from api.v1.item import _images_status
+        rows = [{"doc_type": "IMAGE", "status": "NO_IMAGE"}]
+        check("행이 사라지면 화면도 '사진 없음'으로 답한다",
+              _images_status(rows, 0), "NO_IMAGE")
+        check("행이 남아 있는 동안에는 READY(볼 수 있는 것은 사실이다)",
+              _images_status(rows, 3), "READY")
+    finally:
+        env.close()
+
+
+def test_three_sources_never_diverge():
+    """★ 구조적 가드: **수집 결과 / 디스크 / DB** 세 근거가 절대 갈라지지 않는다.
+
+    ## 왜 목록이 아니라 불변식인가
+
+    이 저장소의 사진 결함은 전부 **같은 한 문장**으로 요약된다 —
+    *"세 근거 중 둘이 갈라졌다."*
+
+        BUGS #113  수집 결과에는 지문이 있는데 비교 대상(디스크)을 안 봤다
+        BUGS #114  디스크는 줄었는데 DB를 지웠다(부분 수집인데)
+        BUGS #120  형식이 바뀌자 디스크에 순번이 둘이 됐다(수집 결과는 하나)
+        BUGS #127  DB는 줄었는데 디스크가 안 줄었다
+        BUGS #128  법원은 0장인데 DB/디스크가 그대로였다
+
+    개별 검사를 하나씩 늘리는 방식은 **다음 인스턴스를 못 잡는다**(#120을 고칠 때
+    #127을 놓친 것이 그 증거다). 그래서 시나리오를 표로 돌리며 매 단계 불변식을 건다.
+    새 시나리오는 표에 한 줄만 추가하면 된다.
+
+    ## 불변식
+
+        완전 수집(partial=False)이면:
+            set(디스크 순번) == set(수집 결과 순번) == set(DB 순번)
+        부분 수집(partial=True)이면:
+            디스크/DB 는 **줄어들지 않는다**(사용자가 보던 것을 잃지 않는다)
+    """
+    print("\n--- 5-I. 세 근거(수집/디스크/DB)가 갈라지지 않는다 (Sprint 191) ---")
+    from crawler.image_crawler import collect_images
+    from crawler.image_assets import list_stored_images
+    from storage.database import save_auction_images
+
+    # (라벨, 법원이 이번에 주는 것)  — payload=None 이면 깨진 데이터(디코드 실패)
+    JPG = lambda n: make_jpeg(100 + n, 200)
+    PNG = lambda n: make_png(100 + n, 200)
+    SCENARIOS = [
+        ("신규 3장",            [(1, JPG), (2, JPG), (3, JPG)]),
+        ("동일 재수집",          [(1, JPG), (2, JPG), (3, JPG)]),
+        ("2번만 형식 변경",       [(1, JPG), (2, PNG), (3, JPG)]),
+        ("1장 추가",             [(1, JPG), (2, PNG), (3, JPG), (4, JPG)]),
+        ("가운데 1장 삭제",       [(1, JPG), (2, PNG), (4, JPG)]),
+        ("뒤 2장 삭제",          [(1, JPG), (2, PNG)]),
+        ("부분 수집(4중 2 실패)",  [(1, JPG), (2, PNG), (3, None), (4, None)]),
+        ("다시 완전 수집 4장",     [(1, JPG), (2, JPG), (3, JPG), (4, JPG)]),
+    ]
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        prev_disk, prev_db = set(), set()
+
+        for label, spec in SCENARIOS:
+            els = [img_el("전경도", seq, (fn(seq) if fn else b""))
+                   for seq, fn in spec]
+            res = collect_images(FakeDriver(els), court, case_no, item_no,
+                                 overwrite=True)
+            if res.get("images"):
+                save_auction_images(court, case_no, item_no, res["images"],
+                                    complete=not res.get("partial"))
+
+            collected = {r["seq"] for r in res.get("images", [])}
+            disk = {r["seq"] for r in list_stored_images(court, case_no, item_no)}
+            dbseq = {r["seq"] for r in env.images_of(1)}
+
+            if res.get("partial"):
+                # 부분 수집: 잃지 않는 것이 규칙이다(정확히 같아질 필요는 없다).
+                check_true("[%s] 부분 수집은 디스크를 잃지 않는다" % label,
+                           prev_disk <= disk, (sorted(prev_disk), sorted(disk)))
+                check_true("[%s] 부분 수집은 DB를 잃지 않는다" % label,
+                           prev_db <= dbseq, (sorted(prev_db), sorted(dbseq)))
+            else:
+                check("[%s] 수집결과 == 디스크" % label, sorted(disk), sorted(collected))
+                check("[%s] 수집결과 == DB" % label, sorted(dbseq), sorted(collected))
+
+            # 어떤 경우든 DB가 가리키는 파일은 실제로 존재해야 한다.
+            missing = [r["storage_path"] for r in env.images_of(1)
+                       if not os.path.isfile(env.apiimg.resolve_stored_path(
+                           r["storage_path"]))]
+            check("[%s] DB가 가리키는 파일이 전부 존재한다" % label, missing, [])
+
+            prev_disk, prev_db = disk, dbseq
+
+        # 마지막 상태가 실제로 의미 있는 값인지 — 표가 통째로 no-op 이 아니었음을 보증
+        check_true("시나리오를 실제로 통과했다(마지막 4장)", prev_db == {1, 2, 3, 4},
+                   sorted(prev_db))
+    finally:
+        env.close()
+
+
 def test_no_photos_is_not_a_failure():
     """법원이 사진을 안 주는 물건 — 실패로 기록하면 영원히 재시도된다."""
     print("\n--- 6. 사진 없음은 실패가 아니다 ---")
@@ -813,13 +1296,29 @@ def test_case_level_status_reuse():
                    not any(x.endswith(".tmp") for x in os.listdir(d2)), os.listdir(d2))
 
         # --- 이미 있으면 아예 건드리지 않는다(기존 스킵 경로가 먼저 잡는다)
+        before = {n: os.stat(os.path.join(d2, n)) for n in os.listdir(d2)}
         res2 = dc.collect_status(None, court, case_no, "2", "qa-btn-unused")
         check("이미 있으면 스킵한다(성공)", res2["success"], True)
         # 스킵 경로는 `_empty_result()`를 그대로 돌려주므로 `reused_from` 키 자체가 없다.
         # 즉 "재사용도 하지 않았다"가 키 부재로 드러난다 — 그것을 고정한다.
         check_true("스킵 경로는 재사용을 타지 않는다(reused_from 키 없음)",
                    "reused_from" not in res2, sorted(res2))
-        check("스킵 경로는 파일을 다시 쓰지 않는다", res2["files_saved"], [])
+
+        # ★ 2026-08-19 Sprint 217 (BUGS #144): 예전에는 이 자리에서
+        #   `files_saved == []` 를 확인했다. 그 단언의 **의도**는 "다시 쓰지 않는다"인데,
+        #   빈 목록을 그 증거로 삼은 것이 문제였다 — 그러다 보니 `_record_doc_raw()` 가
+        #   `if not files_saved: return` 으로 실체 기록을 통째로 건너뛰는 결함
+        #   (파일은 있는데 doc_raw 0행, 화면은 READY)을 이 검사가 **오히려 고정하고
+        #   있었다.** 의도를 그대로 두고 증거만 바꾼다: 다시 쓰지 않았다는 것은
+        #   **파일이 그대로라는 사실**로 확인하고, `files_saved` 는 이제
+        #   "이번 판정의 근거가 된 실체 파일"을 가리킨다.
+        after = {n: os.stat(os.path.join(d2, n)) for n in os.listdir(d2)}
+        check("스킵 경로는 파일을 다시 쓰지 않는다(mtime/크기 그대로)",
+              {n: (v.st_mtime_ns, v.st_size) for n, v in after.items()},
+              {n: (v.st_mtime_ns, v.st_size) for n, v in before.items()})
+        check("스킵 경로도 이미 가진 실체를 가리킨다",
+              sorted(os.path.basename(x) for x in res2["files_saved"]),
+              ["status.html", "status.json"])
 
         # --- ★ 형제가 빈 캡처면 퍼뜨리지 않는다
         d3dir = os.path.join(env.docs, court, "2025타경999", "1")
@@ -1099,20 +1598,49 @@ def test_save_auction_images_defenses():
         check("덮어쓴 값이 반영된다", rows[0]["file_hash"], "h1b")
 
         # 법원이 사진을 줄이면 옛 행이 남으면 안 된다
-        for seq in (2, 3):
-            p = os.path.join(d, "0%d.jpg" % seq)
-            with open(p, "wb") as f:
+        #
+        # ★ 2026-08-18 Sprint 191 정정 — 이 블록은 예전에 `save_auction_images()`를
+        #   **누적 빌더처럼** 쓰고 있었다({1,2} 저장 -> {1,3} 저장 -> 행이 1,2,3이 되기를
+        #   기대). 그것이 통과하려면 "이번에 안 준 순번(2)의 행을 남긴다"가 참이어야 하는데,
+        #   그건 이 함수가 막으려는 바로 그 상태다. 옛 구현이 `seq > max_seq`로만 지웠기 때문에
+        #   우연히 통과하던 것이고, 검사가 **약한 semantics를 굳히고 있었다.**
+        #   이제는 한 번의 호출이 곧 "지금 법원이 주는 전부"이므로 집합 차집합으로 정리한다.
+        paths = {}
+        for seq in (2, 3, 4):
+            pth = os.path.join(d, "0%d.jpg" % seq)
+            with open(pth, "wb") as f:
                 f.write(make_jpeg())
-            save_auction_images(court, case_no, item_no,
-                                [{"seq": 1, "kind": "전경도", "path": real, "file_hash": "h",
-                                  "width": 1, "height": 1},
-                                 {"seq": seq, "kind": "전경도", "path": p, "file_hash": "h",
-                                  "width": 1, "height": 1}])
-        check("누적 3장 기록(1,2,3)", [r["seq"] for r in env.images_of(1)], [1, 2, 3])
+            paths[seq] = pth
+
+        def _img(seq, path):
+            return {"seq": seq, "kind": "전경도", "path": path, "file_hash": "h",
+                    "width": 1, "height": 1}
+
         save_auction_images(court, case_no, item_no,
-                            [{"seq": 1, "kind": "전경도", "path": real, "file_hash": "h",
-                              "width": 1, "height": 1}])
-        check("사진이 줄면 뒤쪽 옛 행이 정리된다", [r["seq"] for r in env.images_of(1)], [1])
+                            [_img(1, real)] + [_img(s_, paths[s_]) for s_ in (2, 3, 4)])
+        check("4장 기록(1,2,3,4)", [r["seq"] for r in env.images_of(1)], [1, 2, 3, 4])
+
+        # ★ 가운데 순번이 빠지는 경우 — `seq > max_seq` 비교로는 절대 못 잡는다.
+        #   법원이 1,2,4만 주면 3번 행은 살아남고, 그 행이 가리키는 파일은 이미 사라져 있다
+        #   (= 화면은 있다는데 열면 404). 집합 차집합이라야 정리된다.
+        stat_gap = save_auction_images(
+            court, case_no, item_no,
+            [_img(1, real), _img(2, paths[2]), _img(4, paths[4])])
+        check("가운데가 빠지면 그 행만 정리된다(1,2,4)",
+              [r["seq"] for r in env.images_of(1)], [1, 2, 4])
+        check("정리된 행 수", stat_gap["removed_stale"], 1)
+
+        save_auction_images(court, case_no, item_no, [_img(1, real)])
+        check("사진이 줄면 옛 행이 정리된다", [r["seq"] for r in env.images_of(1)], [1])
+
+        # 부분 수집이면 여전히 지우지 않는다(보호가 새 규칙에도 그대로 살아 있는가)
+        save_auction_images(court, case_no, item_no,
+                            [_img(1, real)] + [_img(s_, paths[s_]) for s_ in (2, 3, 4)])
+        stat_part = save_auction_images(court, case_no, item_no, [_img(1, real)],
+                                        complete=False)
+        check("부분 수집은 집합이 줄어도 지우지 않는다", stat_part["removed_stale"], 0)
+        check("사용자가 보던 4장이 그대로다",
+              [r["seq"] for r in env.images_of(1)], [1, 2, 3, 4])
     finally:
         env.close()
 
@@ -1382,7 +1910,7 @@ def test_worker_consults_authoritative_date_before_expiring():
     """
     print("\n--- 15-C. worker 배선 (Sprint 145) ---")
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "doc_worker.py"), encoding="utf-8").read()
+                            "doc_worker.py"), encoding="utf-8-sig").read()
     check_true("reconcile_queue_auction_date를 import한다",
                "reconcile_queue_auction_date" in src.split("def main")[0])
     # 종결 호출보다 먼저 나와야 한다.
@@ -1462,6 +1990,17 @@ def test_partial_collection_does_not_delete_old_photos():
         st4 = save_auction_images(court, case_no, item_no, [], complete=True)
         check("저장 0장이면 삭제도 0", st4["removed_stale"], 0)
         check("전체 실패에도 기존 사진 보존", _rows(), [1, 2, 3])
+
+        # (5) 법원이 사진을 **추가**했다 — 2026-08-18 Sprint 189에 명시적으로 추가한 경우다.
+        #     (2)(3)(4)가 "줄었다/일부만 받았다/전부 실패했다"를 각각 고정하는데, 정작
+        #     가장 흔한 변경인 **늘어남**은 어느 검사도 이름을 붙여 두지 않았다.
+        #     늘어날 때는 지울 것이 없어야 하고(옛 행은 전부 살아 있는 사진이다),
+        #     새 순번이 그대로 붙어야 한다.
+        seven = five[:3] + [_mk(6), _mk(7)]
+        st5 = save_auction_images(court, case_no, item_no, seven, complete=True)
+        check("추가 수집 저장 5장", st5["saved"], 5)
+        check("추가일 때는 지울 것이 없다", st5["removed_stale"], 0)
+        check("새 순번이 그대로 붙는다", _rows(), [1, 2, 3, 6, 7])
     finally:
         env.close()
 
@@ -1736,6 +2275,41 @@ def test_api_images_status_variants():
         check("NO_IMAGE 그대로 전달", body["images_status"], "NO_IMAGE")
         check("사진 0장", body["image_count"], 0)
         check("대표 이미지 없음", body["representative_image"], None)
+
+        # ★ READY 인데 볼 사진이 0장인 자기모순은 그대로 전달하지 않는다 (Sprint 208).
+        #
+        #   같은 스프린트에서 이 상태를 실제로 만들어 냈다 — `doc_worker` 가 성공을 먼저
+        #   기록하고 사진 기록에서 실패하면 `document_status`=READY, `auction_image`=0행이
+        #   된다. 그 순서는 바로잡았지만 여기는 **두 번째 방어선**이다.
+        #   그대로 내보내면 화면이 "사진 있음"이라 말하고 목록은 빈 상태가 된다.
+        c = env.conn()
+        c.execute("UPDATE document_status SET status='READY' WHERE doc_type='IMAGE'")
+        c.commit()
+        c.close()
+        body = client.get("/api/v1/item/1").json()
+        check("★ READY 기록 + 사진 0장 -> READY라고 답하지 않는다",
+              body["images_status"], "COLLECTING")
+        check("그때도 사진은 0장 그대로", body["image_count"], 0)
+
+        # 대조군 - FAILED 는 낮추지 않는다("볼 사진 없음"과 모순되지 않는다)
+        c = env.conn()
+        c.execute("UPDATE document_status SET status='FAILED' WHERE doc_type='IMAGE'")
+        c.commit()
+        c.close()
+        check("대조군: FAILED는 그대로 전달",
+              client.get("/api/v1/item/1").json()["images_status"], "FAILED")
+
+        # 대조군 - 사진이 실제로 있으면 READY 가 맞다
+        c = env.conn()
+        c.execute("UPDATE document_status SET status='READY' WHERE doc_type='IMAGE'")
+        c.execute("INSERT INTO auction_image (item_id,seq,kind,storage_path,file_hash,"
+                  "file_size,width,height,crawl_date) "
+                  "VALUES (1,1,'전경도','documents/x/1.jpg','h',100,10,10,'2026-08-18')")
+        c.commit()
+        c.close()
+        body = client.get("/api/v1/item/1").json()
+        check("대조군: 사진이 있으면 READY", body["images_status"], "READY")
+        check("대조군: 개수도 함께 오른다", body["image_count"], 1)
     finally:
         env.close()
 
@@ -1780,6 +2354,124 @@ def test_oversized_ids_are_404_not_500():
         check("범위 판정 함수: 초과", is_sqlite_int(SQLITE_MAX_INT + 1), False)
     finally:
         env.close()
+
+
+def test_deletion_never_escapes_document_root():
+    """삭제가 `documents/` 밖으로 나가지 않는다 (2026-08-18 Sprint 192, BUGS #131).
+
+    ## 왜 이 검사가 생겼나
+
+    `api/v1/images.py` 는 **서빙**할 때 이미 경로 봉쇄를 한다. 그 파일의 주석이 이유를
+    적어 두었다: *"DB 값에서 경로를 만들기 때문에 문서 쪽보다 오히려 더 필요하다
+    (관리 도구나 옛 마이그레이션이 넣은 값이 항상 얌전하다고 가정하지 않는다)."*
+
+    그런데 Sprint 191 이 추가한 `remove_stored_image_files()` 는 **같은 출처
+    (`auction_image.storage_path`)의 값으로 파일을 지우면서 그 검사가 없었다.**
+    읽기보다 삭제가 더 위험한데 방어는 읽기에만 있었던 셈이다.
+
+    ## 전수 가드도 함께 건다
+
+    "이 함수만 고쳤다"로 끝내지 않는다. 소스 트리의 **모든 삭제 지점**을 AST 로 찾아,
+    DB/외부에서 온 경로를 지우는 곳이 봉쇄 없이 남아 있지 않은지 확인한다.
+    """
+    print("\n--- 18-B. 삭제는 documents/ 밖으로 못 나간다 (Sprint 192, BUGS #131) ---")
+    import crawler.image_assets as ia
+    from crawler.image_assets import remove_stored_image_files, is_inside_document_root
+
+    tmp = tempfile.mkdtemp(prefix="qa_del_guard_")
+    docs = os.path.join(tmp, "documents")
+    os.makedirs(docs)
+    saved = ia.DOCUMENT_ROOT
+    ia.DOCUMENT_ROOT = docs
+    try:
+        inside_dir = os.path.join(docs, "법원", "사건", "1", "images")
+        os.makedirs(inside_dir)
+        inside = os.path.join(inside_dir, "01.jpg")
+        with open(inside, "wb") as f:
+            f.write(b"x" * 100)
+
+        outside = os.path.join(tmp, "SECRET.txt")
+        with open(outside, "wb") as f:
+            f.write(b"do-not-delete")
+        # ★ `..` 개수를 손으로 세지 않는다 — 처음 작성했을 때 한 단계 모자라
+        #   `documents/` 안에 머무는 경로를 만들어 놓고 "탈출"이라 부르고 있었다.
+        #   실제 목표 파일까지의 상대경로를 계산해 **반드시 탈출하는** 경로를 만든다.
+        traversal = os.path.join(inside_dir, os.path.relpath(outside, inside_dir))
+        check_true("탈출 경로가 실제로 바깥 파일을 가리킨다",
+                   os.path.realpath(traversal) == os.path.realpath(outside),
+                   (traversal, outside))
+
+        check("안쪽 경로는 안쪽으로 판정", is_inside_document_root(inside), True)
+        check("바깥 경로는 바깥으로 판정", is_inside_document_root(outside), False)
+        check("`..` 로 빠져나가는 경로도 바깥",
+              is_inside_document_root(traversal), False)
+
+        removed = remove_stored_image_files([inside, outside, traversal])
+        check("안쪽 하나만 지운다", removed, 1)
+        check_true("안쪽 파일은 지워졌다", not os.path.exists(inside))
+        check_true("바깥 파일은 그대로다", os.path.exists(outside))
+
+        # 없는 파일은 조용히 넘어간다(목표 상태와 같으므로 실패가 아니다)
+        check("이미 없는 파일은 0", remove_stored_image_files([inside]), 0)
+        check("빈 입력은 0", remove_stored_image_files([]), 0)
+        check("None 입력도 0", remove_stored_image_files(None), 0)
+    finally:
+        ia.DOCUMENT_ROOT = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- 전수: 소스의 모든 삭제 지점이 안전한 출처를 쓰는가 ---
+    #
+    # DB 에서 온 경로를 지우는 곳은 `remove_stored_image_files()` 하나여야 한다.
+    # 나머지는 전부 **코드가 구성한 경로**(다운로드 폴더 / image_path() / *.tmp / 상수)다.
+    import ast as _ast
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    DELETERS = {"remove", "unlink", "rmdir", "rmtree"}
+    sites = []
+    unparsed = []      # 못 읽은/못 판 파일 — **조용히 넘기지 않는다**
+    for rel in ("crawler", "storage", "api"):
+        base = os.path.join(root, rel)
+        for dp_, dn, fn in os.walk(base):
+            dn[:] = [d for d in dn if d != "__pycache__"]
+            for f_ in fn:
+                if not f_.endswith(".py"):
+                    continue
+                path = os.path.join(dp_, f_)
+                # ★ `utf-8-sig` 여야 한다 (2026-08-18 Sprint 195, BUGS #133).
+                #   이 저장소의 소스 70개에 UTF-8 BOM 이 있고, `encoding="utf-8"` 로 읽으면
+                #   BOM 이 `\ufeff` 로 남아 `ast.parse` 가 거부한다. 그걸 `except SyntaxError:
+                #   continue` 로 넘기면 **그 파일들이 감사에서 통째로 사라진다** —
+                #   실측: 이 스캔 범위(crawler/storage/api) 안에서만 16개가 빠졌고, 그중
+                #   `crawler/image_crawler.py` 에는 실제 삭제 지점이 3곳 있었다.
+                #   (기존 가드들은 전부 utf-8-sig 를 쓰고 있었다. 이 둘만 빠져 있었다.)
+                try:
+                    with open(path, encoding="utf-8-sig") as fh:
+                        tree = _ast.parse(fh.read())
+                except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+                    unparsed.append("%s (%s)" % (
+                        os.path.relpath(path, root).replace(os.sep, "/"),
+                        type(exc).__name__))
+                    continue
+                for node in _ast.walk(tree):
+                    if (isinstance(node, _ast.Call)
+                            and isinstance(node.func, _ast.Attribute)
+                            and node.func.attr in DELETERS
+                            and isinstance(node.func.value, _ast.Name)
+                            and node.func.value.id in ("os", "shutil")):
+                        sites.append((os.path.relpath(path, root).replace(os.sep, "/"),
+                                      node.lineno))
+
+    # ★ 못 본 파일이 하나라도 있으면 이 검사의 결론은 성립하지 않는다.
+    check("스캔 범위의 모든 파일을 실제로 읽고 팠다", unparsed, [])
+    check_true("삭제 지점을 실제로 찾았다", len(sites) >= 5, sites)
+    # 봉쇄가 있어야 하는 파일(= DB 값을 지우는 곳)에 실제로 봉쇄 함수가 있는지 확인한다.
+    guard_src = open(os.path.join(root, "crawler", "image_assets.py"),
+                     encoding="utf-8-sig").read()
+    check_true("삭제 함수가 봉쇄를 호출한다",
+               "if not is_inside_document_root(path)" in guard_src,
+               "remove_stored_image_files 에 봉쇄가 없다")
+    print("    삭제 지점 %d곳: %s"
+          % (len(sites), ", ".join("%s:%d" % x for x in sorted(sites))))
 
 
 def test_image_path_traversal_blocked():
@@ -1991,6 +2683,49 @@ def test_path_segment_rule_is_single_sourced():
         check("쓰는 쪽/읽는 쪽 경로 일치 (case=%r item=%r)" % (case, item),
               api_dir(court, case, item), crawler_dir(court, case, item))
 
+    # ★ **루트 자체**도 같은가 (2026-08-19 Sprint 217 보강).
+    #   위 비교는 전체 경로라 루트가 갈라지면 어차피 걸린다. 그런데 두 모듈이 각자
+    #   `DOCUMENT_ROOT` 를 들고 있다는 사실은 **경로가 같아도 그대로 남는 위험**이다 —
+    #   실제로 테스트 하네스가 한쪽만 갈아 끼워 서빙이 항상 404 가 된 적이 있다
+    #   (12-L 을 쓰다가 걸렸다). 사본이 몇 개인지 여기서 눈에 보이게 못 박는다.
+    import api.v1.documents as _apidoc
+    import api.v1.images as _apiimg
+    import crawler.doc_paths as _dp
+    import crawler.image_assets as _ia
+    roots = {
+        "api.v1.documents": _apidoc.DOCUMENT_ROOT,
+        "api.v1.images": _apiimg.DOCUMENT_ROOT,
+        "crawler.doc_paths": _dp.DOCUMENT_ROOT,
+        "crawler.image_assets": _ia.DOCUMENT_ROOT,
+    }
+    # ★ `PROJECT_ROOT` 도 **6개 모듈이 각자 계산한다** (2026-08-19 Sprint 217 보강).
+    #   디렉터리 깊이가 달라 식이 서로 다른 것은 정상이다 —
+    #   `os.path.dirname(...)` 을 두 번 감는 것과 세 번 감는 것이 섞여 있다.
+    #   위험한 것은 **파일이 옮겨졌을 때 조용히 다른 곳을 가리키는 것**이다:
+    #   `storage/database.py` 의 값은 `to_relative_storage_path()` 가 저장 경로를
+    #   상대경로로 접는 기준이라, 어긋나면 DB 에 적힌 경로가 아무 데도 안 맞게 된다.
+    #   식이 아니라 **결과**를 대조한다.
+    import api.v1.registry as _apireg
+    import storage.database as _dbmod
+    project_roots = {
+        "api.v1.documents": _apidoc.PROJECT_ROOT,
+        "api.v1.images": _apiimg.PROJECT_ROOT,
+        "api.v1.registry": _apireg.PROJECT_ROOT,
+        "crawler.doc_paths": _dp.PROJECT_ROOT,
+        "crawler.image_assets": _ia.PROJECT_ROOT,
+        "storage.database": _dbmod.PROJECT_ROOT,
+    }
+    check_true("PROJECT_ROOT 를 계산하는 모듈을 실제로 찾았다(검사가 공허하지 않다)",
+               len(project_roots) >= 6, len(project_roots))
+    check("PROJECT_ROOT 6곳이 같은 곳을 가리킨다",
+          sorted(set(os.path.normcase(os.path.abspath(v))
+                     for v in project_roots.values())),
+          [os.path.normcase(os.path.abspath(_dp.PROJECT_ROOT))])
+
+    check("문서 루트를 들고 있는 모듈 4곳이 같은 값을 본다",
+          sorted(set(os.path.normcase(os.path.abspath(v)) for v in roots.values())),
+          [os.path.normcase(os.path.abspath(_dp.DOCUMENT_ROOT))])
+
     # 정규화 함수 자체의 계약
     check("슬래시는 밑줄로", sanitize_path_segment("a/b"), "a_b")
     check("역슬래시도 밑줄로", sanitize_path_segment("a\\b"), "a_b")
@@ -2009,6 +2744,1486 @@ def test_path_segment_rule_is_single_sourced():
         root = _os.path.realpath(DOCUMENT_ROOT)
         check_true("case_no=%r 가 documents/ 밖으로 못 나간다" % bad,
                    _os.path.commonpath([root, p]) == root, p)
+
+
+def test_image_success_is_not_recorded_before_the_photos_are():
+    """사진을 DB에 적기 **전에** 성공을 먼저 기록하지 않는가 (Sprint 208).
+
+    ## 무엇이 문제였나
+
+    `doc_worker` 의 성공 분기는 이 순서였다.
+
+        mark_queue_done(...)        # 큐 done + document_status READY
+        save_auction_images(...)    # auction_image 행
+
+    뒤엣것이 실패하면(DB 잠금, 파일 접근 실패 등) 바깥 `except` 가 큐를 되돌려
+    재시도는 되지만 **`document_status` 는 이미 READY 로 덮여 있다.**
+    화면은 "사진 있음"이라고 말하는데 `auction_image` 는 0행이다.
+    재시도가 소진되면(`MAX_DOC_RETRY`) 그 거짓말이 영구가 된다.
+
+    fixture 재현 결과(수정 전):
+
+        document_queue   pending (retry 1)
+        document_status  IMAGE / READY      <- 볼 수 있다고 말한다
+        auction_image    0행                <- 가리킬 사진이 없다
+
+    ## 문서와 사진의 비대칭이 원인이다
+
+    문서(spec/status/appraisal)의 실체 기록인 `doc_raw` 는 `mark_queue_done()` 이
+    **여는 트랜잭션 안에서** 쓰인다 - 원자적이라 이 창이 없다.
+    사진만 `save_auction_images()` 가 트랜잭션 밖에 있었다.
+
+    ## 이 검사가 고정하는 것
+
+    사진 기록이 실패하면 **성공 표시가 남지 않는다.** 순서를 되돌리면 즉시 FAIL 한다.
+
+    남는 창 하나는 그대로 인정한다 - 사진을 먼저 적고 `mark_queue_done()` 이 실패하면
+    `auction_image` 에 행이 있고 성공 표시는 없다. 그 방향은 **안전한 쪽**이다
+    (화면이 거짓말하지 않고, 재시도가 `INSERT OR REPLACE` 로 덮는다).
+    """
+    print("\n--- 12-F. 사진을 적기 전에 성공을 먼저 기록하지 않는다 (Sprint 208) ---")
+    import doc_worker
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        env.enqueue(court, case_no, item_no, "image")
+
+        img_dir = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(img_dir)
+        images = []
+        for i in (1, 2):
+            p = os.path.join(img_dir, "%02d.jpg" % i)
+            with open(p, "wb") as fh:
+                fh.write(make_jpeg(pad=MIN_FIXTURE_PAD + 64 * i))
+            images.append({"seq": i, "kind": "전경도", "path": p,
+                           "file_size": os.path.getsize(p),
+                           "file_hash": hashlib.sha256(open(p, "rb").read()).hexdigest(),
+                           "width": 1, "height": 1})
+
+        def fake_collect(driver, court_code, case_no_, item_no_, doc_type, btn_id,
+                         overwrite=False):
+            return {"success": True, "previous_hash": None, "new_hash": "h1",
+                    "files_saved": 2, "images": images, "partial": False,
+                    "no_asset": False}
+
+        def exploding_save(*a, **kw):
+            raise RuntimeError("사진 기록 실패 (주입)")
+
+        originals = {}
+        for name, val in (("collect_document", fake_collect),
+                          ("save_auction_images", exploding_save),
+                          ("go_to_case_detail", lambda *a, **k: True),
+                          ("init_db", lambda: None),
+                          ("reset_stale_queue", lambda: None),
+                          ("build_download_driver", lambda: object()),
+                          ("restart_download_driver", lambda d: object())):
+            originals[name] = getattr(doc_worker, name)
+            setattr(doc_worker, name, val)
+        orig_sleep = doc_worker.time_module.sleep
+        doc_worker.time_module.sleep = lambda *a, **k: None
+        os.environ["DOC_WORKER_TEST_MODE"] = "1"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                doc_worker.main()
+        finally:
+            for name, val in originals.items():
+                setattr(doc_worker, name, val)
+            doc_worker.time_module.sleep = orig_sleep
+
+        c = env.conn()
+        try:
+            statuses = [r["status"] for r in
+                        c.execute("SELECT status FROM document_status").fetchall()]
+            n_img = c.execute("SELECT COUNT(*) FROM auction_image").fetchone()[0]
+            q = c.execute("SELECT status, retry_count FROM document_queue").fetchone()
+        finally:
+            c.close()
+
+        check("사진 기록이 실패했으므로 auction_image는 0행", n_img, 0)
+        # ★ 본론: 볼 수 있다고 말하는 상태가 남으면 안 된다.
+        claimed = [st for st in statuses if st in ("READY", "NO_IMAGE")]
+        check("★ '볼 수 있다'는 상태를 남기지 않았다", claimed, [])
+        check_true("큐는 재시도 대상으로 남는다 (%s/retry=%s)" % (q["status"], q["retry_count"]),
+                   q["status"] in ("pending", "failed") and q["retry_count"] >= 1,
+                   dict(q))
+
+        # 대조군 - 사진 기록이 성공하면 정상적으로 READY + 행이 함께 생긴다.
+        #
+        # ★ 큐를 손으로 되돌린 뒤 돌린다. `mark_queue_failed()` 가 `last_attempt_at` 을
+        #   지금으로 찍어 두고, 클레임은 `RETRY_INTERVAL_MINUTES` 안에 다시 집지 않는다.
+        #   그것은 옳은 동작이고 여기서 검증하려는 것이 아니다(재시도 간격은
+        #   `test_document_queue.py` 소관). 이 대조군이 보려는 것은 **성공 경로에서
+        #   사진과 상태가 함께 생기는가** 하나다. 되돌리지 않으면 이 검사가
+        #   "0장"을 보고 결함이라고 오해한다 - 실제로 한 번 그렇게 실패했다.
+        c = env.conn()
+        try:
+            c.execute("UPDATE document_queue SET status='pending', retry_count=0,"
+                      " last_attempt_at=NULL")
+            c.commit()
+        finally:
+            c.close()
+
+        for name, val in (("collect_document", fake_collect),
+                          ("go_to_case_detail", lambda *a, **k: True),
+                          ("init_db", lambda: None),
+                          ("reset_stale_queue", lambda: None),
+                          ("build_download_driver", lambda: object()),
+                          ("restart_download_driver", lambda d: object())):
+            originals[name] = getattr(doc_worker, name)
+            setattr(doc_worker, name, val)
+        doc_worker.time_module.sleep = lambda *a, **k: None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                doc_worker.main()
+        finally:
+            for name, val in originals.items():
+                setattr(doc_worker, name, val)
+            doc_worker.time_module.sleep = orig_sleep
+
+        c = env.conn()
+        try:
+            statuses2 = [r["status"] for r in
+                         c.execute("SELECT status FROM document_status").fetchall()]
+            n_img2 = c.execute("SELECT COUNT(*) FROM auction_image").fetchone()[0]
+        finally:
+            c.close()
+        check("대조군: 정상 처리면 사진이 기록된다", n_img2, 2)
+        check_true("대조군: 그때는 READY가 생긴다", "READY" in statuses2, statuses2)
+    finally:
+        env.close()
+
+
+def _run_image_worker_case(env, court, case_no, item_no, qid,
+                           collect_result, save_mode=None, new_seqs=(1, 2),
+                           make_files=True):
+    """한 시나리오를 `doc_worker.main()` 으로 끝까지 흘려보내고 최종 상태를 돌려준다.
+
+    "예외가 났다"로 판정하지 않는다 — **큐 최종 상태**까지 본다.
+    """
+    import doc_worker
+
+    img_dir = os.path.join(env.docs, court, case_no, item_no, "images")
+    if not os.path.isdir(img_dir):
+        os.makedirs(img_dir)
+
+    images = []
+    for i in new_seqs:
+        p = os.path.join(img_dir, "%02d.jpg" % i)
+        if make_files:
+            with open(p, "wb") as fh:
+                fh.write(make_jpeg(pad=MIN_FIXTURE_PAD + 64 * i))
+        size = os.path.getsize(p) if os.path.exists(p) else 999
+        digest = (hashlib.sha256(open(p, "rb").read()).hexdigest()
+                  if os.path.exists(p) else "0" * 64)
+        images.append({"seq": i, "kind": "전경도", "path": p, "file_size": size,
+                       "file_hash": digest, "width": 1, "height": 1})
+
+    result = dict(collect_result)
+    if result.get("images") == "USE":
+        result["images"] = images
+
+    def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+        return result
+
+    real_save = doc_worker.save_auction_images
+    if save_mode == "raise":
+        def patched(*a, **k):
+            raise RuntimeError("DB asset 기록 실패 (주입)")
+    elif save_mode == "zero":
+        def patched(*a, **k):
+            return {"saved": 0, "skipped_missing": 0, "removed_stale": 0}
+    else:
+        patched = real_save
+
+    originals = {}
+    for name, val in (("collect_document", fake_collect),
+                      ("save_auction_images", patched),
+                      ("go_to_case_detail", lambda *a, **k: True),
+                      ("init_db", lambda: None),
+                      ("reset_stale_queue", lambda: None),
+                      ("build_download_driver", lambda: object()),
+                      ("restart_download_driver", lambda d: object())):
+        originals[name] = getattr(doc_worker, name)
+        setattr(doc_worker, name, val)
+    orig_sleep = doc_worker.time_module.sleep
+    doc_worker.time_module.sleep = lambda *a, **k: None
+    os.environ["DOC_WORKER_TEST_MODE"] = "1"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            doc_worker.main()
+    finally:
+        for name, val in originals.items():
+            setattr(doc_worker, name, val)
+        doc_worker.time_module.sleep = orig_sleep
+
+    c = env.conn()
+    try:
+        q = c.execute("SELECT status FROM document_queue WHERE id=?", (qid,)).fetchone()
+        n = c.execute("SELECT COUNT(*) FROM auction_image").fetchone()[0]
+        st = [r["status"] for r in
+              c.execute("SELECT status FROM document_status").fetchall()]
+    finally:
+        c.close()
+    return {"queue": q["status"], "images": n, "status": st}
+
+
+def test_image_done_requires_actual_asset_record():
+    """이미지 성공판정 A~F — **큐가 done 이 되는 조건**을 표로 고정한다 (Sprint 214).
+
+    ## 왜 필요한가
+
+    Sprint 208 이 순서를 바로잡았다(실체 기록 -> 성공 기록). 그것만으로는 부족했다.
+    `save_auction_images()` 는 **예외를 던지지 않고** 0장을 기록할 수 있다 —
+    디스크에 파일이 없으면 그 항목을 건너뛰고 `saved=0` 을 돌려준다.
+    호출부가 그 반환값을 **로그로만** 써서, 한 장도 남기지 못한 실행이
+    `done` + `READY` 로 끝났다. fixture 로 두 경로를 재현했다.
+
+        C 수집기가 준 경로에 파일이 없다   -> done/READY/0행   (수정 전)
+        E save 가 saved=0 을 돌려준다      -> done/READY/0행   (수정 전)
+
+    "함수를 불렀다"와 "성공했다"는 다르다.
+
+    ## 표
+
+        A 다운로드 실패(success=False)   done 아님
+        B 부분 수집(partial=True)        **done** — 문서화된 계약이다(아래 참고)
+        C 파일이 디스크에 없다            done 아님
+        D 기록 중 예외                   done 아님
+        E 기록이 0장                     done 아님
+        F 전체 성공                      done
+
+    ## B 가 done 인 것은 결함이 아니라 계약이다
+
+    `crawler/image_crawler.collect_images()` 의 docstring 이 명시한다 —
+    "부분 성공을 전체 성공으로 뭉개지 않는다 ... **큐에서는 종결되지만** 로그와
+    반환값에 사실이 남는다." 한 장이라도 남으면 사용자가 볼 것이 생기고,
+    실패로 돌리면 재시도 예산을 태우다 결국 `failed` 로 끝난다.
+    이 검사는 그 계약을 **그대로 고정**한다 — 바꾸려면 여기가 먼저 실패해야 한다.
+
+    ## 기존 asset 보존도 함께 본다
+
+    A/C/D/E 는 전부 실패지만, **이미 갖고 있던 사진 2장은 그대로 남아야 한다.**
+    `save_auction_images()` 가 `saved and complete` 일 때만 지우므로 저장소 계층에서
+    이미 보장되지만, 호출부를 바꿀 때 깨질 수 있어 여기서 함께 잠근다.
+    """
+    print("\n--- 12-G. 이미지 성공판정 A~F (Sprint 214) ---")
+    from storage.database import save_auction_images
+
+    OK = {"success": True, "previous_hash": None, "new_hash": "h1",
+          "files_saved": 2, "images": "USE", "partial": False, "no_asset": False}
+
+    # (라벨, collect 결과, save 주입, 새 순번, 파일 생성, 기대 큐 상태)
+    CASES = [
+        ("A 다운로드 실패", dict(OK, success=False, images=[], files_saved=0),
+         None, (1, 2), True, "pending"),
+        ("B 부분 수집(계약상 성공)", dict(OK, partial=True), None, (1, 2), True, "done"),
+        ("C 파일이 디스크에 없다", dict(OK), None, (3, 4), False, "pending"),
+        ("D 기록 중 예외", dict(OK), "raise", (1, 2), True, "pending"),
+        ("E 기록이 0장", dict(OK), "zero", (1, 2), True, "pending"),
+        ("F 전체 성공", dict(OK), None, (1, 2), True, "done"),
+    ]
+
+    for seeded in (False, True):
+        for label, res, mode, seqs, mkfiles, expect in CASES:
+            env = Env()
+            try:
+                court, case_no, item_no = env.seed_item()
+                qid = env.enqueue(court, case_no, item_no, "image")
+
+                if seeded:
+                    # 이미 정상 수집돼 있던 사진 2장(순번 1,2)
+                    d = os.path.join(env.docs, court, case_no, item_no, "images")
+                    os.makedirs(d)
+                    olds = []
+                    for i in (1, 2):
+                        p = os.path.join(d, "%02d.jpg" % i)
+                        with open(p, "wb") as fh:
+                            fh.write(make_jpeg(pad=MIN_FIXTURE_PAD + 8 * i))
+                        olds.append({"seq": i, "kind": "전경도", "path": p,
+                                     "file_size": os.path.getsize(p),
+                                     "file_hash": hashlib.sha256(
+                                         open(p, "rb").read()).hexdigest(),
+                                     "width": 1, "height": 1})
+                    save_auction_images(court, case_no, item_no, olds, complete=True)
+                    # ★ 실물에서는 화면 상태도 함께 있다 — `mark_queue_done()` 이
+                    #   `auction_image` 와 `document_status` 를 같이 남기기 때문이다.
+                    #   `save_auction_images()` 만 부르면 화면 상태가 없어 실물보다
+                    #   좁은 픽스처가 된다(처음에 그렇게 만들어 기대값을 헛짚었다).
+                    c = env.conn()
+                    try:
+                        c.execute("INSERT INTO document_status (item_id, doc_type, status)"
+                                  " VALUES (1,'IMAGE','READY')")
+                        c.commit()
+                    finally:
+                        c.close()
+
+                got = _run_image_worker_case(env, court, case_no, item_no, qid,
+                                             res, mode, seqs, mkfiles)
+                tag = "기존있음" if seeded else "기존없음"
+                check("%s [%s] 큐 최종 상태" % (label, tag), got["queue"], expect)
+
+                # 실패 시나리오에서 이미 갖고 있던 사진을 잃지 않는다.
+                if seeded and expect != "done":
+                    check_true("%s [%s] ★ 기존 사진 2장을 잃지 않았다" % (label, tag),
+                               got["images"] >= 2, got["images"])
+                    # 실패가 **이미 볼 수 있던 것**을 빼앗지 않는다 (BUGS #122 계열).
+                    check("%s [%s] 이미 READY 이던 화면 상태를 유지한다" % (label, tag),
+                          [x for x in got["status"] if x in ("READY", "NO_IMAGE")],
+                          ["READY"])
+            finally:
+                env.close()
+
+
+def test_document_done_requires_the_file_to_exist():
+    """문서: **저장했다는 파일이 실제로 있어야** done 이다 (Sprint 214 §2).
+
+    사진에서 고친 것과 **같은 계열**이다. `_record_doc_raw()` 의 docstring 이
+    이미 이 상태를 적고 있었다 —
+
+        "파일이 없으면 ... doc_raw 행을 만들지 않는다 — 큐/상태는 **이미 done/READY로
+         갔지만** ... 여기서 뒤집지는 않는다 (뒤집으려면 collect_document() 의 성공
+         판정을 고쳐야 한다)."
+
+    fixture 로 재현했다(수정 전):
+
+        queue=done  document_status=SPEC/READY  doc_raw=0행
+        API        available=true + viewer_url  (열면 없는 파일)
+
+    ## 검사 범위를 좁게 잡은 이유
+
+    - `files_saved` 가 **비어 있으면 검사하지 않는다**. "이미 존재. 스킵" 경로가
+      정상적으로 빈 목록을 돌려준다 — 그 문서는 이전 실행에서 이미 받아 뒀다.
+      여기서 실패로 뒤집으면 **정상 동작을 실패로 만든다**(반대 방향 결함).
+    - `doc_exists()` 로 완성도를 요구하지 않는다. 문서에도 부분 성공
+      (원본만 저장, 구조화 실패)이 계약으로 있어서, 그것까지 뒤집으면 정책 변경이 된다.
+    """
+    print(chr(10) + "--- 12-H. 문서는 저장했다는 파일이 있어야 done (Sprint 214) ---")
+    import doc_worker
+
+    def run(files, make, expect_queue):
+        env = Env()
+        try:
+            court, case_no, item_no = env.seed_item()
+            qid = env.enqueue(court, case_no, item_no, "spec")
+            d = os.path.join(env.docs, court, case_no, item_no)
+            os.makedirs(d, exist_ok=True)
+            paths = [os.path.join(d, f) for f in files]
+            if make:
+                for p in paths:
+                    with open(p, "wb") as fh:
+                        fh.write(b"%PDF-1.4" + b"x" * 400)
+
+            def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+                return {"success": True, "previous_hash": None, "new_hash": "h1",
+                        "files_saved": paths, "partial": False, "no_asset": False}
+
+            originals = {}
+            for name, val in (("collect_document", fake_collect),
+                              ("go_to_case_detail", lambda *a, **k: True),
+                              ("init_db", lambda: None),
+                              ("reset_stale_queue", lambda: None),
+                              ("build_download_driver", lambda: object()),
+                              ("restart_download_driver", lambda dd: object())):
+                originals[name] = getattr(doc_worker, name)
+                setattr(doc_worker, name, val)
+            orig_sleep = doc_worker.time_module.sleep
+            doc_worker.time_module.sleep = lambda *a, **k: None
+            os.environ["DOC_WORKER_TEST_MODE"] = "1"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    doc_worker.main()
+            finally:
+                for name, val in originals.items():
+                    setattr(doc_worker, name, val)
+                doc_worker.time_module.sleep = orig_sleep
+
+            c = env.conn()
+            try:
+                q = c.execute("SELECT status FROM document_queue WHERE id=?",
+                              (qid,)).fetchone()["status"]
+                st = [r["status"] for r in
+                      c.execute("SELECT status FROM document_status").fetchall()]
+                raw = c.execute("SELECT COUNT(*) FROM doc_raw").fetchone()[0]
+            finally:
+                c.close()
+            return q, st, raw
+        finally:
+            env.close()
+
+    q, st, raw = run(["spec.pdf"], True, "done")
+    check("정상: 큐 done", q, "done")
+    check("정상: 화면 READY", st, ["READY"])
+    check("정상: doc_raw 1행", raw, 1)
+
+    q, st, raw = run(["spec.pdf"], False, "pending")
+    check("★ 저장했다는 파일이 없으면 done 이 아니다", q, "pending")
+    check("★ '볼 수 있다'는 상태를 만들지 않는다", st, [])
+    check("doc_raw 도 남지 않는다", raw, 0)
+
+    # 대조군 — "이미 존재. 스킵" 은 files_saved 가 비어 있다. 실패로 뒤집으면 안 된다.
+    q, st, raw = run([], False, "done")
+    check("대조군: files_saved 가 비면(스킵 경로) 그대로 done", q, "done")
+
+
+def app_for_tests():
+    """`api_server.app` 을 필요한 순간에만 가져온다(모듈 최상단 import 를 늘리지 않는다)."""
+    from api_server import app
+    return app
+
+
+def _run_doc_worker_real_collector(env, court, case_no, item_no, qid):
+    """`collect_document()` 를 **가짜로 바꾸지 않고** worker 를 한 바퀴 돌린다.
+
+    12-H 는 수집기를 가짜로 바꿔 성공판정만 봤다. 여기서 보려는 것은 그 반대다 —
+    **실제 수집기의 "이미 존재. 스킵" 분기**가 무엇을 돌려주고, 그것이 DB 에
+    어떻게 남는가. 스킵 분기는 driver 를 건드리기 전에 return 하므로
+    브라우저 없이도 진짜 코드가 그대로 돈다.
+    """
+    import doc_worker
+
+    originals = {}
+    for name, val in (("go_to_case_detail", lambda *a, **k: True),
+                      ("init_db", lambda: None),
+                      ("reset_stale_queue", lambda: None),
+                      ("build_download_driver", lambda: object()),
+                      ("restart_download_driver", lambda dd: object())):
+        originals[name] = getattr(doc_worker, name)
+        setattr(doc_worker, name, val)
+    orig_sleep = doc_worker.time_module.sleep
+    doc_worker.time_module.sleep = lambda *a, **k: None
+    os.environ["DOC_WORKER_TEST_MODE"] = "1"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            doc_worker.main()
+    finally:
+        for name, val in originals.items():
+            setattr(doc_worker, name, val)
+        doc_worker.time_module.sleep = orig_sleep
+
+    c = env.conn()
+    try:
+        q = c.execute("SELECT status FROM document_queue WHERE id=?",
+                      (qid,)).fetchone()["status"]
+        st = [(r["doc_type"], r["status"]) for r in
+              c.execute("SELECT doc_type,status FROM document_status ORDER BY doc_type")]
+        raw = [dict(r) for r in c.execute(
+            "SELECT doc_type, doc_version, storage_path, file_size, file_hash"
+            " FROM doc_raw ORDER BY doc_type, doc_version")]
+        ver = c.execute("SELECT COUNT(*) FROM document_version_log").fetchone()[0]
+    finally:
+        c.close()
+    return {"queue": q, "status": st, "raw": raw, "version_log": ver}
+
+
+def test_queue_write_failure_after_the_photos_are_recorded():
+    """실체는 남았는데 **큐 성공기록이 실패**하면? 그리고 그 뒤 재시도는? (Sprint 217)
+
+    Sprint 208/214 는 순서(실체 -> 성공)와 판정(결과를 본다)을 고쳤다. 남은 칸이 있다 —
+    **그 둘 사이**에서 죽는 경우다. `save_auction_images()` 는 이미 커밋했는데
+    `mark_queue_done()` 이 실패한다(DB 잠금, 디스크 가득, 프로세스 kill 직전 등).
+
+    ## 이 검사가 고정하는 것
+
+        [3] 큐 성공기록 실패
+            큐        pending / retry 1      재시도 가능하다
+            사진      2행 그대로             이미 확보한 실체를 잃지 않는다
+            화면      IMAGE 행이 **없다**    거짓 READY 를 만들지 않는다
+            개정이력  0행                    끝나지 않은 실행이 이력을 남기지 않는다
+            API       사진 2장 / READY       실제로 볼 수 있으니 이것은 거짓이 아니다
+
+        [3-b] **즉시** 다시 돌려도 집어가지 않는다
+            `RETRY_INTERVAL_MINUTES` 가 지나기 전에는 claim 되지 않는다.
+            (뜨거운 재시도 루프로 법원 서버를 두드리지 않는다 — BUGS #101 계열)
+
+        [5] 재시도 성공
+            사진      여전히 2행             INSERT OR REPLACE 라 두 벌 쌓이지 않는다
+            디스크    파일 2개 / .tmp 없음   고아 파일이 생기지 않는다
+            큐        done / 화면 READY
+            개정이력  0행                    **바이트가 그대로면 거짓 개정을 남기지 않는다**
+
+    마지막 줄이 특히 중요하다 — 재시도는 "다시 저장"이지 "개정"이 아니다.
+    """
+    print(chr(10) + "--- 12-J. 큐 성공기록 실패와 그 뒤의 재시도 (Sprint 217) ---")
+    from datetime import datetime as _dt, timedelta as _td
+    from fastapi.testclient import TestClient
+    import doc_worker
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        qid = env.enqueue(court, case_no, item_no, "image")
+        d = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(d)
+        images = []
+        for i in (1, 2):
+            p = os.path.join(d, "%02d.jpg" % i)
+            with open(p, "wb") as fh:
+                fh.write(make_jpeg(pad=MIN_FIXTURE_PAD + 64 * i))
+            with open(p, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+            images.append({"seq": i, "kind": "전경도", "path": p,
+                           "file_size": os.path.getsize(p), "file_hash": digest,
+                           "width": 1, "height": 1})
+        set_hash = hashlib.sha256(
+            "".join(i["file_hash"] for i in images).encode("ascii")).hexdigest()
+
+        calls = []
+
+        def run(done_raises, previous_hash):
+            """`collect_images()` 가 실제로 돌려주는 모양 그대로 흘려보낸다."""
+            def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+                calls.append(overwrite)
+                return {"success": True, "previous_hash": previous_hash,
+                        "new_hash": set_hash, "files_saved": [i["path"] for i in images],
+                        "images": list(images), "partial": False, "no_asset": False}
+
+            real_done = doc_worker.mark_queue_done
+
+            def done_patch(*a, **k):
+                if done_raises:
+                    raise RuntimeError("큐 성공기록 실패 (주입)")
+                return real_done(*a, **k)
+
+            originals = {}
+            for name, val in (("collect_document", fake_collect),
+                              ("mark_queue_done", done_patch),
+                              ("go_to_case_detail", lambda *a, **k: True),
+                              ("init_db", lambda: None),
+                              ("reset_stale_queue", lambda: None),
+                              ("build_download_driver", lambda: object()),
+                              ("restart_download_driver", lambda dd: object())):
+                originals[name] = getattr(doc_worker, name)
+                setattr(doc_worker, name, val)
+            orig_sleep = doc_worker.time_module.sleep
+            doc_worker.time_module.sleep = lambda *a, **k: None
+            os.environ["DOC_WORKER_TEST_MODE"] = "1"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    doc_worker.main()
+            finally:
+                for name, val in originals.items():
+                    setattr(doc_worker, name, val)
+                doc_worker.time_module.sleep = orig_sleep
+
+        def snap():
+            c = env.conn()
+            try:
+                q = c.execute("SELECT status, retry_count FROM document_queue WHERE id=?",
+                              (qid,)).fetchone()
+                return {
+                    "queue": q["status"], "retry": q["retry_count"],
+                    "rows": c.execute("SELECT COUNT(*) FROM auction_image").fetchone()[0],
+                    "seqs": [r["seq"] for r in c.execute(
+                        "SELECT seq FROM auction_image ORDER BY seq")],
+                    "status": [r["status"] for r in c.execute(
+                        "SELECT status FROM document_status")],
+                    "vlog": c.execute(
+                        "SELECT COUNT(*) FROM document_version_log").fetchone()[0],
+                }
+            finally:
+                c.close()
+
+        # --- [3] 사진은 기록됐는데 큐 성공기록이 실패한다 (첫 수집이라 previous_hash="")
+        run(done_raises=True, previous_hash="")
+        got = snap()
+        check("[3] 큐는 재시도 대기로 돌아간다", got["queue"], "pending")
+        check("[3] 재시도 횟수가 1 올랐다", got["retry"], 1)
+        check("[3] ★ 이미 기록된 사진 2행을 잃지 않는다", got["rows"], 2)
+        check("[3] ★ 거짓 READY 를 만들지 않는다(화면 상태 없음)", got["status"], [])
+        check("[3] 끝나지 않은 실행이 개정 이력을 남기지 않는다", got["vlog"], 0)
+        body = TestClient(app_for_tests()).get("/api/v1/item/1").json()
+        check("[3] API 사진 수", body["image_count"], 2)
+        check("[3] API 상태(실제로 볼 수 있으므로 READY 가 맞다)",
+              body["images_status"], "READY")
+
+        # --- [3-b] 재시도 간격 전에는 집어가지 않는다
+        before_calls = len(calls)
+        run(done_raises=False, previous_hash=set_hash)
+        check("[3-b] ★ 재시도 간격 전에는 수집기를 부르지 않는다",
+              len(calls) - before_calls, 0)
+        check("[3-b] 큐도 그대로", snap()["queue"], "pending")
+
+        # --- [5] 간격이 지난 뒤 재시도: 같은 사진을 다시 기록한다
+        c = env.conn()
+        try:
+            c.execute("UPDATE document_queue SET last_attempt_at=? WHERE id=?",
+                      ((_dt.now() - _td(hours=3)).isoformat(), qid))
+            c.commit()
+        finally:
+            c.close()
+        run(done_raises=False, previous_hash=set_hash)   # 디스크가 그대로이므로 지문도 같다
+        got = snap()
+        check("[5] 큐 done", got["queue"], "done")
+        check("[5] 화면 READY", got["status"], ["READY"])
+        check("[5] ★ 사진 행이 두 벌 쌓이지 않는다", got["rows"], 2)
+        check("[5] 순번도 그대로", got["seqs"], [1, 2])
+        check("[5] ★ 바이트가 같으면 거짓 개정을 남기지 않는다", got["vlog"], 0)
+        check("[5] 디스크에 고아/임시 파일이 없다", sorted(os.listdir(d)),
+              ["01.jpg", "02.jpg"])
+        body = TestClient(app_for_tests()).get("/api/v1/item/1").json()
+        check("[5] API 사진 수", body["image_count"], 2)
+        check("[5] API 상태", body["images_status"], "READY")
+    finally:
+        env.close()
+
+
+def test_skip_path_records_the_document_it_already_has():
+    """"이미 존재. 스킵" 이 **실체 기록까지 건너뛰지는 않는다** (Sprint 217, BUGS #144).
+
+    ## 재현한 상태 (수정 전)
+
+        파일 spec.pdf 는 디스크에 있다
+        doc_raw 는 0행이다          (앞선 실행의 mark_queue_done 이 롤백됐다 등)
+          -> 재시도가 스킵 분기를 탄다 -> files_saved=[]
+          -> mark_queue_done -> _record_doc_raw 가 `if not files_saved: return`
+          -> 큐 done / 화면 READY / **doc_raw 0행**
+          -> API available=true 인데 page_count/file_size/doc_version 이 **영구 null**
+
+    영구인 이유가 핵심이다 — 다음 수집도 파일이 있으니 **같은 스킵 분기**를 탄다.
+    스스로 회복되는 경로가 없다. 사진 쪽은 같은 자리를 이미 복구하고 있었다
+    (`image_crawler._describe_existing()`: "파일은 있는데 auction_image 행만 없는
+    상태를 여기서 스스로 복구한다"). 문서만 그 복구가 없었다.
+
+    ## 함께 고정하는 것
+
+    - 반복 실행이 **doc_version 을 부풀리지 않는다** (내용이 같으면 새 행 없음, Sprint 187)
+    - 바뀐 것이 없으므로 `document_version_log` 에 **거짓 개정을 남기지 않는다**
+    - status(파일 2개)는 대표가 **json** 이다 (`_PRIMARY_EXT`)
+    - API 가 실제로 쪽수/크기/버전을 답한다 (근거가 DB 가 아니라 응답이다)
+    """
+    print(chr(10) + "--- 12-I. 스킵 경로도 실체를 기록한다 (Sprint 217) ---")
+    from crawler.doc_paths import existing_doc_files
+
+    # (doc_type, 만들 파일들, 대표로 기록돼야 할 파일)
+    CASES = [
+        ("spec", ["spec.pdf"], "spec.pdf"),
+        ("appraisal", ["appraisal.pdf"], "appraisal.pdf"),
+        ("status", ["status.html", "status.json"], "status.json"),
+    ]
+
+    for doc_type, files, primary in CASES:
+        env = Env()
+        try:
+            court, case_no, item_no = env.seed_item()
+            d = os.path.join(env.docs, court, case_no, item_no)
+            os.makedirs(d, exist_ok=True)
+            for f in files:
+                with open(os.path.join(d, f), "wb") as fh:
+                    fh.write(b"%PDF-1.4" if f.endswith("pdf") else b"{}")
+                    fh.write(b"x" * 300)
+
+            # 헬퍼 자체가 `doc_exists()` 와 같은 목록을 본다.
+            got_files = existing_doc_files(court, case_no, item_no, doc_type)
+            check("%s: 이미 있는 파일 목록" % doc_type,
+                  sorted(os.path.basename(p) for p in got_files), sorted(files))
+
+            qid = env.enqueue(court, case_no, item_no, doc_type)
+            r1 = _run_doc_worker_real_collector(env, court, case_no, item_no, qid)
+
+            check("%s: 스킵이어도 큐는 done" % doc_type, r1["queue"], "done")
+            check_true("%s: 화면 READY" % doc_type,
+                       ("READY" in [s for _, s in r1["status"]]), r1["status"])
+            check("%s: ★ doc_raw 가 1행 남는다(수정 전 0행)" % doc_type,
+                  len(r1["raw"]), 1)
+            # 앞 단언이 깨져도 **뒤 단언까지 함께 보이도록** 인덱싱하지 않는다 —
+            # 변이 주입 때 IndexError 로 죽어 나머지 검사가 가려졌다(그 자체가 맹점이다).
+            first = r1["raw"][0] if r1["raw"] else {}
+            check("%s: 대표 파일" % doc_type,
+                  os.path.basename(first.get("storage_path") or ""), primary)
+            check_true("%s: 크기가 실제 파일 크기다" % doc_type,
+                       first.get("file_size") == os.path.getsize(
+                           os.path.join(d, primary)),
+                       first.get("file_size"))
+            check("%s: 바뀐 것이 없으니 개정 이력은 0행" % doc_type, r1["version_log"], 0)
+
+            # 두 번째 실행 — 같은 파일, 같은 스킵. 버전이 오르면 안 된다.
+            #   큐 행을 새로 만들지 않고 **되돌린다** — migration 018 의
+            #   UNIQUE(court,case,item,doc_type) 때문에 같은 항목은 한 행뿐이고,
+            #   실제로도 재시도는 그 한 행이 pending 으로 돌아오는 방식이다.
+            c = env.conn()
+            try:
+                c.execute("UPDATE document_queue SET status='pending' WHERE id=?", (qid,))
+                c.commit()
+            finally:
+                c.close()
+            r2 = _run_doc_worker_real_collector(env, court, case_no, item_no, qid)
+            check("%s: 재실행 후에도 doc_raw 1행(중복 없음)" % doc_type, len(r2["raw"]), 1)
+            check("%s: doc_version 유지" % doc_type,
+                  (r2["raw"][0]["doc_version"] if r2["raw"] else None), 1)
+            check("%s: 재실행이 거짓 개정을 남기지 않는다" % doc_type, r2["version_log"], 0)
+        finally:
+            env.close()
+
+    # --- API 가 실제로 답하는가 (근거를 DB 가 아니라 응답에 둔다) ---
+    from fastapi.testclient import TestClient
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        d = os.path.join(env.docs, court, case_no, item_no)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "spec.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4" + b"x" * 400)
+        qid = env.enqueue(court, case_no, item_no, "spec")
+        _run_doc_worker_real_collector(env, court, case_no, item_no, qid)
+
+        from api_server import app
+        body = TestClient(app).get("/api/v1/item/1").json()
+        spec = next((x for x in body["documents"] if x["doc_type"] == "SPEC"), {})
+        check("API: available", spec.get("available"), True)
+        check("API: ★ 파일 크기가 null 이 아니다", spec.get("file_size"), 408)
+        check("API: ★ doc_version 이 null 이 아니다", spec.get("doc_version"), 1)
+    finally:
+        env.close()
+
+
+def test_document_revision_survives_a_queue_write_failure():
+    """개정이 **롤백을 건너 살아남는가** — 그리고 무엇은 살아남지 못하는가 (Sprint 217).
+
+    12-J 가 사진에 대해 본 자리를 문서로 옮긴다. 다만 문서에는 사진에 없는 것이 있다 —
+    `doc_raw` 의 **버전**이다. 순서를 그대로 흘려보내면 이렇게 된다.
+
+    ```
+    1회차  옛 문서 수집            doc_raw v1(H0)
+    2회차  법원이 바꿈 -> 재수집    디스크는 H1 이 됐는데 mark_queue_done() 이 실패
+                                  -> 트랜잭션 롤백: version_log 0행, doc_raw 는 v1 그대로
+    3회차  재시도                  디스크가 이미 H1 이라 수집기가 재는 previous_hash 도 H1
+                                  -> `previous_hash == new_hash` -> **개정 이력을 안 남긴다**
+                                  -> 그러나 `_record_doc_raw()` 는 자기 마지막 행(H0)과
+                                     비교하므로 **v2(H1) 를 제대로 쌓는다**
+    ```
+
+    ## 실측 (대조군과 나란히)
+
+    ```
+    정상                    queue=done  version_log 1행  doc_raw v1,v2
+    큐 기록 실패 후 재시도   queue=done  version_log 0행  doc_raw v1,v2
+    ```
+
+    **잃는 것은 `document_version_log` 한 행뿐이고, 바뀌었다는 사실 자체는 `doc_raw`
+    가 지킨다.** 그 테이블은 이 저장소에 **제품 독자가 없다**(쓰는 곳은
+    `mark_queue_done()` 하나, 읽는 곳은 일회성 리포트 스크립트뿐).
+
+    그래서 여기서 고치지 않는다 — 되살리려면 수집 **전에** 지문을 큐에 적어 둬야 하고,
+    그것은 사용자 영향이 0인 이력 한 행을 위해 큐 구조를 바꾸는 일이다.
+    대신 **알고 있다는 것을 이 검사로 고정한다.** 나중에 그 테이블에 독자가 생기면
+    이 단언이 그때의 결정을 강제한다(0행이 계약인지 결함인지 여기서 다시 정해야 한다).
+    """
+    print(chr(10) + "--- 12-K. 개정은 롤백을 건너 살아남는가 (Sprint 217) ---")
+    from datetime import datetime as _dt, timedelta as _td
+    import doc_worker
+
+    def run(env, court, case_no, item_no, content, prev, new, done_raises):
+        d = os.path.join(env.docs, court, case_no, item_no)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "spec.pdf")
+
+        def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+            with open(path, "wb") as fh:      # 수집기는 실제로 디스크를 바꾼다
+                fh.write(content)
+            return {"success": True, "previous_hash": prev, "new_hash": new,
+                    "files_saved": [path], "partial": False, "no_asset": False}
+
+        real_done = doc_worker.mark_queue_done
+
+        def done_patch(*a, **k):
+            if done_raises:
+                raise RuntimeError("큐 성공기록 실패 (주입)")
+            return real_done(*a, **k)
+
+        originals = {}
+        for name, val in (("collect_document", fake_collect),
+                          ("mark_queue_done", done_patch),
+                          ("go_to_case_detail", lambda *a, **k: True),
+                          ("init_db", lambda: None),
+                          ("reset_stale_queue", lambda: None),
+                          ("build_download_driver", lambda: object()),
+                          ("restart_download_driver", lambda dd: object())):
+            originals[name] = getattr(doc_worker, name)
+            setattr(doc_worker, name, val)
+        orig_sleep = doc_worker.time_module.sleep
+        doc_worker.time_module.sleep = lambda *a, **k: None
+        os.environ["DOC_WORKER_TEST_MODE"] = "1"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                doc_worker.main()
+        finally:
+            for name, val in originals.items():
+                setattr(doc_worker, name, val)
+            doc_worker.time_module.sleep = orig_sleep
+
+    def age(env, qid, status=None):
+        c = env.conn()
+        try:
+            if status:
+                c.execute("UPDATE document_queue SET status=?, last_attempt_at=? WHERE id=?",
+                          (status, (_dt.now() - _td(hours=3)).isoformat(), qid))
+            else:
+                c.execute("UPDATE document_queue SET last_attempt_at=? WHERE id=?",
+                          ((_dt.now() - _td(hours=3)).isoformat(), qid))
+            c.commit()
+        finally:
+            c.close()
+
+    OLD = b"%PDF-1.4" + b"OLD" * 100
+    NEW = b"%PDF-1.4" + b"NEW" * 100
+    H0 = hashlib.sha256(OLD).hexdigest()
+    H1 = hashlib.sha256(NEW).hexdigest()
+
+    for label, crashed in (("정상(대조군)", False), ("큐 기록 실패 후 재시도", True)):
+        env = Env()
+        try:
+            court, case_no, item_no = env.seed_item()
+            qid = env.enqueue(court, case_no, item_no, "spec")
+            run(env, court, case_no, item_no, OLD, "", H0, False)      # 1회차
+            age(env, qid, "refresh")
+            run(env, court, case_no, item_no, NEW, H0, H1, crashed)    # 2회차
+            if crashed:
+                age(env, qid)
+                run(env, court, case_no, item_no, NEW, H1, H1, False)  # 3회차(재시도)
+
+            c = env.conn()
+            try:
+                q = c.execute("SELECT status FROM document_queue WHERE id=?",
+                              (qid,)).fetchone()["status"]
+                vlog = c.execute(
+                    "SELECT COUNT(*) FROM document_version_log").fetchone()[0]
+                raw = [(r["doc_version"], r["file_hash"]) for r in c.execute(
+                    "SELECT doc_version, file_hash FROM doc_raw ORDER BY doc_version")]
+            finally:
+                c.close()
+
+            check("[%s] 큐는 결국 done" % label, q, "done")
+            check("[%s] ★ 바뀌었다는 사실은 doc_raw 가 지킨다" % label,
+                  [v for v, _h in raw], [1, 2])
+            check("[%s] 최신 doc_raw 가 새 내용을 가리킨다" % label,
+                  raw[-1][1] if raw else None, H1)
+            check("[%s] document_version_log 행 수" % label, vlog, 0 if crashed else 1)
+        finally:
+            env.close()
+
+
+def test_document_partial_collection_contract():
+    r"""문서 **부분 수집**이 어디서 끝나는가 (Sprint 217, 문서 시나리오 4).
+
+    사진에는 12-G B 가 있다(부분 수집은 계약상 done). 문서에도 같은 계약이 있는데
+    그것을 고정한 검사가 없었다. `collect_status()` 의 except 절이 그 경로다 —
+
+        html 은 원본이라 이미 저장됐으면 "부분 성공"으로 처리하고
+        재시도 큐에는 남기지 않는다 (json 구조화만 나중에 별도로 재시도하면 되므로)
+
+    ## 이 검사가 고정하는 것
+
+        큐            done          (계약: 부분 성공도 종결이다)
+        화면          READY
+        doc_raw       1행 — 대표는 **status.html**(json 이 없으니 files_saved[0])
+        page_count    None          (html 은 쪽수 개념이 없다. 0 으로 뭉개지 않는다)
+        API           available=true + viewer_url
+        뷰어 실체     `status.html` 이 **실제로 있다** -> 거짓말이 아니다
+        doc_exists()  **False**     (json 이 없으므로 "완성"은 아니다)
+
+    ## 마지막 두 줄이 함께 있는 것이 핵심이다
+
+    큐는 done 인데 `doc_exists()` 는 False 다. 즉 **이 상태는 스스로 끝나지 않는다** —
+    재수집(overwrite) 트리거가 걸리기 전까지 json 은 영원히 없다. 그것이 결함인지
+    계약인지는 제품 판단이라 여기서 정하지 않는다(재시도를 켜면 정책 변경이다).
+    대신 **상태가 그렇다는 사실을 코드로 고정**한다.
+
+    운영 실측(2026-08-19): STATUS 1,876행 중 html-only 는 **0건**이다.
+    지금 터져 있는 상태가 아니라, 도달 가능한 경로를 잠가 두는 것이다.
+    """
+    print(chr(10) + "--- 12-L. 문서 부분 수집의 계약 (Sprint 217) ---")
+    from crawler.doc_paths import doc_exists
+    from fastapi.testclient import TestClient
+    import doc_worker
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        qid = env.enqueue(court, case_no, item_no, "status")
+        d = os.path.join(env.docs, court, case_no, item_no)
+        os.makedirs(d, exist_ok=True)
+        html_path = os.path.join(d, "status.html")
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write("<div>2024타경1 조사일시 2026-08-19</div>")
+
+        def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+            # `collect_status()` 의 except 절이 돌려주는 모양 그대로
+            return {"success": True, "partial": True, "no_asset": False,
+                    "files_saved": [html_path], "previous_hash": "",
+                    "new_hash": "h-html"}
+
+        originals = {}
+        for name, val in (("collect_document", fake_collect),
+                          ("go_to_case_detail", lambda *a, **k: True),
+                          ("init_db", lambda: None),
+                          ("reset_stale_queue", lambda: None),
+                          ("build_download_driver", lambda: object()),
+                          ("restart_download_driver", lambda dd: object())):
+            originals[name] = getattr(doc_worker, name)
+            setattr(doc_worker, name, val)
+        orig_sleep = doc_worker.time_module.sleep
+        doc_worker.time_module.sleep = lambda *a, **k: None
+        os.environ["DOC_WORKER_TEST_MODE"] = "1"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                doc_worker.main()
+        finally:
+            for name, val in originals.items():
+                setattr(doc_worker, name, val)
+            doc_worker.time_module.sleep = orig_sleep
+
+        c = env.conn()
+        try:
+            q = c.execute("SELECT status FROM document_queue WHERE id=?",
+                          (qid,)).fetchone()["status"]
+            st = [(r["doc_type"], r["status"]) for r in
+                  c.execute("SELECT doc_type,status FROM document_status")]
+            raw = [dict(r) for r in c.execute(
+                "SELECT doc_type, storage_path, page_count FROM doc_raw")]
+        finally:
+            c.close()
+
+        check("부분 수집도 큐에서는 종결된다(계약)", q, "done")
+        check("화면 상태", st, [("STATUS", "READY")])
+        check("doc_raw 1행", len(raw), 1)
+        check("대표 파일은 html(json 이 없으므로)",
+              os.path.basename(raw[0]["storage_path"]) if raw else None, "status.html")
+        check("html 에는 쪽수가 없다(0 으로 뭉개지 않는다)",
+              raw[0]["page_count"] if raw else "no-row", None)
+        check_true("★ 큐는 done 인데 doc_exists() 는 False 다(스스로 끝나지 않는 상태)",
+                   not doc_exists(court, case_no, item_no, "status"), "doc_exists=True")
+
+        body = TestClient(app_for_tests()).get("/api/v1/item/1").json()
+        entry = next((x for x in body["documents"] if x["doc_type"] == "STATUS"), {})
+        check("API available", entry.get("available"), True)
+        check("API viewer_url", entry.get("viewer_url"),
+              "/api/v1/item/1/documents/STATUS")
+        # ★ available=true 가 **거짓말이 아닌지** 실제로 열어 본다.
+        r = TestClient(app_for_tests()).get("/api/v1/item/1/documents/STATUS")
+        check("뷰어가 실제로 200 을 준다(available 이 거짓말이 아니다)", r.status_code, 200)
+    finally:
+        env.close()
+
+def test_court_removed_photos_end_to_end_through_the_worker():
+    r"""법원이 사진을 전부 내린 경우를 **doc_worker 로 관통**한다 (Sprint 217).
+
+    ## 5-H 와 무엇이 다른가
+
+    5-H 는 `clear_images_if_absence_confirmed()` 를 **직접** 부르고, 그 뒤에 오는
+    `mark_queue_done(status=NO_IMAGE)` 는 손으로 흉내 냈다("그 효과를 재현").
+    즉 저장소 계층의 규칙은 고정했지만 **호출부가 그 규칙을 실제로 쓰는지**는
+    코드를 읽어서만 알 수 있었다. 이 저장소가 반복해 구분해 온 것이 정확히 그 둘이다 —
+
+        함수가 있다  !=  호출된다  !=  올바른 순서로 호출된다
+
+    여기서는 `doc_worker.main()` 을 세 번 돌린다. 대역은 수집기 하나뿐이다.
+
+    ## 순서가 결과를 바꾼다
+
+    `clear_images_if_absence_confirmed()` 는 **1회차인지 2회차인지를
+    `document_status` 로 판단한다.** 그런데 `mark_queue_done()` 이 그 값을
+    `NO_IMAGE` 로 덮는다. 그래서 정리는 **반드시 mark_queue_done 보다 먼저** 와야 한다.
+    순서가 뒤집히면 **1회차에 곧바로 지운다** — 한 번의 관측 실패로 사용자가 보던
+    사진이 전부 사라지는, 이 파이프라인에서 가장 파괴적인 동작이다.
+
+    **변이로 실제로 확인했다**(추측이 아니다). 정리 블록을 `mark_queue_done()` 뒤로
+    옮기면 1회차에서 이 검사가 운다:
+
+        [1회차] 사진 3행을 지우지 않는다   0  (기대 3)
+        [1회차] 파일도 그대로              [] (기대 3개)
+        [1회차] API 는 아직 3장을 준다      0  (기대 3)
+
+    호출을 아예 없애면 2회차에서 운다(FAIL 6건).
+    """
+    print(chr(10) + "--- 12-M. 사진 전부 내림: worker 관통 2회 확인 (Sprint 217) ---")
+    from datetime import datetime as _dt, timedelta as _td
+    from fastapi.testclient import TestClient
+    from storage.database import save_auction_images
+    import doc_worker
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        qid = env.enqueue(court, case_no, item_no, "image")
+        d = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(d)
+        olds = []
+        for i in (1, 2, 3):
+            path = os.path.join(d, "%02d.jpg" % i)
+            with open(path, "wb") as fh:
+                fh.write(make_jpeg(pad=MIN_FIXTURE_PAD + 32 * i))
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+            olds.append({"seq": i, "kind": "전경도", "path": path,
+                         "file_size": os.path.getsize(path), "file_hash": digest,
+                         "width": 1, "height": 1})
+        save_auction_images(court, case_no, item_no, olds, complete=True)
+        c = env.conn()
+        try:
+            c.execute("INSERT INTO document_status (item_id, doc_type, status)"
+                      " VALUES (1,'IMAGE','READY')")
+            c.commit()
+        finally:
+            c.close()
+
+        def fake_collect(driver, cc, cn, ino, dt, btn, overwrite=False):
+            # `collect_images()` 가 사진 요소를 하나도 못 찾았을 때의 반환 모양
+            return {"success": True, "no_asset": True, "images": [], "files_saved": [],
+                    "partial": False, "previous_hash": "", "new_hash": ""}
+
+        def run():
+            originals = {}
+            for name, val in (("collect_document", fake_collect),
+                              ("go_to_case_detail", lambda *a, **k: True),
+                              ("init_db", lambda: None),
+                              ("reset_stale_queue", lambda: None),
+                              ("build_download_driver", lambda: object()),
+                              ("restart_download_driver", lambda dd: object())):
+                originals[name] = getattr(doc_worker, name)
+                setattr(doc_worker, name, val)
+            orig_sleep = doc_worker.time_module.sleep
+            doc_worker.time_module.sleep = lambda *a, **k: None
+            os.environ["DOC_WORKER_TEST_MODE"] = "1"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    doc_worker.main()
+            finally:
+                for name, val in originals.items():
+                    setattr(doc_worker, name, val)
+                doc_worker.time_module.sleep = orig_sleep
+
+        def requeue():
+            cc = env.conn()
+            try:
+                cc.execute("UPDATE document_queue SET status='pending', last_attempt_at=?"
+                           " WHERE id=?", ((_dt.now() - _td(hours=3)).isoformat(), qid))
+                cc.commit()
+            finally:
+                cc.close()
+
+        def snap():
+            files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+            cc = env.conn()
+            try:
+                q = cc.execute("SELECT status FROM document_queue WHERE id=?",
+                               (qid,)).fetchone()["status"]
+            finally:
+                cc.close()
+            return {"queue": q, "rows": len(env.images_of(1)), "files": files,
+                    "status": env.status_of(1, "IMAGE")}
+
+        # --- 1회차: 상태만 바뀌고 사진은 남는다
+        run()
+        got = snap()
+        check("[1회차] 큐 done(실패가 아니다 - 재시도해도 같다)", got["queue"], "done")
+        check("[1회차] 화면 상태 NO_IMAGE", got["status"], "NO_IMAGE")
+        check("[1회차] ★ 사진 3행을 지우지 않는다", got["rows"], 3)
+        check("[1회차] 파일도 그대로", got["files"], ["01.jpg", "02.jpg", "03.jpg"])
+        body = TestClient(app_for_tests()).get("/api/v1/item/1").json()
+        check("[1회차] API 는 아직 3장을 준다", body["image_count"], 3)
+        check("[1회차] 볼 수 있으므로 READY", body["images_status"], "READY")
+
+        # --- 2회차: 같은 관측이 한 번 더 -> 그때 정리한다
+        requeue()
+        run()
+        got = snap()
+        check("[2회차] 큐 done", got["queue"], "done")
+        check("[2회차] ★ 사진 행이 정리된다", got["rows"], 0)
+        check("[2회차] ★ 파일도 정리된다(고아 파일 없음)", got["files"], [])
+        check("[2회차] 화면 상태 NO_IMAGE", got["status"], "NO_IMAGE")
+        body = TestClient(app_for_tests()).get("/api/v1/item/1").json()
+        check("[2회차] API 사진 0장", body["image_count"], 0)
+        check("[2회차] ★ 없는 사진을 READY 라고 하지 않는다",
+              body["images_status"], "NO_IMAGE")
+        check("[2회차] 대표 이미지도 없다", body["representative_image"], None)
+
+        # --- 3회차: 이미 비었으면 아무 일도 일어나지 않는다
+        requeue()
+        run()
+        got = snap()
+        check("[3회차] 아무 일도 없다", (got["queue"], got["rows"], got["status"]),
+              ("done", 0, "NO_IMAGE"))
+    finally:
+        env.close()
+
+
+def test_list_and_detail_show_the_same_photo():
+    r"""검색목록 썸네일과 상세페이지 대표 사진이 **같은 것을 가리키는가** (Sprint 218).
+
+    ## 왜 따로 봐야 하나
+
+    두 화면은 **서로 다른 코드**로 대표 사진을 고른다.
+
+        검색목록   api/v1/search.py    `SELECT item_id, MIN(seq) ... GROUP BY item_id`
+        상세페이지 api/v1/item.py      `ORDER BY seq` 로 읽어 `images[0]`
+
+    같은 규칙("가장 앞선 순번")을 **두 벌로 구현**한 것이다. 이 저장소가 반복해 겪은
+    모양이고(BUGS #107/#112/#136/#161), 한쪽만 바뀌면 **목록과 상세가 다른 사진을
+    보여 준다** — 사용자에게는 "클릭했더니 다른 집이 나온다"로 보인다.
+
+    16번은 상세만, 17번은 목록만 본다. **둘을 나란히 놓고 대조한 검사는 없었다.**
+
+    ## 함께 보는 것
+
+        물건 ID 혼선     A 의 썸네일이 B 를 가리키지 않는가 (순번이 서로 다른 두 물건)
+        사진 없는 물건    깨진 이미지가 아니라 **키는 있고 값이 null**
+        실제 서빙        목록이 준 URL 과 상세가 준 URL 이 **같은 바이트**를 준다
+        목록 견고성      DB 행이 가리키는 파일이 사라져도 **목록 자체는 200**
+    """
+    print(chr(10) + "--- 12-N. 목록 썸네일 == 상세 대표 사진 (Sprint 218) ---")
+    from fastapi.testclient import TestClient
+    from storage.database import save_auction_images
+
+    env = Env()
+    try:
+        # 순번을 일부러 어긋나게 만든다 — A 는 2,3 / B 는 1,4 / C 는 사진 없음.
+        # 두 구현이 각자 "가장 앞선 순번"을 고르지 않으면 여기서 갈라진다.
+        court = "서울중앙지방법원"
+        seeded = {}
+        c = env.conn()
+        try:
+            case_id = c.execute(
+                "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                (court, "2024타경100")).lastrowid
+            for item_id, item_no in ((1, "1"), (2, "2"), (3, "3")):
+                c.execute("INSERT INTO auction_item"
+                          " (id,case_id,court_name,case_no,item_no,auction_date)"
+                          " VALUES (?,?,?,?,?,?)",
+                          (item_id, case_id, court, "2024타경100", item_no, "2099-01-01"))
+            c.commit()
+        finally:
+            c.close()
+
+        for item_id, item_no, seqs in ((1, "1", (2, 3)), (2, "2", (1, 4))):
+            d = os.path.join(env.docs, court, "2024타경100", item_no, "images")
+            os.makedirs(d)
+            payload = []
+            for seq in seqs:
+                path = os.path.join(d, "%02d.jpg" % seq)
+                # 물건마다 다른 바이트 — 섞이면 크기로 드러난다.
+                # pad 는 MIN_IMAGE_BYTES(1,024) 를 넉넉히 넘겨야 한다 —
+                # 그 아래는 저장 계층이 아예 기록하지 않는다(BUGS #148).
+                with open(path, "wb") as fh:
+                    fh.write(make_jpeg(pad=4096 + 100 * item_id + seq))
+                with open(path, "rb") as fh:
+                    digest = hashlib.sha256(fh.read()).hexdigest()
+                payload.append({"seq": seq, "kind": "전경도", "path": path,
+                                "file_size": os.path.getsize(path),
+                                "file_hash": digest, "width": 1, "height": 1})
+            save_auction_images(court, "2024타경100", item_no, payload, complete=True)
+            seeded[item_id] = payload
+
+        client = TestClient(app_for_tests())
+
+        # --- 목록
+        r = client.get("/api/v1/search?include_closed=true&size=50")
+        check("검색 200", r.status_code, 200)
+        items = {it["id"]: it for it in r.json()["items"]}
+        check("세 물건이 모두 목록에 있다", sorted(items), [1, 2, 3])
+
+        check("A(순번 2,3) 의 대표는 2", items[1]["thumbnail_url"],
+              "/api/v1/item/1/images/2")
+        check("B(순번 1,4) 의 대표는 1", items[2]["thumbnail_url"],
+              "/api/v1/item/2/images/1")
+        check("사진 없는 물건은 null(키는 있다)", items[3]["thumbnail_url"], None)
+        check_true("★ 썸네일 URL 이 자기 물건 id 를 가리킨다",
+                   all(items[i]["thumbnail_url"].split("/")[4] == str(i)
+                       for i in (1, 2)),
+                   {i: items[i]["thumbnail_url"] for i in (1, 2)})
+
+        # --- 상세와 대조
+        for item_id in (1, 2):
+            body = client.get("/api/v1/item/%d" % item_id).json()
+            rep = body["representative_image"]
+            check("[물건 %d] ★ 목록 썸네일 == 상세 대표 사진" % item_id,
+                  items[item_id]["thumbnail_url"], rep["url"])
+            check("[물건 %d] 상세 대표도 thumbnail_url 과 같다" % item_id,
+                  rep["thumbnail_url"], items[item_id]["thumbnail_url"])
+
+        detail3 = client.get("/api/v1/item/3").json()
+        check("사진 없는 물건은 상세에도 대표가 없다",
+              detail3["representative_image"], None)
+        check("사진 없는 물건의 상태는 COLLECTING(아직 안 해 본 것)",
+              detail3["images_status"], "COLLECTING")
+
+        # --- 두 URL 이 정말 같은 바이트를 주는가
+        for item_id in (1, 2):
+            a = client.get(items[item_id]["thumbnail_url"])
+            b = client.get(client.get("/api/v1/item/%d" % item_id)
+                           .json()["representative_image"]["url"])
+            check("[물건 %d] 목록 URL 서빙 200" % item_id, a.status_code, 200)
+            check("[물건 %d] ★ 목록과 상세가 같은 바이트" % item_id,
+                  a.content == b.content, True)
+            check("[물건 %d] 다른 물건의 바이트가 아니다" % item_id,
+                  len(a.content), seeded[item_id][0]["file_size"])
+
+        # --- 목록 견고성: DB 는 있는데 파일이 사라져도 목록 자체는 살아 있어야 한다
+        os.remove(seeded[1][0]["path"])
+        r = client.get("/api/v1/search?include_closed=true&size=50")
+        check("★ 파일이 사라져도 검색 목록은 200", r.status_code, 200)
+        gone = {it["id"]: it for it in r.json()["items"]}
+        check("URL 자체는 그대로 준다(프런트가 onError 로 감춘다)",
+              gone[1]["thumbnail_url"], "/api/v1/item/1/images/2")
+        check("그 URL 은 404 다(200 으로 거짓말하지 않는다)",
+              client.get(gone[1]["thumbnail_url"]).status_code, 404)
+        check("다른 물건은 영향을 받지 않는다",
+              client.get(gone[2]["thumbnail_url"]).status_code, 200)
+    finally:
+        env.close()
+
+
+def test_list_thumbnail_reflects_a_changed_photo():
+    r"""사진이 바뀌면 **검색목록도 새 사진을 보여 주는가** (Sprint 218).
+
+    URL 은 `/images/{순번}` 이라 사진이 교체돼도 **주소가 바뀌지 않는다.**
+    그래서 "목록이 최신을 보여 주는가"는 전적으로 **조건부 캐시**에 달려 있다.
+
+        같은 바이트   -> ETag 동일 -> 304, 브라우저는 캐시를 재사용한다 (아끼는 것)
+        바뀐 바이트   -> ETag 변경 -> 200 + 새 바이트 (보여 줘야 하는 것)
+
+    두 번째가 깨지면 사용자는 **옛 사진을 영원히 본다.** 그리고 그 상태는
+    "정상 캐시 적중"과 화면상 구별되지 않는다.
+
+    ETag 는 Starlette 가 (mtime, size) 로 만든다. 그래서 **크기가 같은 다른 사진**으로
+    바꿔 본다 — 크기만 보는 구현이면 여기서 잡힌다.
+    """
+    print(chr(10) + "--- 12-O. 사진 교체가 목록에 반영되는가 (Sprint 218) ---")
+    from fastapi.testclient import TestClient
+    from storage.database import save_auction_images
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        d = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(d)
+        path = os.path.join(d, "01.jpg")
+        first = make_jpeg(width=100, height=200, pad=4096)
+        with open(path, "wb") as fh:
+            fh.write(first)
+        save_auction_images(court, case_no, item_no, [{
+            "seq": 1, "kind": "전경도", "path": path,
+            "file_size": os.path.getsize(path),
+            "file_hash": hashlib.sha256(first).hexdigest(),
+            "width": 100, "height": 200}], complete=True)
+
+        client = TestClient(app_for_tests())
+        url = "/api/v1/item/1/images/1"
+
+        r1 = client.get(url)
+        check("첫 요청 200", r1.status_code, 200)
+        etag1 = r1.headers.get("etag")
+        check_true("ETag 가 있다", bool(etag1), r1.headers)
+
+        # --- 바뀌지 않았으면 304 (캐시를 아낀다)
+        r2 = client.get(url, headers={"If-None-Match": etag1})
+        check("내용이 그대로면 304", r2.status_code, 304)
+        check("304 는 바이트를 보내지 않는다", len(r2.content), 0)
+
+        # --- 같은 **크기**의 다른 사진으로 교체한다
+        second = make_jpeg(width=300, height=400, pad=4096)
+        check("교체본은 크기가 같다(크기만 보는 구현을 걸러낸다)",
+              len(second), len(first))
+        check_true("교체본은 내용이 다르다", second != first)
+        time.sleep(0.01)
+        with open(path, "wb") as fh:
+            fh.write(second)
+
+        r3 = client.get(url, headers={"If-None-Match": etag1})
+        check("★ 사진이 바뀌면 304 가 아니라 200 이다", r3.status_code, 200)
+        check("★ 새 바이트를 준다", r3.content == second, True)
+        etag2 = r3.headers.get("etag")
+        check_true("★ ETag 도 바뀐다(옛 캐시가 무효화된다)", etag1 != etag2,
+                   (etag1, etag2))
+
+        # --- 목록이 주는 URL 도 같은 자리를 가리킨다(주소는 안 바뀐다)
+        s = client.get("/api/v1/search?include_closed=true").json()["items"]
+        me = next(it for it in s if it["id"] == 1)
+        check("목록 URL 은 그대로다(교체돼도 주소는 안 바뀐다)",
+              me["thumbnail_url"], url)
+        check("목록 URL 을 다시 받으면 새 사진이다",
+              client.get(me["thumbnail_url"]).content == second, True)
+    finally:
+        env.close()
+
+
+def test_recorded_photo_is_always_servable():
+    r"""기록된 사진은 **반드시 서빙될 수 있어야** 한다 (Sprint 218, BUGS #148).
+
+    ## 발견 경위
+
+    검색목록 썸네일 관통 검사를 쓰다가 서빙이 404 를 냈다. 원인은 픽스처의 사진이
+    작아서였는데, 그 과정에서 **저장 계층과 서빙 계층의 "있다" 기준이 다르다**는
+    것이 드러났다.
+
+        save_auction_images()          size <= 0 만 거절        <- 행을 만드는 곳
+        image_exists()                 >= MIN_IMAGE_BYTES
+        api/v1/images.py (서빙)         >= MIN_IMAGE_BYTES
+
+    즉 1~1,023바이트 파일은 이렇게 끝났다(실측 재현):
+
+        auction_image 1행  ->  API image_count=1 / images_status=READY
+                           ->  검색목록도 그 URL 을 썸네일로 준다
+                           ->  그 URL 은 **404**
+
+    `image_exists()` 의 docstring 이 이미 규약을 적어 두고 있었다 —
+    *"쓰는 쪽과 읽는 쪽의 '있다' 정의가 갈라지면 화면은 READY 인데 뷰어는 404 가 된다"*.
+    정작 **행을 만드는 함수만** 그 규약 밖에 있었다.
+
+    ## 운영 영향
+
+    실측(2026-08-19): `auction_image` 45행의 최소 크기 **35,746바이트** — 영향 0건.
+    수집기가 이미 같은 하한으로 걸러내므로 정상 경로로는 도달하지 않는다.
+    막는 것은 잘린 파일 · 수동 조작 · 옛 backfill 이 남길 수 있는 행이다.
+
+    ## 이 검사가 고정하는 것
+
+        저장       하한 미만은 기록하지 않는다(`skipped_missing` 으로 센다)
+        API        기록이 없으므로 image_count=0, 대표 없음, 목록 썸네일 null
+        기준 일치   세 곳이 **같은 상수**를 본다 (규칙이 두 벌이 되지 않게)
+    """
+    print(chr(10) + "--- 12-P. 기록된 사진은 서빙될 수 있어야 한다 (Sprint 218) ---")
+    from fastapi.testclient import TestClient
+    from storage.database import save_auction_images
+    from crawler.image_assets import MIN_IMAGE_BYTES, image_exists
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        d = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(d)
+
+        def record(seq, nbytes):
+            path = os.path.join(d, "%02d.jpg" % seq)
+            data = make_jpeg(pad=max(0, nbytes - 60))
+            with open(path, "wb") as fh:
+                fh.write(data)
+            return path, save_auction_images(court, case_no, item_no, [{
+                "seq": seq, "kind": "전경도", "path": path,
+                "file_size": os.path.getsize(path),
+                "file_hash": hashlib.sha256(data).hexdigest(),
+                "width": 1, "height": 1}], complete=False)
+
+        # --- 하한 미만
+        small_path, stat = record(1, 300)
+        check_true("픽스처가 실제로 하한 미만이다",
+                   os.path.getsize(small_path) < MIN_IMAGE_BYTES,
+                   os.path.getsize(small_path))
+        check("★ 하한 미만은 기록하지 않는다", stat["saved"], 0)
+        check("건너뛴 것으로 센다(조용히 사라지지 않는다)", stat["skipped_missing"], 1)
+        check("auction_image 행이 없다", len(env.images_of(1)), 0)
+        check("image_exists() 도 없다고 답한다",
+              image_exists(court, case_no, item_no, 1, "jpg"), False)
+
+        client = TestClient(app_for_tests())
+        body = client.get("/api/v1/item/1").json()
+        check("API 사진 0장", body["image_count"], 0)
+        check("대표 이미지 없음", body["representative_image"], None)
+        check("★ 없는 사진을 READY 라고 하지 않는다", body["images_status"], "COLLECTING")
+        listed = client.get("/api/v1/search?include_closed=true").json()["items"]
+        me = next((it for it in listed if it["id"] == 1), None)
+        check_true("검색 목록에 물건은 나온다", me is not None, listed)
+        check("★ 목록 썸네일도 null(깨진 자리를 만들지 않는다)",
+              (me or {}).get("thumbnail_url"), None)
+
+        # --- 하한 이상은 그대로 기록되고 실제로 서빙된다 (대조군)
+        big_path, stat2 = record(2, MIN_IMAGE_BYTES * 3)
+        check("대조군: 하한 이상은 기록된다", stat2["saved"], 1)
+        body = client.get("/api/v1/item/1").json()
+        check("대조군: API 1장", body["image_count"], 1)
+        rep = body["representative_image"]
+        check("대조군: 대표는 순번 2", rep["seq"], 2)
+        r = client.get(rep["url"])
+        check("★ 대조군: 기록된 사진은 실제로 서빙된다", r.status_code, 200)
+        check("바이트가 파일과 같다", len(r.content), os.path.getsize(big_path))
+        listed = client.get("/api/v1/search?include_closed=true").json()["items"]
+        me = next(it for it in listed if it["id"] == 1)
+        check("대조군: 목록 썸네일도 그 사진", me["thumbnail_url"], rep["url"])
+    finally:
+        env.close()
+
+
+def test_existence_rule_is_single_sourced():
+    r"""사진이 "있다"를 판정하는 **모든 자리가 같은 상수**를 보는가 (Sprint 218).
+
+    12-P 가 시나리오를 잡는다면 이 검사는 **모양**을 잡는다. 판정처가 셋이다:
+
+        storage/database.py  save_auction_images()   행을 만든다
+        crawler/image_assets.py  image_exists()      수집기가 "이미 있다"를 판단한다
+        api/v1/images.py                              사용자에게 내준다
+
+    셋 중 하나만 느슨해지면 "화면은 있다는데 열면 404" 가 돌아온다.
+    숫자를 각자 적어 두면 언젠가 갈라지므로 **상수 이름**을 참조하는지 본다.
+    (`test_false_success.py` 4 가 문서 쪽에서 이미 같은 방식으로 지키고 있다.)
+    """
+    print(chr(10) + "--- 12-Q. 사진 '있다' 기준의 단일화 (Sprint 218) ---")
+    import ast
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    SOURCE_MODULE = "crawler.image_assets"
+    DECIDERS = [
+        (os.path.join("storage", "database.py"), "save_auction_images"),
+        (os.path.join("crawler", "image_assets.py"), "image_exists"),
+        (os.path.join("api", "v1", "images.py"), "get_item_image"),
+    ]
+
+    def func_node(tree, name):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == name:
+                return n
+        return None
+
+    for rel, fname in DECIDERS:
+        path = os.path.join(root, rel)
+        tree = ast.parse(open(path, encoding="utf-8-sig").read(), filename=path)
+        fn = func_node(tree, fname)
+        check_true("%s:%s 를 찾았다" % (rel, fname), fn is not None, fname)
+        if fn is None:
+            continue
+        body = ast.unparse(fn)
+        check_true("%s:%s 가 MIN_IMAGE_BYTES 를 쓴다" % (rel, fname),
+                   "MIN_IMAGE_BYTES" in body,
+                   "숫자를 따로 적으면 언젠가 갈라진다")
+
+        # ★ **이름만 같고 값을 따로 적는** 복제를 잡는다 (2026-08-19 Sprint 218).
+        #   처음 쓴 이 검사는 문자열 포함만 봤고, 변이(`_MIN_IMAGE_BYTES = 1024` 를
+        #   함수 안에 박음)가 **그대로 통과했다.** 부분 문자열이 이름을 덮었기 때문이다.
+        #   숫자로 정의하는 대입이 있으면 그 자체가 규칙 이중화다.
+        literal_defs = []
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+                continue
+            target = n.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if "MIN_IMAGE_BYTES" not in target.id:
+                continue
+            if isinstance(n.value, ast.Constant):
+                literal_defs.append("%s = %r" % (target.id, n.value.value))
+        check("%s:%s 안에서 하한을 숫자로 다시 정의하지 않는다" % (rel, fname),
+              literal_defs, [])
+
+        # 그 이름이 **단일 소스에서 왔는가** — 모듈 최상단이든 함수 안이든
+        # `crawler.image_assets` 에서 import 한 흔적이 있어야 한다.
+        imported = False
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and (n.module or "") == SOURCE_MODULE:
+                if any(a.name == "MIN_IMAGE_BYTES" for a in n.names):
+                    imported = True
+                    break
+        own = rel.replace(os.sep, "/").endswith("crawler/image_assets.py")
+        check_true("%s 의 하한이 단일 소스(%s)에서 온다" % (rel, SOURCE_MODULE),
+                   own or imported,
+                   "import 흔적이 없다 - 값을 따로 들고 있을 가능성")
+
+    # 상수가 실제로 하나인지(재정의가 없는지) 확인한다.
+    import crawler.image_assets as ia
+    defs = [l for l in open(os.path.join(root, "crawler", "image_assets.py"),
+                            encoding="utf-8-sig").read().splitlines()
+            if l.startswith("MIN_IMAGE_BYTES")]
+    check("상수 정의는 한 곳뿐", len(defs), 1)
+    check_true("상수 값이 양수다", ia.MIN_IMAGE_BYTES > 0, ia.MIN_IMAGE_BYTES)
+    print("    MIN_IMAGE_BYTES = %d / 판정처 %d곳" % (ia.MIN_IMAGE_BYTES, len(DECIDERS)))
 
 
 def test_url_rules_match_between_modules():
@@ -2042,13 +4257,13 @@ def test_frontend_contract():
     print("\n--- 20. 프런트/백엔드 계약 ---")
     root = os.path.dirname(os.path.abspath(__file__))
     page = os.path.join(root, "src", "app", "properties", "[id]", "page.tsx")
-    src = open(page, encoding="utf-8").read()
+    src = open(page, encoding="utf-8-sig").read()
 
     for field in ("images_status", "representative_image", "thumbnail_url",
                   "page_count", "download_url", "viewer_url"):
         check_true("프런트가 %s를 쓴다" % field, field in src)
 
-    item_src = open(os.path.join(root, "api", "v1", "item.py"), encoding="utf-8").read()
+    item_src = open(os.path.join(root, "api", "v1", "item.py"), encoding="utf-8-sig").read()
     for field in ("images_status", "representative_image", "thumbnail_url",
                   "image_count", "page_count", "viewer_url", "download_url", "available"):
         check_true("서버가 %s를 준다" % field, '"%s"' % field in item_src)
@@ -2068,6 +4283,12 @@ if __name__ == "__main__":
     test_image_write_failure_leaves_no_partial_file()
     test_overwrite_enables_recollection()
     test_image_change_detection()
+    test_format_change_leaves_no_ghost_file()
+    test_duplicate_seq_on_disk_refuses_to_fingerprint()
+    test_refresh_does_not_rewrite_identical_photos()
+    test_reduced_photo_count_removes_files_too()
+    test_court_removed_all_photos_needs_two_sightings()
+    test_three_sources_never_diverge()
     test_no_photos_is_not_a_failure()
     test_dom_change_is_a_failure_not_silent_success()
     test_bad_payloads_are_rejected()
@@ -2091,9 +4312,22 @@ if __name__ == "__main__":
     test_api_images_status_variants()
     test_oversized_ids_are_404_not_500()
     test_image_path_traversal_blocked()
+    test_deletion_never_escapes_document_root()
     test_worker_skips_navigation_when_sibling_reuse_possible()
     test_reconcile_uses_court_in_identity_key()
     test_path_segment_rule_is_single_sourced()
+    test_image_success_is_not_recorded_before_the_photos_are()
+    test_image_done_requires_actual_asset_record()
+    test_document_done_requires_the_file_to_exist()
+    test_queue_write_failure_after_the_photos_are_recorded()
+    test_document_revision_survives_a_queue_write_failure()
+    test_document_partial_collection_contract()
+    test_court_removed_photos_end_to_end_through_the_worker()
+    test_list_and_detail_show_the_same_photo()
+    test_list_thumbnail_reflects_a_changed_photo()
+    test_recorded_photo_is_always_servable()
+    test_existence_rule_is_single_sourced()
+    test_skip_path_records_the_document_it_already_has()
     test_url_rules_match_between_modules()
     test_frontend_contract()
 

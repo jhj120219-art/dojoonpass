@@ -91,6 +91,305 @@ INTENT_CASES = [
 ]
 
 
+def check_search_list_contract():
+    r"""검색목록: **API 응답 -> React 타입 -> 실제 렌더**가 한 줄로 이어지는가 (Sprint 220).
+
+    ## 왜 필요한가
+
+    이 셋은 **서로 다른 파일**에 각자 적혀 있다.
+
+        api/v1/search.py       row_to_item() 이 만드는 딕셔너리 키
+        src/app/search/types.ts  SearchResultItem 이 선언한 필드
+        src/app/search/ResultList.tsx  item.<필드> 로 실제로 그리는 것
+
+    한쪽만 바뀌면 화면은 **오류 없이 빈칸**이 된다 — `item.foo` 가 `undefined` 면
+    React 는 아무것도 그리지 않고 조용히 넘어간다. 콘솔에도, 서버에도 흔적이 없다.
+    이 저장소가 반복해 잡아 온 "조용한 실패"의 프런트 판본이다.
+
+    실측(2026-08-19) 기준: API 19키 / 타입 19필드 / 렌더 17필드, 어긋남 0.
+    (`crawl_date`, `validation_status` 는 응답에는 있지만 목록이 그리지 않는다 —
+     그것은 결함이 아니라 선택이다. 반대 방향만 결함이다.)
+
+    ## 검사 방향은 **한쪽만**이다
+
+        렌더가 쓰는데 API 가 안 준다   -> **결함**(빈칸이 된다)
+        타입이 선언했는데 API 가 안 준다 -> **결함**(타입이 거짓말한다)
+        API 가 주는데 안 쓴다          -> 결함 아님(쓸지 말지는 화면의 선택)
+    """
+    import ast
+    import io as _io
+    import re as _re
+
+    print("\n--- 검색목록 계약: API -> 타입 -> 렌더 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def strip_comments(text):
+        text = _re.sub(r"/\*[\s\S]*?\*/",
+                       lambda m: _re.sub(r"[^\n]", " ", m.group(0)), text)
+        return _re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), text)
+
+    # 1) API 가 실제로 내는 키 — 문자열 grep 이 아니라 AST 로 딕셔너리 리터럴을 읽는다
+    api_src = _io.open(os.path.join(root, "api", "v1", "search.py"),
+                       encoding="utf-8-sig").read()
+    api_keys = set()
+    for node in ast.walk(ast.parse(api_src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "row_to_item":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict):
+                    ks = [k.value for k in sub.keys if isinstance(k, ast.Constant)]
+                    if len(ks) > 5:
+                        api_keys = set(ks)
+                        break
+    check("API row_to_item 의 키를 읽었다(검사가 공허하지 않다)", len(api_keys) >= 15,
+          "-> %d개" % len(api_keys))
+
+    # 2) React 타입이 선언한 필드
+    ts_path = os.path.join(root, "src", "app", "search", "types.ts")
+    ts_src = strip_comments(_io.open(ts_path, encoding="utf-8-sig").read())
+    m = _re.search(r"export type SearchResultItem\s*=\s*\{([\s\S]*?)\n\}", ts_src)
+    ts_keys = set(_re.findall(r"^\s*([A-Za-z_]\w*)\??\s*:", m.group(1), _re.M)) if m else set()
+    check("types.ts 의 SearchResultItem 을 읽었다", len(ts_keys) >= 15,
+          "-> %d개" % len(ts_keys))
+
+    # 3) 목록이 실제로 그리는 필드
+    list_src = strip_comments(_io.open(
+        os.path.join(root, "src", "app", "search", "ResultList.tsx"),
+        encoding="utf-8-sig").read())
+    used = set(_re.findall(r"\bitem\.([A-Za-z_]\w*)", list_src))
+    check("ResultList 가 쓰는 필드를 읽었다", len(used) >= 10, "-> %d개" % len(used))
+
+    # --- 한쪽 방향만 결함이다
+    check("★ 타입이 선언했는데 API 가 주지 않는 필드",
+          sorted(ts_keys - api_keys) == [],
+          "-> %s (타입이 거짓말한다)" % sorted(ts_keys - api_keys))
+    check("★ 렌더가 쓰는데 API 가 주지 않는 필드",
+          sorted(used - api_keys) == [],
+          "-> %s (화면이 조용히 빈칸이 된다)" % sorted(used - api_keys))
+    check("★ 렌더가 쓰는데 타입에 없는 필드",
+          sorted(used - ts_keys) == [],
+          "-> %s" % sorted(used - ts_keys))
+
+    print("    API %d키 / 타입 %d필드 / 렌더 %d필드 (응답에만 있는 것: %s)"
+          % (len(api_keys), len(ts_keys), len(used),
+             ", ".join(sorted(api_keys - used)) or "없음"))
+
+
+def check_no_stale_read_path():
+    r"""법원 데이터가 바뀐 뒤 화면이 **옛 값을 보여줄 경로**가 있는가 (Sprint 220).
+
+    검색·상세는 매 요청마다 SQLite 를 직접 읽는다 — 응답 캐시 계층이 없다.
+    프런트도 `src/lib/api.ts` 의 모든 fetch 가 `cache: no-store` 다.
+    즉 **stale 이 생길 자리 자체가 없다.**
+
+    그런데 그것은 지금의 선택일 뿐 강제된 적이 없다. 성능을 이유로 캐시를
+    한 줄 넣으면 그 순간 "매각기일이 어제 값으로 보인다"가 가능해지고,
+    그 실패는 **화면에 오류로 나타나지 않는다**(그냥 옛 숫자가 보인다).
+
+    사진 바이트만은 ETag 로 캐시된다 — 그것은 의도이고, 교체 시 갱신되는지는
+    `test_asset_pipeline.py` 12-O 가 따로 본다(같은 크기의 다른 사진으로 검증).
+
+    실측(2026-08-19): `api.ts` fetch 5곳 / `no-store` 5곳, 라우터 캐시 헤더 0곳.
+    """
+    import io as _io
+    import re as _re
+
+    print("\n--- 데이터 신선도: 옛 값을 보여줄 경로가 없는가 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def strip_comments(text):
+        text = _re.sub(r"/\*[\s\S]*?\*/",
+                       lambda m: _re.sub(r"[^\n]", " ", m.group(0)), text)
+        return _re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), text)
+
+    api_ts = os.path.join(root, "src", "lib", "api.ts")
+    code = strip_comments(_io.open(api_ts, encoding="utf-8-sig").read())
+    fetches = len(_re.findall(r"\bfetch\(", code))
+    nostore = code.count("no-store")
+    check("api.ts 의 fetch 를 실제로 찾았다(검사가 공허하지 않다)", fetches >= 4,
+          "-> %d개" % fetches)
+    check("★ 모든 fetch 가 no-store 다(옛 응답을 재사용하지 않는다)",
+          nostore >= fetches, "-> fetch %d / no-store %d" % (fetches, nostore))
+
+    # 서버 라우터에 캐시 헤더가 붙지 않았는가 (사진 서빙은 예외 — 별도 파일이다)
+    stale_headers = []
+    for name in ("item.py", "search.py"):
+        path = os.path.join(root, "api", "v1", name)
+        body = strip_comments(_io.open(path, encoding="utf-8-sig").read())
+        for token in ("Cache-Control", "max-age", "s-maxage"):
+            if token in body:
+                stale_headers.append("%s:%s" % (name, token))
+    check("★ 검색/상세 응답에 캐시 헤더가 없다", sorted(stale_headers) == [],
+          "-> %s (넣으려면 매각기일이 옛 값으로 보이는 경우를 먼저 답해야 한다)"
+          % sorted(stale_headers))
+    print("    api.ts fetch %d곳 / no-store %d곳" % (fetches, nostore))
+
+def check_every_list_screen_contract():
+    r"""**목록 성격의 화면 전부**가 자기 API 와 계약이 맞는가 (Sprint 221).
+
+    앞의 검사는 검색목록 하나만 봤다. 같은 모양의 화면이 셋 더 있다.
+
+        검색목록      api/v1/search.py       row_to_item()
+        관심물건      api/v1/favorites.py    SELECT ai.* + favorited_at
+        최근 본 물건   api/v1/recent_items.py SELECT ai.* + viewed_at
+        상세페이지     api/v1/item.py         get_item()
+
+    `SELECT ai.*` 는 `auction_item` 의 컬럼을 그대로 준다 - 즉 계약이 **스키마에
+    묶여 있다.** 컬럼 이름이 바뀌면 화면이 조용히 빈칸이 되고, 그 실패는
+    서버에도 콘솔에도 남지 않는다.
+
+    실측(2026-08-19): 네 화면 모두 **어긋남 0**.
+
+    ## 함께 기록하는 사실 - 썸네일은 검색목록에만 있다
+
+    `thumbnail_url` 을 주는 것은 `search.py` 뿐이다. 관심물건/최근 본 물건은
+    **사진을 전혀 보여 주지 않는다**(그 화면에 `<img>` 가 없다).
+    사용자는 검색목록에서 사진을 보고 담았는데 관심물건에서는 사진이 사라진다.
+
+    고치려면 API 와 화면을 **함께** 바꿔야 하고(제품 디자인 결정), 여기서 하지 않는다.
+    대신 이 검사가 **규칙**을 건다 - 어느 화면이든 `thumbnail_url` 을 그리기 시작하면
+    그 화면의 API 도 그것을 주어야 한다. 한쪽만 바뀌면 여기서 걸린다.
+    """
+    import io as _io
+    import re as _re
+    import sqlite3 as _sqlite3
+
+    print("\n--- 목록 성격 화면 전체의 데이터 계약 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def strip_comments(text):
+        text = _re.sub(r"/\*[\s\S]*?\*/",
+                       lambda m: _re.sub(r"[^\n]", " ", m.group(0)), text)
+        return _re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), text)
+
+    def rendered(rel, var):
+        src = strip_comments(_io.open(os.path.join(root, rel), encoding="utf-8-sig").read())
+        return set(_re.findall(r"\b" + var + r"\.([A-Za-z_]\w*)", src))
+
+    # `SELECT ai.*` 로 주는 화면의 API 필드 = auction_item 컬럼 + 화면별 추가 컬럼
+    from storage.database import DB_PATH as _DB_PATH
+    conn = _sqlite3.connect("file:%s?mode=ro" % _DB_PATH.replace("\\", "/"), uri=True)
+    try:
+        item_cols = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)")}
+    finally:
+        conn.close()
+    check("auction_item 컬럼을 읽었다(검사가 공허하지 않다)", len(item_cols) >= 15,
+          "-> %d개" % len(item_cols))
+
+    SCREENS = [
+        ("관심물건", "src/app/favorites/page.tsx", "item", item_cols | {"favorited_at"}),
+        ("최근 본 물건", "src/app/properties/recent/page.tsx", "item",
+         item_cols | {"viewed_at"}),
+    ]
+    for label, rel, var, provided in SCREENS:
+        used = rendered(rel, var)
+        check("%s: 렌더 필드를 실제로 찾았다" % label, len(used) >= 8, "-> %d개" % len(used))
+        check("%s: 렌더가 쓰는데 API 가 주지 않는 필드" % label,
+              sorted(used - provided) == [],
+              "-> %s (화면이 조용히 빈칸이 된다)" % sorted(used - provided))
+
+    # 상세페이지 - get_item() 이 만드는 키와 대조
+    import ast as _ast
+    detail_keys = set()
+    detail_src = _io.open(os.path.join(root, "api", "v1", "item.py"),
+                          encoding="utf-8-sig").read()
+    for node in _ast.walk(_ast.parse(detail_src)):
+        if isinstance(node, _ast.FunctionDef) and node.name == "get_item":
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Dict):
+                    ks = {k.value for k in sub.keys if isinstance(k, _ast.Constant)}
+                    if len(ks) > len(detail_keys):
+                        detail_keys = ks
+    check("상세 API 의 키를 읽었다", len(detail_keys) >= 20, "-> %d개" % len(detail_keys))
+    detail_used = rendered("src/app/properties/[id]/page.tsx", "property")
+    check("상세: 렌더가 쓰는데 API 가 주지 않는 필드",
+          sorted(detail_used - detail_keys) == [],
+          "-> %s" % sorted(detail_used - detail_keys))
+
+    # ★ 썸네일 규칙 - 그리는 화면은 API 도 주어야 한다
+    thumb_screens = []
+    for label, rel, var, provided in SCREENS + [
+            ("검색목록", "src/app/search/ResultList.tsx", "item", None)]:
+        src = strip_comments(_io.open(os.path.join(root, rel), encoding="utf-8-sig").read())
+        if "thumbnail_url" in src:
+            thumb_screens.append((label, rel, provided))
+    broken = [lbl for lbl, rel, provided in thumb_screens
+              if provided is not None and "thumbnail_url" not in provided]
+    check("★ 썸네일을 그리는 화면은 API 도 thumbnail_url 을 준다",
+          sorted(broken) == [], "-> %s (화면만 바뀌면 빈칸이 된다)" % sorted(broken))
+    print("    썸네일을 그리는 화면: %s (관심물건/최근본물건은 아직 사진이 없다)"
+          % ", ".join(l for l, _r, _p in thumb_screens))
+
+
+def check_search_issues_a_constant_number_of_queries():
+    r"""검색 API 가 **결과 개수와 무관하게 같은 수의 SQL** 을 내는가 (2026-08-19 Sprint 223).
+
+    ## 왜 이 검사인가
+
+    "배치 조회를 쓴다"는 것은 **코드를 읽어서** 아는 사실이고, 실제로 몇 번 나가는지는
+    **재 봐야** 아는 사실이다. Sprint 145가 썸네일 배치 조회를 넣었지만, 그 뒤로
+    "정말 1회인가"를 잰 적은 없었다. 한 줄만 잘못 옮겨도 물건마다 한 번씩 나가고,
+    그때도 화면은 똑같이 잘 보인다 — **느려질 뿐이다.** 그래서 눈이 아니라 계측이 필요하다.
+
+    ## 실측 (2026-08-19)
+
+        size=1  -> items 1 / thumbnails 1 / SQL 3
+        size=3  -> items 3 / thumbnails 3 / SQL 3
+        size=9  -> items 9 / thumbnails 9 / SQL 3
+
+        3회 = COUNT(*) + 페이지 행 + auction_image 배치(MIN(seq) GROUP BY)
+        (로그인 상태면 favorites 배치가 1회 더 붙는다 — 이 검사는 비로그인 기준)
+
+    개수가 늘어도 SQL 이 늘지 않는다. 즉 **N+1 이 아니다.**
+
+    ## 어떻게 재는가
+
+    `sqlite3.Connection.set_trace_callback` 으로 실제 실행된 문장을 센다.
+    `storage.database.get_connection` 을 감싸므로 라우터가 어떤 경로로 커넥션을
+    얻든 같은 계측이 걸린다.
+    """
+    import sqlite3  # noqa: F401  (set_trace_callback 의 출처를 명시)
+    import storage.database as _db
+
+    print("\n--- 검색 API 의 SQL 횟수 (N+1 감시) ---")
+    stmts = []
+    original = _db.get_connection
+
+    def traced():
+        conn = original()
+        conn.set_trace_callback(lambda s: stmts.append(" ".join(s.split())[:80]))
+        return conn
+
+    # 라우터가 모듈 상단에서 이름을 가져갔을 수 있으므로 그쪽도 바꿔 준다.
+    import api.v1.search as _search
+    patched = [(_db, "get_connection", original)]
+    _db.get_connection = traced
+    if getattr(_search, "get_connection", None) is original:
+        patched.append((_search, "get_connection", original))
+        _search.get_connection = traced
+    try:
+        counts = {}
+        for size in (1, 9):
+            stmts.clear()
+            body = client.get("/api/v1/search", params={"page": 1, "size": size}).json()
+            counts[size] = (len(stmts), len(body["items"]))
+    finally:
+        for mod, name, value in patched:
+            setattr(mod, name, value)
+
+    # 검사가 공허하지 않으려면 계측이 실제로 걸려야 한다.
+    check("SQL 을 실제로 계측했다(검사가 공허하지 않다)",
+          counts[1][0] > 0 and counts[9][1] > counts[1][1],
+          "-> %s" % counts)
+    check("★ 결과가 늘어도 SQL 횟수가 늘지 않는다(N+1 아님)",
+          counts[1][0] == counts[9][0],
+          "-> size1 %d회 / size9 %d회" % (counts[1][0], counts[9][0]))
+    # 상한도 함께 건다 — 같은 수로 늘어나는(전부 N+1) 경우를 막는다.
+    check("★ 검색 1회의 SQL 이 4회를 넘지 않는다",
+          counts[9][0] <= 4, "-> %d회" % counts[9][0])
+    print("    size=1 %d회 / size=9 %d회 (COUNT + 페이지 + 썸네일 배치)"
+          % (counts[1][0], counts[9][0]))
+
+
 def run():
     print("=" * 70)
     print(" /api/v1/search 주소 Intent 회귀 (건수 비의존)")
@@ -475,6 +774,11 @@ def run():
     r = client.get("/api/v1/search/regions", params={"sido": "없는지역명"})
     check("알 수 없는 sido -> 200 + 빈 목록", r.status_code == 200 and r.json()["sigungu"] == [],
           "-> %d %s" % (r.status_code, r.text[:60]))
+
+    check_search_list_contract()
+    check_no_stale_read_path()
+    check_every_list_screen_contract()
+    check_search_issues_a_constant_number_of_queries()
 
     print()
     if FAILURES:

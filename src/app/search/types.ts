@@ -23,7 +23,16 @@ export type SearchQueryParams = {
   max_bid_price?: number
   min_bid_rate?: number
   max_bid_rate?: number
-  // 아래 4개 필드는 DB에 대응 컬럼/데이터가 없어 현재 백엔드 미지원 (STEP3/4 보고 대상)
+  // 아래 4개 필드는 백엔드가 읽지 않는다(api/v1/search.py에 같은 이름의 Query 없음).
+  //
+  // 2026-08-18 Sprint 205 정정: 원문은 "DB에 대응 컬럼/데이터가 없어"였는데 **절반만
+  // 맞다.** 컬럼은 없지만 **데이터는 이미 있다** - `auction_item.full_address` 끝
+  // 대괄호에 `[집합건물 철근콘크리트구조 29.95㎡]` / `[토지 대 420㎡]` 형태로
+  // 1,876행 중 1,852행(98.7%). 재크롤도 필요 없다.
+  //
+  // 못 만들고 있는 이유는 데이터가 아니라 **의미 정의**다 - 다층 건물은 층별 면적이
+  // 여러 개이고(첫 값만 쓰면 최대 103배 과소), 지분 물건 128건은 표시 면적이 전체다.
+  // 상세는 docs/SPRINT203_SEARCH_FILTER_DEPENDENCY_AUDIT.md.
   min_building_area?: number
   max_building_area?: number
   min_land_area?: number

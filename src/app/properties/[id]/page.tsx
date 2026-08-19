@@ -12,6 +12,7 @@ import { CONTAINER } from '@/lib/layout'
 // 어느 쪽으로 통일할지는 미결정이라 중복만 제거했다 — src/lib/format.ts 주석 참고.
 import { formatPriceEok as formatPrice, formatWon } from '@/lib/format'
 import SiteHeader from '@/components/SiteHeader'
+import { useFocusTrap } from '@/lib/useFocusTrap'
 
 interface DocumentStatusItem {
   doc_type: string
@@ -277,6 +278,12 @@ export default function PropertyDetailPage() {
   // 페이지 이동은 **쪽수를 아는 PDF에서만** 그린다. STATUS는 HTML이라 page_count가
   // null이고(쪽이라는 개념이 없다), 모르는 것을 아는 척해 1/? 같은 UI를 그리지 않는다.
   const canPageNavigate = typeof viewingDocPageCount === 'number' && viewingDocPageCount > 1
+
+  // 모달이 열린 동안 키보드 포커스를 모달 안에 가둔다(Sprint 223, BUGS #151).
+  // Escape/화살표는 이미 있었지만 **Tab 은 오버레이 뒤로 그대로 빠져나갔다** —
+  // 사진 라이트박스를 열고 Tab 을 누르면 검은 배경에 가려 **보이지 않는 버튼**에 섬다(실측).
+  const docModalRef = useFocusTrap<HTMLDivElement>(!!viewingDoc)
+  const photoModalRef = useFocusTrap<HTMLDivElement>(!!viewingImage)
 
   // 라이트박스/뷰어 키보드 조작. 모달이 열려 있을 때만 리스너를 단다.
   useEffect(() => {
@@ -601,13 +608,13 @@ export default function PropertyDetailPage() {
   if (loading) return (
     <div className="min-h-screen bg-gray-50">
       <SiteHeader />
-      <div className="flex items-center justify-center py-20"><p className="text-gray-400">불러오는 중...</p></div>
+      <main className="flex items-center justify-center py-20"><p className="text-gray-400">불러오는 중...</p></main>
     </div>
   )
   if (loadError || !property) return (
     <div className="min-h-screen bg-gray-50">
       <SiteHeader />
-      <div className="flex flex-col items-center justify-center py-20 gap-1">
+      <main className="flex flex-col items-center justify-center py-20 gap-1">
         {loadError === 'unavailable' ? (
           <>
             <p className="text-gray-500 font-medium">물건 정보를 불러오지 못했습니다</p>
@@ -619,7 +626,7 @@ export default function PropertyDetailPage() {
         <Link href="/" className="mt-4 rounded-xl bg-gray-100 px-4 py-2 text-sm font-medium text-gray-600">
           검색 화면으로
         </Link>
-      </div>
+      </main>
     </div>
   )
   return (
@@ -674,13 +681,13 @@ export default function PropertyDetailPage() {
         </div>
       )}
       {favError && (
-        <div className={`${CONTAINER} pt-3`}>
+        <div role="alert" className={`${CONTAINER} pt-3`}>
           <p className="text-xs text-red-500">{favError}</p>
         </div>
       )}
       {/* 데스크톱에서 카드가 1320px를 가로지르지 않도록 xl에서 2열로 나눈다.
           카드 순서(DOM 순서)는 그대로 유지된다 — 정보 구성은 변경 대상이 아니다(§9.3). */}
-      <div className={`${CONTAINER} py-4 space-y-3 xl:space-y-0 xl:grid xl:grid-cols-2 xl:gap-3 xl:items-start`}>
+      <main className={`${CONTAINER} py-4 space-y-3 xl:space-y-0 xl:grid xl:grid-cols-2 xl:gap-3 xl:items-start`}>
         <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
           <div className="flex items-start justify-between gap-2">
             <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">{property.property_type || '유형미상'}</span>
@@ -792,7 +799,7 @@ export default function PropertyDetailPage() {
                       aria-label={`${im.kind ?? '사진'} ${i + 1}번 크게 보기`}
                     >
                       {brokenImages[im.seq] ? (
-                        <span className="text-[10px] text-gray-400 flex w-full h-full items-center justify-center">없음</span>
+                        <span className="text-[0.625rem] text-gray-400 flex w-full h-full items-center justify-center">없음</span>
                       ) : (
                         // eslint-disable-next-line @next/next/no-img-element
                         <img
@@ -1238,15 +1245,21 @@ export default function PropertyDetailPage() {
             </div>
           )}
           {registryMessage && (
-            <p className="text-xs text-red-400 mt-2">{registryMessage}</p>
+            <p role="alert" className="text-xs text-red-400 mt-2">{registryMessage}</p>
           )}
         </div>
-      </div>
+      </main>
+      {/* role/aria-modal 은 **픽셀을 바꾸지 않는다** (2026-08-19 Sprint 221).
+          없으면 스크린리더가 "모달이 열렸다"를 알리지 못하고, 뒤의 목록·가격이
+          여전히 읽힌다 - 사용자는 자기가 어디에 있는지 알 수 없다.
+          제목(h2)을 aria-labelledby 로 가리켜 모달의 이름도 준다. */}
       {viewingDoc && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex flex-col z-50">
+        <div ref={docModalRef}
+             className="fixed inset-0 bg-black bg-opacity-50 flex flex-col z-50"
+             role="dialog" aria-modal="true" aria-labelledby="doc-viewer-title">
           <div className="bg-white px-4 py-3 flex items-center gap-3 border-b border-gray-100 flex-wrap">
             <button onClick={() => setViewingDoc(null)} className="text-gray-500 text-lg" aria-label="닫기">✕</button>
-            <h2 className="text-sm font-bold text-gray-900">{DOC_TYPE_LABEL[viewingDoc] || viewingDoc}</h2>
+            <h2 id="doc-viewer-title" className="text-sm font-bold text-gray-900">{DOC_TYPE_LABEL[viewingDoc] || viewingDoc}</h2>
             {docAvailable === 'ok' && (
               <div className="ml-auto flex items-center gap-3">
                 {canPageNavigate && (
@@ -1359,10 +1372,12 @@ export default function PropertyDetailPage() {
       {/* 사진 라이트박스 (2026-08-17 Sprint 144).
           좌우 화살표와 키보드(←/→/Esc)로 넘긴다. */}
       {viewingImage && (
-        <div className="fixed inset-0 bg-black bg-opacity-90 flex flex-col z-50">
+        <div ref={photoModalRef}
+             className="fixed inset-0 bg-black bg-opacity-90 flex flex-col z-50"
+             role="dialog" aria-modal="true" aria-labelledby="photo-viewer-title">
           <div className="px-4 py-3 flex items-center gap-3 text-white">
             <button onClick={() => setViewingImageSeq(null)} className="text-lg" aria-label="닫기">✕</button>
-            <h2 className="text-sm font-bold">
+            <h2 id="photo-viewer-title" className="text-sm font-bold">
               {viewingImage.kind ?? '물건 사진'}
             </h2>
             <span className="ml-auto text-xs text-gray-300 tabular-nums">

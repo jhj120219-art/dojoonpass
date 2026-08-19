@@ -427,6 +427,99 @@ def test_all_file_serving_paths_check_size():
                    "이 자리가 느슨하면 화면은 '수집완료'인데 다운로드는 404가 된다")
 
 
+def test_success_is_never_recorded_without_evidence():
+    """수집기가 `success=True` 를 쓰는 **모든 자리**가 실체를 함께 알리는가 (Sprint 217).
+
+    ## 왜 구조 검사인가
+
+    BUGS #144 는 시나리오 하나를 끝까지 흘려보내다 나왔다 — `collect_spec()` 의
+    "이미 존재. 스킵" 분기가 `success=True` 만 쓰고 `files_saved` 는 빈 채로 돌려줬고,
+    그 빈 목록 때문에 `_record_doc_raw()` 가 실체 기록을 통째로 건너뛰었다
+    (파일은 있는데 `doc_raw` 0행, 화면은 READY, **다음 수집도 같은 분기라 영구**).
+
+    같은 모양의 분기가 두 수집기에 **11곳** 있다. 하나를 고쳤다고 나머지가 안전하다는
+    보장은 없고, 새 분기가 생길 때 조용히 되돌아갈 수도 있다. 그래서 시나리오가 아니라
+    **모양**을 건다.
+
+    ## 규칙
+
+        같은 문장 목록(같은 분기) 안에서 `result["success"] = True` 를 쓰면,
+        그 목록 어딘가에 `files_saved` / `images` / `no_asset` 중 하나도 함께 있어야 한다.
+
+    `no_asset` 을 증거로 인정하는 이유: "법원에 자산이 없다"는 **저장할 것이 없다는
+    사실 자체가 결과**다(사진 미제공 물건이 실제로 있다). 그것까지 실패로 뒤집으면
+    재시도 예산만 태운다.
+
+    ## 이 검사가 못 보는 것 (적어 둔다)
+
+    정적 검사라 **실행 순서와 도달 가능성은 보지 않는다.** 증거가 같은 분기 안에
+    "있기만" 하면 통과한다. 실제로 그 값이 옳은지는 fixture 가 본다
+    (`test_asset_pipeline.py` 12-G/H/I/J). 이 검사는 **빠뜨림**을 잡는 그물이다.
+    """
+    print(chr(10) + "--- 5. 성공 기록에는 실체가 따라붙는가 (구조 검사) ---")
+    import ast
+
+    TARGETS = [os.path.join("crawler", "doc_crawler.py"),
+               os.path.join("crawler", "image_crawler.py")]
+    EVIDENCE = ("files_saved", "images", "no_asset")
+
+    def result_key(node):
+        """`result["<키>"]` 이면 그 키, 아니면 None."""
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == "result"):
+            sl = node.slice
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                return sl.value
+        return None
+
+    def statement_lists(fn):
+        """함수 안의 모든 **문장 목록**(본문/분기별 suite)을 모은다."""
+        found = []
+
+        def walk(node):
+            for _, val in ast.iter_fields(node):
+                if isinstance(val, list) and val and isinstance(val[0], ast.stmt):
+                    found.append(val)
+                    for st in val:
+                        walk(st)
+                elif isinstance(val, ast.AST):
+                    walk(val)
+        walk(fn)
+        return found
+
+    flagged = []
+    checked = 0
+    for rel in TARGETS:
+        path = os.path.join(REPO_ROOT, rel)
+        check_true("%s 가 존재한다" % rel, os.path.exists(path), path)
+        if not os.path.exists(path):
+            continue
+        tree = ast.parse(open(path, encoding="utf-8-sig").read())
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for lst in statement_lists(fn):
+                keys = set()
+                success_lines = []
+                for st in lst:
+                    if isinstance(st, ast.Assign) and len(st.targets) == 1:
+                        key = result_key(st.targets[0])
+                        if not key:
+                            continue
+                        keys.add(key)
+                        if (key == "success" and isinstance(st.value, ast.Constant)
+                                and st.value.value is True):
+                            success_lines.append(st.lineno)
+                for ln in success_lines:
+                    checked += 1
+                    if not (keys & set(EVIDENCE)):
+                        flagged.append("%s:%s:%d" % (rel, fn.name, ln))
+
+    # 검사기 자신이 눈이 멀지 않았는지부터 본다 — 0곳을 훑고 "이상 없음"이라고
+    # 말하는 것이 이 저장소가 반복해 경계해 온 실패 방식이다.
+    check_true("success=True 를 쓰는 자리를 실제로 찾았다", checked >= 8, checked)
+    check("★ 실체 없이 성공을 기록하는 자리", sorted(set(flagged)), [])
+    print("    훑은 자리 %d곳 / 대상 파일 %d개" % (checked, len(TARGETS)))
+
+
 def run():
     print("=" * 60)
     print("false success 회귀 테스트 (Sprint 98)")
@@ -436,6 +529,7 @@ def run():
     test_zero_byte_document_is_not_served()
     test_zero_byte_registry_document_is_not_served()
     test_all_file_serving_paths_check_size()
+    test_success_is_never_recorded_without_evidence()
 
     print("\n" + "=" * 60)
     if failures:

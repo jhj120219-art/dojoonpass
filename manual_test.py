@@ -22,7 +22,7 @@ def wait_loading(driver):
         WebDriverWait(driver, 30).until(
             EC.invisibility_of_element_located((By.ID, "__processbarIFrame"))
         )
-    except:
+    except Exception:   # bare 는 Ctrl-C 도 삼킨다 (Sprint 217)
         pass
     time.sleep(2)
 

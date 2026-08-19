@@ -155,7 +155,12 @@ def _is_bare_broad_except(handler: ast.ExceptHandler) -> bool:
     오류"일 가능성이 높아 로그가 없어도 결함이 아니다 — 실제로 `subscriptions.py` 등이
     그런 경우에 의도적으로 `logger.warning` 없이 처리한다."""
     if handler.type is None:
-        return False  # bare `except:` — 이 저장소에는 없지만 있다면 별개 사안
+        # bare `except:` 는 여기서 다루지 않는다 — **별개 사안이고 아래 4에서 전수로 본다.**
+        # (2026-08-19 Sprint 217 정정: 예전 주석은 "이 저장소에는 없지만"이라고 적었는데
+        #  **사실이 아니었다.** 이 검사가 `api/` 만 훑기 때문에 안 보였을 뿐,
+        #  `collect_documents.py` 에 4곳이 있었다. 검사 범위가 좁은 것을
+        #  "없다"로 적으면 그 문장이 다음 사람을 잘못 안심시킨다.)
+        return False
     return isinstance(handler.type, ast.Name) and handler.type.id == "Exception"
 
 
@@ -224,7 +229,15 @@ def test_no_silent_broad_except_raises_http_exception():
             src = f.read()
         try:
             tree = ast.parse(src, filename=path)
-        except SyntaxError:
+        except SyntaxError as exc:
+            # ★ 조용히 건너뛰지 않는다 (2026-08-19 Sprint 217).
+            #   `continue` 로 넘기면 그 파일은 영원히 검사에서 빠지고 결과는 **초록**으로
+            #   남는다 — 이 저장소가 감사 도구에서 반복해 겪은 함정이고
+            #   (BOM 16개가 조용히 빠져 있던 BUGS #133), 아래 4번 검사는 이미 같은 자리를
+            #   결함으로 보고하고 있었다. 두 검사가 같은 파일에서 규칙이 달랐다.
+            offenders.append("%s (파싱 실패: %s)"
+                             % (os.path.relpath(path, os.path.dirname(
+                                 os.path.abspath(__file__))), exc))
             continue
         scanned += 1
         for node in ast.walk(tree):
@@ -241,10 +254,134 @@ def test_no_silent_broad_except_raises_http_exception():
     check("로그 없이 HTTPException을 던지는 지점", offenders, [])
 
 
+
+# ---------------------------------------------------------------------------
+# 4. bare `except:` 전수 검색 (2026-08-19 Sprint 217)
+# ---------------------------------------------------------------------------
+# `except:` 는 `BaseException` 까지 잡는다 — **Ctrl-C(KeyboardInterrupt)와 SystemExit 도
+# 삼킨다.** 이 저장소는 이미 그 이유로 한 번 고친 적이 있다(`api/v1/item.py` 의 선택적
+# 인증: "예전에는 bare except라 KeyboardInterrupt/SystemExit까지 삼켰고 원인도 남지 않았다").
+#
+# 그런데 그 교훈이 `api/` 밖으로 퍼지지 않았다. 위 3번 검사가 `api/` 만 훑기 때문에
+# `collect_documents.py` 의 4곳은 오랫동안 보이지 않았다. **검사 범위가 좁은 것을
+# "없다"로 읽으면 안 된다** — 이 저장소가 반복해 경계해 온 실패 방식이다.
+#
+# 대상은 **파이프라인 모듈**이다. 일회성 분석/점검 스크립트(analyze_*, check_*, step*,
+# patch_*, manual_test 등)는 사람이 앞에서 돌려 보는 도구라 같은 규칙을 요구하지 않는다 —
+# 다만 **그 결정을 여기 적어 둔다**(제외를 조용히 하면 다음 사람이 범위를 오해한다).
+# ★ 목록을 손으로 적지 않는다 (2026-08-19 Sprint 217 보강).
+#
+#   처음엔 루트 스크립트 이름을 박아 뒀다. 그러면 **새 파이프라인 스크립트가 생겨도
+#   검사 밖**이고, 하한(>=40)도 그것을 못 잡는다 — 이미 40개는 넘으니까.
+#   `test_pipeline_integrity.py:test_sqlite_now_is_localtime` 이 같은 이유로 이미
+#   git 에게 묻는 방식으로 옮겨 갔다. 규칙이 두 벌이면 한쪽이 늦게 썩는다.
+#
+#   일회성 조사 스크립트(step*/check_*/patch_*/analyze_*)는 `.gitignore` 대상이라
+#   자동으로 빠진다 — 제외 목록을 우리가 따로 들고 있지 않는다.
+#   `test_*.py` 만 명시적으로 뺀다(검사 대상이 아니라 검사 자신이다).
+PIPELINE_ROOTS = ("api", "storage", "crawler", "normalizer", "validator",
+                  "models", "search", "intent", "config", "filter")
+# git 을 못 쓰는 배포본을 위한 폴백. **좁지만 0개보다 낫다.**
+FALLBACK_FILES = ("doc_worker.py", "mvp_scraper.py", "migrate_execute.py",
+                  "refresh_priority.py", "api_server.py", "collect_documents.py",
+                  "revalidate.py")
+
+
+SCAN_MODE = {"how": ""}
+
+
+def _iter_pipeline_source_files():
+    """파이프라인 소스 `.py` 경로들. git 이 아는 파일 + 아직 커밋 안 된 새 파일."""
+    import subprocess
+    root = os.path.dirname(os.path.abspath(__file__))
+    rels = []
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
+            cwd=root, capture_output=True, text=True, timeout=30)
+        if out.returncode == 0:
+            rels = [r for r in out.stdout.split() if r.endswith(".py")]
+    except (OSError, subprocess.SubprocessError):
+        rels = []
+
+    if len(rels) < 20:
+        # git 목록을 얻지 못했다. 폴백은 **좁다는 사실을 말한다** —
+        # 조용히 좁은 범위로 초록을 내면 그것이 이 파일이 막으려는 함정이다.
+        SCAN_MODE["how"] = "fallback"
+        print("    (git 목록을 얻지 못해 폴백 목록으로 대체한다 - 범위가 좁다)")
+        for name in FALLBACK_FILES:
+            path = os.path.join(root, name)
+            if os.path.exists(path):
+                yield path
+        for sub in PIPELINE_ROOTS:
+            for dirpath, _dirs, files in os.walk(os.path.join(root, sub)):
+                if "__pycache__" in dirpath:
+                    continue
+                for fn in files:
+                    if fn.endswith(".py"):
+                        yield os.path.join(dirpath, fn)
+        return
+
+    SCAN_MODE["how"] = "git"
+    for rel in sorted(rels):
+        norm = rel.replace("\\", "/")
+        base = norm.rsplit("/", 1)[-1]
+        if base.startswith("test_"):
+            continue                    # 검사 대상이 아니라 검사 자신이다
+        top = norm.split("/", 1)[0]
+        if "/" in norm and top not in PIPELINE_ROOTS:
+            continue                    # tests/ 등 파이프라인 밖
+        yield os.path.join(root, norm.replace("/", os.sep))
+
+
+def test_no_bare_except_in_pipeline():
+    """파이프라인 모듈에 `except:` (BaseException 포획)가 없어야 한다."""
+    print(chr(10) + "--- 4. bare except 전수 검색 (파이프라인 모듈) ---")
+
+    # 검사 로직이 살아 있는지부터 — 결함 샘플은 잡고 정상 샘플은 통과시켜야 한다.
+    NL = chr(10)
+    bad = ast.parse(NL.join(["try:", "    x()", "except:", "    pass", ""])).body[0].handlers[0]
+    good = ast.parse(NL.join(["try:", "    x()", "except Exception:", "    pass", ""])).body[0].handlers[0]
+    check_true("검사 로직: bare 를 잡는다", bad.type is None)
+    check_true("검사 로직: 좁힌 except 는 통과시킨다", good.type is not None)
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    offenders, scanned = [], 0
+    for path in _iter_pipeline_source_files():
+        with open(path, encoding="utf-8-sig") as f:
+            src = f.read()
+        try:
+            tree = ast.parse(src, filename=path)
+        except SyntaxError as exc:
+            # ★ 조용히 건너뛰지 않는다. 파싱 실패를 `continue` 로 넘기면 그 파일은
+            #   영원히 검사에서 빠지고 결과는 초록으로 남는다(이 저장소가 감사 도구에서
+            #   실제로 겪은 함정). 실패 자체를 결함으로 보고한다.
+            offenders.append("%s (파싱 실패: %s)" % (os.path.relpath(path, root), exc))
+            continue
+        scanned += 1
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                offenders.append("%s:%d" % (os.path.relpath(path, root), node.lineno))
+
+    # 하한을 함께 고정한다 — 열거가 깨지면 0개를 훑고 조용히 초록이 된다(TEST_PLAN 규칙).
+    #
+    # ★ 하한을 **열거 방식별로** 다르게 잡는다 (2026-08-19 Sprint 217).
+    #   git 목록이면 실측 86개다. 거기에 40 을 걸면 "절반이 사라져도 안 걸리는 값"이 되고,
+    #   그것은 TEST_PLAN 이 하지 말라고 적어 둔 바로 그 하한이다.
+    #   폴백(git 없음)은 범위가 원래 좁으므로 같은 값을 요구할 수 없다 —
+    #   대신 그 사실을 출력으로 말한다.
+    floor = 80 if SCAN_MODE["how"] == "git" else 40
+    check_true("파이프라인 파일을 실제로 훑었다(%s, 하한 %d)"
+               % (SCAN_MODE["how"] or "미상", floor), scanned >= floor, scanned)
+    check("bare except 를 쓰는 지점", sorted(offenders), [])
+    print("    훑은 파일 %d개" % scanned)
+
+
 if __name__ == "__main__":
     test_search_endpoint_logs_root_cause()
     test_search_regions_endpoint_logs_root_cause()
     test_no_silent_broad_except_raises_http_exception()
+    test_no_bare_except_in_pipeline()
 
     print()
     if failures:

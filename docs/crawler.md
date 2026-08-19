@@ -173,6 +173,10 @@ storage/database.py        save_auction_images() -> auction_image (UNIQUE(item_i
    재사용은 `SIBLING_REUSE_MAX_AGE_SECONDS`(기본 6시간) 안의 형제만 대상으로 한다 —
    몇 달 전 파일을 복사하면 새로 받았다면 얻었을 최신본 대신 옛것을 주게 되는데,
    "언제 다시 받을 것인가"는 재수집 정책(미결정)이라 여기서 정하지 않고 보수적으로 좁혔다.
+   ★ 2026-08-18 Sprint 189: 정책이 정해졌고, 그래서 **재수집(`overwrite=True`)일 때는
+     형제 복사를 아예 쓰지 않는다.** 형제 사본도 같은 옛 수집분이라, 복사해 오면
+     법원이 갱신한 새 문서 대신 옛 내용을 다시 저장하고 큐는 done이 되어 재수집 기회가
+     사라진다. 최초 수집에서는 그대로 유효하다(물건당 navigation 약 15초 절감).
    형제 파일이 빈 캡처면 복사하지 않고 직접 수집한다(빈 캡처를 퍼뜨리지 않는다).
 
 0. **[2026-08-07 발견, 데이터 소실] `auction` 테이블 UNIQUE 키에 법원이 없다.**
@@ -335,6 +339,14 @@ analyze_docs.py         <- 파이프라인 단계가 **아니다**. 배치에 �
 그래서 `doc_raw` 0행 / `parsed_document` 0행이고, `rights_summary` 162건은 과거에 사람이
 한 번 돌린 결과가 남아 있는 것이다.
 
+> **[2026-08-19 Sprint 217] 위 문단의 "`doc_raw` 0행"은 지금 사실이 아니다.**
+> Sprint 144가 `mark_queue_done()` 안에서 채우도록 고쳤고 **실측 556행**이다
+> (아래 "Sprint 144에 해소됐다" 절 참고). 이 문단은 2026-08-11 시점의 기록으로 남긴다 —
+> 여기까지만 읽고 "지금도 0행"으로 오해하지 않도록 그 자리에 표시해 둔다.
+> `parsed_document` 0행은 **여전히 사실**이다. `rights_summary` 는 오늘 재실측에서
+> **161건**이다(문서의 162건과 1건 차이 — 그 사이의 정리로 보이나 경위는 확인하지
+> 못했다. "확인하지 못함"과 "없음"을 섞지 않기 위해 그대로 적는다).
+
 이것이 권리분석 커버리지가 8.7%(162/1,870)에 머무는 근본 원인이다. 화면 결함이 아니다.
 
 **이 넷을 배치에 넣는 것은 운영 스케줄 변경이므로 Sprint 55 범위 밖(SKIP)이다.**
@@ -367,6 +379,12 @@ analyze_docs.py         <- 파이프라인 단계가 **아니다**. 배치에 �
 
 `doc_raw`(storage_path / file_hash / file_size / page_count)를 채우는 것은 아래쪽뿐이라
 현재 **0행**이다. 라이브 경로는 해시를 계산해 `document_version_log`에만 쓰고 나머지는 버린다.
+
+★ **2026-08-17 Sprint 144에 해소됐다** — `mark_queue_done()`이 같은 트랜잭션에서 `doc_raw`를
+채운다(실측 556행). 위 표의 `collect_document()` 행 `doc_raw` **X**는 그 함수 자신이
+쓰지 않는다는 뜻이고, 파이프라인 전체로는 채워진다. 그리고 `document_version_log`는
+2026-08-18 Sprint 189의 변경 기반 재수집으로 **처음으로 실제 도달 가능해졌다**
+(아래 "변경 기반 재수집" 절).
 
 라이브 경로가 `doc_raw`를 쓰게 하려면 `page_count`에 pdfplumber가 필요한데,
 **2026-08-11 Sprint 61에 설치돼 이 제약은 해소됐다**(`pdfplumber==0.11.10`).
@@ -499,6 +517,307 @@ if auction_date and auction_date < today:
   그 판단이 참조하는 값의 출처만 사본에서 원본으로 바뀌었다.
 - `status`는 건드리지 않는다 — 이미 종결된 행을 되살릴지는 재수집 정책이라 제품 판단이다
   (`enqueue_documents()`의 Sprint 74 주석과 같은 규약).
+  ★ 2026-08-18 Sprint 189: 그 제품 판단이 내려졌다. 되살리는 주체는 여기가 아니라
+    `requeue_changed_documents()`이고, 기준은 **법원 원천이 실제로 바뀌었는가**다
+    (아래 "변경 기반 재수집" 절 참고). 이 함수는 여전히 status를 건드리지 않는다 —
+    "값이 사실과 다른 것"을 고치는 일과 "다시 받을지 정하는 일"은 서로 다른 책임이다.
 - 매칭되는 물건이 없으면 큐 값을 그대로 돌려준다(판단을 바꾸지 않는다).
 - Sprint 74가 `enqueue_documents()`에 넣은 갱신은 **06:00 크롤이 돌 때만** 동작하므로
   이 검사와 중복이 아니라 보완 관계다(크롤과 크롤 사이의 구멍을 이쪽이 막는다).
+
+
+---
+
+## 변경 기반 재수집 (2026-08-18, Sprint 189)
+
+법원 원천이 바뀌면 **다음 수집 주기에 그 물건의 관련 자산만** 다시 받는다.
+전면 재수집(실측 약 1.9시간)이 아니라 표적 재수집(84초 규모)이다.
+
+### 사슬
+
+```
+법원 원천 변경
+  -> mvp_scraper -> upsert_batch()       auction 갱신
+  -> migrate_execute()                    auction_item 갱신 + **필드 단위 변경 판정**
+  -> requeue_changed_documents()          done -> 'refresh'   ★ Sprint 189가 채운 칸
+  -> claim_next_queue_item()              'refresh' -> 'in_progress_refresh', overwrite=True
+  -> doc_worker -> collect_document(overwrite=True)
+  -> previous_hash != new_hash            document_version_log 1행
+  -> auction_image / doc_raw              실체 기록
+  -> API -> 상세페이지
+```
+
+### 큐 상태 어휘
+
+`document_queue.status`는 TEXT이고 CHECK 제약이 없다 — 값 추가는 **스키마 변경이 아니다**
+(그래서 승인 없이 가능하다). 새 컬럼을 만들지 않은 이유가 이것이다.
+
+```
+pending              한 번도 수집한 적 없다        -> overwrite=False
+refresh              이미 있지만 다시 받아야 한다  -> overwrite=True
+in_progress          pending 을 집어간 상태
+in_progress_refresh  refresh 를 집어간 상태
+```
+
+진행 상태를 두 갈래로 나눈 것이 핵심이다. 재시도(`mark_queue_failed`)와 stale 회수
+(`reset_stale_queue`)가 **원래 어느 쪽이었는지 알아야** 제자리로 돌려놓을 수 있다.
+하나로 합치면 재수집 의도가 첫 실패에서 조용히 사라지고, 그다음 시도는
+`overwrite=False`라 "이미 존재. 스킵"으로 **성공 처리**된다 — 가장 나쁜 실패 방식이다.
+
+### 기록하는 사진은 **서빙될 수 있는 사진**이어야 한다 (2026-08-19 Sprint 218, BUGS #148)
+
+"있다"를 판정하는 자리가 셋이고, 그중 **행을 만드는 곳만** 기준이 달랐다.
+
+```
+save_auction_images()      size <= 0 만 거절        <- 행을 만드는 곳
+image_exists()             >= MIN_IMAGE_BYTES(1,024)
+api/v1/images.py (서빙)     >= MIN_IMAGE_BYTES
+```
+
+1~1,023바이트 파일은 DB 에 행이 생기고 → API 가 `image_count=1 / READY` 를 주고
+→ 검색목록도 썸네일 URL 을 주는데 → **그 URL 은 404** 였다.
+이제 세 곳이 같은 상수를 본다(`test_asset_pipeline.py` 12-Q 가 AST 로 고정).
+
+정상 경로는 바뀌지 않는다 — 수집기가 이미 `len(data) < MIN_IMAGE_BYTES` 로 걸러낸다.
+막는 것은 잘린 파일·수동 조작·옛 backfill 이 남길 수 있는 행이다.
+운영 실측(2026-08-19): 45행의 최소 크기 35,746바이트로 **영향 0건**.
+
+### "이미 존재. 스킵"도 실체는 기록한다 (2026-08-19 Sprint 217, BUGS #144)
+
+스킵 분기는 **파일을 다시 쓰지 않는다.** 그러나 예전에는 `files_saved=[]` 로 돌아왔고,
+그러면 `mark_queue_done()` -> `_record_doc_raw()` 가 맨 앞에서 반환한다
+(`if not files_saved: return`). 결과:
+
+```
+파일 spec.pdf 는 있다 / doc_raw 는 0행
+  -> 큐 done / 화면 READY
+  -> API available=true 인데 page_count·file_size·doc_version 이 **영구 null**
+  -> 다음 수집도 같은 스킵 분기 -> 스스로 회복되는 경로가 없다
+```
+
+이제 세 분기(spec/status/appraisal) 전부 `doc_paths.existing_doc_files()` 로
+**이미 갖고 있는 파일**을 결과에 담는다. `doc_exists()` 와 같은 목록·같은 기준을 쓴다.
+사진 쪽은 같은 자리를 처음부터 복구하고 있었다(`image_crawler._describe_existing()`) —
+문서만 없던 칸을 메운 것이다.
+
+바뀌지 않는 것: 파일을 다시 쓰지 않고(mtime 무변경), `previous_hash`/`new_hash` 는
+그대로 비어 `document_version_log` 에 거짓 개정을 남기지 않으며, `_record_doc_raw()` 의
+내용 무변경 판정(Sprint 187)이 `doc_version` 부풀림을 막는다.
+
+### 무엇이 바뀌면 무엇을 다시 받는가
+
+`storage/database.py:REFRESH_DOC_TYPES_BY_FIELD` 하나가 유일한 정의처다.
+
+| 바뀐 필드 | 다시 받는 자산 | 근거 |
+|---|---|---|
+| `auction_date` | spec, status | 법원은 **기일마다 매각물건명세서를 다시 올린다** |
+| `minimum_bid_price` | spec | 저감된 최저가가 명세서에 적혀 있다 |
+| `status` | spec, status | 유찰/변경/취하/정지가 두 문서에 반영된다 |
+| `appraisal_price` | appraisal, image | 감정가 변동 = 재감정 = 감정평가서 + 현장 재촬영 |
+
+**사진을 기일/최저가에 넣지 않는다.** 사진은 감정 시점의 것이라 유찰로 값만 내려갈 때는
+바뀌지 않는다. 넣으면 매일 수천 장을 이유 없이 다시 받는다.
+
+### 되돌릴 것과 건드리지 않을 것
+
+```
+done                  -> refresh   단, 매각기일이 아직 지나지 않은 물건만
+SKIPPED_EXPIRED       -> pending   단, 기일이 미래로 다시 잡혔을 때만 (한 번도 못 받았으므로
+                                   overwrite 가 아니다)
+pending / refresh     그대로       이미 대기 중
+in_progress(_refresh) 그대로       워커가 소유 중 — 뺏으면 그 실행이 done 으로 덮는다
+failed                그대로       자기 재시도 경로가 따로 있다
+SKIPPED_UNSUPPORTED   그대로       성공할 수 없는 항목의 영구 종결. 되살리면
+                                   mark_queue_unsupported() 가 끊은 무한 재시도가 되살아난다
+```
+
+"기일이 지난 물건은 되돌리지 않는다"는 조건은 실제 DB 사본으로 돌려 보다가 추가했다 —
+되돌리면 워커의 2차 방어선에 걸려 곧바로 `SKIPPED_EXPIRED`가 되므로, **아무것도 다시
+받지 못한 채 성공 기록(done)만 잃는다.**
+
+### 상한과 스위치
+
+- `REFRESH_MAX_ITEMS_PER_RUN = 300`. 초과분은 큐에 그대로 남아 다음 실행의 후보가 되고,
+  **잘린 건수는 로그와 반환값에 남는다**(조용한 절단 금지).
+  아직 실측 근거가 없는 값이라, 재수집이 실제로 돌기 시작하면 다시 정한다.
+- `DOJOONPASS_REFRESH_ON_CHANGE=0` 이면 관측만 하고 예약하지 않는다(기본 켬).
+
+### 정렬은 바꾸지 않았다
+
+`priority`는 매각기일 임박도에서 나온 제품의 중요도다. 재수집을 앞세우면 **한 번도
+수집된 적 없는 임박 물건**이 뒤로 밀린다. 총량은 위 상한으로 따로 제한한다.
+
+### 실패해도 이미 가진 것을 잃지 않는다
+
+재수집이 최종 실패해도 화면 상태(`document_status`)가 `READY`/`NO_IMAGE`면 **그대로
+유지한다**(`DOC_STATUS_HAS_ARTIFACT`). 아니면 화면은 "수집실패"인데 파일 서빙은 200으로
+옛 문서를 내려 주는 어긋남이 생긴다(BUGS #122, #50 계열). 큐 행은 `failed`로 남으므로
+실패 사실 자체는 유실되지 않는다.
+
+### 지문은 **내용**에서 뜬다 — 우리가 찍은 메타데이터는 제외 (BUGS #124)
+
+`status.json`에는 우리가 매 수집마다 새로 찍는 `extracted_at`이 들어 있다. 파일 전체를
+해싱하면 **법원 자료가 그대로여도 지문이 매번 달라진다** = 매 수집이 거짓 개정이다.
+
+```
+_fields_hash(fields)          fields 만 정렬된 canonical JSON 으로 직렬화 -> sha256
+status_content_hash(path)     디스크의 status.json 에서 **같은 공식**으로
+```
+
+두 공식이 갈라지면 이미지 BUGS #113/#120과 정확히 같은 결과가 된다 — 그래서 한 함수를
+양쪽이 함께 쓴다. 형제 물건 재사용 경로도 마찬가지다(복사해 온 파일의 `extracted_at`은
+그 형제를 수집한 시각이라 비교 근거가 될 수 없다).
+
+자산별 지문의 근거를 한 자리에 모으면:
+
+| 자산 | 지문의 근거 | 왜 |
+|---|---|---|
+| 사진 | 파일별 sha256을 순번 순으로 이어 붙여 다시 sha256 | 법원이 URL을 안 주므로 바이트가 유일한 근거 |
+| 명세서/감정평가서 | PDF 파일 전체 sha256 | 파일에 우리 메타데이터가 없다 |
+| 현황조사서 | **`fields`의 canonical JSON** sha256 | 파일에 우리가 찍은 `extracted_at`이 있다 |
+
+### 내용이 그대로면 파일을 다시 쓰지 않는다 (BUGS #125)
+
+같은 바이트를 다시 써도 **mtime이 바뀐다.** 서빙 쪽 ETag는 Starlette가 (mtime, size)로
+만들기 때문에, 내용이 그대로여도 **모든 브라우저 캐시가 무효화된다** —
+`api/http_cache.py`가 조건부 요청으로 아끼려던 바로 그 바이트다.
+
+```
+검색 1페이지 썸네일  약 2MB      물건당 사진 1.3~1.9MB      감정평가서 1건 3.4MB
+```
+
+재수집 대상은 정의상 "사용자가 지금 보고 있는" 물건이라 체감이 가장 큰 자리다.
+
+```
+사진        _same_bytes_on_disk(dest, digest) 이면 쓰지 않는다
+status      내용 지문이 같으면 html/json 둘 다 쓰지 않는다 (_write_text_if_changed)
+spec/appr.  new_hash == previous_hash 이면 목적지를 건드리지 않고 다운로드분만 치운다
+```
+
+판정은 **크기가 아니라 바이트 지문**으로 한다 — 크기만 보면 같은 크기의 다른 내용을 놓친다.
+
+`status.json`의 `extracted_at`은 이제 **"이 내용을 처음 확인한 수집 시각"**이라는 뜻이다.
+#124가 그 필드를 지문에서 뺐으므로 변경 감지에는 영향이 없다.
+
+### 사진 집합의 세 근거는 언제나 같아야 한다 (2026-08-18 Sprint 191)
+
+사진에는 근거가 셋 있고, **완전 수집 뒤에는 반드시 같아야 한다.**
+
+```
+수집 결과   collect_images() 가 돌려주는 images[].seq
+디스크      documents/<법원>/<사건>/<물건>/images/ 의 파일들
+DB          auction_image 행
+```
+
+이 저장소가 겪은 사진 결함은 **전부** 이 셋 중 둘이 갈라진 것이다
+(#113 #114 #120 #127 #128). 그래서 각 상황을 지키는 코드가 나뉘어 있다:
+
+| 무엇이 | 어디가 지키나 |
+|---|---|
+| 같은 순번의 다른 확장자 | `_remove_other_ext_for_seq()` (쓰기 직후, BUGS #120) |
+| 이제 없는 순번 | `_remove_files_not_in()` (완전 수집일 때만, BUGS #127) |
+| DB 옛 행 | `save_auction_images()` **집합 차집합** (완전 수집일 때만, BUGS #127) |
+| 0장으로 줄어든 경우 | `clear_images_if_absence_confirmed()` (**2회 확인**, BUGS #128) |
+| 바이트가 같은 재수집 | 쓰지 않는다 (mtime/ETag 보존, BUGS #125) |
+
+**부분 수집(`partial=True`)이면 어느 것도 지우지 않는다.** "법원이 줄였다"와 "일부만
+받아졌다"는 구별할 수 없고, 지운 것은 되돌릴 수 없다.
+
+`seq > max_seq` 가 아니라 **집합 차집합**인 이유: 법원이 가운데 순번을 빼는 경우
+(1,2,4만 제공)를 `>` 비교는 못 잡는다 — 3번 행이 살아남고 그 파일은 이미 없다.
+
+### 0장 케이스만 다르게 다룬다 (BUGS #128)
+
+`doc_worker` 는 `if result.get("images")` 로 가드한다(빈 목록은 전체 실패와 구별되지
+않으므로 **그 가드는 옳다**). 그래서 0장은 별도 경로로 처리하고, **두 번 연속 확인**을
+요구한다.
+
+```
+1회차: document_status 가 READY -> NO_IMAGE. 사진은 남긴다(경고 로그).
+2회차: 이미 NO_IMAGE 인데 또 no_asset -> 행과 파일을 정리한다.
+```
+
+1회차 기억은 `document_status` 자체가 한다(새 컬럼 없음).
+`clear_images_if_absence_confirmed()`는 `mark_queue_done()` **보다 먼저** 불러야 한다.
+정리 순서는 **DB 행 -> 파일**이다(반대면 "DB 는 있다는데 파일이 없다"가 된다).
+
+### 문서의 "완료"는 필요한 파일 **전부**다 (BUGS #129)
+
+```
+spec        spec.pdf
+status      status.html + status.json      <- 둘 다 있어야 완료
+appraisal   appraisal.pdf
+```
+
+예전에는 status 를 `status.json` 하나로 판정했는데 **뷰어가 서빙하는 것은
+`status.html`** 이다. json 만 남으면 "완료"로 오판해 영구히 재수집에서 빠지고 뷰어는
+404다. 단일 소스는 `crawler/doc_paths.py:DOC_REQUIRED_FILES` 이고,
+`test_doc_storage_atomicity.py` 7i 가 서빙 표와의 정합성을 강제한다.
+
+### 배치는 두 번 돌지 않는다 (2026-08-18 Sprint 194)
+
+```
+doc_worker    logs/doc_worker.lock    stale 5시간
+mvp_scraper   logs/mvp_scraper.lock   stale 6시간   <- Sprint 194 신설
+```
+
+구현은 `storage/checkpoint.py:RunLock` 하나다(규칙을 베끼지 않는다).
+락을 못 잡으면 **실패가 아니라 조용한 건너뜀**이다 — 다른 실행이 이미 그 일을 하고 있다.
+
+매일 크롤에 락이 필요한 이유:
+
+```
+logs/checkpoint.json   CheckpointManager.save() 가 파일 전체를 읽어 고쳐 쓴다 ->
+                       두 실행이 겹치면 진행 상황이 서로 덮인다
+법원 서버              전체 크롤 약 3.1시간(파생) -> 같은 사건을 두 배로 긁는다
+```
+
+예약 작업끼리는 `MultipleInstances=IgnoreNew` 로 안 겹친다. 락이 막는 것은
+**수동 실행과 스케줄 실행이 겹치는 경우**다.
+
+★ 락을 못 잡은 쪽은 **남의 락을 지우면 안 된다.** 지우면 먼저 돌던 실행이 무방비가
+된다. `test_doc_worker_recovery.py` §11 이 그것을 고정한다.
+
+### PDF 수집: 탭이 아니라 **파일 도착**이 성공 조건이다 (2026-08-18 Sprint 201, BUGS #135)
+
+`get_download_driver_options()` 는 `plugins.always_open_pdf_externally: True` 를 켠다.
+그래서 Chrome 은 PDF 를 **렌더링하지 않고 곧바로 내려받는다.**
+
+그 결과 `window.open(pdf_url)` 로 연 탭은 **그릴 것이 없어 뜨지도 않는다.**
+즉 **다운로드가 성공할수록 탭은 안 생긴다.**
+
+```
+잘못된 성공 조건   새 탭이 떴는가          -> 성공할수록 거짓이 된다
+옳은 성공 조건     파일이 도착했는가        -> wait_for_download()
+```
+
+`collect_appraisal()` 은 탭이 없으면 이제 **다운로드 도착 여부로 판단한다.**
+둘 다 없을 때만 실패다.
+
+실측(2026-08-18): 수정 전 이 경로는 `success=False` 를 내면서 2.5MB PDF 를
+`downloads/` 에 버렸고, 그 파일은 그 물건의 기존 `appraisal.pdf` 와 sha256 이 같았다.
+`downloads/` 에는 그렇게 버려진 고아가 **8개 / 14.0MB** 쌓여 있었다.
+
+★ 받아 놓고 못 옮긴 파일은 `audit_asset_integrity.py` [8] 이 상시 탐지한다.
+
+### 명세서도 같았다 (2026-08-18 Sprint 202, BUGS #136)
+
+위 규칙은 감정평가서만의 이야기가 아니다. `collect_spec()` 도 같은 모양이었다.
+법원이 명세서를 뷰어 대신 **PDF 로 바로** 내려 주면 탭이 뜨지 않고 파일만 도착하는데,
+그 분기가 파일을 확인조차 하지 않고 실패로 끝냈다.
+
+```
+탭이 떴다      -> 문서뷰어다. '파일저장' 을 눌러 받는다 (기존 경로, 그대로)
+탭이 없는데
+파일이 왔다    -> **뷰어 단계를 건너뛰고 바로 저장한다** (신설)
+둘 다 없다     -> 그때만 실패다
+```
+
+뷰어는 다운로드를 얻기 위한 **수단**이지 목적이 아니다. 파일이 이미 손에 있으면
+뷰어를 찾을 이유가 없다.
+
+증거: `downloads/` 고아 8개 중 **5개가 매각물건명세서**였다(2026-08-18 실측).
+
+주의: 여전히 미확정인 경로가 하나 남는다 — **뷰어 탭은 뜨는데 30초 안에 파일이
+안 오는** 경우. 그건 타임아웃 튜닝 문제라 운영 로그 없이 정하지 않는다.
+`audit_asset_integrity.py` [8] 이 계속 지켜본다.

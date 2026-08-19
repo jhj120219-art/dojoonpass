@@ -117,5 +117,20 @@ def get_doc_button_id(doc_type: str, item_no: str) -> str:
 # Worker 종료 시각 (HH:MM, 24시간제)
 DOC_WORKER_END_TIME: str = "04:00"
 
+# Worker 시작 시각. 실행 창 길이를 계산하려면 시작도 알아야 한다
+# (예약 작업 등록 시각과 같아야 한다 — register_scheduler_tasks.ps1).
+DOC_WORKER_START_TIME: str = "02:00"
+
+# 큐 1행을 실제로 수집하는 데 걸리는 시간(초). **실측값이다.**
+# ---------------------------------------------------------------------------
+#   브라우저 이동 15.2초 + 수집 약 6.8초  = 약 22초   (2026-08-17 Sprint 146/147 실측)
+#   + doc_worker 루프 끝의 time_module.sleep(2)
+# 기일이 지난 행은 브라우저를 열지 않고 5.1ms 로 종결되며, `continue` 로 그 sleep 도
+# 건너뛴다 — 그래서 적체 2,733행이 13.9초밖에 안 든다(Sprint 146 실측).
+#
+# 이 값은 `REFRESH_MAX_ITEMS_PER_RUN` 의 안전성을 계산하는 근거다.
+# 회귀가 이 상수로 산술을 검증하므로, 실측이 달라지면 여기만 고치면 된다.
+DOC_COLLECT_SECONDS_PER_ROW: float = 24.0
+
 # 우선순위 재계산(01:50) 관련
 PRIORITY_REFRESH_TIME: str = "01:50"

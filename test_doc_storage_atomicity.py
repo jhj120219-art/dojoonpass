@@ -15,7 +15,9 @@ doc_exists()는 status.json의 존재+0바이트초과만으로 "완료"를 판�
     python test_doc_storage_atomicity.py
 """
 import sys
+import hashlib
 import os
+import json
 import shutil
 import stat
 import tempfile
@@ -290,7 +292,12 @@ def test_status_overlay_has_data():
     body = src[src.index("def collect_status("):src.index("def collect_appraisal(")]
     check("collect_status가 대기 조건에서 데이터 유무를 본다",
           body.count("status_overlay_has_data") >= 2, True)
-    save_idx = body.index("html_tmp = html_path")
+    # 저장 지점을 **함수 이름**으로 찾는다 (2026-08-18 Sprint 189 정정).
+    #   예전에는 `html_tmp = html_path` 라는 **구현 세부**를 찾았다. Sprint 189가 그 두 줄을
+    #   `_write_text_if_changed()` 헬퍼로 옮기자 이 검사가 ValueError로 죽었다 — 제품 결함이
+    #   아니라 검사가 리팩터링에 부러진 것이다. 지키려는 불변식("빈 캡처 관문이 저장보다
+    #   앞에 있다")은 그대로 두고, 저장을 가리키는 표지만 덜 부서지는 것으로 바꾼다.
+    save_idx = body.index("_write_text_if_changed(html_path")
     guard_idx = body.rindex("status_overlay_has_data", 0, save_idx)
     check_true("저장 직전에 빈 캡처 관문이 있다", guard_idx < save_idx)
 
@@ -388,11 +395,33 @@ def test_finalize_download_moves_file():
                 os.remove(p)
 
 
+def _force_rmtree(path):
+    """읽기 전용 속성을 풀어 가며 지운다.
+
+    ★ 2026-08-18 Sprint 189: 이 헬퍼는 원래 아래 "이전 실행 잔해" 정리에만 있었고,
+      **이번 실행 자기 디렉터리는 맨 `shutil.rmtree()`로 지우고 있었다.** 그래서
+      OneDrive 가 R 속성을 붙일 만큼 시간이 지난 실행은 cleanup 에서 `PermissionError`로
+      죽었고 — 테스트 전체가 exit 1 이 되면서 **지우지 못한 디렉터리가 그대로 남아
+      다음 실행도 같은 자리에서 죽었다.** 실제로 6벌이 쌓여 있었다(2026-08-18 실측,
+      Sprint 189 작업 중 실제로 이 연쇄를 겪었다).
+
+      방어는 이미 있었는데 **두 호출 지점 중 하나만 쓰고 있었다** — 이 저장소가
+      #110/#112 에서 배운 것과 같은 모양이라, 여기서도 호출 지점을 하나로 합친다.
+    """
+    def onerror(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=onerror)
+
+
 def cleanup():
     print("\n--- cleanup (qa test doc dir only) ---")
     root = os.path.join(DOCUMENT_ROOT, QA_COURT)
     if os.path.isdir(root):
-        shutil.rmtree(root)
+        _force_rmtree(root)
     check_true("qa test doc dir removed", not os.path.isdir(root))
 
     # ── 이전 실행이 강제 종료돼 남긴 잔해도 쓸어낸다 (2026-08-13 Sprint 96) ──
@@ -408,15 +437,6 @@ def cleanup():
     #   그 상태에서 `shutil.rmtree`는 `PermissionError [WinError 5]`로 실패한다 ―
     #   `ignore_errors=True`는 그 실패를 **조용히 삼켜** 지운 줄 알게 만든다.
     #   갓 만든 디렉터리는 아직 속성이 붙기 전이라 성공하고, 오래 남은 것만 실패한다.
-    def _force_rmtree(path):
-        def onerror(func, target, _exc):
-            try:
-                os.chmod(target, stat.S_IWRITE)
-                func(target)
-            except OSError:
-                pass
-        shutil.rmtree(path, onerror=onerror)
-
     stale = []
     if os.path.isdir(DOCUMENT_ROOT):
         for name in os.listdir(DOCUMENT_ROOT):
@@ -636,6 +656,583 @@ def test_collect_spec_refuses_non_pdf_download():
             shutil.rmtree(download_dir, ignore_errors=True)
 
 
+def test_overwrite_of_existing_pdf_is_atomic():
+    """재수집으로 **기존 PDF를 덮어쓸 때**도 원자적이어야 한다 (2026-08-18 Sprint 189, BUGS #121).
+
+    ## 왜 이 검사가 생겼나
+
+    여기는 원래 `shutil.move(downloaded_path, dest_path)`였다. 목적지가 없을 때는
+    `os.rename()` 한 번이라 원자적이다. 문제는 **목적지가 이미 있을 때**다 —
+    Windows의 `os.rename()`은 기존 파일이 있으면 `FileExistsError`를 내고,
+    `shutil.move()`는 그 예외를 잡아 조용히 `copy2()` 폴백으로 넘어간다.
+    실측(2026-08-18, Python 3.12.10):
+
+        목적지 없음 -> RENAME (원자적)
+        목적지 있음 -> COPY   (비원자적)   <- **재수집이 항상 여기로 온다**
+
+    비원자적 복사 도중 프로세스가 죽으면 잘린 PDF가 목적지에 남는다. 그리고
+    `doc_exists()`는 "존재 + 크기 0 초과"만 보므로 그 잘린 파일을 **완성된 문서로
+    취급**해, 다음 수집이 "이미 있다"고 건너뛴다 — 깨진 문서가 영구히 남는다.
+    Sprint 189가 재수집을 켠 순간 실제로 도달하는 경로가 됐다.
+
+    같은 일을 하는 `collect_documents.py:249`는 이미 `os.replace()`를 쓰고 있었다.
+    **두 수집기만 빠져 있었다.**
+    """
+    import crawler.doc_crawler as dc
+
+    print("\n--- 7d. 기존 PDF 덮어쓰기가 원자적이다 (Sprint 189, BUGS #121) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_atomic_overwrite_")
+    try:
+        dest = os.path.join(tmp, "spec.pdf")
+        old_bytes = b"%PDF-1.4-old"
+        new_bytes = b"%PDF-1.7-new"
+        with open(dest, "wb") as f:
+            f.write(old_bytes)
+
+        # (1) 목적지가 이미 있어도 내용이 정확히 교체된다.
+        src = os.path.join(tmp, "download.pdf")
+        with open(src, "wb") as f:
+            f.write(new_bytes)
+        dc.move_into_place(src, dest)
+        check("덮어쓰기 후 새 내용", open(dest, "rb").read(), new_bytes)
+        check_true("원본(다운로드분)은 남지 않는다", not os.path.exists(src))
+        check_true("임시 파일도 남지 않는다", not os.path.exists(dest + ".tmp"))
+
+        # (2) 교체 **직전**에 죽어도 목적지는 옛 파일 그대로다(반쪽 파일이 아니다).
+        #     os.replace()를 터뜨려 "복사는 끝났지만 교체 전에 죽은" 순간을 만든다.
+        src2 = os.path.join(tmp, "download2.pdf")
+        with open(src2, "wb") as f:
+            f.write(b"%PDF-9.9-crash")
+
+        calls = {"n": 0}
+        orig_replace = dc.os.replace
+
+        def boom(a, b):
+            calls["n"] += 1
+            if calls["n"] >= 2:          # 1회차는 다운로드분 -> .tmp 이동
+                raise OSError("qa-simulated-crash-before-swap")
+            return orig_replace(a, b)
+
+        dc.os.replace = boom
+        try:
+            raised = False
+            try:
+                dc.move_into_place(src2, dest)
+            except OSError:
+                raised = True
+        finally:
+            dc.os.replace = orig_replace
+
+        check_true("교체 실패는 호출자에게 알린다(조용한 성공 금지)", raised)
+        check("교체 전에 죽으면 목적지는 이전 파일 그대로", open(dest, "rb").read(), new_bytes)
+        check_true("실패해도 .tmp 잔재를 남기지 않는다", not os.path.exists(dest + ".tmp"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_no_collector_uses_non_atomic_move():
+    """같은 계열이 다른 곳에 없는지 **전수 검색**한다 (2026-08-18 Sprint 189).
+
+    인스턴스만 고치면 반드시 다음이 남는다 — 이 저장소가 #110/#112에서 배운 것이다.
+    목적지에 직접 쓰는 이동(`shutil.move`/`shutil.copy*`)이 수집 계층에 남아 있으면
+    여기서 걸린다.
+    """
+    print("\n--- 7e. 수집 계층에 비원자적 이동이 남아 있지 않다 (Sprint 189) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    targets = []
+    for rel in ("crawler", "storage"):
+        base = os.path.join(root, rel)
+        for dp, dn, fn in os.walk(base):
+            dn[:] = [d for d in dn if d != "__pycache__"]
+            targets.extend(os.path.join(dp, f) for f in fn if f.endswith(".py"))
+    targets.append(os.path.join(root, "collect_documents.py"))
+
+    # ★ 텍스트 grep 이 아니라 AST 로 본다. 이 파일과 `doc_crawler.py` 자신이 결함을
+    #   **설명하는 문장**에 `shutil.move(...)` 를 그대로 적고 있어서, 문자열 검색은
+    #   산문을 코드로 오판한다(실제로 처음 작성했을 때 그렇게 걸렸다).
+    import ast as _ast
+
+    BANNED = {"move", "copy2", "copyfile", "copy"}
+    offenders = []
+    unparsed = []      # 못 읽은/못 판 파일 — **조용히 넘기지 않는다**
+    for path in sorted(targets):
+        # ★ `utf-8-sig` 여야 한다 (2026-08-18 Sprint 195, BUGS #133).
+        #   BOM 이 있는 소스를 `utf-8` 로 읽으면 `\ufeff` 가 남아 `ast.parse` 가 거부하고,
+        #   `except SyntaxError: continue` 가 그 파일을 감사에서 통째로 지운다.
+        #   실측: 이 스캔 범위에서 `storage/database.py`, `crawler/image_crawler.py` 등
+        #   16개가 빠져 있었다 — 전수 가드가 전수가 아니었다.
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                tree = _ast.parse(fh.read())
+        except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            unparsed.append("%s (%s)" % (
+                os.path.relpath(path, root).replace(os.sep, "/"),
+                type(exc).__name__))
+            continue
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, _ast.Attribute) and fn.attr in BANNED
+                    and isinstance(fn.value, _ast.Name) and fn.value.id == "shutil"):
+                continue
+            # 목적지 옆 임시 이름으로 복사한 뒤 `os.replace()` 로 바꾸는 것은 정상 경로다
+            # (`move_into_place()` 의 볼륨 간 폴백). 두 번째 인자가 tmp 변수인지로 가린다.
+            dest_arg = node.args[1] if len(node.args) > 1 else None
+            if isinstance(dest_arg, _ast.Name) and "tmp" in dest_arg.id.lower():
+                continue
+            offenders.append("%s:%d" % (rel, node.lineno))
+
+    # ★ 못 본 파일이 있으면 "없다"는 결론이 성립하지 않는다.
+    check("스캔 범위의 모든 파일을 실제로 읽고 팠다", unparsed, [])
+    check("수집/저장 계층에 목적지 직접 쓰기가 없다", offenders, [])
+    check_true("검색 대상 파일을 실제로 찾았다", len(targets) >= 8, len(targets))
+
+
+def test_status_hash_ignores_our_own_timestamp():
+    """현황조사서 지문이 **우리가 찍은 수집 시각**에 흔들리지 않는가 (Sprint 189, BUGS #124).
+
+    ## 왜 이 검사가 생겼나
+
+    `status.json` 에는 `extracted_at`(수집 시각)이 들어 있다. 예전에는 변경 감지 지문을
+    그 파일 **전체**에서 떴다(`calc_file_hash(json_path)`). 그러면 법원 자료가 하나도
+    안 바뀌어도 지문이 매번 달라진다.
+
+    재수집을 켜기 전에는 이 경로에 두 번 오지 않아 드러나지 않았다. 켜는 순간:
+
+        document_version_log   매 수집마다 1행 (전부 거짓 개정)
+        doc_raw.doc_version    매 수집마다 +1  (BUGS #115 가 막으려던 바로 그것,
+                               `api/v1/item.py` 가 사용자 응답에 그대로 싣는다)
+
+    이 저장소는 원인을 이미 알고 있었다 — Sprint 145 의 형제 재사용 주석이
+    "차이는 우리가 찍는 extracted_at 하나뿐"이라고 실측해 적어 두었다.
+    그 관찰이 변경 감지 쪽으로 연결되지 않았을 뿐이다.
+    """
+    import crawler.doc_crawler as dc
+
+    print("\n--- 7f. 현황조사서 지문이 수집 시각에 흔들리지 않는다 (Sprint 189, BUGS #124) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_status_hash_")
+    try:
+        fields = {"b_id": "값2", "a_id": "값1"}
+        jp = os.path.join(tmp, "status.json")
+
+        def write(payload):
+            with open(jp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        write({"extracted_at": "2026-08-18T01:00:00", "fields": fields})
+        h1 = dc.status_content_hash(jp)
+
+        # 같은 내용, **다른 수집 시각** -> 지문이 같아야 한다
+        write({"extracted_at": "2026-08-19T09:99:99", "fields": fields})
+        h2 = dc.status_content_hash(jp)
+        check("수집 시각이 달라도 지문은 같다", h2, h1)
+
+        # 키 순서만 다른 같은 내용 -> 지문이 같아야 한다(표현의 차이가 내용의 차이로 둔갑 금지)
+        write({"extracted_at": "2026-08-18T01:00:00",
+               "fields": {"a_id": "값1", "b_id": "값2"}})
+        check("키 순서가 달라도 지문은 같다", dc.status_content_hash(jp), h1)
+
+        # 실제 내용이 바뀌면 지문이 달라야 한다(대조군 — 없으면 이 검사는 공허하다)
+        write({"extracted_at": "2026-08-18T01:00:00",
+               "fields": {"a_id": "값1", "b_id": "바뀐값"}})
+        check_true("내용이 바뀌면 지문이 달라진다",
+                   dc.status_content_hash(jp) != h1)
+
+        # 디스크 쪽 공식과 수집 쪽 공식이 같아야 한다 (이미지 BUGS #113/#120 과 같은 책임)
+        check("디스크 공식 == 수집 공식", dc.status_content_hash(jp),
+              dc._fields_hash({"a_id": "값1", "b_id": "바뀐값"}))
+
+        # 파일이 없거나 깨졌으면 "판단할 수 없다"는 뜻의 빈 문자열
+        os.remove(jp)
+        check("파일이 없으면 빈 지문", dc.status_content_hash(jp), "")
+        with open(jp, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        check("깨진 JSON도 빈 지문", dc.status_content_hash(jp), "")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_unchanged_content_preserves_browser_cache():
+    """내용이 그대로면 **파일을 다시 쓰지 않는다** (2026-08-18 Sprint 189).
+
+    같은 내용을 다시 써도 mtime 이 바뀌고, 서빙 쪽 ETag 는 Starlette 가 (mtime, size) 로
+    만들기 때문에 **모든 브라우저 캐시가 무의미하게 무효화된다**
+    (`api/http_cache.py` 가 조건부 요청으로 아끼려던 바로 그 바이트다).
+    재수집 대상은 정의상 "사용자가 지금 보고 있는" 물건이라 체감이 크다.
+
+    대조군을 함께 고정한다 — 내용이 **바뀌면** 반드시 쓴다. 구분하지 못하면 공허하다.
+    """
+    import crawler.doc_crawler as dc
+
+    print("\n--- 7g. 내용 무변경이면 파일을 다시 쓰지 않는다 (Sprint 189) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_cache_preserve_")
+    try:
+        path = os.path.join(tmp, "status.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("<div>같은 내용</div>")
+        before = os.stat(path).st_mtime_ns
+
+        check("같은 내용이면 쓰지 않는다",
+              dc._write_text_if_changed(path, "<div>같은 내용</div>"), False)
+        check("mtime 이 그대로다(ETag 보존)", os.stat(path).st_mtime_ns, before)
+
+        check("다른 내용이면 쓴다",
+              dc._write_text_if_changed(path, "<div>바뀐 내용</div>"), True)
+        check("내용이 실제로 교체된다",
+              open(path, encoding="utf-8").read(), "<div>바뀐 내용</div>")
+        check_true("임시 파일을 남기지 않는다", not os.path.exists(path + ".tmp"))
+
+        # 파일이 없으면 새로 쓴다
+        fresh = os.path.join(tmp, "new.html")
+        check("없던 파일은 쓴다", dc._write_text_if_changed(fresh, "x"), True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_identical_pdf_is_not_replaced():
+    """같은 PDF 를 다시 받았을 때 목적지를 건드리지 않는가 (2026-08-18 Sprint 189).
+
+    감정평가서 실측 3.4MB 다. 내용이 그대로인데 mtime 을 바꾸면 사용자가 그 3.4MB 를
+    이유 없이 다시 내려받는다. 대조군(내용이 바뀌면 교체)을 함께 고정한다.
+    """
+    import crawler.doc_crawler as dc
+    import crawler.doc_paths as dp
+
+    print("\n--- 7h. 같은 PDF 는 목적지를 건드리지 않는다 (Sprint 189) ---")
+    docs_root = tempfile.mkdtemp(prefix="qa_samepdf_docs_")
+    download_dir = tempfile.mkdtemp(prefix="qa_samepdf_dl_")
+    orig_root, orig_dl, orig_wait = dp.DOCUMENT_ROOT, dc.DOWNLOAD_DIR, dc.wait_for_download
+    try:
+        dp.DOCUMENT_ROOT = docs_root
+        dc.DOWNLOAD_DIR = download_dir
+        court, case_no, item_no = "QA법원", "2026타경2", "1"
+        dest = os.path.join(dp.get_doc_dir(court, case_no, item_no), "spec.pdf")
+
+        same = b"%PDF-1.4-same" + b"S" * 300
+        with open(dest, "wb") as f:
+            f.write(same)
+        before = os.stat(dest).st_mtime_ns
+
+        # 1) 법원이 **같은** 문서를 다시 준다 -> 목적지를 건드리지 않는다
+        dl = os.path.join(download_dir, "again.pdf")
+        with open(dl, "wb") as f:
+            f.write(same)
+        dc.wait_for_download = lambda before_files, timeout=30: dl
+
+        r = dc.collect_spec(_FakeSpecViewerDriver(), court, case_no, item_no, "btn",
+                            overwrite=True)
+        check("무변경도 성공이다", r["success"], True)
+        check("지문이 같다(개정 아님)", r["previous_hash"], r["new_hash"])
+        check("mtime 이 그대로다(ETag 보존)", os.stat(dest).st_mtime_ns, before)
+        check_true("다운로드분은 치운다", not os.path.exists(dl))
+
+        # 2) 대조군 — 법원이 **바꾼** 문서를 준다 -> 교체된다
+        changed = b"%PDF-1.7-changed" + b"C" * 400
+        dl2 = os.path.join(download_dir, "changed.pdf")
+        with open(dl2, "wb") as f:
+            f.write(changed)
+        dc.wait_for_download = lambda before_files, timeout=30: dl2
+
+        r2 = dc.collect_spec(_FakeSpecViewerDriver(), court, case_no, item_no, "btn",
+                             overwrite=True)
+        check("변경은 성공", r2["success"], True)
+        check_true("지문이 다르다(개정)", r2["previous_hash"] != r2["new_hash"])
+        check("파일이 실제로 교체된다", open(dest, "rb").read(), changed)
+    finally:
+        dc.wait_for_download = orig_wait
+        dc.DOWNLOAD_DIR = orig_dl
+        dp.DOCUMENT_ROOT = orig_root
+        shutil.rmtree(docs_root, ignore_errors=True)
+        shutil.rmtree(download_dir, ignore_errors=True)
+
+
+def test_completeness_matches_what_the_viewer_serves():
+    """★ 구조적 가드: **"수집 완료" 기준**과 **뷰어가 서빙하는 파일**이 갈라지지 않는다.
+
+    ## 왜 이 검사가 생겼나 (2026-08-18 Sprint 191, BUGS #129)
+
+    완료 판정(`doc_exists`)은 `status.json` 하나만 봤는데, 뷰어가 내려 주는 것은
+    `status.html` 이었다(`api/v1/documents.py:DOC_TYPE_FILES`). **두 정의가 서로 다른
+    파일을 가리키고 있었다.**
+
+        status.json 만 남은 상태 -> doc_exists()=True  (영원히 재수집 대상에서 제외)
+                                 -> 뷰어는 404
+                                 = "화면은 READY 인데 열면 없다"
+
+    BUGS #22/#50/#61/#64 와 같은 계열이고, 이번에는 **정의가 두 벌**인 형태였다.
+    실측(2026-08-18): 실데이터 json-only 0건 / html+json 163건 — 지금 터지는 버그는
+    아니었지만, 두 벌인 상태 자체가 결함이다.
+
+    이 검사는 목록을 손으로 맞추지 않는다 — **서빙 표에서 파일명을 읽어** 완료 기준에
+    들어 있는지 확인한다. 새 문서 종류가 생겨도 저절로 따라간다.
+    """
+    from crawler.doc_paths import DOC_REQUIRED_FILES, doc_exists, get_doc_dir
+    import crawler.doc_paths as dp_mod
+    from api.v1.documents import DOC_TYPE_FILES
+
+    print("\n--- 7i. 완료 기준 == 뷰어 서빙 대상 (Sprint 191, BUGS #129) ---")
+
+    # (1) 구조: 뷰어가 서빙하는 파일은 반드시 완료 기준 안에 있어야 한다
+    mismatched = []
+    for doc_type, (filename, _mime) in sorted(DOC_TYPE_FILES.items()):
+        required = DOC_REQUIRED_FILES.get(doc_type.lower())
+        if not required or filename not in required:
+            mismatched.append((doc_type, filename, required))
+    check("서빙 파일이 전부 완료 기준에 포함된다", mismatched, [])
+    check_true("검사 대상 문서 종류를 실제로 찾았다", len(DOC_TYPE_FILES) >= 3,
+               sorted(DOC_TYPE_FILES))
+
+    # 반대 방향도 본다 — 완료 기준의 종류가 서빙 표에 전부 있는가
+    missing_serve = sorted(set(DOC_REQUIRED_FILES) - {k.lower() for k in DOC_TYPE_FILES})
+    check("완료 기준의 모든 종류를 서빙한다", missing_serve, [])
+
+    # (2) 동작: status 는 두 파일이 다 있어야 완료다
+    docs_root = tempfile.mkdtemp(prefix="qa_reqfiles_")
+    orig = dp_mod.DOCUMENT_ROOT
+    try:
+        dp_mod.DOCUMENT_ROOT = docs_root
+        court, case_no, item_no = "QA법원", "2026타경9", "1"
+        d = get_doc_dir(court, case_no, item_no)
+        html = os.path.join(d, "status.html")
+        js = os.path.join(d, "status.json")
+
+        check("아무것도 없으면 미완료", doc_exists(court, case_no, item_no, "status"), False)
+
+        with open(js, "w", encoding="utf-8") as f:
+            f.write('{"fields": {"a": "1"}}')
+        # ★ 이것이 이번에 고친 자리다 — 예전에는 여기서 True 였다(뷰어는 404인데).
+        check("json 만 있으면 미완료(뷰어가 서빙할 것이 없다)",
+              doc_exists(court, case_no, item_no, "status"), False)
+
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<div>2023타경5035</div>")
+        check("둘 다 있어야 완료", doc_exists(court, case_no, item_no, "status"), True)
+
+        os.remove(js)
+        check("json 이 사라지면 다시 미완료",
+              doc_exists(court, case_no, item_no, "status"), False)
+
+        # 대조군 — 파일 하나짜리 종류는 그 하나로 판정한다
+        with open(os.path.join(d, "spec.pdf"), "wb") as f:
+            f.write(b"%PDF-1.4 x")
+        check("spec 은 파일 하나로 완료", doc_exists(court, case_no, item_no, "spec"), True)
+        check("appraisal 은 아직 미완료",
+              doc_exists(court, case_no, item_no, "appraisal"), False)
+    finally:
+        dp_mod.DOCUMENT_ROOT = orig
+        shutil.rmtree(docs_root, ignore_errors=True)
+
+
+class _FakeNoTabDriver:
+    """PDF 를 **탭 없이 곧바로 내려받는** 브라우저. BUGS #135 의 실제 조건이다.
+
+    `plugins.always_open_pdf_externally: True` 인 Chrome 은 PDF 를 렌더링하지 않고
+    다운로드한다. `window.open()` 으로 연 탭은 그릴 것이 없어 **뜨지도 않는다.**
+    즉 다운로드가 성공할수록 탭은 안 생긴다.
+    """
+
+    def __init__(self):
+        self.current_window_handle = "main"
+        self._handles = ["main"]
+
+    @property
+    def window_handles(self):
+        return list(self._handles)
+
+    class _El:
+        """iframe 대역. `collect_appraisal` 은 src 에서 PDF 주소를 뽑는다."""
+
+        def __init__(self, src=""):
+            self._src = src
+
+        def get_attribute(self, name):
+            return self._src if name == "src" else ""
+
+    def find_element(self, by, value):
+        return self._El()
+
+    def find_elements(self, by, value):
+        # 안쪽 iframe 의 src 가 PDF 를 가리켜야 pdf_url 이 만들어진다.
+        return [self._El("/viewer/HR2025-0609-0001.pdf")]
+
+    def execute_script(self, script, *args):
+        return None          # 탭을 만들지 않는다 (핵심)
+
+    class _SwitchTo:
+        def __init__(self, outer):
+            self._outer = outer
+
+        def window(self, handle):
+            self._outer.current_window_handle = handle
+
+        def default_content(self):
+            # 실제 collect_appraisal 이 부른다 - 대역이 실물보다 좁으면 TypeError/
+            # AttributeError 가 "수집 실패"로 삼켜진다(Sprint 189 에 같은 일을 겪었다).
+            return None
+
+        def frame(self, *a, **kw):
+            return None
+
+    @property
+    def switch_to(self):
+        return self._SwitchTo(self)
+
+    def close(self):
+        pass
+
+
+def test_appraisal_saves_when_tab_never_opens():
+    """감정평가서: **탭이 안 떠도 다운로드가 왔으면 저장한다** (Sprint 201, BUGS #135).
+
+    ## 무엇이 잘못돼 있었나
+
+    `collect_appraisal()` 은 `window.open(pdf_url)` 뒤 새 탭이 뜨기를 기다리고,
+    안 뜨면 **`wait_for_download()` 를 부르지도 않고 실패로 끝냈다.**
+
+    그런데 이 드라이버는 `plugins.always_open_pdf_externally: True` 로 만들어진다 —
+    Chrome 은 PDF 를 그리지 않고 내려받고, 그리면 될 것이 없는 탭은 뜨지 않는다.
+    **다운로드가 성공할수록 탭이 안 생기는 구조**였다.
+
+    ## 실측 (2026-08-18)
+
+    실브라우저로 이 경로를 태우자 로그는 `appraisal PDF 탭 생성 실패` 였는데
+    `downloads/` 에는 2,528,908 바이트 PDF 가 도착해 있었고, 그 물건의 기존
+    `appraisal.pdf` 와 **sha256 이 일치**했다. 받아 놓고 버린 것이다.
+
+    그리고 `downloads/` 최상위에 고아 PDF 8개가 쌓여 있었다. 그중 4개는 같은 문서의
+    Chrome 중복 이름(`... (1).pdf` ~ `(3).pdf`) 이었다 —
+    **같은 문서를 네 번 받아 네 번 버렸다는 증거다.**
+
+    ## 대조군
+
+    "탭도 없고 다운로드도 없으면" 은 여전히 실패여야 한다. 그것까지 성공으로 만들면
+    아무것도 안 받고 성공했다고 말하는, 이 저장소가 BUGS #47 이래 잡아 온 부류가 된다.
+    """
+    import crawler.doc_crawler as dc
+    import crawler.doc_paths as dp_mod
+
+    print("\n--- 7j. 탭이 안 떠도 다운로드가 왔으면 저장한다 (Sprint 201, BUGS #135) ---")
+    docs_root = tempfile.mkdtemp(prefix="qa_notab_docs_")
+    download_dir = tempfile.mkdtemp(prefix="qa_notab_dl_")
+    orig = (dp_mod.DOCUMENT_ROOT, dc.DOWNLOAD_DIR, dc.wait_for_download,
+            dc.NEW_WINDOW_TIMEOUT)
+    try:
+        dp_mod.DOCUMENT_ROOT = docs_root
+        dc.DOWNLOAD_DIR = download_dir
+        dc.NEW_WINDOW_TIMEOUT = 1        # 탭을 기다리느라 테스트가 느려지지 않게
+        court, case_no, item_no = "QA법원", "2026타경11", "1"
+        dest = os.path.join(dp_mod.get_doc_dir(court, case_no, item_no), "appraisal.pdf")
+
+        # --- 1) 탭은 안 뜨지만 PDF 가 도착한 경우 -> 저장돼야 한다 ---
+        arrived = os.path.join(download_dir, "HR2025-0609-0001.pdf")
+        payload = b"%PDF-1.7" + b"A" * 400
+        with open(arrived, "wb") as f:
+            f.write(payload)
+        dc.wait_for_download = lambda before, timeout=30: arrived
+
+        r = dc.collect_appraisal(_FakeNoTabDriver(), court, case_no, item_no, "btn-id")
+        check("탭이 없어도 성공으로 끝난다", r["success"], True)
+        check_true("목적지에 저장된다", os.path.isfile(dest))
+        check("저장된 내용이 받은 내용과 같다",
+              hashlib.sha256(open(dest, "rb").read()).hexdigest(),
+              hashlib.sha256(payload).hexdigest())
+        check_true("다운로드 폴더에 고아를 남기지 않는다", not os.path.exists(arrived))
+
+        # --- 2) 대조군: 탭도 없고 다운로드도 없으면 여전히 실패 ---
+        os.remove(dest)
+        dc.wait_for_download = lambda before, timeout=30: None
+        r2 = dc.collect_appraisal(_FakeNoTabDriver(), court, case_no, item_no, "btn-id")
+        check("아무것도 안 왔으면 실패다", r2["success"], False)
+        check_true("아무것도 저장하지 않는다", not os.path.exists(dest))
+
+        # --- 3) 대조군: 받은 것이 PDF 가 아니면 저장하지 않는다(기존 방어 유지) ---
+        bad = os.path.join(download_dir, "bad.pdf")
+        with open(bad, "wb") as f:
+            f.write(b"<html>error</html>")
+        dc.wait_for_download = lambda before, timeout=30: bad
+        r3 = dc.collect_appraisal(_FakeNoTabDriver(), court, case_no, item_no, "btn-id")
+        check("가짜 PDF 는 여전히 거부한다", r3["success"], False)
+        check_true("가짜 PDF 는 목적지에 안 남는다", not os.path.exists(dest))
+    finally:
+        (dp_mod.DOCUMENT_ROOT, dc.DOWNLOAD_DIR, dc.wait_for_download,
+         dc.NEW_WINDOW_TIMEOUT) = orig
+        shutil.rmtree(docs_root, ignore_errors=True)
+        shutil.rmtree(download_dir, ignore_errors=True)
+
+
+def test_spec_saves_when_tab_never_opens():
+    """명세서: **탭이 안 떠도 다운로드가 왔으면 저장한다** (Sprint 202, BUGS #136).
+
+    BUGS #135(감정평가서)를 고친 뒤 **같은 모양이 명세서에도 있는지** 전수로 훑다 나왔다.
+    `collect_spec()` 도 새 탭을 성공 조건으로 삼고, 안 뜨면 `wait_for_download()` 를
+    부르지도 않고 실패로 끝냈다.
+
+    ## 근거
+
+    `downloads/` 최상위 고아 8개 중 **5개가 매각물건명세서**였다(2026-08-18 실측,
+    전체 14.0MB). 즉 명세서 다운로드가 도착했는데 저장되지 않은 전례가 실제로 있다.
+    Chrome 은 `plugins.always_open_pdf_externally: True` 로 만들어지므로, 법원이 명세서를
+    뷰어 대신 PDF 로 바로 내려 주면 **그릴 것이 없어 탭이 뜨지 않고 파일만 도착한다.**
+
+    ## 대조군을 함께 둔다
+
+    뷰어 경로(탭이 뜨는 정상 경로)가 그대로 동작해야 한다. 탭이 뜨면 예전처럼
+    '파일저장' 버튼을 찾아 눌러야 하고, 그 경로를 건드리면 안 된다.
+    """
+    import crawler.doc_crawler as dc
+    import crawler.doc_paths as dp_mod
+
+    print("\n--- 7k. 명세서도 탭 없이 도착하면 저장한다 (Sprint 202, BUGS #136) ---")
+    docs_root = tempfile.mkdtemp(prefix="qa_specnotab_docs_")
+    download_dir = tempfile.mkdtemp(prefix="qa_specnotab_dl_")
+    orig = (dp_mod.DOCUMENT_ROOT, dc.DOWNLOAD_DIR, dc.wait_for_download,
+            dc.NEW_WINDOW_TIMEOUT)
+    try:
+        dp_mod.DOCUMENT_ROOT = docs_root
+        dc.DOWNLOAD_DIR = download_dir
+        dc.NEW_WINDOW_TIMEOUT = 1
+        court, case_no, item_no = "QA법원", "2026타경12", "1"
+        dest = os.path.join(dp_mod.get_doc_dir(court, case_no, item_no), "spec.pdf")
+
+        # --- 1) 탭은 안 뜨지만 PDF 가 도착 -> 저장 ---
+        arrived = os.path.join(download_dir, "명세서.pdf")
+        payload = b"%PDF-1.4" + b"S" * 300
+        with open(arrived, "wb") as f:
+            f.write(payload)
+        dc.wait_for_download = lambda before, timeout=30: arrived
+
+        r = dc.collect_spec(_FakeNoTabDriver(), court, case_no, item_no, "btn-id")
+        check("탭이 없어도 성공으로 끝난다", r["success"], True)
+        check_true("목적지에 저장된다", os.path.isfile(dest))
+        check("내용이 받은 것과 같다",
+              hashlib.sha256(open(dest, "rb").read()).hexdigest(),
+              hashlib.sha256(payload).hexdigest())
+        check_true("고아를 남기지 않는다", not os.path.exists(arrived))
+
+        # --- 2) 대조군: 탭도 없고 다운로드도 없으면 실패 ---
+        os.remove(dest)
+        dc.wait_for_download = lambda before, timeout=30: None
+        r2 = dc.collect_spec(_FakeNoTabDriver(), court, case_no, item_no, "btn-id")
+        check("아무것도 안 왔으면 실패다", r2["success"], False)
+        check_true("아무것도 저장하지 않는다", not os.path.exists(dest))
+
+        # --- 3) 대조군: 뷰어 경로(탭이 뜨는 정상 경로)는 그대로 동작한다 ---
+        arrived2 = os.path.join(download_dir, "viewer.pdf")
+        with open(arrived2, "wb") as f:
+            f.write(payload)
+        dc.wait_for_download = lambda before, timeout=30: arrived2
+        r3 = dc.collect_spec(_FakeSpecViewerDriver(), court, case_no, item_no, "btn-id")
+        check("뷰어 경로도 여전히 성공한다", r3["success"], True)
+        check_true("뷰어 경로도 목적지에 저장한다", os.path.isfile(dest))
+    finally:
+        (dp_mod.DOCUMENT_ROOT, dc.DOWNLOAD_DIR, dc.wait_for_download,
+         dc.NEW_WINDOW_TIMEOUT) = orig
+        shutil.rmtree(docs_root, ignore_errors=True)
+        shutil.rmtree(download_dir, ignore_errors=True)
+
+
 def test_wait_for_download_completion_rules():
     """다운로드 완료 판정 규칙 (2026-08-13 Sprint 85 신설).
 
@@ -828,10 +1425,19 @@ def test_wait_for_download_callers_check_the_result():
 
     guarded = 0
     problems = []
+    # ★ `body` 만 보면 `else:` / `except:` / `finally:` 안의 호출을 통째로 놓친다
+    #   (2026-08-18 Sprint 202 정정). 실제로 `collect_spec()` 의 뷰어 경로를 `else:` 로
+    #   옮기자 그 호출 지점이 **가드에서 사라졌다** — 검사는 통과하는데 보지 않는 상태다.
+    #   문장 리스트를 갖는 속성을 전부 훑는다. 새 문법이 생겨도 속성 이름으로 따라간다.
+    STMT_LISTS = ("body", "orelse", "finalbody")
+    blocks = []
     for parent in ast.walk(tree):
-        body = getattr(parent, "body", None)
-        if not isinstance(body, list):
-            continue
+        for attr in STMT_LISTS:
+            lst = getattr(parent, attr, None)
+            if isinstance(lst, list) and lst and isinstance(lst[0], ast.stmt):
+                blocks.append(lst)
+
+    for body in blocks:
         for i, stmt in enumerate(body):
             if not (isinstance(stmt, ast.Assign) and is_target_call(stmt.value)):
                 continue
@@ -869,6 +1475,14 @@ def run():
         test_document_hash_functions_agree()
         test_looks_like_pdf_rejects_non_pdf_bytes()
         test_collect_spec_refuses_non_pdf_download()
+        test_overwrite_of_existing_pdf_is_atomic()
+        test_no_collector_uses_non_atomic_move()
+        test_status_hash_ignores_our_own_timestamp()
+        test_unchanged_content_preserves_browser_cache()
+        test_identical_pdf_is_not_replaced()
+        test_completeness_matches_what_the_viewer_serves()
+        test_appraisal_saves_when_tab_never_opens()
+        test_spec_saves_when_tab_never_opens()
         test_wait_for_download_completion_rules()
         test_wait_for_download_callers_check_the_result()
     finally:

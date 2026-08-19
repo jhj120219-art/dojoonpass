@@ -1,5 +1,10 @@
 ﻿from fastapi import APIRouter
-from storage.database import get_connection
+from storage.database import (
+    get_connection,
+    QUEUE_STATUS_PENDING,
+    QUEUE_STATUS_REFRESH,
+    QUEUE_IN_PROGRESS_STATUSES,
+)
 
 router = APIRouter()
 
@@ -81,8 +86,15 @@ def document_stats():
             "status_failed": status_failed,
             "appraisal_failed": appraisal_failed,
             "total_failures": total_failed,
-            "queue_pending": queue_counts.get("pending", 0),
-            "queue_in_progress": queue_counts.get("in_progress", 0),
+            # 2026-08-18 Sprint 189: 큐 어휘가 늘었다('refresh'/'in_progress_refresh').
+            # 하드코딩한 목록으로 세면 **새 값이 조용히 어느 칸에도 안 잡힌다** —
+            # BUGS #119가 정확히 그 부류였다. 단일 소스(storage.database)를 참조한다.
+            "queue_pending": queue_counts.get(QUEUE_STATUS_PENDING, 0),
+            # 재수집 대기. 순수 추가 필드다(기존 필드 의미 불변).
+            "queue_refresh": queue_counts.get(QUEUE_STATUS_REFRESH, 0),
+            # "지금 작업 중인 건수"는 최초 수집이든 재수집이든 같은 뜻이므로 합산한다.
+            "queue_in_progress": sum(queue_counts.get(v, 0)
+                                     for v in QUEUE_IN_PROGRESS_STATUSES),
             "queue_failed": queue_counts.get("failed", 0),
         }
     finally:
