@@ -72,6 +72,26 @@ async def add_security_headers(request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    # 2026-08-20 Sprint 237: **사용자별** 응답은 브라우저 디스크에 남기지 않는다.
+    #
+    # 실측(Sprint 237): JSON 응답 9종 전부 `Cache-Control` 이 **없었다.**
+    # 헤더가 없으면 브라우저는 휴리스틱 캐싱에 맡겨진다 - 공용 PC 에서 로그아웃한 뒤에도
+    # 앞사람의 관심물건/최근본 응답이 디스크에 남을 수 있다.
+    #
+    # 조건을 좁게 잡는다:
+    #   - `Authorization` 헤더가 있는 요청만 (= 그 사용자에게만 해당하는 응답)
+    #   - **검증자(ETag/Last-Modified)가 붙은 응답은 건드리지 않는다.**
+    #     그쪽은 문서/사진 파일이고, 조건부 요청으로 304 를 돌려주며 실측 235KB/395KB 를
+    #     아끼고 있다(api/http_cache.py). no-store 를 씌우면 그 절약이 사라진다.
+    #
+    # 신선도 계약은 **깨지지 않는다** - no-store 는 "헤더 없음"보다 엄격하기만 하다.
+    # 서버가 주는 데이터는 그대로이고, 브라우저가 덜 보관할 뿐이다.
+    if request.headers.get("authorization"):
+        has_validator = ("etag" in response.headers
+                         or "last-modified" in response.headers)
+        if not has_validator:
+            response.headers["Cache-Control"] = "no-store"
     return response
 
 app.include_router(search_router, prefix="/api/v1", tags=["search"])

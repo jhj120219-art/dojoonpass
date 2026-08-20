@@ -6,6 +6,7 @@ from storage.database import get_connection
 from api.auth import decode_supabase_jwt
 from api.constants import is_sqlite_int
 from api.v1.recent_items import record_view
+from api.v1.thumbnails import image_url as _image_url
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +142,6 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
 # 파일 경로에서 반복해 겪은 어긋남을 URL에서 되풀이하지 않도록 한 곳에 모아 둔다.
 def _document_url(item_id: int, doc_type: str) -> str:
     return "/api/v1/item/%d/documents/%s" % (item_id, doc_type)
-
-
-def _image_url(item_id: int, seq: int) -> str:
-    return "/api/v1/item/%d/images/%d" % (item_id, seq)
 
 
 def _document_entry(item_id: int, row, doc_raw_by_type) -> dict:

@@ -152,6 +152,22 @@ include_closed(기본 false)
 
 전체 파라미터/필터 구조/정렬/인덱스의 상세 근거는 `docs/search-engine.md` 참고(2026-08-06 코드 기준 재동기화됨).
 
+### 대표 사진 URL 규칙 (2026-08-20 Sprint 224)
+
+목록 성격의 응답에 실리는 `thumbnail_url` 의 출처는 `api/v1/thumbnails.py` **하나뿐**이다.
+
+```
+IMAGE_URL_TEMPLATE = "/api/v1/item/%d/images/%d"     실제 라우트(api/v1/images.py)와 같아야 한다
+fetch_thumbnail_seqs(conn, ids)  -> {item_id: MIN(seq)}   쿼리 **1회** (물건 수와 무관)
+thumbnail_url(id, seqs)          -> URL 또는 None
+```
+
+- 대표 = 순번(`seq`)이 가장 앞선 사진. 상세가 `images[0]` 을 대표로 쓰는 것과 같은 규칙이다.
+- 사진이 없는 물건은 **키는 있고 값이 `null`** 이다(프런트 분기를 단순하게 유지한다).
+- 이 규칙을 화면마다 따로 적으면 어긋났을 때 **"목록에는 나오는데 열면 404"** 가 된다.
+  화면은 정상으로 보이고 로그도 조용해 눈으로 찾기 어렵다.
+- 주는 엔드포인트: `GET /api/v1/search`, `GET /api/v1/favorites`, `GET /api/v1/recent-items`.
+
 ### 공통 응답 형식 (인증 필요 API 전용)
 ```json
 {"success": true, "data": {...}, "message": null}
@@ -608,6 +624,8 @@ Task Scheduler (매일 06:00)
 ### `document_queue` claim 의 `None` 은 한 가지 뜻이다 (2026-08-18 Sprint 191, BUGS #130)
 
 `claim_next_queue_item()` 이 `None` 을 돌려주는 것은 **"지금 가져갈 행이 없다"** 하나뿐이다.
+(2026-08-20 Sprint 236: 워커는 이제 이 함수를 감싼 `claim_next_item_rows()` 를 부르고,
+그쪽은 같은 뜻을 **빈 목록**으로 돌려준다. 첫 행 선택과 경쟁 처리는 여전히 이 함수가 한다.)
 
 예전에는 두 가지가 같은 `None` 이었다:
 

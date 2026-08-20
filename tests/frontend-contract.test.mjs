@@ -48,6 +48,11 @@ async function getText(path) {
 
 let homeHtml = ''
 
+// 데이터 전제의 판정 결과. before() 가 채우고, 데이터가 꼭 필요한 검사만 이것을 본다.
+let dataAvailable = false
+let dataDiagnosis = ''
+const nlIndent = '\n  '
+
 before(async () => {
   let res
   try {
@@ -85,15 +90,58 @@ before(async () => {
     `백엔드 검색 API가 200이 아닙니다 (${apiRes.status}) — ${API_BASE}/api/v1/search`
   )
 
-  // 물건이 0건이면 결과 데이터를 보는 검사들이 "기능이 깨진 것"처럼 실패한다.
-  // 데이터 부족과 기능 결함을 구분해 준다(설계 원칙 3 — 건수 자체는 단언하지 않는다).
+  // 물건이 0건인지 확인한다. **여기서 실패시키지는 않는다** (2026-08-20 Sprint 224).
+  //
+  // ★ 앞 판본은 여기서 assert 로 막았다. before() 훅이 실패하면 node:test 는 **그 아래
+  //   전부**를 실패로 떨어뜨린다 — 실측 2026-08-20: 50개 test / 93개 단언이 한꺼번에
+  //   빨간불이 됐다. 그런데 그중 데이터를 실제로 보는 것은 **단 하나**였다.
+  //   나머지(라우팅·리다이렉트·랜드마크·h1·aria-label·레이아웃·레거시 경로…)는 결과가
+  //   0건이어도 전부 판정 가능하다. 즉 데이터가 하루만 낡아도 **접근성/라우팅 계약이
+  //   통째로 관측 불능**이 되고 있었고, 화면상으로는 "93건 실패"라 진짜 결함과 구별되지도
+  //   않았다. 관측 공백을 결함으로 보고하면 안 되고, 반대로 감춰도 안 된다.
+  //
+  //   그래서: 전제는 **전용 검사 하나**로 명시적으로 실패시키고(조용한 초록 방지),
+  //   데이터가 필요 없는 검사는 **실제로 실행**한다. 데이터가 꼭 필요한 검사만 skip 한다
+  //   (skip 은 통과가 아니다 — 판정하지 못했다는 뜻이다).
   const payload = await apiRes.json()
-  assert.ok(
-    typeof payload?.total === 'number' && payload.total > 0,
-    `백엔드에 검색 가능한 물건이 0건입니다 (total=${payload?.total}). ` +
-      `크롤 데이터가 비었거나 전부 만료됐습니다 — 결과 데이터를 단언하는 검사는 이 상태에서 의미가 없습니다.`
-  )
+  dataAvailable = typeof payload?.total === 'number' && payload.total > 0
+
+  // "비었다"와 "전부 지났다"는 원인도 조치도 다르다 — 뭉뚱그리지 않는다.
+  // 기본 검색은 `auction_date >= 오늘`이므로, include_closed 로 다시 물어 구분한다.
+  if (!dataAvailable) {
+    try {
+      const all = await fetch(`${API_BASE}/api/v1/search?size=1&include_closed=true`, {
+        cache: 'no-store',
+      })
+      const allPayload = await all.json()
+      dataDiagnosis =
+        allPayload?.total > 0
+          ? `DB 에는 물건이 ${allPayload.total}건 있으나 **매각기일이 전부 지났다**` +
+            ` — 크롤이 멈춰 있다(수집 파이프라인 확인). DB 가 빈 것이 아니다.`
+          : `DB 자체가 비어 있다 (include_closed 로도 0건) — 수집이 한 번도 되지 않았다.`
+    } catch (err) {
+      dataDiagnosis = `원인을 확인하지 못했다 (include_closed 재조회 실패: ${err.message})`
+    }
+  }
 })
+
+describe('백엔드 데이터 전제 (Sprint 224)', () => {
+  // 이 검사 **하나만** 데이터 부족을 보고한다. 아래의 다른 검사들은 그것과 무관하게
+  // 각자 판정한다. 빨간불 93개 대신 원인을 정확히 가리키는 빨간불 1개다.
+  test('기본 검색에 판정 가능한 물건이 있다 (다른 검사의 전제)', () => {
+    assert.ok(
+      dataAvailable,
+      `백엔드 기본 검색이 0건이다 — 결과 데이터를 단언하는 검사는 판정할 수 없다.` +
+        `${nlIndent}${dataDiagnosis}`
+    )
+  })
+})
+
+// 결과 카드가 실제로 렌더됐는가. 헤더의 `/properties/recent` 링크에 속지 않도록
+// **id + ids 컨텍스트**까지 있는 형태만 인정한다.
+function hasResultCards(html) {
+  return /\/properties\/\d+\?ids=/.test(html)
+}
 
 describe('첫 화면 = 검색 화면 (MASTER_SPEC §4)', () => {
   test('`/`는 redirect되지 않는다 (비로그인)', async () => {
@@ -159,10 +207,11 @@ describe('`/search` 호환 유지 (MASTER_SPEC §2.1)', () => {
 })
 
 describe('결과 → 상세 링크 계약 (MASTER_SPEC §9)', () => {
-  test('결과 카드가 /properties/{id}로 링크하며 목록 컨텍스트를 싣는다', () => {
+  test('결과 카드가 /properties/{id}로 링크하며 목록 컨텍스트를 싣는다', (t) => {
     const m = homeHtml.match(/\/properties\/(\d+)\?ids=([\d,%C]*)&(?:amp;)?i=(\d+)/)
-    if (!homeHtml.includes('/properties/')) {
-      // 결과 0건인 DB 상태에서는 검증할 링크 자체가 없다 — 실패가 아니라 skip 대상.
+    if (!hasResultCards(homeHtml)) {
+      // 결과 0건인 DB 상태에서는 검증할 링크 자체가 없다 — 판정 불가(통과가 아니다).
+      t.skip('결과 카드 0개 — 판정 불가. 사유는 "백엔드 데이터 전제" 검사 참고')
       return
     }
     assert.ok(m, '결과 카드 링크가 `/properties/{id}?ids=...&i=...` 형태가 아닙니다')
@@ -624,7 +673,13 @@ describe('검색조건이 실제 결과 데이터에 반영된다 (Sprint 49)', 
     assert.equal(wrong.length, 0, `경기 조건인데 다른 지역이 섞여 있습니다: ${wrong.slice(0, 3).join(' / ')}`)
   })
 
-  test('결과가 없는 조건과 있는 조건이 서로 다른 화면을 만든다', async () => {
+  test('결과가 없는 조건과 있는 조건이 서로 다른 화면을 만든다', async (t) => {
+    // 이 파일에서 **결과가 실제로 있어야만** 판정되는 유일한 검사다
+    // (나머지는 0건 상태를 스스로 처리하거나 데이터를 보지 않는다).
+    if (!dataAvailable) {
+      t.skip('기본 검색 0건 — 판정 불가(통과가 아니다). 사유는 "백엔드 데이터 전제" 검사 참고')
+      return
+    }
     const hit = (await getText('/')).body
     const miss = (await getText('/?dong=%EC%A1%B4%EC%9E%AC%ED%95%98%EC%A7%80%EC%95%8A%EB%8A%94%EB%8F%99')).body
     assert.ok(!hit.includes('검색 결과가 없습니다'), '조건 없는 첫 화면이 0건입니다')
@@ -653,8 +708,11 @@ describe('비로그인 개인화 액션 노출 정책 (MASTER_SPEC §8.2)', () =
     })
   })
 
-  test('비로그인 첫 화면에도 즐겨찾기 버튼이 보인다', () => {
-    if (!homeHtml.includes('/properties/')) return // 결과 0건 상태
+  test('비로그인 첫 화면에도 즐겨찾기 버튼이 보인다', (t) => {
+    if (!hasResultCards(homeHtml)) {
+      t.skip('결과 카드 0개 — 판정 불가. 사유는 "백엔드 데이터 전제" 검사 참고')
+      return
+    }
     assert.ok(
       homeHtml.includes('aria-label="즐겨찾기 추가"'),
       '비로그인 결과 카드에 즐겨찾기 버튼이 없습니다'

@@ -1,6 +1,7 @@
 ﻿from fastapi import APIRouter, Depends
 from datetime import datetime
 from storage.database import get_connection
+from api.v1.thumbnails import fetch_thumbnail_seqs, thumbnail_url
 from api.auth import get_current_user, success
 
 router = APIRouter()
@@ -26,6 +27,8 @@ def get_recent_items(user_id: str = Depends(get_current_user)):
             ORDER BY ri.viewed_at DESC, ri.id DESC
             LIMIT 20
         """, (user_id,)).fetchall()
+        # 대표 사진 순번 배치 조회 (2026-08-20 Sprint 224) — favorites.py 와 같은 함수.
+        thumbnails = fetch_thumbnail_seqs(conn, [r["id"] for r in rows])
         items = []
         for row in rows:
             items.append({
@@ -43,6 +46,8 @@ def get_recent_items(user_id: str = Depends(get_current_user)):
                 "auction_date": row["auction_date"],
                 "status": row["status"],
                 "fail_count": row["fail_count"],
+                # 사진이 없는 물건은 null — 프런트가 썸네일 자리를 아예 만들지 않는다.
+                "thumbnail_url": thumbnail_url(row["id"], thumbnails),
                 "viewed_at": row["viewed_at"],
             })
         return success(items)

@@ -257,9 +257,20 @@ describe('마이페이지 — 소스 계약 (Sprint 54)', () => {
     // 같은 결제가 화면마다 다른 금액으로 보인다.
     assert.ok(src.includes('formatWon'), '청구 금액에 formatWon을 쓰지 않습니다')
     assert.ok(
-      !/formatPrice/.test(src),
+      // ★ 2026-08-20 Sprint 226 — 이 정규식은 원래 **제어문자**로 굳어 있었다.
+      //   /\bformatPrice\b/ 로 쓰려던 것이 파일에 0x08(백스페이스) 바이트로 들어가
+      //   "백스페이스 문자"를 찾게 돼 **영원히 일치하지 않았다** — 즉 이 단언은
+      //   `formatPrice` 가 다시 들어와도 **절대 실패하지 않는** 공허한 검사였다.
+      !new RegExp(String.raw`\bformatPrice\b`).test(src),
       '마이페이지가 축약 표기(formatPrice)를 씁니다 — 청구 금액이 실제와 어긋납니다'
     )
+
+    // 검사가 공허하지 않다는 것을 같은 자리에서 증명한다 — 합성 입력에서는 반드시 잡혀야 한다.
+    const probe = new RegExp(String.raw`\bformatPrice\b`)
+    assert.ok(probe.test(`const x = formatPrice(1)`),
+      '검사기가 formatPrice 를 못 잡는다 — 이 단언은 공허하다')
+    assert.ok(!probe.test(`const x = formatPriceLike(1)`),
+      '단어 경계가 동작하지 않는다')
   })
 
   test('formatWon이 공용으로 한 곳에만 정의된다', async () => {

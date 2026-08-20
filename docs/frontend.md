@@ -23,20 +23,32 @@
 - `/properties/recent`: 최근조회 목록. FastAPI `GET /api/v1/recent-items` 사용 (Release 완료)
 
   **2026-08-19 Sprint 218 — 검색목록 썸네일은 상세와 같은 사진이어야 한다.**
-  검색 결과 카드의 대표 사진은 `src/app/search/ResultThumbnail.tsx`(작은 클라이언트 섬)가
+  목록 카드의 대표 사진은 `src/components/ResultThumbnail.tsx`(작은 클라이언트 섬)가
   그린다. 서버 컴포넌트인 `ResultList.tsx` 안에서는 `onError` 를 쓸 수 없기 때문이다
   (그 오류는 `tsc`/`eslint`/`build` 셋 다 못 잡고 화면만 죽는다 — 그 파일 주석 참고).
 
-  대표 사진을 고르는 규칙이 **두 곳에 각자** 있다는 점이 이 화면의 위험이다:
+  **2026-08-20 Sprint 224 — 사진을 그리는 화면이 셋이 됐다.**
+  검색목록 · 관심물건(`/favorites`) · 최근 본 물건(`/properties/recent`) 이 **같은
+  컴포넌트**를 쓴다. 그래서 파일이 `src/app/search/` 에서 `src/components/` 로 옮겨졌다 —
+  화면마다 따로 만들면 한쪽만 `onError` 를 빠뜨려 그 화면에서만 깨진 아이콘이 남는다.
+
+  대표 사진을 고르는 규칙은 이제 **한 곳에만** 있다(Sprint 224 이전에는 둘로 갈라져
+  있었고, 화면이 늘면 넷이 될 참이었다):
 
   ```
-  검색목록   api/v1/search.py   SELECT item_id, MIN(seq) ... GROUP BY item_id
-  상세페이지 api/v1/item.py     ORDER BY seq 로 읽어 images[0]
+  api/v1/thumbnails.py   IMAGE_URL_TEMPLATE / image_url() / fetch_thumbnail_seqs()
+    <- api/v1/search.py         검색목록      (배치 1회)
+    <- api/v1/favorites.py      관심물건      (배치 1회)
+    <- api/v1/recent_items.py   최근 본 물건  (배치 1회)
+    <- api/v1/item.py           상세 images[] (같은 URL 규칙)
   ```
 
-  한쪽만 바뀌면 **"클릭했더니 다른 집이 나온다"** 가 된다.
+  갈라지면 **"목록에는 나오는데 열면 404"** 또는 **"클릭했더니 다른 집이 나온다"** 가
+  된다. 둘 다 화면은 정상으로 보이고 로그도 조용하다.
   `test_asset_pipeline.py` 12-N 이 두 응답을 나란히 놓고 **같은 URL·같은 바이트**인지
   대조한다. 12-O 는 사진이 교체됐을 때 목록도 새 사진을 받는지(ETag)까지 본다.
+  16-B2(Sprint 224)는 **네 화면이 글자 그대로 같은 URL** 을 주는지, 그 URL 이 실제로
+  200 으로 열리는지, 그리고 건수가 늘어도 쿼리 수가 늘지 않는지(N+1)를 함께 본다.
 
   **빈 상태**: 사진이 없으면 `thumbnail_url` 이 `null` 이고 `<img>` 를 아예 만들지
   않는다(깨진 아이콘도, 빈 자리도 남기지 않는다). 서빙이 404 를 내면
@@ -280,7 +292,7 @@
 ```
 검사한 텍스트 199개 / WCAG AA 대비(4.5:1) 미달 81개 (41%)
 text-gray-400 on white = 2.6:1        기준의 58%
-탭 타깃 53개 중 44px 미만 44개 (83%)   그중 24px 미만 5개 = WCAG 2.5.8 AA 위반
+탭 타깃 53개 중 44px 미만 44개 (83%)   그중 24px 미만 5개 (★ 2026-08-20 Sprint 225 정정: 위반 아님 — 간격 예외로 적합)
 물건 주소 12px / "최저입찰가"·"감정가 3.8억" 11px
 소스: text-xs 111 / text-gray-400 106 (상세페이지가 각 55 로 가장 심하다)
 ```

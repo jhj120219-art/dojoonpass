@@ -1545,6 +1545,10 @@ ALLOWED_SQL_TEXT_INTERPOLATIONS = {
     # (N+1 쿼리 제거, docs/SPRINT130_MIGRATE_EXECUTE_N_PLUS_1.md). 요청으로 도달하는
     # 경로가 아니라 일일 배치 스크립트다.
     ("migrate_execute.py", "placeholders"),
+    # 2026-08-20 Sprint 224 신설. `api/v1/search.py` 의 이미 허용된 `placeholders` 를
+    # 그대로 옮겨 온 것이다(대표 사진 배치 조회를 세 화면이 공유하게 하면서 모듈로 분리).
+    # 내용은 항상 `?` 문자만 반복되고 개수만 가변, 값은 전부 `?` 로 바인딩된다.
+    ("api/v1/thumbnails.py", "placeholders"),
 }
 # ★ 문자열 `+` 연결도 SQL 텍스트를 만든다 (2026-08-14 추가).
 #
@@ -2157,10 +2161,112 @@ def test_config_constants_match_their_copies():
                 return int(h) * 60 + int(mm)
             window = _mins2(m7.group(1)) - _mins2(m5.group(1))
             limit = int(m8.group(1)) * 60
+            # ★ 창이 음수면 이 비교는 **언제나 참**이다 - 공허하게 통과한다
+            #   (2026-08-20 Sprint 237). 종료가 시작보다 앞서면 `is_time_up()` 이
+            #   기동 즉시 True 를 돌려주어 그날 수집이 통째로 사라지는데,
+            #   여기서는 그것이 "한계 안에 들어온다"로 읽힌다.
+            check_true("실행 창이 양수다(음수면 아래 비교가 공허해진다)",
+                       window > 0,
+                       "종료 %s 가 시작 %s 보다 앞선다 - 워커가 기동 즉시 끝난다"
+                       % (m7.group(1), m5.group(1)))
             check_true("스케줄러 실행시간 한계(%d분)가 worker 실행 창(%d분) 이상이다"
                        % (limit, window), limit >= window, (limit, window))
 
-    # --- (7) 대조군 — 이 검사가 공허하지 않다 ---------------------------------
+    # --- (7) ★ 문서 수집 창이 **사건 크롤 시작 전에** 닫히는가 -----------------
+    #
+    # 2026-08-20 Sprint 230 신설. 여기가 스케줄 산술에서 유일하게 비어 있던 다리다.
+    #
+    # 세 작업 중 **둘이 Chrome 을 띄운다.**
+    #
+    #     DocWorker  -> doc_worker.py     -> build_download_driver()  (다운로드 폴더 사용)
+    #     DailyCrawl -> mvp_scraper.py    -> crawl_court() -> base_crawler.build_driver()
+    #
+    # 지금 값은 안전하다 — 문서 수집 창이 04:00 에 닫히고 사건 크롤은 06:00 에 시작한다.
+    # 그런데 **그 관계를 지키는 것이 아무것도 없었다.** `DOC_WORKER_END_TIME` 을
+    # 큐를 더 소진하려고 07:00 으로 늘리는 것은 지극히 자연스러운 변경인데,
+    # 그 순간 두 크롤러가 **같은 법원 사이트를 동시에** 두드린다.
+    #
+    # 증상이 조용하다 — 둘 다 자기 락(mvp_scraper.lock / doc_worker.lock)을 갖고 있어
+    # **서로를 막지 못한다.** 락은 자기 자신의 중복 실행만 막는다.
+    # 세션 간섭·법원 부하·다운로드 폴더 교차는 전부 "가끔 실패"로만 나타난다.
+    #
+    # DailyCrawl 시각은 config 에 상수가 **없다**(다른 둘과 달리). 그래서 PS1 에서 읽는다.
+    if m7 and ps1:
+        mdc = re.search(r"DailyCrawl[^\n]*?Time\s*=\s*'([0-9:]+)'", ps1)
+        check_true("등록 스크립트에서 DailyCrawl 시각을 찾았다", bool(mdc), None)
+        if mdc:
+            def _m(hhmm):
+                h, mm = hhmm.split(":")
+                return int(h) * 60 + int(mm)
+            check_true("★ 문서 수집 창(~%s)이 사건 크롤 시작(%s) 전에 닫힌다"
+                       % (m7.group(1), mdc.group(1)),
+                       _m(m7.group(1)) <= _m(mdc.group(1)),
+                       "겹치면 Chrome 두 개가 같은 법원을 동시에 두드린다: %s vs %s"
+                       % (m7.group(1), mdc.group(1)))
+
+            # --- (7-b) ★ **여유**가 있는가 - 같기만 해서는 부족하다 -------------
+            #
+            # 2026-08-20 Sprint 237 추가. 위 검사는 `<=` 라 **종료 시각 == 크롤 시작**
+            # 을 통과시킨다. 그런데 워커는 그 시각에 딱 멈추지 않는다:
+            # `is_time_up()` 은 루프 **맨 위**에서만 검사되므로, 이미 집어서 처리 중이던
+            # 행 하나는 종료 시각을 **지나서도** 끝까지 처리된다.
+            #
+            # 실측(logs/doc_run.log 907구간): 행 1개 처리 최대 **42.2초**.
+            # 코드가 허용하는 이론 최대는 그보다 크다 - wait_for_detail 20초
+            # (40회 x 0.5초) + OVERLAY_TIMEOUT 15초 + NEW_WINDOW_TIMEOUT 15초.
+            #
+            # 그래서 END == 06:00 으로 두면 06:00 에 시작하는 사건 크롤과 **실제로**
+            # 겹친다. 둘은 서로의 락을 보지 않으므로(각자 자기 중복만 막는다) 아무도
+            # 말리지 않고, 증상은 "가끔 실패"로만 나타난다.
+            #
+            # 여유 5분은 위 이론 최대(약 50초)의 여섯 배다. 넉넉하되, 창을 늘릴 여지를
+            # 불필요하게 깎지 않는 값으로 잡았다.
+            OVERRUN_MARGIN_MIN = 5
+            gap = _m(mdc.group(1)) - _m(m7.group(1))
+            check_true("★ 종료(%s)와 크롤 시작(%s) 사이에 %d분 이상 여유가 있다"
+                       % (m7.group(1), mdc.group(1), OVERRUN_MARGIN_MIN),
+                       gap >= OVERRUN_MARGIN_MIN,
+                       "여유 %d분 - 마지막 행이 종료 시각을 넘겨 처리되면 크롤과 겹친다"
+                       " (실측 행 1개 최대 42.2초)" % gap)
+
+    # --- (8) ★ 진입점 목록을 손으로 적은 곳이 PS1 과 어긋나지 않는가 -----------
+    #
+    # `test_crawl_exit_code.py` 는 배치 3종의 이름을 **하드코딩**해 두고 errorlevel
+    # 검사를 확인한다. PS1 에 네 번째 작업이 생기면 그 배치는 **아무도 검사하지 않는다** —
+    # 실패 은폐 검사가 새 진입점만 비껴간다.
+    #
+    # 이 저장소가 이미 같은 함정을 겪었다(하드코딩한 목록만 믿기).
+    # 그래서 두 목록이 같은지 여기서 대조한다. 어느 쪽이 늘어도 걸린다.
+    if ps1:
+        ps1_bats = set(re.findall(r"Bat\s*=\s*'([^']+)'", ps1))
+        check_true("PS1 에서 배치 목록을 실제로 읽었다(검사가 공허하지 않다)",
+                   len(ps1_bats) >= 3, sorted(ps1_bats))
+
+        exitcode_src = read("test_crawl_exit_code.py")
+        check_true("test_crawl_exit_code.py 를 읽었다", bool(exitcode_src), None)
+        if exitcode_src:
+            hardcoded = set(re.findall(r'"(run_[a-z_]+\.bat)"', exitcode_src))
+            check("★ 하드코딩된 배치 목록이 PS1 의 작업 목록과 같다",
+                  sorted(hardcoded), sorted(ps1_bats))
+
+        # PS1 이 가리키는 배치가 실제로 존재하는가 (PS1 -> .bat 연결)
+        missing_bat = sorted(b for b in ps1_bats
+                             if not os.path.exists(os.path.join(root, b)))
+        check("★ PS1 이 가리키는 배치가 전부 존재한다", missing_bat, [])
+
+        # 그 배치가 부르는 파이썬 스크립트가 실제로 존재하는가 (.bat -> .py 연결)
+        missing_py = []
+        for b in sorted(ps1_bats):
+            bp = os.path.join(root, b)
+            if not os.path.exists(bp):
+                continue
+            body = open(bp, encoding="utf-8-sig", errors="replace").read()
+            for script in re.findall(r'"%PY%"\s+([A-Za-z0-9_]+\.py)', body):
+                if not os.path.exists(os.path.join(root, script)):
+                    missing_py.append("%s -> %s" % (b, script))
+        check("★ 배치가 부르는 파이썬 스크립트가 전부 존재한다", missing_py, [])
+
+    # --- (9) 대조군 — 이 검사가 공허하지 않다 ---------------------------------
     check_true("대조군: 두 사본 파일을 실제로 읽었다",
                bool(db) and bool(ps1), (bool(db), bool(ps1)))
 

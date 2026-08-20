@@ -233,21 +233,24 @@ def check_every_list_screen_contract():
         최근 본 물건   api/v1/recent_items.py SELECT ai.* + viewed_at
         상세페이지     api/v1/item.py         get_item()
 
-    `SELECT ai.*` 는 `auction_item` 의 컬럼을 그대로 준다 - 즉 계약이 **스키마에
-    묶여 있다.** 컬럼 이름이 바뀌면 화면이 조용히 빈칸이 되고, 그 실패는
-    서버에도 콘솔에도 남지 않는다.
+    이 두 화면의 응답은 **명시적인 dict 리터럴**이다(`dict(row)` 가 아니다).
+    그래서 "API 가 무엇을 주는가"의 근거는 스키마가 아니라 **그 dict 의 키**다 -
+    상세페이지를 이미 그렇게 대조하고 있었고(AST), 여기도 같은 방식으로 맞춘다.
 
-    실측(2026-08-19): 네 화면 모두 **어긋남 0**.
+    ★ 2026-08-20 (Sprint 224) 정정. 이 검사의 앞 판본은 제공 필드를
+      `auction_item 컬럼 + {favorited_at}` 으로 **가정**했다. 그 가정은 계산된 키
+      (`thumbnail_url` 처럼 컬럼이 아닌 값)를 표현할 수 없어서, API 가 실제로 그
+      키를 주기 시작하자 **없는 결함을 보고했다.** 소스에서 읽을 수 있는 사실을
+      손으로 베껴 적으면 반드시 이렇게 어긋난다.
 
-    ## 함께 기록하는 사실 - 썸네일은 검색목록에만 있다
+    스키마 결합은 따로 본다 - dict 가 읽는 `row["X"]` 의 X 가 실제 `auction_item`
+    컬럼인가. 컬럼이 사라지면 여기서 걸린다(런타임에는 KeyError -> 500 이다).
 
-    `thumbnail_url` 을 주는 것은 `search.py` 뿐이다. 관심물건/최근 본 물건은
-    **사진을 전혀 보여 주지 않는다**(그 화면에 `<img>` 가 없다).
-    사용자는 검색목록에서 사진을 보고 담았는데 관심물건에서는 사진이 사라진다.
+    ## 썸네일 규칙
 
-    고치려면 API 와 화면을 **함께** 바꿔야 하고(제품 디자인 결정), 여기서 하지 않는다.
-    대신 이 검사가 **규칙**을 건다 - 어느 화면이든 `thumbnail_url` 을 그리기 시작하면
-    그 화면의 API 도 그것을 주어야 한다. 한쪽만 바뀌면 여기서 걸린다.
+    어느 화면이든 `thumbnail_url` 을 그리기 시작하면 그 화면의 API 도 그것을 주어야
+    한다. 한쪽만 바뀌면 여기서 걸린다 - 2026-08-20 현재 검색목록·관심물건·
+    최근 본 물건 **셋 다** 그리고, 셋 다 받는다.
     """
     import io as _io
     import re as _re
@@ -265,7 +268,8 @@ def check_every_list_screen_contract():
         src = strip_comments(_io.open(os.path.join(root, rel), encoding="utf-8-sig").read())
         return set(_re.findall(r"\b" + var + r"\.([A-Za-z_]\w*)", src))
 
-    # `SELECT ai.*` 로 주는 화면의 API 필드 = auction_item 컬럼 + 화면별 추가 컬럼
+    import ast as _ast
+
     from storage.database import DB_PATH as _DB_PATH
     conn = _sqlite3.connect("file:%s?mode=ro" % _DB_PATH.replace("\\", "/"), uri=True)
     try:
@@ -275,12 +279,47 @@ def check_every_list_screen_contract():
     check("auction_item 컬럼을 읽었다(검사가 공허하지 않다)", len(item_cols) >= 15,
           "-> %d개" % len(item_cols))
 
+    def api_dict(rel_py, func_name):
+        """그 함수가 만드는 응답 dict 의 (키 집합, 읽는 row 컬럼 집합).
+
+        키를 손으로 적지 않고 **소스에서 읽는다** - 손으로 적으면 API 가 바뀔 때마다
+        검사가 거짓 실패를 낸다(실제로 그랬다).
+        """
+        src = _io.open(os.path.join(root, *rel_py.split("/")), encoding="utf-8-sig").read()
+        for node in _ast.walk(_ast.parse(src)):
+            if not (isinstance(node, _ast.FunctionDef) and node.name == func_name):
+                continue
+            keys, cols = set(), set()
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Dict):
+                    ks = {k.value for k in sub.keys if isinstance(k, _ast.Constant)}
+                    if len(ks) > len(keys):
+                        keys = ks
+                # row["case_no"] 처럼 첨자로 읽는 컬럼
+                if (isinstance(sub, _ast.Subscript)
+                        and isinstance(sub.value, _ast.Name) and sub.value.id == "row"
+                        and isinstance(sub.slice, _ast.Constant)
+                        and isinstance(sub.slice.value, str)):
+                    cols.add(sub.slice.value)
+            return keys, cols
+        return set(), set()
+
     SCREENS = [
-        ("관심물건", "src/app/favorites/page.tsx", "item", item_cols | {"favorited_at"}),
+        ("관심물건", "src/app/favorites/page.tsx", "item",
+         "api/v1/favorites.py", "get_favorites", {"favorited_at"}),
         ("최근 본 물건", "src/app/properties/recent/page.tsx", "item",
-         item_cols | {"viewed_at"}),
+         "api/v1/recent_items.py", "get_recent_items", {"viewed_at"}),
     ]
-    for label, rel, var, provided in SCREENS:
+    screen_provided = {}
+    for label, rel, var, rel_py, func, joined in SCREENS:
+        provided, read_cols = api_dict(rel_py, func)
+        screen_provided[label] = provided
+        check("%s: API 응답 키를 실제로 읽었다(검사가 공허하지 않다)" % label,
+              len(provided) >= 10, "-> %d개" % len(provided))
+        # 스키마 결합 - dict 가 읽는 컬럼이 실제로 존재하는가(없으면 런타임 500)
+        check("%s: API 가 읽는 컬럼이 전부 auction_item 에 있다" % label,
+              sorted(read_cols - item_cols - joined) == [],
+              "-> %s (컬럼이 사라지면 500)" % sorted(read_cols - item_cols - joined))
         used = rendered(rel, var)
         check("%s: 렌더 필드를 실제로 찾았다" % label, len(used) >= 8, "-> %d개" % len(used))
         check("%s: 렌더가 쓰는데 API 가 주지 않는 필드" % label,
@@ -288,7 +327,6 @@ def check_every_list_screen_contract():
               "-> %s (화면이 조용히 빈칸이 된다)" % sorted(used - provided))
 
     # 상세페이지 - get_item() 이 만드는 키와 대조
-    import ast as _ast
     detail_keys = set()
     detail_src = _io.open(os.path.join(root, "api", "v1", "item.py"),
                           encoding="utf-8-sig").read()
@@ -306,18 +344,23 @@ def check_every_list_screen_contract():
           "-> %s" % sorted(detail_used - detail_keys))
 
     # ★ 썸네일 규칙 - 그리는 화면은 API 도 주어야 한다
+    #   `<ResultThumbnail>` 은 공용 컴포넌트라 화면 파일에 `thumbnail_url` 문자열이
+    #   그대로 나타난다(prop 으로 넘긴다). 주석은 지운 뒤에 본다.
+    search_keys = {k for k in _re.findall(r'"([a-z_]+)":', _io.open(
+        os.path.join(root, "api", "v1", "search.py"), encoding="utf-8-sig").read())}
+    candidates = [(label, rel, screen_provided[label]) for label, rel, _v, _p, _f, _j in SCREENS]
+    candidates.append(("검색목록", "src/app/search/ResultList.tsx", search_keys))
     thumb_screens = []
-    for label, rel, var, provided in SCREENS + [
-            ("검색목록", "src/app/search/ResultList.tsx", "item", None)]:
+    for label, rel, provided in candidates:
         src = strip_comments(_io.open(os.path.join(root, rel), encoding="utf-8-sig").read())
         if "thumbnail_url" in src:
-            thumb_screens.append((label, rel, provided))
-    broken = [lbl for lbl, rel, provided in thumb_screens
-              if provided is not None and "thumbnail_url" not in provided]
+            thumb_screens.append((label, provided))
+    check("썸네일을 그리는 화면을 실제로 찾았다(검사가 공허하지 않다)",
+          len(thumb_screens) >= 1, "-> %d개" % len(thumb_screens))
+    broken = [lbl for lbl, provided in thumb_screens if "thumbnail_url" not in provided]
     check("★ 썸네일을 그리는 화면은 API 도 thumbnail_url 을 준다",
           sorted(broken) == [], "-> %s (화면만 바뀌면 빈칸이 된다)" % sorted(broken))
-    print("    썸네일을 그리는 화면: %s (관심물건/최근본물건은 아직 사진이 없다)"
-          % ", ".join(l for l, _r, _p in thumb_screens))
+    print("    썸네일을 그리는 화면: %s" % ", ".join(l for l, _p in thumb_screens))
 
 
 def check_search_issues_a_constant_number_of_queries():
@@ -370,7 +413,16 @@ def check_search_issues_a_constant_number_of_queries():
         counts = {}
         for size in (1, 9):
             stmts.clear()
-            body = client.get("/api/v1/search", params={"page": 1, "size": size}).json()
+            # ★ 이 파일의 다른 모든 호출과 같이 include_closed=True 로 잰다.
+            #   기본값(False)은 `auction_date >= 오늘` 을 걸므로, 크롤이 며칠만 멈춰도
+            #   결과가 0건이 되어 **코드가 멀쩡한데 이 검사만 빨간불**이 된다.
+            #   실제로 2026-08-20 에 그렇게 됐다(마지막 크롤 08-12, 최신 매각기일 08-19).
+            #   측정 대상은 "행 수에 따라 SQL 이 늘어나는가"이지 "오늘 이후 물건이 있는가"가
+            #   아니다 — 후자는 test_pipeline_integrity.py 가 따로 본다.
+            body = client.get(
+                "/api/v1/search",
+                params={"page": 1, "size": size, "include_closed": True},
+            ).json()
             counts[size] = (len(stmts), len(body["items"]))
     finally:
         for mod, name, value in patched:
@@ -379,7 +431,7 @@ def check_search_issues_a_constant_number_of_queries():
     # 검사가 공허하지 않으려면 계측이 실제로 걸려야 한다.
     check("SQL 을 실제로 계측했다(검사가 공허하지 않다)",
           counts[1][0] > 0 and counts[9][1] > counts[1][1],
-          "-> %s" % counts)
+          "-> %s (계측이 걸렸는가 / size 를 늘렸을 때 행이 실제로 늘었는가)" % counts)
     check("★ 결과가 늘어도 SQL 횟수가 늘지 않는다(N+1 아님)",
           counts[1][0] == counts[9][0],
           "-> size1 %d회 / size9 %d회" % (counts[1][0], counts[9][0]))

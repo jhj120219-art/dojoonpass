@@ -303,6 +303,19 @@ def test_live_db_drift_is_measurable():
 #     SKIPPED_EXPIRED 큐 행                     186   그중 document_status=COLLECTING  183
 #     document_status=COLLECTING & 물건 만료됨   5,049
 #     document_status=COLLECTING & 물건 진행중      20
+#
+# ★ 2026-08-20 재측정 (Sprint 229) — 보류 비용이 커지고 있다.
+#
+#     document_status=COLLECTING 총합            5,069  (고아 행 0)
+#     그중 물건 만료됨                           5,069
+#     그중 물건 진행중                               0  <- 20 -> 0
+#     큐에 살아 있는 행이 없어 **영원히 안 끝나는** 것  2,921  <- 183 -> 2,921 (16배)
+#       (그와 별개로 큐 행이 아예 없는 물건 715개 x 3종 = 2,145건도 같은 상태다)
+#
+#   숫자가 커진 원인은 상태머신이 아니라 **크롤이 2026-08-12 이후 멈춰** 큐가 전부
+#   만료된 것이다. 즉 이것은 코드 결함의 증거가 아니라 **데이터 공백의 그림자**다.
+#   그렇다고 무해하지도 않다 — 화면은 계속 "수집중"(=기다리면 온다)이라고 말한다.
+#   수집이 재개된 뒤에도 이 값이 남는지는 그때 다시 재야 판정할 수 있다.
 #     auction_item 1,876건 중 만료             1,867  (99.5%)
 #
 # 사용자에게 보이는가 - **보인다.** 검색(`/api/v1/search`)은 D7 기본값으로 만료 물건을
@@ -387,10 +400,42 @@ def test_live_expired_collecting_is_measurable():
         """).fetchone()[0]
         print("    만료 물건의 COLLECTING: %d건 / 진행중 물건의 COLLECTING: %d건"
               % (expired_collecting, live_collecting))
+
         # 과거에 쌓인 값이라 코드 수정만으로 0이 되지 않는다(§5와 같은 이유).
         # 계약은 '0이어야 한다'가 아니라 '측정 경로가 유효해야 한다'다.
-        check_true("측정할 수 있다(조회 경로가 유효)", expired_collecting >= 0)
-        check_true("두 값을 구분해서 셀 수 있다", live_collecting >= 0)
+        #
+        # ★ 2026-08-20 Sprint 229 — 앞 판본의 단언은 **절대 실패할 수 없었다.**
+        #
+        #     check_true("측정할 수 있다", expired_collecting >= 0)
+        #     check_true("두 값을 구분해서 셀 수 있다", live_collecting >= 0)
+        #
+        #   COUNT(*) 는 언제나 0 이상이다. 조인이 깨져 0행을 세든, 컬럼 이름이 바뀌어
+        #   빈 결과가 나오든 **똑같이 통과한다.** "측정 경로가 유효하다"는 것을
+        #   검증한다고 적어 놓고 실제로는 아무것도 검증하지 않았다
+        #   (`docs/BUGS.md` #161 과 같은 계열 — 공허한 단언).
+        #
+        #   대신 **깨질 수 있는 불변식**을 건다: 두 갈래의 합은 전체와 같아야 한다.
+        #   어긋나면 그 차이는 곧 **물건이 없는 document_status 행**(고아)이다 —
+        #   조인이 조용히 떨어뜨리는 행이고, 지금까지 아무도 세지 않았다.
+        total_collecting = c.execute(
+            "SELECT COUNT(*) FROM document_status WHERE status = 'COLLECTING'"
+        ).fetchone()[0]
+        orphan_collecting = c.execute("""
+            SELECT COUNT(*) FROM document_status ds
+            WHERE ds.status = 'COLLECTING'
+              AND NOT EXISTS (SELECT 1 FROM auction_item ai WHERE ai.id = ds.item_id)
+        """).fetchone()[0]
+        print("    COLLECTING 총합 %d건 / 물건이 없는 고아 행 %d건"
+              % (total_collecting, orphan_collecting))
+
+        check_true("두 갈래의 합이 전체와 같다(조인이 행을 떨어뜨리지 않았다)",
+                   expired_collecting + live_collecting + orphan_collecting
+                   == total_collecting,
+                   "만료 %d + 진행중 %d + 고아 %d != 전체 %d"
+                   % (expired_collecting, live_collecting, orphan_collecting,
+                      total_collecting))
+        check_true("★ 대응 물건이 없는 document_status 행이 없다",
+                   orphan_collecting == 0, "고아 %d건" % orphan_collecting)
     finally:
         c.close()
 

@@ -29,6 +29,15 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 관심물건/최근 본 물건은 로그인이 필요한 화면이라 이 파일에서도 토큰이 필요해졌다
+# (2026-08-20 Sprint 224). `api/auth.py` 가 모듈 최상단에서 한 번만 읽으므로 **import 전**에
+# 넣는다. `.env` 에 진짜 값이 이미 있으면 그것을 그대로 쓰고(운영 값을 조용히 덮어쓰지
+# 않는다), 없을 때만 이 프로세스 안에서만 유효한 합성 값을 쓴다 —
+# `test_api_regression.py` 가 쓰는 것과 같은 방식이다.
+if not os.environ.get("SUPABASE_JWT_SECRET"):
+    os.environ["SUPABASE_JWT_SECRET"] = "asset-pipeline-local-only-" + hashlib.sha256(
+        b"asset-pipeline").hexdigest()[:16]
+
 failures = []
 
 
@@ -2177,6 +2186,165 @@ def test_search_thumbnail_contract():
 
 
 
+def test_favorites_and_recent_thumbnail_contract():
+    """관심물건·최근 본 물건도 대표 사진을 주는가 (2026-08-20 Sprint 224).
+
+    ## 왜 이 검사인가
+
+    사용자는 검색목록에서 **사진을 보고** 물건을 담는다. 그런데 관심물건 화면을 열면
+    사진이 사라져 있었다 — `thumbnail_url` 을 주는 API 가 `search.py` 하나뿐이었다.
+    같은 물건이 화면마다 달라 보이면 어느 것이 어느 것인지 알아보기 어렵다.
+
+    ## 무엇을 고정하는가
+
+        1. 두 API 모두 `thumbnail_url` 키를 **항상** 준다(사진이 없으면 null).
+        2. 대표는 `MIN(seq)` — 일부러 1번을 비우고 2,3번만 넣어 확인한다.
+        3. 그 URL 이 **실제로 200 으로 열린다**(저장 성공 != 서빙 성공).
+        4. 네 화면(검색목록/관심물건/최근 본 물건/상세)이 **글자 그대로 같은 URL** 을 준다.
+        5. 기존 키가 하나도 사라지지 않았다(Breaking Change 금지).
+        6. 건수가 늘어도 쿼리 수가 늘지 않는다(N+1 아님).
+
+    6번이 특히 중요하다 — N+1 이 되어도 **화면은 똑같이 잘 보인다. 느려질 뿐이다.**
+    결과 기반 검사로는 절대 잡히지 않으므로 쿼리 수를 직접 센다.
+    """
+    print("\n--- 16-B2. 관심물건/최근 본 물건 대표 사진 계약 (Sprint 224) ---")
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from storage.database import save_auction_images
+    import api.v1.favorites as favmod
+    import api.v1.recent_items as recmod
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1, case_no="2024타경1", item_no="1")
+        env.seed_item(item_id=2, case_no="2024타경2", item_no="1")
+
+        # 사진은 물건 1번에만, 그리고 **1번 순번을 비운 채** 2·3번만 넣는다.
+        d = os.path.join(env.docs, court, case_no, item_no, "images")
+        os.makedirs(d)
+        payload = []
+        for seq in (2, 3):
+            fp = os.path.join(d, "%02d.jpg" % seq)
+            with open(fp, "wb") as f:
+                f.write(make_jpeg())
+            payload.append({"seq": seq, "kind": "전경도", "path": fp,
+                            "file_hash": "h%d" % seq, "width": 525, "height": 700})
+        save_auction_images(court, case_no, item_no, payload)
+
+        USER = "qa-thumb-user"
+        c = env.conn()
+        try:
+            for iid in (1, 2):
+                c.execute("INSERT INTO favorites (user_id,item_id,created_at) VALUES (?,?,?)",
+                          (USER, iid, "2026-08-%02dT00:00:00" % (10 + iid)))
+                c.execute("INSERT INTO recent_items (user_id,item_id,viewed_at) VALUES (?,?,?)",
+                          (USER, iid, "2026-08-%02dT00:00:00" % (10 + iid)))
+            c.commit()
+        finally:
+            c.close()
+
+        from api.auth import SUPABASE_JWT_SECRET
+        from api_server import app
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer " + jwt.encode(
+            {"sub": USER}, SUPABASE_JWT_SECRET, algorithm="HS256")}
+
+        seen = {}
+        for label, path in (("관심물건", "/api/v1/favorites"),
+                            ("최근 본 물건", "/api/v1/recent-items")):
+            r = client.get(path, headers=headers)
+            check("%s 200" % label, r.status_code, 200)
+            rows = {i["id"]: i for i in (r.json().get("data") or [])}
+            check_true("%s: 두 물건이 다 돌아왔다(검사가 공허하지 않다)" % label,
+                       set(rows) == {1, 2}, sorted(rows))
+            check_true("%s: 키 자체는 항상 존재한다" % label,
+                       all("thumbnail_url" in i for i in rows.values()),
+                       sorted(rows.get(1, {})))
+            check("%s: 대표는 가장 앞선 순번(MIN(seq)=2)" % label,
+                  rows[1]["thumbnail_url"], "/api/v1/item/1/images/2")
+            check("%s: 사진 없는 물건은 null" % label, rows[2]["thumbnail_url"], None)
+            # 저장 성공과 서빙 성공은 다른 사실이다 — 실제로 열어 본다.
+            check("%s: 그 URL 이 실제로 열린다" % label,
+                  client.get(rows[1]["thumbnail_url"]).status_code, 200)
+            seen[label] = rows[1]["thumbnail_url"]
+
+            extra = "favorited_at" if label == "관심물건" else "viewed_at"
+            for key in ("id", "case_no", "item_no", "court_name", "property_type", "sido",
+                        "sigungu", "full_address", "appraisal_price", "minimum_bid_price",
+                        "bid_rate", "auction_date", "status", "fail_count", extra):
+                check_true("%s 기존 키 유지: %s" % (label, key), key in rows[1], sorted(rows[1]))
+
+        # 검색목록·상세와 **글자 그대로** 같은가 — 갈라지면 "목록엔 뜨는데 열면 404" 다.
+        c = env.conn()
+        try:
+            c.execute("UPDATE auction_item SET auction_date='2099-01-01', sido='서울',"
+                      " minimum_bid_price=1, appraisal_price=1, bid_rate=1, fail_count=0")
+            c.commit()
+        finally:
+            c.close()
+        search_items = client.get("/api/v1/search?include_closed=true&size=50").json()["items"]
+        search_url = {i["id"]: i["thumbnail_url"] for i in search_items}[1]
+        # 상세는 envelope 없이 본문을 그대로 준다(이 파일의 16-A 도 같은 방식으로 읽는다).
+        detail_url = client.get("/api/v1/item/1", headers=headers).json()["images"][0]["url"]
+        urls = {"검색목록": search_url, "상세": detail_url}
+        urls.update(seen)
+        check_true("네 화면이 같은 URL 을 준다", len(set(urls.values())) == 1, urls)
+
+        # ★ N+1 — 건수를 늘려도 쿼리 수가 같아야 한다.
+        counter = {"n": 0}
+
+        class Counting:
+            def __init__(self, inner):
+                self._i = inner
+
+            def execute(self, q, *a, **k):
+                counter["n"] += 1
+                return self._i.execute(q, *a, **k)
+
+            def __getattr__(self, n):
+                return getattr(self._i, n)
+
+        def measure(mod, path):
+            orig = mod.get_connection
+            mod.get_connection = lambda _o=orig: Counting(_o())
+            try:
+                counter["n"] = 0
+                n_rows = len(client.get(path, headers=headers).json()["data"])
+                return n_rows, counter["n"]
+            finally:
+                mod.get_connection = orig
+
+        before = {"관심물건": measure(favmod, "/api/v1/favorites"),
+                  "최근 본 물건": measure(recmod, "/api/v1/recent-items")}
+        # seed_item() 은 자기 커넥션을 따로 열고 커밋한다 — 바깥에서 쓰기 트랜잭션을
+        # 붙들고 있으면 "database is locked" 가 난다. 그래서 **먼저 다 심고** 그 다음에
+        # 관심물건/최근 본 물건 행을 한 커넥션으로 넣는다.
+        extra_ids = [100 + n for n in range(8)]
+        for iid in extra_ids:
+            env.seed_item(item_id=iid, case_no="2024타경%d" % iid, item_no="1")
+        c = env.conn()
+        try:
+            for iid in extra_ids:
+                c.execute("INSERT INTO favorites (user_id,item_id,created_at) VALUES (?,?,?)",
+                          (USER, iid, "2026-08-20T00:00:00"))
+                c.execute("INSERT INTO recent_items (user_id,item_id,viewed_at) VALUES (?,?,?)",
+                          (USER, iid, "2026-08-20T00:00:00"))
+            c.commit()
+        finally:
+            c.close()
+        after = {"관심물건": measure(favmod, "/api/v1/favorites"),
+                 "최근 본 물건": measure(recmod, "/api/v1/recent-items")}
+
+        for label in ("관심물건", "최근 본 물건"):
+            check_true("%s: 건수가 실제로 늘었다(검사가 공허하지 않다)" % label,
+                       after[label][0] > before[label][0], (before[label], after[label]))
+            check_true("%s: 건수가 늘어도 쿼리 수가 같다(N+1 아님)" % label,
+                       before[label][1] == after[label][1], (before[label], after[label]))
+        print("    (건수, 쿼리수)  전 %s / 후 %s" % (before, after))
+    finally:
+        env.close()
+
+
 def test_item_detail_is_not_n_plus_one():
     """상세 응답의 쿼리 수가 **사진 개수에 비례해 늘지 않는가** (2026-08-17 Sprint 154).
 
@@ -4226,6 +4394,263 @@ def test_existence_rule_is_single_sourced():
     print("    MIN_IMAGE_BYTES = %d / 판정처 %d곳" % (ia.MIN_IMAGE_BYTES, len(DECIDERS)))
 
 
+def test_download_of_another_case_is_refused():
+    """내려받은 파일이 **다른 사건의 것**이면 저장하지 않는다 (2026-08-20 Sprint 228).
+
+    ## 어떻게 남의 파일이 들어오는가
+
+    `wait_for_download()` 는 "다운로드 폴더에 **새로 생긴** PDF" 를 집는다.
+    어느 사건의 것인지는 보지 않는다. 그래서 이런 순서가 가능하다.
+
+        1. 사건 A 수집 -> 30초 안에 안 옴 -> 포기(타임아웃). 다운로드는 계속 진행 중
+        2. 사건 B 수집 시작 -> before_files 스냅샷 (A 의 것은 아직 .crdownload)
+        3. A 의 다운로드 완료 -> A.pdf 가 생긴다 = **새 파일**
+        4. wait_for_download() 가 그것을 집는다 -> **A 의 문서가 B 로 저장된다**
+
+    타임아웃은 실제로 일어난다 - `docs/SPRINT199` 가 실행 중에 겪었고,
+    `downloads/` 의 고아 파일 8개가 그 흔적이다(그중 5개는 같은 파일이 4번 쌓였다).
+
+    ## 왜 결과 검사로는 절대 안 잡히나
+
+    저장된 것은 **진짜 PDF** 다. 크기도 정상이고 해시도 계산되고 상태는 READY 가 된다.
+    화면에서도 정상으로 보인다. 사용자는 **다른 사건의 매각물건명세서를 보고 입찰을
+    판단하게 된다.** 그래서 파일이 들어오는 **입구**에서 막아야 한다.
+
+    ## 판정 규칙 (확실할 때만 막는다)
+
+        파일명에 사건번호가 있다 + 다르다  -> 거부
+        파일명에 사건번호가 있다 + 같다    -> 통과
+        파일명에 사건번호가 없다           -> 통과 (감정평가서는 업체 코드라 없다)
+    """
+    print("\n--- 21. 남의 사건 파일을 저장하지 않는다 (Sprint 228) ---")
+    from crawler.doc_crawler import (
+        downloaded_file_case_no,
+        downloaded_file_belongs_to_case,
+    )
+
+    # 실측 근거: downloads/ 에 실제로 남아 있던 고아 파일들의 이름 (2026-08-20)
+    SPEC_A = "2023타경103287_2026.06.17_매각물건명세서(재작성,6)_참여_김윤회.pdf"
+    SPEC_B = "2023타경118942_2026.06.16_매각물건명세서(재작성,1)_참여_오해주.pdf"
+    SPEC_B_DUP = "2023타경118942_2026.06.16_매각물건명세서(재작성,1)_참여_오해주 (3).pdf"
+    APPRAISAL = "HR2025-0609-0001.pdf"        # 업체 코드 - 사건번호가 없다
+
+    check("실제 파일명에서 사건번호를 뽑는다", downloaded_file_case_no(SPEC_A), "2023타경103287")
+    check("Chrome 이 붙인 ' (3)' 중복 접미사에도 뽑힌다",
+          downloaded_file_case_no(SPEC_B_DUP), "2023타경118942")
+    check("사건번호가 없는 파일명은 None", downloaded_file_case_no(APPRAISAL), None)
+
+    # ★ 핵심 - 남의 사건 파일은 거부
+    check("★ 다른 사건의 파일은 거부한다",
+          downloaded_file_belongs_to_case(SPEC_A, "2023타경118942"), False)
+    check("같은 사건의 파일은 통과한다",
+          downloaded_file_belongs_to_case(SPEC_A, "2023타경103287"), True)
+    check("중복 접미사가 붙어도 같은 사건이면 통과",
+          downloaded_file_belongs_to_case(SPEC_B_DUP, "2023타경118942"), True)
+
+    # 판단 근거가 없으면 막지 않는다 - "없으면 거부"로 만들면 감정평가서가 전부 막힌다
+    check("사건번호가 없는 파일명은 막지 않는다(모르는 것은 막지 않는다)",
+          downloaded_file_belongs_to_case(APPRAISAL, "2023타경118942"), True)
+
+    # 병합 사건 - 구성요소 각각과 정확히 비교 (실측 22.7%)
+    merged = "2008타경25092 / 2015타경19958"
+    check("병합 사건의 앞쪽과 일치하면 통과",
+          downloaded_file_belongs_to_case("2008타경25092_x.pdf", merged), True)
+    check("병합 사건의 뒤쪽과 일치해도 통과",
+          downloaded_file_belongs_to_case("2015타경19958_x.pdf", merged), True)
+    check("병합 사건 어느 쪽과도 다르면 거부",
+          downloaded_file_belongs_to_case("2024타경1_x.pdf", merged), False)
+
+    # ★ 부분 문자열 함정 - 이 저장소가 이미 두 번 당한 자리
+    check("★ 접두 부분 문자열을 같은 사건으로 보지 않는다",
+          downloaded_file_belongs_to_case("2024타경100920_x.pdf", "2024타경1009"), False)
+    check("★ 반대 방향도 마찬가지",
+          downloaded_file_belongs_to_case("2024타경1009_x.pdf", "2024타경100920"), False)
+
+    # 경로가 섞여 들어와도 파일명만 본다
+    check("디렉터리 경로에 든 사건번호에 속지 않는다",
+          downloaded_file_case_no(os.path.join("2024타경999", APPRAISAL)), None)
+
+    # 방어선이 실제로 배선돼 있는가 - 함수만 있고 안 쓰면 아무 일도 안 일어난다
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "crawler", "doc_crawler.py"), encoding="utf-8-sig").read()
+    wired = src.count("if not downloaded_file_belongs_to_case(")
+    check("★ 두 다운로드 경로(spec/appraisal)에 전부 배선돼 있다", wired, 2)
+
+
+def test_photos_are_not_taken_from_the_wrong_item():
+    """물건번호를 특정하지 못하면 **사진은 수집하지 않는다** (2026-08-20 Sprint 230).
+
+    ## 왜 사진만 다른가
+
+    `crawler/base_crawler.py:go_to_case_detail()` 의 docstring 이 이미 적어 두었다 —
+
+        문서(spec/appraisal)  버튼 id 에 물건번호가 붙어 있어 어느 물건의 페이지에서
+                              눌러도 그 물건의 문서가 나온다(실측: 다중물건 22건에서
+                              서로 다른 물건이 같은 바이트인 경우 0건)
+        사진(image)           **버튼이 없다.** 상세페이지에 그려진 캐러셀을 그대로 읽는다
+                              -> 물건이 틀리면 사진도 틀린다
+
+    ## 무엇이 문제였나
+
+    목록에서 그 물건 행을 못 찾으면 코드는 `logger.warning` 만 남기고
+    **첫 일치 항목으로 진행**했다. 경고는 아무도 읽지 않고, 저장된 사진은 진짜 사진이라
+    `audit_asset_integrity.py` 의 어떤 항목에도 걸리지 않는다.
+    사용자는 **다른 물건의 사진**을 보게 된다.
+
+    (2026-08-17 실측 기록: 2025타경311 은 물건 1과 2의 사진이 실제로 같았다 —
+     같은 건물이라 법원이 같은 전경도를 준다. 즉 그 표본에서는 **우연히** 결과가 같았을 뿐이다.)
+
+    ## 그렇다고 항상 거부하지는 않는다
+
+    목록의 물건번호 표기가 조금만 달라져도 사진 수집이 통째로 멈추면 안 된다.
+    **모호할 때만** 거부한다.
+
+        후보가 1개                -> 모호하지 않다. 그대로 진행
+        후보 여러 개 + 정확 일치   -> 그 행으로 진행
+        후보 여러 개 + 불일치      -> **거부**(사진일 때만)
+        목록이 물건번호를 안 준다   -> 판단 근거가 없다. 막지 않는다
+    """
+    print("\n--- 22. 물건이 모호하면 사진을 수집하지 않는다 (Sprint 230) ---")
+    import crawler.base_crawler as bc
+
+    calls = {"moved": []}
+
+    class FakeDriver:
+        def execute_script(self, script):
+            calls["moved"].append(script)
+
+    def install(list_items, detail_ok=True):
+        """목록/진입 단계를 대체한다 - 이 검사의 관심사는 **어느 행을 고르는가** 다."""
+        bc.go_to_schedule = lambda driver, court: (True, True)
+        bc.collect_list_items = lambda driver, limit: list_items
+        bc.wait_for_detail = lambda driver, case_no: detail_ok
+
+    orig = (bc.go_to_schedule, bc.collect_list_items, bc.wait_for_detail)
+    try:
+        from config.courts import ALL_COURTS
+        court_code = ALL_COURTS[0].code
+
+        def row(case_no, obj_no, idx):
+            return {"case_no": case_no, "obj_no": obj_no, "dtl_idx": idx}
+
+        CASE = "2025타경311"
+
+        # (1) 후보 여러 개 + 요청 물건이 목록에 없다 -> 사진은 거부
+        install([row(CASE, "1", 10), row(CASE, "2", 11)])
+        calls["moved"] = []
+        got = bc.go_to_case_detail(FakeDriver(), court_code, CASE, "3",
+                                   require_exact_item=True)
+        check("★ 모호할 때 사진 수집은 진입하지 않는다", got, False)
+        check("★ 거부하면 상세로 이동조차 하지 않는다", calls["moved"], [])
+
+        # (2) 같은 상황에서 **문서**는 종전대로 진행한다(버튼 id 가 물건을 특정한다)
+        install([row(CASE, "1", 10), row(CASE, "2", 11)])
+        calls["moved"] = []
+        got = bc.go_to_case_detail(FakeDriver(), court_code, CASE, "3",
+                                   require_exact_item=False)
+        check("문서는 종전대로 첫 일치로 진행한다", got, True)
+        check_true("문서는 상세로 이동한다", len(calls["moved"]) == 1, calls["moved"])
+
+        # (3) 정확히 일치하는 행이 있으면 **그 행**으로 간다
+        install([row(CASE, "1", 10), row(CASE, "2", 11)])
+        calls["moved"] = []
+        got = bc.go_to_case_detail(FakeDriver(), court_code, CASE, "2",
+                                   require_exact_item=True)
+        check("정확 일치가 있으면 진입한다", got, True)
+        check("★ 첫 행이 아니라 요청한 물건의 행으로 간다",
+              calls["moved"], ["moveDtlPage(11)"])
+
+        # (4) 후보가 하나뿐이면 모호하지 않다 - 막지 않는다
+        install([row(CASE, "1", 10)])
+        calls["moved"] = []
+        got = bc.go_to_case_detail(FakeDriver(), court_code, CASE, "9",
+                                   require_exact_item=True)
+        check("후보가 하나면 모호하지 않다(막지 않는다)", got, True)
+
+        # (5) 목록이 물건번호를 아예 주지 않으면 판단 근거가 없다 - 막지 않는다
+        install([row(CASE, "", 10), row(CASE, "", 11)])
+        calls["moved"] = []
+        got = bc.go_to_case_detail(FakeDriver(), court_code, CASE, "2",
+                                   require_exact_item=True)
+        check("물건번호 정보가 없으면 막지 않는다(모르는 것은 막지 않는다)", got, True)
+
+        # (6) 배선 확인 - doc_worker 가 사진일 때만 정확 일치를 요구하는가
+        #
+        # 2026-08-20 Sprint 236: 예전에는 doc_worker 소스를 grep 해서
+        # "require_exact_item=(doc_type ==" 문자열이 있는지만 봤다. 그 방식은
+        # **문자열이 그대로 있으면서 실행 경로가 끊겨도 통과한다** - 이 저장소가
+        # 반복해 경계하는 "grep 결과만으로 실행 경로 판정"이다. 실제로 이번에
+        # 물건 단위 batching 이 들어오면서 호출이 `_ensure_detail_page()` 를
+        # 거치게 됐고, 그때 이 검사는 정확히 그 이유로 울었다.
+        #
+        # 이제는 **실제로 불러 본다.** 사진일 때만 엄격하게 들어가는지,
+        # 그리고 batching 이 그 엄격함을 깨뜨리지 않는지를 함께 본다.
+        import doc_worker as dw
+
+        src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "doc_worker.py"), encoding="utf-8-sig").read()
+        flat = " ".join(src.split())
+        check_true("★ doc_worker 가 사진일 때만 정확 일치를 요구한다(호출부)",
+                   'require_exact=(doc_type == "image")' in flat,
+                   [l.strip() for l in src.splitlines() if "require_exact" in l][:4])
+
+        seen = []
+        dw_orig = (dw.go_to_case_detail, dw.wait_for_detail)
+        try:
+            def spy_go(driver, court_code, case_no, item_no=None,
+                       require_exact_item=False):
+                seen.append(require_exact_item)
+                return True
+
+            dw.go_to_case_detail = spy_go
+            dw.wait_for_detail = lambda driver, case_no: True
+
+            # 사진 -> 엄격
+            st = {}
+            dw._ensure_detail_page(object(), st, "B1", "2024타경1", "1",
+                                   require_exact=True)
+            check("★ 사진은 엄격하게 들어간다", seen, [True])
+
+            # 같은 물건의 문서는 그 엄격한 페이지를 **재사용**한다(이동 없음)
+            dw._ensure_detail_page(object(), st, "B1", "2024타경1", "1",
+                                   require_exact=False)
+            check("★ 엄격한 페이지를 문서가 재사용한다(이동 추가 없음)", seen, [True])
+            check("재사용 횟수가 기록된다", st.get("reused"), 1)
+
+            # ★ 반대 방향은 재사용하지 않는다 - 느슨하게 들어간 페이지를
+            #   사진이 그대로 쓰면 Sprint 230 이 막은 "다른 물건의 사진"이 돌아온다.
+            seen[:] = []
+            st2 = {}
+            dw._ensure_detail_page(object(), st2, "B2", "2024타경2", "1",
+                                   require_exact=False)
+            dw._ensure_detail_page(object(), st2, "B2", "2024타경2", "1",
+                                   require_exact=True)
+            check("★ 느슨한 페이지를 사진이 재사용하지 않는다", seen, [False, True])
+
+            # 다른 물건이면 당연히 다시 들어간다
+            seen[:] = []
+            st3 = {}
+            dw._ensure_detail_page(object(), st3, "B3", "2024타경3", "1",
+                                   require_exact=False)
+            dw._ensure_detail_page(object(), st3, "B3", "2024타경3", "2",
+                                   require_exact=False)
+            check("다른 물건이면 다시 들어간다", len(seen), 2)
+
+            # 화면을 벗어나 있으면(수집기가 원래 창으로 못 돌아온 경우) 다시 들어간다
+            seen[:] = []
+            st4 = {}
+            dw._ensure_detail_page(object(), st4, "B4", "2024타경4", "1",
+                                   require_exact=False)
+            dw.wait_for_detail = lambda driver, case_no: False
+            dw._ensure_detail_page(object(), st4, "B4", "2024타경4", "1",
+                                   require_exact=False)
+            check("★ 페이지를 벗어나 있으면 재사용하지 않고 다시 들어간다", len(seen), 2)
+        finally:
+            dw.go_to_case_detail, dw.wait_for_detail = dw_orig
+    finally:
+        bc.go_to_schedule, bc.collect_list_items, bc.wait_for_detail = orig
+
+
 def test_url_rules_match_between_modules():
     print("\n--- 19. API URL 규칙이 라우트와 일치한다 ---")
     import api.v1.item as itemmod
@@ -4308,6 +4733,7 @@ if __name__ == "__main__":
     test_worker_consults_authoritative_date_before_expiring()
     test_api_contract()
     test_search_thumbnail_contract()
+    test_favorites_and_recent_thumbnail_contract()
     test_item_detail_is_not_n_plus_one()
     test_api_images_status_variants()
     test_oversized_ids_are_404_not_500()
@@ -4328,6 +4754,8 @@ if __name__ == "__main__":
     test_recorded_photo_is_always_servable()
     test_existence_rule_is_single_sourced()
     test_skip_path_records_the_document_it_already_has()
+    test_download_of_another_case_is_refused()
+    test_photos_are_not_taken_from_the_wrong_item()
     test_url_rules_match_between_modules()
     test_frontend_contract()
 

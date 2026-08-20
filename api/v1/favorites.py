@@ -5,6 +5,7 @@ from datetime import datetime
 from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import ErrorCode, is_sqlite_int
+from api.v1.thumbnails import fetch_thumbnail_seqs, thumbnail_url
 
 router = APIRouter()
 
@@ -99,6 +100,11 @@ def get_favorites(user_id: str = Depends(get_current_user)):
             WHERE f.user_id = ?
             ORDER BY f.created_at DESC, f.id DESC
         """, (user_id,)).fetchall()
+        # 대표 사진 순번을 **쿼리 1회**로 (2026-08-20 Sprint 224).
+        # 검색목록에서 사진을 보고 담았는데 관심물건에서는 사진이 사라지던 공백을 메운다.
+        # 물건마다 따로 물으면 곧바로 N+1이고, 그때도 화면은 똑같이 잘 보인다 —
+        # 느려질 뿐이다. 그래서 search.py 와 **같은 함수**를 쓴다.
+        thumbnails = fetch_thumbnail_seqs(conn, [r["id"] for r in rows])
         items = []
         for row in rows:
             items.append({
@@ -116,6 +122,8 @@ def get_favorites(user_id: str = Depends(get_current_user)):
                 "auction_date": row["auction_date"],
                 "status": row["status"],
                 "fail_count": row["fail_count"],
+                # 사진이 없는 물건은 null — 프런트가 썸네일 자리를 아예 만들지 않는다.
+                "thumbnail_url": thumbnail_url(row["id"], thumbnails),
                 "favorited_at": row["favorited_at"],
             })
         return success(items)

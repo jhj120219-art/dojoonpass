@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import time
 import glob
+import re
 import shutil
 import hashlib
 import logging
@@ -32,6 +33,8 @@ from crawler.doc_paths import (  # noqa: F401  (하위 호환 재노출)
     CASE_LEVEL_DOC_TYPES,
     _PRIMARY_EXT,
 )
+# 병합 사건을 정확히 비교하는 판정. 같은 판정을 두 벌 만들지 않는다.
+from crawler.resume import case_no_matches_list_entry
 
 KAPANET_BASE = "https://ca.kapanet.or.kr"
 OVERLAY_TIMEOUT = 15
@@ -108,6 +111,70 @@ def restart_download_driver(driver):
     new_driver = build_download_driver()
     logger.info("드라이버 재시작 완료")
     return new_driver
+
+
+def downloaded_file_case_no(path: str) -> Optional[str]:
+    """내려받은 파일 이름에 박혀 있는 사건번호. 없으면 `None`.
+
+    법원이 내려주는 매각물건명세서 파일명은 사건번호로 시작한다 (실측 2026-08-20,
+    `downloads/` 에 남아 있던 고아 파일들):
+
+        2023타경103287_2026.06.17_매각물건명세서(재작성,6)_참여_김윤회.pdf
+        2023타경118942_2026.06.16_매각물건명세서(재작성,1)_참여_오해주.pdf
+
+    반면 감정평가서는 **업체 코드**라 사건번호가 없다 (같은 실측):
+
+        HR2025-0609-0001.pdf / JDG231207-2-001.pdf / sw24-041101.pdf
+
+    그래서 이 함수는 "찾으면 돌려주고, 없으면 None" 만 한다.
+    **없다고 실패로 만들지 않는다** — 사건번호를 안 넣는 문서 종류가 실제로 있다.
+    """
+    m = re.search(r"\d{4}타경\d+", os.path.basename(path or ""))
+    return m.group(0) if m else None
+
+
+def downloaded_file_belongs_to_case(path: str, case_no: str) -> bool:
+    """내려받은 파일이 **지금 수집 중인 사건의 것**인가.
+
+    ## 왜 이 검사가 필요한가 (2026-08-20 Sprint 228)
+
+    `wait_for_download()` 는 "다운로드 폴더에 **새로 생긴** PDF" 를 집는다. 어느 사건의
+    것인지는 보지 않는다. 평소에는 맞지만, **앞선 수집이 타임아웃(30초)으로 포기한 뒤에도
+    그 다운로드가 계속 진행 중이면** 이야기가 달라진다.
+
+        1. 사건 A 수집 -> 30초 안에 안 옴 -> 포기(타임아웃). 다운로드는 **계속 진행 중**
+        2. 사건 B 수집 시작 -> before_files 스냅샷 (A 의 것은 아직 .crdownload)
+        3. A 의 다운로드 완료 -> `A.pdf` 가 생긴다 = **새 파일**
+        4. `wait_for_download()` 가 그것을 집는다 -> **A 의 문서가 B 의 것으로 저장된다**
+
+    실제로 타임아웃은 일어난다 — `docs/SPRINT199_BATCHING_FEASIBILITY.md` 가 실행 중에
+    겪었고, `downloads/` 에 고아 파일 8개(14.0MB)가 남아 있는 것이 그 흔적이다.
+    그중 5개는 **같은 파일이 " (1)" " (2)" " (3)" 로 네 번** 쌓여 있다.
+
+    그 결과는 조용하다 — PDF 이고, 크기도 정상이고, 해시도 계산되고, 화면에는 READY 로
+    보인다. **사용자는 다른 사건의 매각물건명세서를 보고 입찰을 판단하게 된다.**
+    이 저장소가 반복해서 잡아 온 "조용한 실패" 중에서도 결과가 가장 나쁜 쪽이다.
+
+    ## 판정 규칙 — 확실할 때만 막는다
+
+        파일명에 사건번호가 있다 + 다르다   -> **거부** (확실히 남의 것이다)
+        파일명에 사건번호가 있다 + 같다     -> 통과
+        파일명에 사건번호가 없다            -> 통과 (판단할 근거가 없다. 추측하지 않는다)
+
+    마지막 줄이 중요하다. 감정평가서처럼 사건번호를 안 넣는 문서가 실제로 있으므로
+    "없으면 거부"로 만들면 **멀쩡한 수집이 전부 막힌다.** 모르는 것은 막지 않는다.
+
+    ## 병합 사건
+
+    `case_no` 는 `"2008타경25092 / 2015타경19958"` 처럼 여러 사건일 수 있다(실측 22.7%).
+    구성요소 각각과 **정확히** 비교한다 — 부분 문자열 비교는 하지 않는다
+    (`crawler/resume.py:case_no_matches_list_entry()` 와 같은 판정을 쓴다. 같은 판정을
+    두 벌 만들면 한쪽만 고쳐진다).
+    """
+    found = downloaded_file_case_no(path)
+    if not found:
+        return True                      # 판단할 근거가 없다 - 막지 않는다
+    return case_no_matches_list_entry(found, case_no or "")
 
 
 def calc_file_hash(path: str) -> str:
@@ -359,6 +426,21 @@ def collect_spec(driver, court_code: str, case_no: str, item_no: str, btn_id: st
             if not downloaded_path:
                 logger.warning("[%s-%s] spec 다운로드 미완료(타임아웃)", case_no, item_no)
                 return result
+
+        # ★ 이 파일이 **정말 이 사건의 것인가** (2026-08-20 Sprint 228).
+        #   `wait_for_download()` 는 "새로 생긴 PDF" 만 본다 — 어느 사건인지는 안 본다.
+        #   앞선 수집이 타임아웃으로 포기한 뒤에도 그 다운로드가 계속 진행 중이면,
+        #   그것이 **이 수집의 새 파일**로 잡혀 남의 문서가 이 사건으로 저장된다.
+        #   결과가 조용하다 - PDF 이고 크기도 정상이라 화면에는 READY 로 보인다.
+        #   파일명에 사건번호가 없으면(감정평가서 등) 판단하지 않고 통과시킨다.
+        if not downloaded_file_belongs_to_case(downloaded_path, case_no):
+            logger.error(
+                "[%s-%s] %s 다운로드가 **다른 사건**의 파일이다 - 저장하지 않음: %s "
+                "(앞선 수집의 지연 완료 의심)",
+                case_no, item_no, "spec", os.path.basename(downloaded_path))
+            # 지우지 않는다 - 원래 주인이 있는 파일이고, 지우면 그 사건의 재수집도 잃는다.
+            # 고아로 남는 것은 audit_asset_integrity.py [8] 이 보고한다.
+            return result
 
         if not _looks_like_pdf(downloaded_path):
             logger.warning("[%s-%s] spec 다운로드가 PDF가 아니다(오류 페이지/손상 의심) - 저장하지 않음: %s",
@@ -847,6 +929,21 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
             else:
                 logger.warning("[%s-%s] appraisal: 탭도 안 뜨고 다운로드도 오지 않았다",
                                case_no, item_no)
+            return result
+
+        # ★ 이 파일이 **정말 이 사건의 것인가** (2026-08-20 Sprint 228).
+        #   `wait_for_download()` 는 "새로 생긴 PDF" 만 본다 — 어느 사건인지는 안 본다.
+        #   앞선 수집이 타임아웃으로 포기한 뒤에도 그 다운로드가 계속 진행 중이면,
+        #   그것이 **이 수집의 새 파일**로 잡혀 남의 문서가 이 사건으로 저장된다.
+        #   결과가 조용하다 - PDF 이고 크기도 정상이라 화면에는 READY 로 보인다.
+        #   파일명에 사건번호가 없으면(감정평가서 등) 판단하지 않고 통과시킨다.
+        if not downloaded_file_belongs_to_case(downloaded_path, case_no):
+            logger.error(
+                "[%s-%s] %s 다운로드가 **다른 사건**의 파일이다 - 저장하지 않음: %s "
+                "(앞선 수집의 지연 완료 의심)",
+                case_no, item_no, "appraisal", os.path.basename(downloaded_path))
+            # 지우지 않는다 - 원래 주인이 있는 파일이고, 지우면 그 사건의 재수집도 잃는다.
+            # 고아로 남는 것은 audit_asset_integrity.py [8] 이 보고한다.
             return result
 
         if not _looks_like_pdf(downloaded_path):

@@ -8,7 +8,7 @@ from datetime import datetime
 
 from config.settings import get_doc_button_id, DOC_WORKER_END_TIME
 from storage.database import (
-    init_db, reset_stale_queue, claim_next_queue_item,
+    init_db, reset_stale_queue, claim_next_item_rows, release_queue_rows,
     mark_queue_done, mark_queue_failed, mark_queue_skipped_expired,
     mark_queue_unsupported, save_auction_images, reconcile_queue_auction_date,
     clear_images_if_absence_confirmed,
@@ -19,7 +19,7 @@ from crawler.doc_crawler import (
     SIBLING_REUSE_MAX_AGE_SECONDS,
 )
 from crawler.doc_paths import CASE_LEVEL_DOC_TYPES, find_sibling_case_document
-from crawler.base_crawler import go_to_case_detail
+from crawler.base_crawler import go_to_case_detail, wait_for_detail
 from models.crawl_outcome import DocWorkerOutcome
 from storage.checkpoint import RunLock
 
@@ -81,6 +81,97 @@ def _acquire_lock() -> bool:
 
 def _release_lock() -> None:
     _lock().release()
+
+
+class CaseNotReachable(Exception):
+    """사건 상세로 들어가지 못했다 — **브라우저 고장이 아니다** (2026-08-20 Sprint 232).
+
+    `go_to_case_detail()` 이 False 를 돌려주는 이유는 둘 다 정상적인 판단 결과다.
+
+        1. 그 사건이 법원 목록에 없다 (기일이 지나 빠졌거나 취하/변경)
+        2. 물건번호가 모호해 **일부러 진입하지 않았다** (Sprint 230 의 사진 오염 방어)
+
+    둘 다 브라우저는 멀쩡하다. 그런데 예전에는 이것을 그냥 `Exception` 으로 올려
+    `except` 절이 **드라이버를 통째로 재시작**했다.
+
+    ## 왜 고치는가 — 시간보다 **연쇄 위험**이 문제다
+
+    실측(`logs/doc_run.log`, 2026-07-08~07-12 11일치):
+
+        "사건 매칭 실패" 255회, 전부 뒤에 드라이버 재시작이 따라붙었다
+        재시작 -> 재개까지 평균 5.9초 (중앙값 5.9 / 최대 11.4)
+        합계 1,506초 = 25.1분  ->  하루 평균 2.3분 (실행 창 120분의 약 2%)
+
+    시간 낭비 자체는 **크지 않다**. 진짜 문제는 그 다음이다 —
+    `restart_download_driver()` 가 실패하면 Sprint 137 의 방어가 발동해
+    **그 날 실행 전체를 중단**한다. 즉 "사건 하나를 못 찾았다"는 무해한 사실이
+    운 나쁘면 **하루치 수집을 통째로 죽일 수 있다.**
+
+    그리고 Sprint 230 이 넣은 *의도적 거부*(사진 물건 모호)도 같은 경로를 타서,
+    **옳은 판단이 드라이버 재시작을 부르는** 모양이 됐다.
+
+    그래서 이 경우만 따로 잡아 재시작 없이 다음 항목으로 넘어간다.
+    재시도 예산은 종전대로 소모한다(큐 의미론은 바꾸지 않는다).
+    """
+
+
+def _batch_order(row: dict) -> int:
+    """묶음 안의 처리 순서. **사진을 먼저** 둔다 (2026-08-20 Sprint 236).
+
+    사진만 `require_exact_item=True` 로 들어가야 한다 - 버튼이 없어 페이지에 그려진
+    것을 그대로 읽으므로 물건이 틀리면 사진도 틀린다(Sprint 230). 사진을 먼저 처리하면
+    그 **엄격한** 이동 한 번을 나머지 종류가 그대로 재사용한다. 반대 순서로 두면
+    느슨하게 들어갔다가 사진 차례에 다시 들어가야 해서 이동이 2회가 된다.
+
+    사진 수집은 DOM 을 읽기만 하므로(클릭도 창 열기도 없다 - crawler/image_crawler.py
+    에서 driver 를 쓰는 곳은 `find_elements` 한 줄뿐이다) 뒤 순서를 망가뜨리지 않는다.
+    """
+    return 0 if row.get("doc_type") == "image" else 1
+
+
+def _ensure_detail_page(driver, state: dict, court_code: str, case_no: str,
+                        item_no: str, require_exact: bool) -> bool:
+    """상세페이지에 서 있게 만든다. **이미 서 있으면 이동하지 않는다.**
+
+    ## 왜 (2026-08-20 Sprint 236, BUGS #173)
+
+    `go_to_case_detail()` 은 실측 중앙값 10.9초다. 같은 물건의 4종을 받으려고 같은
+    페이지에 네 번 들어가던 것을 한 번으로 줄인다 - 이 저장소에서 가장 큰 단일 비용이다.
+
+    ## ★ 믿지 않고 확인한다
+
+    "아까 들어갔으니 아직 그 페이지일 것"이라고 **가정하지 않는다.** 문서 수집기는
+    새 창을 열고 닫은 뒤 원래 창으로 돌아오는데, 그 복구가 전부 `try/except: pass`
+    다(crawler/doc_crawler.py 의 finally 두 곳). 돌아오지 못한 채로 다음 종류를
+    처리하면 **엉뚱한 화면에서 남의 문서를 긁는다** - 이 저장소가 사진에서 겪은
+    (Sprint 230) 것과 같은 계열의, 조용히 틀리는 결함이다.
+
+    그래서 재사용 전에 `wait_for_detail()` 로 화면을 실제로 확인한다. 이미 그 페이지면
+    첫 폴에서 곧바로 True 라 비용이 사실상 없고, 벗어나 있으면 정직하게 다시 이동한다.
+
+    ## 엄격도
+
+    엄격하게(`require_exact_item=True`) 들어간 페이지는 느슨한 요구에도 쓸 수 있지만,
+    그 반대는 안 된다. 느슨하게 들어간 페이지를 사진이 재사용하면 Sprint 230 이 막은
+    "다른 물건의 사진"이 그대로 돌아온다.
+    """
+    key = (court_code, case_no, item_no)
+    if state.get("key") == key and (state.get("exact") or not require_exact):
+        if wait_for_detail(driver, case_no):
+            logger.info("[%s-%s] 상세페이지 재사용 - 이동 생략", case_no, item_no)
+            state["reused"] = state.get("reused", 0) + 1
+            return True
+        logger.warning("[%s-%s] 상세페이지를 벗어나 있다 - 다시 이동한다", case_no, item_no)
+
+    # 이 시점부터 우리는 브라우저가 어디에 있는지 모른다. 이동이 성공해야만 다시 안다.
+    state["key"] = None
+    ok = go_to_case_detail(driver, court_code, case_no, item_no,
+                           require_exact_item=require_exact)
+    state["navigations"] = state.get("navigations", 0) + 1
+    if ok:
+        state["key"] = key
+        state["exact"] = require_exact
+    return ok
 
 
 def is_time_up() -> bool:
@@ -146,12 +237,23 @@ def main() -> int:
     processed = 0
     succeeded = 0
 
+    # ★ 물건 단위 처리 (2026-08-20 Sprint 236).
+    #   `batch` = 지금 집어 둔 한 물건의 아직 처리하지 않은 큐 행.
+    #   `page`  = 브라우저가 지금 어느 물건의 상세페이지에 서 있는지.
+    #   둘 다 이 실행 안에서만 사는 값이라 모듈 전역으로 두지 않는다
+    #   (전역이면 테스트가 서로의 상태를 물려받는다).
+    batch = []
+    page = {}
+
     try:
         while not is_time_up():
-            item = claim_next_queue_item()
-            if not item:
-                logger.info("대기열 비어있음(또는 재시도 대기 중). 종료")
-                break
+            if not batch:
+                # 한 물건의 행을 한꺼번에 집는다. 사진을 먼저 처리하도록 정렬한다.
+                batch = sorted(claim_next_item_rows(), key=_batch_order)
+                if not batch:
+                    logger.info("대기열 비어있음(또는 재시도 대기 중). 종료")
+                    break
+            item = batch.pop(0)
 
             court_code = item["court_code"]
             case_no = item["case_no"]
@@ -246,9 +348,17 @@ def main() -> int:
                 if result is None:
                     # item_no를 넘긴다 (2026-08-17 Sprint 144). 사진은 버튼 없이 상세페이지
                     # DOM을 그대로 읽으므로 **어느 물건의 페이지인지가 곧 결과**다.
-                    ok = go_to_case_detail(driver, court_code, case_no, item_no)
+                    # ★ 사진일 때만 물건번호 정확 일치를 요구한다 (Sprint 230).
+                    #   문서(spec/appraisal)는 버튼 id 에 물건번호가 붙어 있어 어느 물건의
+                    #   페이지에서 눌러도 그 물건의 문서가 나온다(실측: 다중물건 22건에서
+                    #   서로 다른 물건이 같은 바이트인 경우 0건). 사진은 버튼이 없어
+                    #   **페이지에 그려진 것을 그대로** 읽으므로 물건이 틀리면 사진도 틀린다.
+                    ok = _ensure_detail_page(driver, page, court_code, case_no,
+                                             item_no,
+                                             require_exact=(doc_type == "image"))
                     if not ok:
-                        raise Exception("사건 상세 진입 실패")
+                        # 브라우저 고장이 아니다 - 재시작 없이 이 항목만 실패 처리한다.
+                        raise CaseNotReachable("사건 상세 진입 실패")
 
                     result = collect_document(driver, court_code, case_no, item_no,
                                               doc_type, btn_id, overwrite=overwrite)
@@ -382,9 +492,25 @@ def main() -> int:
                     mark_queue_failed(item["id"], item["retry_count"])
                     logger.warning("[%s-%s] %s 처리 실패 (retry=%d)", case_no, item_no, doc_type, item["retry_count"] + 1)
 
+            except CaseNotReachable as e:
+                # ★ 재시작하지 않는다 (2026-08-20 Sprint 232).
+                #   브라우저는 멀쩡하고 다음 항목은 그대로 진행할 수 있다.
+                #   재시작은 평균 5.9초를 쓰고(실측 255회), 그 재시작이 실패하면
+                #   Sprint 137 방어가 **하루치 실행 전체를 중단**시킨다 —
+                #   "사건 하나를 못 찾았다"가 그런 결과를 부를 이유가 없다.
+                logger.warning("[%s-%s] %s: %s (브라우저 정상 - 재시작 없이 다음 항목으로)",
+                               case_no, item_no, doc_type, str(e))
+                mark_queue_failed(item["id"], item["retry_count"])
+                time_module.sleep(1)
+                continue
+
             except Exception as e:
                 logger.error("[%s-%s] %s 처리 중 오류: %s", case_no, item_no, doc_type, str(e))
                 mark_queue_failed(item["id"], item["retry_count"])
+                # ★ 드라이버를 재시작하면 그 전에 서 있던 페이지는 사라진다.
+                #   기억을 지우지 않으면 다음 종류가 "재사용 가능"으로 읽고
+                #   **빈 페이지에서 수집을 시도**한다 (2026-08-20 Sprint 236).
+                page.clear()
                 try:
                     driver = restart_download_driver(driver)
                 except Exception as restart_exc:
@@ -409,14 +535,27 @@ def main() -> int:
             time_module.sleep(2)
 
     finally:
+        # ★ 집어만 두고 **한 번도 시도하지 않은** 행을 즉시 대기 상태로 돌려놓는다
+        #   (2026-08-20 Sprint 236). 실행 창이 닫혔거나 드라이버 재시작이 실패해
+        #   묶음의 뒷부분이 남은 경우다.
+        #
+        #   되돌리지 않아도 `reset_stale_queue()` 가 10분 뒤 회수하므로 유실은 아니다.
+        #   다만 그 10분 동안 화면은 '수집중'이고, 다음 실행이 그 사이에 뜨면
+        #   집지 못한다. 시도하지 않은 것을 붙들고 있을 이유가 없다.
+        if batch:
+            release_queue_rows([r["id"] for r in batch])
         try:
             driver.quit()
         except Exception:
             pass
         _release_lock()
         elapsed = time_module.time() - start_ts
-        logger.info("===== PDF 수집 Worker 종료 - 시도: %d건, 성공: %d건, 소요시간: %.1f초 =====",
-                     processed, succeeded, elapsed)
+        # 이동 횟수와 재사용 횟수를 함께 남긴다 - batching 이 실제로 동작하는지는
+        # 로그로 확인할 수 있어야 한다(Sprint 235 가 이 값을 로그에서 역산해야 했다).
+        logger.info("===== PDF 수집 Worker 종료 - 시도: %d건, 성공: %d건, "
+                    "상세페이지 이동: %d회, 재사용: %d회, 소요시간: %.1f초 =====",
+                     processed, succeeded, page.get("navigations", 0),
+                     page.get("reused", 0), elapsed)
 
     outcome = DocWorkerOutcome(processed=processed, succeeded=succeeded)
     reason = outcome.failure_reason()

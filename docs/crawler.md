@@ -540,7 +540,9 @@ if auction_date and auction_date < today:
   -> mvp_scraper -> upsert_batch()       auction 갱신
   -> migrate_execute()                    auction_item 갱신 + **필드 단위 변경 판정**
   -> requeue_changed_documents()          done -> 'refresh'   ★ Sprint 189가 채운 칸
-  -> claim_next_queue_item()              'refresh' -> 'in_progress_refresh', overwrite=True
+  -> claim_next_item_rows()               한 물건의 행을 한꺼번에 집는다 (Sprint 236)
+       -> claim_next_queue_item()         'refresh' -> 'in_progress_refresh', overwrite=True
+                                          (첫 행 선택 + overwrite 판정은 여전히 이 함수가 한다)
   -> doc_worker -> collect_document(overwrite=True)
   -> previous_hash != new_hash            document_version_log 1행
   -> auction_image / doc_raw              실체 기록
@@ -821,3 +823,64 @@ logs/checkpoint.json   CheckpointManager.save() 가 파일 전체를 읽어 고�
 주의: 여전히 미확정인 경로가 하나 남는다 — **뷰어 탭은 뜨는데 30초 안에 파일이
 안 오는** 경우. 그건 타임아웃 튜닝 문제라 운영 로그 없이 정하지 않는다.
 `audit_asset_integrity.py` [8] 이 계속 지켜본다.
+
+### ★ 그 타임아웃이 만드는 더 나쁜 결과 (2026-08-20 Sprint 228, BUGS #164)
+
+타임아웃 자체보다 **그 뒤에 일어나는 일**이 위험하다.
+
+`wait_for_download()` 는 `after_files - before_files` 로 **새로 생긴 PDF** 를 집는다.
+어느 사건의 것인지는 보지 않는다. 그래서 이런 순서가 성립한다.
+
+```
+1. 사건 A 수집 -> 30초 안에 안 옴 -> 포기. **다운로드는 계속 진행 중**
+2. 사건 B 수집 시작 -> before_files 스냅샷 (A 의 것은 아직 .crdownload 라 여기 포함)
+3. A 완료 -> Chrome 이 A.crdownload 를 A.pdf 로 바꾼다 = before_files 에 없는 **새 파일**
+4. wait_for_download() 가 그것을 집는다 -> **A 의 문서가 B 로 저장된다**
+```
+
+받은 뒤의 검증이 사건과 무관하다는 것이 문제였다.
+
+```
+크기가 0보다 크고 안정적인가   wait_for_download()
+정말 PDF 인가(매직 바이트)     _looks_like_pdf()
+-> 이 사건의 것인가             **아무도 확인하지 않았다**
+```
+
+결과는 조용하다 — 저장된 것은 진짜 PDF 라 크기·해시·READY·화면 표시가 전부 정상이고
+`audit_asset_integrity.py` 의 [1]~[9] 를 **전부 통과한다.**
+사용자는 다른 사건의 명세서를 보고 입찰을 판단하게 된다.
+
+**방어**: 파일명에 박힌 사건번호로 대조한다. 법원이 주는 명세서 파일명에는 사건번호가
+있고(`2023타경118942_..._매각물건명세서...pdf`), 감정평가서는 업체 코드라 없다
+(`HR2025-0609-0001.pdf`). 그래서 **확실할 때만** 막는다.
+
+```
+사건번호 있음 + 다름  ->  거부       사건번호 있음 + 같음  ->  통과
+사건번호 없음         ->  통과 (판단할 근거가 없다 - "없으면 거부"로 만들면 감정평가서가 전부 막힌다)
+```
+
+병합 사건은 `crawler/resume.py:case_no_matches_list_entry()` 를 **재사용**한다
+(같은 판정을 두 벌 만들면 한쪽만 고쳐진다).
+거부해도 파일은 **지우지 않는다** — 원래 주인이 있고, 지우면 그 사건의 재수집도 잃는다.
+
+남은 위험: 파일명에 사건번호가 없는 종류는 여전히 판정할 수 없다. 더 확실한 방어
+(수집 전 `downloads/` 비우기 / 사건별 하위 폴더)는 각각 진행 중 다운로드 훼손과
+Chrome 프로필 변경이라 승인이 필요하다.
+
+---
+
+## 2026-08-20 Sprint 237 — `MAX_ITEMS` 는 두 가지를 제한한다 (주의)
+
+```
+crawler/court_crawler.py  crawl_court()        collect_list_items(driver, MAX_ITEMS)
+                                               -> 그날 이 법원에서 몇 건 가져올까 = **공급 상한**
+crawler/base_crawler.py   go_to_case_detail()  collect_list_items(driver, MAX_ITEMS)
+                                               -> 아는 사건을 찾으려고 몇 행 훑을까 = **조회 창**
+```
+
+두 번째는 정책이 아니다. **공급을 줄이려고 이 값을 내리면 이미 큐에 있는 사건을
+찾지 못하게 된다** — 조용히, "사건 매칭 실패" 로그만 남기고.
+`test_max_items_contract.py` 가 이 관계(조회 창 >= 공급 상한)를 지킨다.
+
+실측(크롤 로그 1,698회): 수집 건수가 **10에서 205회(12.1%) 몰린다** — 상한이 실제로
+걸리고 있다. 다만 그 너머의 공급량은 자료가 잘려 있어 알 수 없다.

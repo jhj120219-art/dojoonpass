@@ -1606,6 +1606,143 @@ def claim_next_queue_item() -> Optional[Dict]:
         conn.close()
 
 
+# 한 물건에서 한 번에 집어 오는 최대 행 수.
+#
+# 정상 상태에서는 doc_type 종류 수(현재 4)가 자연 상한이다 — migration 018 의
+# UNIQUE(court_code, case_no, item_no, doc_type) 가 같은 종류의 중복 적재를 막는다.
+# 그래도 고정 상한을 두는 이유는, 그 제약이 없던 시절에 적재된 행이나 스키마가
+# 손상된 DB 에서 **한 실행이 한 물건에 무한정 붙들리지 않게** 하기 위해서다.
+QUEUE_BATCH_MAX_ROWS = 8
+
+
+def claim_next_item_rows(max_rows: int = QUEUE_BATCH_MAX_ROWS) -> List[Dict]:
+    """**한 물건**(법원+사건+물건번호)의 처리 가능한 큐 행을 한꺼번에 집어 온다.
+
+    ## 왜 필요한가 (2026-08-20 Sprint 236, BUGS #173)
+
+    `doc_worker` 는 큐 행을 하나씩 집어 **행마다** `go_to_case_detail()` 을 불렀다.
+    같은 물건의 4종(spec/status/appraisal/image)을 받으려고 같은 상세페이지에
+    **네 번** 들어간 것이다. 이동 1회는 실측 중앙값 10.9초인데, 사진 수집 자체는
+    0.0초다(DOM 을 그대로 읽는다). 즉 비용의 거의 전부가 중복 이동이었다.
+
+    이 함수는 **claim 단위만** 행 -> 물건으로 바꾼다. 그 외에는 아무것도 바꾸지 않는다:
+
+        재시도 예산      행마다 그대로 (`retry_count` 는 행의 것이다)
+        성공/실패 기록    행마다 그대로 (`mark_queue_done` / `mark_queue_failed`)
+        refresh 보존     행마다 그대로 (`overwrite` 를 행별로 계산한다)
+        부분 실패        행마다 그대로 (한 종류가 실패해도 나머지는 각자 종결된다)
+
+    ## 첫 행은 기존 함수가 고른다
+
+    `claim_next_queue_item()` 을 그대로 부른다 — 어떤 행을 먼저 볼지(priority,
+    auction_date), 재시도 간격, claim 경쟁에서 밀렸을 때의 재조회까지
+    **판단을 여기서 복제하지 않기 위해서다.** 그 어휘가 두 곳에 생기면 한쪽만
+    고쳐지는 날이 온다(이 저장소가 BUGS #130 에서 겪은 모양이다).
+
+    ## 형제 행은 **best-effort** 다
+
+    이미 집은 첫 행이 있으므로, 형제 행 claim 이 경쟁에서 밀리면 그냥 빼고 돌아간다
+    — 실패가 아니다. 그 행은 이긴 쪽이 처리한다. 여기서 None 을 돌려주면
+    Sprint 191 이 고친 결함(경쟁 1회가 그날 큐 전체를 다음 날로 미룸)을 되살린다.
+
+    ## 형제에도 재시도 간격을 똑같이 건다
+
+    30분 전에 실패한 행은 아직 다시 시도할 때가 아니다. 물건을 묶어 온다는
+    이유로 그 규칙을 건너뛰면, **같은 실행 안에서 같은 행을 연달아 태워**
+    재시도 예산 3회를 몇 분 만에 소진시킨다.
+
+    돌려주는 것: `claim_next_queue_item()` 과 **똑같은 모양의 dict** 목록.
+    집을 것이 없으면 빈 목록(호출부는 그것을 "대기열 비어있음"으로 읽는다).
+    """
+    head = claim_next_queue_item()
+    if not head:
+        return []
+
+    rows = [head]
+    if max_rows <= 1:
+        return rows
+
+    conn = get_connection()
+    try:
+        siblings = conn.execute("""
+            SELECT id, court_code, case_no, item_no, doc_type, retry_count, auction_date, status
+            FROM document_queue
+            WHERE court_code=? AND case_no=? AND item_no=?
+              AND id<>?
+              AND status IN (""" + QUEUE_CLAIMABLE_PLACEHOLDERS + """)
+              AND (
+                    last_attempt_at IS NULL
+                    OR datetime(last_attempt_at) <= datetime(""" + _NOW_LOCAL + """, '-""" + str(RETRY_INTERVAL_MINUTES) + """ minutes')
+              )
+            ORDER BY priority ASC, id ASC
+            LIMIT ?
+        """, (head["court_code"], head["case_no"], head["item_no"], head["id"])
+             + tuple(QUEUE_CLAIMABLE_STATUSES) + (max_rows - 1,)).fetchall()
+
+        for row in siblings:
+            waiting_status = row["status"]
+            claimed_status = QUEUE_CLAIM_STATUS[waiting_status]
+            now = datetime.now().isoformat()
+            cur = conn.execute("""
+                UPDATE document_queue
+                SET status=?, last_attempt_at=?
+                WHERE id=? AND status=?
+            """, (claimed_status, now, row["id"], waiting_status))
+            conn.commit()
+            if not cur.rowcount:
+                # 경쟁에서 밀렸다. 첫 행은 이미 우리 것이므로 이 행만 빼고 진행한다.
+                logger.debug("형제 행 claim 경쟁에서 밀렸다(id=%s) - 이번 묶음에서 제외", row["id"])
+                continue
+            item = dict(row)
+            item["status"] = claimed_status
+            item["overwrite"] = claimed_status in QUEUE_OVERWRITE_STATUSES
+            rows.append(item)
+    finally:
+        conn.close()
+
+    if len(rows) > 1:
+        logger.info("[%s-%s] 큐 %d행을 한 묶음으로 집었다(%s) - 상세페이지 이동 1회로 처리한다",
+                    head["case_no"], head["item_no"], len(rows),
+                    ", ".join(r["doc_type"] for r in rows))
+    return rows
+
+
+def release_queue_rows(queue_ids: List[int]) -> int:
+    """집어 두었지만 **한 번도 시도하지 않은** 행을 즉시 대기 상태로 돌려놓는다.
+
+    실행 창이 닫혀 묶음의 뒷부분을 처리하지 못한 경우에 쓴다.
+
+    ★ `retry_count` 를 건드리지 않는다 — 시도하지 않았으니 예산을 깎을 이유가 없다.
+      (`reset_stale_queue()` 의 `in_progress` 회수와 같은 규칙이다. 그 함수가 10분 뒤
+      해 줄 일을 지금 바로 하는 것뿐이라, 새 정책을 만드는 것이 아니다.)
+
+    ★ `last_attempt_at` 도 건드리지 않는다 — 그 값을 지우면 30분 재시도 간격이
+      사라져, 방금 실패한 행이 곧바로 다시 태워질 수 있다. 회수 경로와 동일하게 둔다.
+    """
+    ids = [int(q) for q in queue_ids]
+    if not ids:
+        return 0
+    conn = get_connection()
+    try:
+        # ★ SQL 을 문자열로 조립하지 않는다.
+        #   `IN (%s)` 로 물음표만 채우는 것은 안전하지만, 이 저장소의 SQL 위생
+        #   검사는 그것을 구별할 수 없다(구별하려 들면 검사가 무뎌진다).
+        #   한 번에 되돌리는 행은 많아야 QUEUE_BATCH_MAX_ROWS 개라 반복문으로 충분하다.
+        released = 0
+        for in_progress, back_to in QUEUE_RESUME_STATUS.items():
+            for queue_id in ids:
+                cur = conn.execute(
+                    "UPDATE document_queue SET status=? WHERE status=? AND id=?",
+                    (back_to, in_progress, queue_id))
+                released += cur.rowcount
+        conn.commit()
+        if released:
+            logger.info("시도하지 않은 큐 %d행을 대기 상태로 돌려놓았다", released)
+        return released
+    finally:
+        conn.close()
+
+
 def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, doc_type: str,
                      previous_hash: str, new_hash: str, status: str = "READY",
                      files_saved: Optional[List[str]] = None) -> None:

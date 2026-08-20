@@ -3,7 +3,7 @@ doc_worker.py의 브라우저/드라이버 장애 복구 회귀 테스트 (2026-
 
 `doc_worker.py`는 selenium을 import하므로(BUGS #47이 CrawlOutcome/DocWorkerOutcome을
 `models/crawl_outcome.py`로 분리한 것과 같은 이유), 실제 브라우저를 띄우지 않고
-`doc_worker.main()`을 돌리려면 모든 브라우저 호출부(claim_next_queue_item/
+`doc_worker.main()`을 돌리려면 모든 브라우저 호출부(claim_next_item_rows/
 go_to_case_detail/collect_document/restart_download_driver/build_download_driver 등)를
 가짜로 바꿔야 한다. 이 파일은 그 몽키패치만 담당하고, 실제 검증 대상은
 "드라이버 재시작 자체가 실패했을 때 나머지 큐 항목을 계속 갉아먹지 않는가"다.
@@ -79,16 +79,22 @@ def test_driver_restart_failure_stops_run_instead_of_burning_retry_budget():
     failed_calls = []
     restart_calls = []
 
-    def fake_claim_next_queue_item():
+    def fake_claim_next_item_rows():
+        # 2026-08-20 Sprint 236: claim 단위가 행 -> 물건으로 바뀌어 **목록**을 돌려준다.
+        # 여기서는 여전히 한 번에 한 행만 준다 - 이 검사가 보는 것(재시작 실패 / 진입 실패)은
+        # 묶음 크기와 무관하고, 기존 검증을 그대로 유지해야 비교가 성립한다.
         if queue:
             item = queue.pop(0)
             claimed_calls.append(item["id"])
-            return item
-        return None
+            return [item]
+        return []
 
     # 2026-08-17 Sprint 144: doc_worker가 item_no까지 넘긴다(물건 사진은 버튼 없이
     # 상세 DOM을 읽으므로 **어느 물건의 페이지인지가 곧 결과**다). 스텁도 받아야 한다.
-    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None):
+    # 2026-08-20 Sprint 230: `require_exact_item` 이 함께 넘어온다(사진일 때만 True).
+    #   `**kwargs` 로 뭉개지 않는다 — 그러면 다음에 인자가 바뀌어도 조용히 통과한다.
+    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None,
+                               require_exact_item=False):
         raise Exception("qa-simulated-browser-crash")
 
     def fake_restart_download_driver(driver):
@@ -101,8 +107,9 @@ def test_driver_restart_failure_stops_run_instead_of_burning_retry_budget():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
-        "claim_next_queue_item": fake_claim_next_queue_item,
+        "claim_next_item_rows": fake_claim_next_item_rows,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
         "go_to_case_detail": fake_go_to_case_detail,
         "restart_download_driver": fake_restart_download_driver,
@@ -139,18 +146,24 @@ def test_driver_restart_success_continues_processing():
     restart_calls = []
     call_count = {"go_to_case_detail": 0}
 
-    def fake_claim_next_queue_item():
+    def fake_claim_next_item_rows():
+        # 2026-08-20 Sprint 236: claim 단위가 행 -> 물건으로 바뀌어 **목록**을 돌려준다.
+        # 여기서는 여전히 한 번에 한 행만 준다 - 이 검사가 보는 것(재시작 실패 / 진입 실패)은
+        # 묶음 크기와 무관하고, 기존 검증을 그대로 유지해야 비교가 성립한다.
         if queue:
             item = queue.pop(0)
             claimed_calls.append(item["id"])
-            return item
-        return None
+            return [item]
+        return []
 
     seen_item_nos = []
 
     overwrite_seen = []
 
-    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None):
+    # 2026-08-20 Sprint 230: `require_exact_item` 이 함께 넘어온다(사진일 때만 True).
+    #   `**kwargs` 로 뭉개지 않는다 — 그러면 다음에 인자가 바뀌어도 조용히 통과한다.
+    def fake_go_to_case_detail(driver, court_code, case_no, item_no=None,
+                               require_exact_item=False):
         call_count["go_to_case_detail"] += 1
         seen_item_nos.append(item_no)
         if call_count["go_to_case_detail"] == 1:
@@ -180,8 +193,9 @@ def test_driver_restart_success_continues_processing():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
-        "claim_next_queue_item": fake_claim_next_queue_item,
+        "claim_next_item_rows": fake_claim_next_item_rows,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
         "go_to_case_detail": fake_go_to_case_detail,
         "collect_document": fake_collect_document,
@@ -209,6 +223,144 @@ def test_driver_restart_success_continues_processing():
     check("성공 건이 있으므로 종료 코드는 0이다", exit_code, 0)
 
 
+def test_case_not_reachable_does_not_restart_the_driver():
+    """사건을 못 찾은 것으로 **드라이버를 재시작하지 않는다** (2026-08-20 Sprint 232).
+
+    ## 왜 이것이 결함이었나
+
+    `go_to_case_detail()` 이 False 를 돌려주는 이유는 둘 다 **정상적인 판단 결과**다.
+
+        1. 그 사건이 법원 목록에 없다 (기일이 지나 빠졌거나 취하/변경)
+        2. 물건번호가 모호해 **일부러 진입하지 않았다** (Sprint 230 의 사진 오염 방어)
+
+    브라우저는 멀쩡하다. 그런데 예전 코드는 이것을 그냥 `Exception` 으로 올려
+    `except` 절이 드라이버를 통째로 재시작했다.
+
+    실측(`logs/doc_run.log` 11일치): "사건 매칭 실패" **255회**, 전부 재시작이 뒤따랐고
+    재개까지 평균 **5.9초**(합계 25.1분 = 하루 평균 2.3분).
+
+    시간 자체는 크지 않다. **진짜 문제는 연쇄다** — 재시작이 실패하면 Sprint 137 의
+    방어가 발동해 **그 날 실행 전체를 중단**한다. "사건 하나를 못 찾았다"가
+    하루치 수집을 죽일 이유가 없다. 게다가 Sprint 230 의 *의도적 거부* 도 같은 경로를
+    타서 **옳은 판단이 재시작을 부르는** 모양이 됐다.
+
+    ## 무엇을 고정하나
+
+        못 찾은 항목만 실패 처리하고 **재시작 0회**
+        다음 항목은 **그대로 계속** 처리된다(과잉 중단이 아니다)
+        재시도 예산은 종전대로 소모한다(큐 의미론 불변)
+        진짜 예외는 여전히 재시작한다(아래 대조군)
+    """
+    print("\n--- 8. 사건 미발견은 드라이버를 재시작하지 않는다 (Sprint 232) ---")
+
+    queue = _make_fake_queue(2)
+    claimed, failed, done, restarts = [], [], [], []
+
+    def fake_claim():
+        if queue:
+            it = queue.pop(0)
+            claimed.append(it["id"])
+            return [it]           # Sprint 236: 물건 단위 claim 은 목록을 돌려준다
+        return []
+
+    calls = {"nav": 0}
+
+    def fake_go(driver, court_code, case_no, item_no=None, require_exact_item=False):
+        calls["nav"] += 1
+        # 첫 항목은 못 찾는다(=False), 두 번째는 정상 진입한다.
+        return calls["nav"] != 1
+
+    def fake_collect(driver, court_code, case_no, item_no, doc_type, btn_id,
+                     overwrite=False):
+        return {"success": True, "previous_hash": None, "new_hash": "h", "partial": False}
+
+    originals = _patch_all({
+        "init_db": lambda: None,
+        "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
+        "build_download_driver": lambda: _FakeDriver("initial"),
+        "claim_next_item_rows": fake_claim,
+        "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
+        "go_to_case_detail": fake_go,
+        "collect_document": fake_collect,
+        "restart_download_driver": lambda d: (restarts.append(1), _FakeDriver("r"))[1],
+        "mark_queue_failed": lambda qid, rc: failed.append(qid),
+        "mark_queue_skipped_expired": lambda *a, **kw: None,
+        "mark_queue_unsupported": lambda *a, **kw: None,
+        "mark_queue_done": lambda qid, *a, **kw: done.append(qid),
+    })
+    orig_sleep = doc_worker.time_module.sleep
+    doc_worker.time_module.sleep = lambda *_a, **_kw: None
+    try:
+        exit_code = doc_worker.main()
+    finally:
+        _restore_all(originals)
+        doc_worker.time_module.sleep = orig_sleep
+
+    check("두 항목 다 claim 됐다(검사가 공허하지 않다)", claimed, [100, 101])
+    check("★ 사건 미발견으로는 드라이버를 재시작하지 않는다", restarts, [])
+    check("못 찾은 항목만 실패로 기록된다", failed, [100])
+    check("★ 다음 항목은 그대로 성공 처리된다(과잉 중단 아님)", done, [101])
+    check("성공 건이 있으므로 종료 코드는 0", exit_code, 0)
+
+
+def test_real_exception_still_restarts_the_driver():
+    """대조군 - **진짜 예외**는 여전히 드라이버를 재시작한다 (Sprint 232).
+
+    위 검사가 "이제 아무것도 재시작하지 않는다"로 과잉 수정되지 않았는지 본다.
+    이것이 없으면 재시작 경로가 통째로 죽어도 통과한다.
+    """
+    print("\n--- 9. 진짜 예외는 여전히 재시작한다 (대조군) ---")
+
+    queue = _make_fake_queue(2)
+    claimed, failed, done, restarts = [], [], [], []
+    calls = {"nav": 0}
+
+    def fake_claim():
+        if queue:
+            it = queue.pop(0)
+            claimed.append(it["id"])
+            return [it]           # Sprint 236: 물건 단위 claim 은 목록을 돌려준다
+        return []
+
+    def fake_go(driver, court_code, case_no, item_no=None, require_exact_item=False):
+        calls["nav"] += 1
+        if calls["nav"] == 1:
+            raise Exception("qa-simulated-browser-crash")   # 진짜 예외
+        return True
+
+    def fake_collect(driver, court_code, case_no, item_no, doc_type, btn_id,
+                     overwrite=False):
+        return {"success": True, "previous_hash": None, "new_hash": "h", "partial": False}
+
+    originals = _patch_all({
+        "init_db": lambda: None,
+        "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
+        "build_download_driver": lambda: _FakeDriver("initial"),
+        "claim_next_item_rows": fake_claim,
+        "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
+        "go_to_case_detail": fake_go,
+        "collect_document": fake_collect,
+        "restart_download_driver": lambda d: (restarts.append(1), _FakeDriver("r"))[1],
+        "mark_queue_failed": lambda qid, rc: failed.append(qid),
+        "mark_queue_skipped_expired": lambda *a, **kw: None,
+        "mark_queue_unsupported": lambda *a, **kw: None,
+        "mark_queue_done": lambda qid, *a, **kw: done.append(qid),
+    })
+    orig_sleep = doc_worker.time_module.sleep
+    doc_worker.time_module.sleep = lambda *_a, **_kw: None
+    try:
+        doc_worker.main()
+    finally:
+        _restore_all(originals)
+        doc_worker.time_module.sleep = orig_sleep
+
+    check("★ 진짜 예외는 재시작을 부른다", len(restarts), 1)
+    check("그 항목은 실패로 기록된다", failed, [100])
+    check("다음 항목은 계속 처리된다", done, [101])
+
+
 def test_lock_prevents_concurrent_run():
     """락 파일이 이미 있으면(신선함) 큐를 전혀 건드리지 않고 즉시 종료해야 한다.
 
@@ -224,13 +376,13 @@ def test_lock_prevents_concurrent_run():
         f.write("99999 qa-fake-lock")
 
     def fail_if_called(*_a, **_kw):
-        raise AssertionError("claim_next_queue_item이 불렸다 - 락이 큐 접근을 막지 못했다")
+        raise AssertionError("claim_next_item_rows가 불렸다 - 락이 큐 접근을 막지 못했다")
 
     originals = _patch_all({
         "init_db": fail_if_called,
         "reset_stale_queue": fail_if_called,
         "build_download_driver": fail_if_called,
-        "claim_next_queue_item": fail_if_called,
+        "claim_next_item_rows": fail_if_called,
     })
     try:
         exit_code = doc_worker.main()
@@ -289,8 +441,9 @@ def test_lock_released_after_normal_run():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
-        "claim_next_queue_item": lambda: None,  # 큐가 비어 즉시 종료
+        "claim_next_item_rows": lambda: [],  # 큐가 비어 즉시 종료
     })
     orig_sleep = doc_worker.time_module.sleep
     doc_worker.time_module.sleep = lambda *_a, **_kw: None
@@ -330,8 +483,9 @@ def test_driver_startup_failure_releases_lock():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
+        "release_queue_rows": lambda ids: 0,
         "build_download_driver": _boom,
-        "claim_next_queue_item": lambda: None,
+        "claim_next_item_rows": lambda: [],
     })
     raised = None
     try:
@@ -377,7 +531,7 @@ def test_out_of_window_run_does_not_start_browser():
         "init_db": lambda: None,
         "reset_stale_queue": _spy_reset,
         "build_download_driver": _spy_driver,
-        "claim_next_queue_item": lambda: None,
+        "claim_next_item_rows": lambda: [],
     })
     try:
         rc = doc_worker.main()
@@ -710,6 +864,8 @@ def test_mvp_scraper_lock_flow():
 def run():
     test_driver_restart_failure_stops_run_instead_of_burning_retry_budget()
     test_driver_restart_success_continues_processing()
+    test_case_not_reachable_does_not_restart_the_driver()
+    test_real_exception_still_restarts_the_driver()
     test_lock_prevents_concurrent_run()
     test_stale_lock_is_taken_over()
     test_lock_released_after_normal_run()

@@ -27,6 +27,67 @@ Owner: CTO
 - **Next.js에서 `NEXT_PUBLIC_` 접두사가 붙은 값은 브라우저에 그대로 노출된다.**
   비밀키에는 절대 이 접두사를 붙이지 않는다.
 
+## ★ [2026-08-20 Sprint 234] 코드 ↔ 문서 이름 대조 실측
+
+코드가 **실제로 읽는** 환경변수를 AST 로 전수 추출해(주석/문자열 제외) 문서와 대조했다.
+이 저장소는 이름 불일치로 실제 사고를 겪은 적이 있다(`JWT_SECRET` vs `SUPABASE_JWT_SECRET`
+— 값을 아무리 넣어도 동작하지 않았다). 그래서 이름이 갈라지는지 다시 쟀다.
+
+### 코드가 실제로 읽는 이름 (백엔드 + 프런트, 실측)
+
+```
+ADMIN_API_KEY / SUPER_ADMIN_API_KEY        api/v1/admin.py
+SUPABASE_JWT_SECRET                        api/auth.py (모듈 최상단, 1회)
+SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL    api/auth.py (or 폴백)
+PAYMENT_PROVIDER                           api/v1/payments.py, payment_providers.py (2곳)
+PAYMENT_WEBHOOK_SECRET                     api/v1/payment_providers.py
+CORS_ALLOW_ORIGINS / LOG_LEVEL             api_server.py (모듈 최상단)
+DOC_WORKER_TEST_MODE                       doc_worker.py
+NEXT_PUBLIC_API_BASE_URL                   src/lib/api.ts
+NEXT_PUBLIC_SUPABASE_URL / ..._ANON_KEY    src/lib/supabaseClient.ts 등
+```
+
+### ★ 발견 1 — `DOC_WORKER_TEST_MODE` 가 문서 어디에도 없었다
+
+**코드는 읽는데 문서에는 한 줄도 없었다.** 그런데 이 값은 무해하지 않다.
+
+```python
+def is_time_up() -> bool:
+    if os.environ.get("DOC_WORKER_TEST_MODE") == "1":
+        return False          # <- 실행 창 검사를 통째로 무력화한다
+```
+
+`"1"` 이면 `doc_worker` 의 **실행 창(02:00~04:00) 검사가 꺼진다.** 회귀 테스트가
+창 밖에서도 루프를 돌리기 위한 장치인데, 운영 환경에 실수로 들어가면
+**워커가 종료 시각을 무시하고 계속 돈다** — 06:00 의 일일 크롤과 겹칠 수 있다
+(둘 다 Chrome 을 띄우고 서로의 락을 보지 않는다).
+
+```
+용도      테스트 전용
+운영값    **설정하지 않는다** (이름 자체가 없어야 한다)
+현재      이 환경에 없음 (실측 2026-08-20)
+```
+
+### ★ 발견 2 — `SUPABASE_ANON_KEY` 는 `.env` 에 있는데 **읽는 코드가 없다**
+
+```
+.env 의 이름   SUPABASE_ANON_KEY  있음
+읽는 코드      **0곳** (백엔드/프런트 전수 검색)
+실제로 쓰는 것  NEXT_PUBLIC_SUPABASE_ANON_KEY  (.env.local, 프런트 전용)
+```
+
+기능에는 영향이 없다(아무도 안 읽으니 아무 일도 안 일어난다). 다만 **"설정했는데 왜
+안 되지"** 의 원인이 되기 쉬운 자리라 기록해 둔다. 아래 §1 의 `SUPABASE_ANON_KEY`
+설명은 그 이름이 **백엔드에서는 쓰이지 않는다**는 점과 함께 읽어야 한다.
+(`.env` 정리는 승인 영역이라 이 세션은 건드리지 않았다.)
+
+### 문서에만 있는 이름은 대부분 드리프트가 아니다
+
+`KG_*` / `SMTP_*` / `SMS_*` / `SENTRY_DSN` / `SLACK_WEBHOOK_URL` / `GA4_*` 는
+**아직 도입하지 않은 연동**의 계획 항목이다(§B/§C 분류 그대로). 이름 불일치가 아니다.
+
+---
+
 ## 현재 상태 요약 (2026-08-07 코드 기준)
 
 | 상태 | 항목 |

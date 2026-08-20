@@ -6,6 +6,8 @@ import { fetchAuthedJSON, ApiError } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { formatPrice } from '@/lib/format'
 import SiteHeader from '@/components/SiteHeader'
+import ResultThumbnail from '@/components/ResultThumbnail'
+import ExportButtons from './ExportButtons'
 import { CONTAINER } from '@/lib/layout'
 
 interface FavoriteItem {
@@ -23,6 +25,8 @@ interface FavoriteItem {
   auction_date: string | null
   status: string | null
   fail_count: number
+  /** 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없는 물건은 null 이다. */
+  thumbnail_url: string | null
   favorited_at: string
 }
 
@@ -75,22 +79,44 @@ export default function FavoritesPage() {
             <p className="text-gray-400">관심물건이 없습니다.</p>
           </div>
         )}
+        {/* 내보내기 (2026-08-20 Sprint 227).
+            0건이어도 버튼을 감추지 않는다 — 사라지는 UI 는 "기능이 없다"로 읽힌다.
+            대신 비활성으로 두어 담은 것이 없다는 사실만 전한다. */}
+        {!error && items && (
+          <div className="flex justify-end pb-3">
+            <ExportButtons rows={items} disabled={items.length === 0} />
+          </div>
+        )}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 items-start">
         {!error && items && items.map((item) => (
           <Link key={item.id} href={`/properties/${item.id}`} className="block">
             <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
-              <div className="flex items-start justify-between mb-1">
-                <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">
-                  {item.property_type || '-'}
-                </span>
-                <span className="text-xs text-gray-400">{item.auction_date || '-'} 매각</span>
+              {/* 대표 사진 (2026-08-20 Sprint 224).
+
+                  사용자는 검색목록에서 **사진을 보고** 담는다. 그런데 여기서는 사진이
+                  사라져 같은 물건인지 알아보기 어려웠다. 검색목록과 같은 컴포넌트
+                  (`@/components/ResultThumbnail`)와 같은 URL 규칙을 쓴다.
+
+                  `thumbnail_url` 이 있을 때만 그린다 — 사진이 없는 물건에 빈 회색 칸을
+                  만들면 오히려 카드가 나빠진다(이 저장소의 사진 보유율은 아직 낮다).
+                  깨진 URL 은 컴포넌트가 onError 로 스스로 자리를 지운다. */}
+              <div className="min-w-0 flex gap-3">
+                {item.thumbnail_url && <ResultThumbnail url={item.thumbnail_url} />}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between mb-1">
+                    <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">
+                      {item.property_type || '-'}
+                    </span>
+                    <span className="text-xs text-gray-400">{item.auction_date || '-'} 매각</span>
+                  </div>
+                  <p className="text-sm font-bold text-gray-900 truncate">
+                    {item.case_no}{item.item_no ? ` (${item.item_no})` : ''}
+                  </p>
+                  <p className="text-xs text-gray-400 truncate">
+                    {item.full_address || [item.sido, item.sigungu].filter(Boolean).join(' ') || '-'}
+                  </p>
+                </div>
               </div>
-              <p className="text-sm font-bold text-gray-900 truncate">
-                {item.case_no}{item.item_no ? ` (${item.item_no})` : ''}
-              </p>
-              <p className="text-xs text-gray-400 truncate">
-                {item.full_address || [item.sido, item.sigungu].filter(Boolean).join(' ') || '-'}
-              </p>
               <div className="mt-3 grid grid-cols-2 gap-2 text-center border-t border-gray-50 pt-3">
                 <div>
                   <p className="text-[0.6875rem] text-gray-400">감정가</p>

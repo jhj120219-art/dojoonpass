@@ -422,6 +422,68 @@ def test_scan_scope_excludes_snapshots():
     print("    검사 대상 .py %d개" % len(files))
 
 
+# ---------------------------------------------------------------------------
+# 이스케이프가 **제어문자로 굳은** 자리 (2026-08-20 Sprint 226 신설)
+# ---------------------------------------------------------------------------
+# 소스에 `\bfoo\b` 라고 쓰려던 것이 파일에 **0x08(백스페이스) 바이트**로 들어가는
+# 사고가 있다. 도구를 거쳐 파일을 쓸 때 역슬래시가 한 겹 사라지면 그렇게 된다.
+#
+# 겉보기로는 알아채기 어렵다 — 에디터가 그 바이트를 거의 보여 주지 않고, 문법 오류도
+# 아니다. 그런데 정규식은 "백스페이스 문자"를 찾게 되므로 **영원히 일치하지 않는다.**
+#
+# 실제 피해(2026-08-20 발견): `tests/source-contract.test.mjs` 의
+#
+#     assert.ok(!/<BS>formatPrice<BS>/.test(src), '마이페이지가 축약 표기를 씁니다')
+#
+# 이 단언은 `formatPrice` 가 다시 들어와도 **절대 실패하지 않는** 공허한 검사였다.
+# 변이로 확인했다 — 결함을 주입하면 고친 판본은 잡고, 옛 판본은 **놓쳤다.**
+#
+# 정상적으로 이 바이트가 필요한 소스 파일은 없다. 그래서 0개를 고정한다.
+FROZEN_ESCAPES = {
+    0x00: r"\0", 0x07: r"\a", 0x08: r"\b", 0x0b: r"\v", 0x0c: r"\f", 0x1b: r"\e",
+}
+
+# 콘솔 인코딩과 무관하지만 **같은 사고**라 여기서 함께 본다(이 파일이 이미 소스를
+# 바이트로 훑고 있고, 형제 검사와 제외 규칙을 공유하기 때문이다).
+FROZEN_SCAN_EXTS = (".py", ".mjs", ".js", ".ts", ".tsx")
+
+
+def _frozen_scan_files():
+    out = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in filenames:
+            if fn.endswith(FROZEN_SCAN_EXTS):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
+def test_no_escape_frozen_into_a_control_character():
+    print("\n--- 이스케이프가 제어문자로 굳은 자리가 없는가 ---")
+    files = _frozen_scan_files()
+    # 하한 — 열거가 깨지면 0개를 훑고 조용히 통과한다.
+    check("검사 대상 소스를 실제로 찾았다(검사가 공허하지 않다)", len(files) >= 80, True)
+
+    hits = []
+    for path in files:
+        data = io.open(path, "rb").read()
+        for code, shown in sorted(FROZEN_ESCAPES.items()):
+            if bytes([code]) in data:
+                rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+                hits.append("%s %s x%d" % (rel, shown, data.count(bytes([code]))))
+    check("★ 제어문자로 굳은 이스케이프", hits[:5], [])
+
+    # 검출기 자체 검증 — 진짜 바이트가 있으면 반드시 잡아야 하고,
+    # 정상적인 두 글자 표기(역슬래시 + b)는 잡으면 안 된다.
+    good = ("re.search(r'" + chr(92) + "bfoo" + chr(92) + "b', s)").encode("utf-8")
+    bad = ("re.search(r'" + chr(8) + "foo" + chr(8) + "', s)").encode("utf-8")
+    check("검출기 자체 검증: 굳은 제어문자를 잡는다",
+          any(bytes([c]) in bad for c in FROZEN_ESCAPES), True)
+    check("검출기 자체 검증: 정상 표기를 잡지 않는다",
+          any(bytes([c]) in good for c in FROZEN_ESCAPES), False)
+    print("    훑은 소스 %d개" % len(files))
+
+
 def run():
     test_scan_scope_excludes_snapshots()
     test_all_output_literals_are_console_encodable()
@@ -429,6 +491,7 @@ def run():
     test_print_actually_survives_cp949_stream()
     test_logger_record_is_not_lost_on_cp949()
     test_known_operator_warnings_are_safe()
+    test_no_escape_frozen_into_a_control_character()
 
     print("\n" + "=" * 55)
     if failures:

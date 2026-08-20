@@ -7,6 +7,7 @@ from datetime import date
 from storage.database import get_connection
 from api.auth import decode_supabase_jwt
 from api.constants import is_sqlite_int
+from api.v1.thumbnails import fetch_thumbnail_seqs, thumbnail_url
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
     analyze_intent,
@@ -79,7 +80,6 @@ def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
     ★ 기존 계약을 깨지 않는다: 키를 **추가만** 했고 기존 필드는 이름·의미 모두 그대로다
       (`docs/backend.md`의 "GET /api/v1/search 응답 필드명" 불변 규칙).
     """
-    thumb_seq = (thumbnails or {}).get(row["id"])
     return {
         "id": row["id"],
         "case_no": row["case_no"],
@@ -100,10 +100,9 @@ def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
         "crawl_date": row["crawl_date"],
         "is_favorited": row["id"] in favorited_ids,
         # 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없으면 null이다.
-        # 경로 규칙은 `api/v1/item.py:_image_url()` / `api/v1/images.py` 라우트와 같아야
-        # 한다 — 갈라지면 "목록에는 나오는데 열면 404"가 된다.
-        "thumbnail_url": ("/api/v1/item/%d/images/%d" % (row["id"], thumb_seq)
-                          if thumb_seq is not None else None),
+        # 경로 규칙은 `api/v1/thumbnails.py` 한 곳에만 있다 — 화면마다 따로 적으면
+        # 어느 하나가 어긋났을 때 "목록에는 나오는데 열면 404"가 된다.
+        "thumbnail_url": thumbnail_url(row["id"], thumbnails),
     }
 
 # ---------------------------------------------------------------------------
@@ -403,16 +402,7 @@ def search(
         #
         # 대표 = 순번이 가장 앞선 사진. `MIN(seq)`로 물건당 한 행만 받는다
         # (`api/v1/item.py`가 상세에서 `images[0]`을 대표로 쓰는 것과 같은 규칙).
-        thumbnails = {}
-        if rows:
-            ids = [r["id"] for r in rows]
-            placeholders = ",".join("?" * len(ids))
-            thumb_rows = conn.execute(
-                f"SELECT item_id, MIN(seq) AS seq FROM auction_image "
-                f"WHERE item_id IN ({placeholders}) GROUP BY item_id",
-                ids
-            ).fetchall()
-            thumbnails = {r["item_id"]: r["seq"] for r in thumb_rows}
+        thumbnails = fetch_thumbnail_seqs(conn, [r["id"] for r in rows])
 
         return {
             "total": total,

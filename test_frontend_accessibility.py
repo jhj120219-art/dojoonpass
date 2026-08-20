@@ -11,7 +11,8 @@
     WCAG AA 대비(4.5:1) 미달          81개  (41%)
     text-gray-400 on white 실제 대비   2.6:1   <- 기준의 58%
     탭 타깃 53개 중 44px 미만          44개  (83%)
-    그중 **24px 미만**                  5개   <- WCAG 2.5.8 (AA) 위반
+    그중 **24px 미만**                  5개   <- ★ 위반 아님(2026-08-20 Sprint 225)
+                                             간격(Spacing) 예외로 적합. 중심 간 54px vs 임계 24px
     14px 미만 텍스트                  111개
 
 가장 나쁜 것은 **무엇이** 작고 흐린가이다.
@@ -102,14 +103,27 @@ def check_le(name, actual, ceiling):
 #   text-gray-400  흰 배경에서 대비 2.6:1 (WCAG AA 4.5:1 의 58%)
 #   text-gray-300  그보다 더 낮다
 # ---------------------------------------------------------------------------
+# ★ 2026-08-20 Sprint 225 — 상한을 재기준했다. **값이 늘어난 것은 코드가 나빠져서가
+#   아니라 이 검사가 그동안 `src/components/` 를 안 보고 있었기 때문이다.**
+#
+#       src/app        text-xs 111 / text-gray-400 106   <- 예전 상한 (여기까지만 셌다)
+#       src/components text-xs   7 / text-gray-400   4   <- **한 번도 세지 않았다**
+#       합계           text-xs 118 / text-gray-400 110
+#
+#   하필 그 사각지대에 `SiteHeader.tsx` 와 `PrimaryNav.tsx` 가 있다 —
+#   **Sprint 219 가 "가장 나쁘다"고 지목해 실측한 헤더 내비 바로 그것**이다.
+#   즉 문서의 "text-xs 111회 / text-gray-400 106회"는 과소 집계였다.
 CEILINGS = {
-    "text-xs": 111,
+    "text-xs": 117,
     "text-[11px]": 0,
     "text-[10px]": 0,
     "text-[0.6875rem]": 6,
     "text-[0.625rem]": 2,
-    "text-gray-400": 106,
+    "text-gray-400": 110,
     "text-gray-300": 6,
+    # 흰 배경 대비 **2.89:1** (실측 2026-08-20, rgb(255,100,103)). 오류 문구 2곳에
+    # 쓰인다 — 하필 **가장 읽혀야 하는 글자**가 본문 회색보다도 잘 안 보인다.
+    "text-red-400": 2,
 }
 
 PATTERNS = {
@@ -120,7 +134,19 @@ PATTERNS = {
     "text-[0.625rem]": r"text-\[0\.625rem\]",
     "text-gray-400": r"\btext-gray-400\b",
     "text-gray-300": r"\btext-gray-300\b",
+    "text-red-400": r"\btext-red-400\b",
 }
+
+# 추적 대상 밖의 **더 나쁜 색**으로 갈아타면 이 상한은 오히려 내려간다 —
+# 그러면 검사는 초록불인데 화면은 나빠진다(2026-08-20 Sprint 225 실측으로 확인한 구멍).
+# 그래서 "쓰이는 낮은 대비 계열을 전부 열거하고, 표에 없는 것이 나타나면 알린다"를 함께 건다.
+# 색조는 굳이 제한하지 않는다 — gray 든 slate 든 zinc 든 200~400 단계는 흰 배경에서
+# 전부 4.5:1 을 넘지 못한다.
+LOW_CONTRAST_SCAN = (
+    r"\btext-(?:gray|slate|zinc|neutral|stone|blue|red|green|orange|amber|yellow"
+    r"|lime|emerald|teal|cyan|sky|indigo|violet|purple|fuchsia|pink|rose)"
+    r"-(?:100|200|300|400)\b"
+)
 
 
 def _strip_comments(src):
@@ -140,10 +166,21 @@ def _strip_comments(src):
 
 
 def _tsx_files():
-    """`src/app` 아래 모든 `.tsx`. 목록을 손으로 적지 않는다 — 새 화면이 생기면
-    다음 실행부터 바로 대상이 된다."""
-    return sorted(glob.glob(os.path.join(ROOT, "src", "app", "**", "*.tsx"),
-                            recursive=True))
+    """화면(`src/app`) **과 공용 컴포넌트(`src/components`)** 의 모든 `.tsx`.
+
+    목록을 손으로 적지 않는다 — 새 화면/새 컴포넌트가 생기면 다음 실행부터 대상이 된다.
+
+    ★ 2026-08-20 Sprint 225: `src/components` 가 빠져 있었다. 화면 파일만 세면
+      **공용 컴포넌트로 옮긴 순간 그 글자는 검사에서 사라진다** — 리팩터링이
+      곧 검사 회피가 된다. 실제로 `SiteHeader.tsx`/`PrimaryNav.tsx` 의
+      `text-xs` 7개와 `text-gray-400` 4개가 한 번도 세어지지 않았고,
+      그것이 하필 Sprint 219 가 "가장 나쁘다"고 지목한 헤더 내비였다.
+      (Sprint 224 에 `ResultThumbnail.tsx` 를 그쪽으로 옮기면서 드러났다.)
+    """
+    out = []
+    for sub in ("app", "components"):
+        out += glob.glob(os.path.join(ROOT, "src", sub, "**", "*.tsx"), recursive=True)
+    return sorted(out)
 
 
 def test_small_and_low_contrast_text_does_not_grow():
@@ -156,7 +193,14 @@ def test_small_and_low_contrast_text_does_not_grow():
     counts = {k: 0 for k in PATTERNS}
     per_file = {}
     for path in files:
-        src = io.open(path, encoding="utf-8-sig").read()
+        # ★ 2026-08-20 Sprint 227 - **주석을 코드로 세고 있었다.**
+        #   이 파일은 `_strip_comments()` 를 이미 갖고 있고 형제 검사들은 쓰는데,
+        #   정작 상한 계수기만 원문을 그대로 셌다. 그래서
+        #     - 클래스 이름을 **설명하는 주석**이 사용 횟수로 잡히고
+        #       (실제로 이 스프린트에서 `text-sm 을 쓴 이유` 를 적었더니 상한을 넘겼다),
+        #     - 반대로 주석을 지우면 상한에 여유가 생겨 **진짜 사용이 늘어도 통과**한다.
+        #   저장소 규칙("주석/문자열을 실제 코드로 세지 않는다")을 계수기만 어기고 있었다.
+        src = _strip_comments(io.open(path, encoding="utf-8-sig").read())
         rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
         hit = {}
         for name, rx in PATTERNS.items():
@@ -169,6 +213,19 @@ def test_small_and_low_contrast_text_does_not_grow():
 
     for name in sorted(CEILINGS):
         check_le("%s 사용 횟수" % name, counts[name], CEILINGS[name])
+
+    # ★ 표에 없는 저대비 클래스가 나타나면 알린다. 상한만 걸면 **추적 밖의 더 나쁜
+    #   색으로 갈아타는 것**을 막지 못한다(상한은 오히려 내려가 초록불이 된다).
+    seen = set()
+    for path in files:
+        src = _strip_comments(io.open(path, encoding="utf-8-sig").read())
+        seen |= set(re.findall(LOW_CONTRAST_SCAN, src))
+    untracked = sorted(seen - set(CEILINGS))
+    check_true("추적 밖의 저대비 클래스가 없다", not untracked,
+               "표(CEILINGS)에 없다 - 대비를 재고 등록하거나 쓰지 않는다: %s" % untracked)
+    # 스캔 자체가 죽으면 위 검사가 공허하게 통과한다 — 하한을 건다.
+    check_true("저대비 클래스 스캔이 실제로 동작했다(검사가 공허하지 않다)",
+               len(seen) >= 2, sorted(seen))
 
     emit("    파일 %d개 / 사용처 상위:" % len(files))
     for rel, hit in sorted(per_file.items(), key=lambda kv: -sum(kv[1].values()))[:5]:
@@ -274,7 +331,9 @@ def test_list_and_detail_keep_semantic_alt_rules():
     반대로 `alt` 를 빠뜨리면 스크린리더가 **URL 을 읽는다** — 그건 결함이다.
     """
     emit("\n--- 3. 사진의 대체 텍스트 규약 ---")
-    thumb = os.path.join(ROOT, "src", "app", "search", "ResultThumbnail.tsx")
+    # 2026-08-20 Sprint 224: 검색목록 전용이 아니게 되어(관심물건/최근 본 물건도 쓴다)
+    # src/components/ 로 옮겼다. 경로를 손으로 적는 검사는 이렇게 같이 옮겨야 한다.
+    thumb = os.path.join(ROOT, "src", "components", "ResultThumbnail.tsx")
     check_true("ResultThumbnail 이 있다", os.path.exists(thumb), thumb)
     if not os.path.exists(thumb):
         return
@@ -344,8 +403,35 @@ def test_no_structural_mobile_overflow():
     files = _tsx_files()
     check_true("화면 소스를 실제로 찾았다", len(files) >= 12, len(files))
 
+    # ★ 검출기를 **넣기 전에** 검증한다(2026-08-20 Sprint 225).
+    #   이 저장소는 "0곳"이라는 결과가 검출기가 죽어서 나온 것인지 코드가 깨끗해서
+    #   나온 것인지 구별하지 못해 여러 번 손해를 봤다. 그래서 고정 폭 정규식을
+    #   **반드시 잡아야 하는 예 / 절대 잡으면 안 되는 예**로 먼저 시험한다.
+    _FIXED_W = r"(?<!max-)(?<!min-)\bw-\[\d{3,}px\]"
+    _MUST_HIT = ['className="w-[420px]"', 'flex w-[1024px] gap-2']
+    _MUST_MISS = ['max-w-[1320px] mx-auto', 'max-w-[180px] truncate',
+                  'min-w-[360px]', 'w-[80px]', 'w-full']
+    check_true("검출기 자체 검증: 고정 폭을 잡는다",
+               all(re.search(_FIXED_W, x) for x in _MUST_HIT), _MUST_HIT)
+    check_true("검출기 자체 검증: 상한(max-w)·min-w·두 자리 폭을 잡지 않는다",
+               not any(re.search(_FIXED_W, x) for x in _MUST_MISS),
+               [x for x in _MUST_MISS if re.search(_FIXED_W, x)])
+
+    # ★ 2026-08-20 Sprint 225 — 검출기가 **상한을 고정 폭으로 오인**하고 있었다.
+    #
+    #   `\bw-\[...\]` 는 `max-w-[180px]` / `min-w-[360px]` 안의 `w-[...]` 에도 걸린다
+    #   (`-` 가 비단어 문자라 그 앞에서 `\b` 가 성립한다). 앞 판본이 `max-w-[1320px]` 로
+    #   한 번 당해서 `\d{3,}` 을 붙였지만 그것으로는 막히지 않는다 — 자릿수가 아니라
+    #   **접두사**가 문제이기 때문이다.
+    #
+    #   `max-w-` 는 고정 폭이 아니라 **상한**이라 가로 넘침의 원인이 될 수 없다.
+    #   `min-w-` 는 원인이 맞고, 바로 아래 줄에서 따로 센다(같은 것을 두 번 세지 않는다).
+    #
+    #   2026-08-20 에 스캔 범위를 `src/components` 까지 넓히자마자 이 결함이 드러났다
+    #   — `SiteHeader.tsx` 의 `max-w-[180px]`(이메일 말줄임 상한)을 결함으로 보고했다.
+    #   범위가 좁으면 검사기 자신의 버그도 함께 숨는다.
     CAUSES = {
-        "고정 w-[NNNpx]": r"\bw-\[\d{3,}px\]",
+        "고정 w-[NNNpx]": r"(?<!max-)(?<!min-)\bw-\[\d{3,}px\]",
         "고정 min-w-[NNNpx]": r"\bmin-w-\[\d{3,}px\]",
         "w-screen": r"\bw-screen\b",
         "100vw": r"100vw",
@@ -1027,7 +1113,10 @@ def test_measured_baseline_is_recorded():
     if not os.path.exists(doc):
         return
     body = io.open(doc, encoding="utf-8-sig").read()
-    for token in ("2.6:1", "4.5:1", "WCAG 2.5.8", "oklch", "11px"):
+    # ★ 2026-08-20 Sprint 225: "WCAG 2.5.8 위반" 이라는 서술이 **틀렸다**는 정정이
+    #   문서에 남아 있는지도 함께 본다. 정정이 사라지면 다음 사람이 같은 오판을 반복한다.
+    for token in ("2.6:1", "4.5:1", "WCAG 2.5.8", "oklch", "11px",
+                  "간격(Spacing) 예외"):
         check_true("문서에 %s 가 적혀 있다" % token, token in body,
                    "실측 근거가 사라지면 수치의 뜻을 알 수 없다")
 

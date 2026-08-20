@@ -522,7 +522,7 @@ def test_overwrite_reaches_the_collector():
         return {"success": True, "previous_hash": "", "new_hash": "h", "partial": False}
 
     _run_doc_worker({
-        "claim_next_queue_item": lambda: claims.pop(0) if claims else None,
+        "claim_next_item_rows": lambda: ([claims.pop(0)] if claims else []),
         "collect_document": fake_collect,
     })
 
@@ -549,7 +549,7 @@ def test_refresh_skips_sibling_shortcut():
                 "reused_from": "/qa/sibling/dir" if driver is None else ""}
 
     _run_doc_worker({
-        "claim_next_queue_item": lambda: claims.pop(0) if claims else None,
+        "claim_next_item_rows": lambda: ([claims.pop(0)] if claims else []),
         "collect_document": fake_collect,
         "find_sibling_case_document": fake_sibling,
     })
@@ -1040,6 +1040,7 @@ def test_every_refresh_capability_is_actually_wired():
         "requeue_changed_documents": "변경 -> 큐 되돌림 (Sprint 189)",
         "doc_types_for_changed_fields": "필드 -> 자산 종류 매핑",
         "claim_next_queue_item": "큐 claim (overwrite 판정 포함)",
+        "claim_next_item_rows": "물건 단위 묶음 claim (Sprint 236)",
         "collect_document": "자산 수집 진입점",
         "collect_images": "사진 수집",
         "mark_queue_done": "성공 종결 + version log",
@@ -1185,7 +1186,7 @@ def test_full_image_chain_reaches_the_api():
                         "no_asset": False}
 
             _run_doc_worker({
-                "claim_next_queue_item": db.claim_next_queue_item,   # 진짜 claim
+                "claim_next_item_rows": db.claim_next_item_rows,     # 진짜 claim(물건 단위)
                 "collect_document": collecting_stub,
                 "mark_queue_done": db.mark_queue_done,               # 진짜 종결
                 "save_auction_images": db.save_auction_images,       # 진짜 기록
@@ -1443,7 +1444,7 @@ def test_image_trigger_reaches_the_collector_end_to_end():
                     "partial": False, "images": [], "files_saved": []}
 
         _run_doc_worker({
-            "claim_next_queue_item": db.claim_next_queue_item,   # ★ 진짜 claim
+            "claim_next_item_rows": db.claim_next_item_rows,     # ★ 진짜 claim(물건 단위)
             "collect_document": fake_collect,
         })
 
@@ -1474,7 +1475,7 @@ def test_image_trigger_reaches_the_collector_end_to_end():
 
         seen.clear()
         _run_doc_worker({
-            "claim_next_queue_item": db.claim_next_queue_item,
+            "claim_next_item_rows": db.claim_next_item_rows,
             "collect_document": fake_collect,
         })
         check("수집기에 spec 이 overwrite=True 로 도달한다",

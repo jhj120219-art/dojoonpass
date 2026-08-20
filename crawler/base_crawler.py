@@ -266,7 +266,8 @@ def collect_list_items(driver: webdriver.Chrome, max_items: int) -> List[dict]:
 
 
 def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str,
-                      item_no: Optional[str] = None) -> bool:
+                      item_no: Optional[str] = None,
+                      require_exact_item: bool = False) -> bool:
     """
     02:00 PDF 수집 Worker 전용 진입 함수.
 
@@ -326,6 +327,28 @@ def go_to_case_detail(driver: webdriver.Chrome, court_code: str, case_no: str,
         want = str(item_no).strip()
         target = next((m for m in matches if (m.get("obj_no") or "").strip() == want), None)
         if target is None:
+            # ★ 2026-08-20 Sprint 230 — 여기서 **거부할 수 있게** 한다.
+            #
+            #   위 docstring 이 이미 위험을 적어 두었다: 물건 사진에는 버튼이 없어
+            #   "잘못된 물건의 페이지에 있으면 그대로 잘못된 사진을 저장한다."
+            #   그런데 실제 동작은 경고만 남기고 **첫 일치 항목으로 진행**이었다.
+            #   경고는 아무도 읽지 않고, 저장된 사진은 진짜 사진이라 어떤 무결성
+            #   검사에도 걸리지 않는다 — 사용자는 **다른 물건의 사진**을 보게 된다.
+            #
+            #   그렇다고 항상 거부하면 blast radius 가 너무 크다. 목록의 물건번호
+            #   표기가 조금만 달라져도 사진 수집이 통째로 멈춘다. 그래서 **모호할
+            #   때만** 거부한다.
+            ambiguous = len(matches) > 1
+            # 목록이 물건번호를 아예 안 주면(DOM 변경 등) 판단할 근거가 없다.
+            # 모르는 것은 막지 않는다 — Sprint 228 의 사건번호 대조와 같은 규칙이다.
+            has_obj_info = any((m.get("obj_no") or "").strip() for m in matches)
+            if require_exact_item and ambiguous and has_obj_info:
+                logger.error(
+                    "[%s] %s 물건 %s 행을 목록에서 못 찾았다(후보 %d개, 물건번호 %s) - "
+                    "**다른 물건의 자산을 저장하지 않기 위해 진입하지 않는다**",
+                    court.name, case_no, want, len(matches),
+                    [(m.get("obj_no") or "").strip() for m in matches])
+                return False
             # 못 찾으면 종전 동작(첫 일치)으로 떨어진다. 다만 **조용히** 떨어지지는
             # 않는다 — 사진처럼 물건별로 달라야 하는 자산이 엉뚱한 물건 것으로
             # 저장될 수 있는 상황이므로 흔적을 남긴다.

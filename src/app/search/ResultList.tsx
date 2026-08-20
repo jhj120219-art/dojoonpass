@@ -2,7 +2,7 @@ import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 import FavoriteButton from './FavoriteButton'
 import { formatPrice } from '@/lib/format'
-import ResultThumbnail from './ResultThumbnail'
+import ResultThumbnail from '@/components/ResultThumbnail'
 
 function formatBidRate(bidRate: number) {
   if (bidRate === null || bidRate === undefined) return '-'
@@ -75,7 +75,9 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
       <div className="min-w-0 flex gap-3">
         {/* 이 파일은 **서버 컴포넌트**라 이벤트 핸들러를 붙일 수 없다. 사진이 깨졌을 때
             자리를 숨기려면 onError가 필요하므로 썸네일만 클라이언트 섬으로 떼어냈다
-            (같은 카드의 FavoriteButton과 같은 방식). 자세한 사유는 ResultThumbnail.tsx. */}
+            (같은 카드의 FavoriteButton과 같은 방식). 자세한 사유는 ResultThumbnail.tsx.
+            (2026-08-20 Sprint 224: 관심물건/최근 본 물건도 같은 컴포넌트를 쓰게 되어
+             src/components/ 로 옮겼다 — 세 화면의 썸네일 규칙이 갈라지지 않게 한다.) */}
         {item.thumbnail_url && <ResultThumbnail url={item.thumbnail_url} />}
         <div className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2 mb-1">

@@ -11,12 +11,134 @@ Last Updated: 2026-08-11 (Sprint 53)
 
 ## 1. 자동 회귀 테스트 (상시 실행 가능)
 
+### 1-000. 2026-08-20 Sprint 237 신설 — `test_max_items_contract.py` / `test_api_cache_headers.py`
+
+```
+python test_max_items_contract.py    # 18검사, 서버 불필요
+python test_api_cache_headers.py     # 12검사, TestClient 사용
+```
+
+**`test_max_items_contract.py`** — 하나의 상수가 **서로 다른 두 가지**를 제한한다는
+사실을 잠근다(공급 상한 / 조회 창). 절단이 실재하는지 **진짜 `collect_list_items`** 를
+가짜 DOM 19건으로 태워 확인하고, 크롤 로그에서 상한이 실제로 걸리는 비율(12.1%)을 센다.
+
+★ "상한을 올리면 공급이 얼마"는 **자료가 잘려 있어 알 수 없다**(right-censored).
+그래서 능력에서 **역산**한 안전 공급 상한을 고정한다. 변이 5/5.
+
+**`test_api_cache_headers.py`** — 인증 요청 + 검증자 없는 응답만 `no-store` 인지,
+그리고 **파일 응답의 304 절약(실측 630KB)이 살아 있는지**를 함께 본다.
+전부 no-store 로 덮는 변이(K2)가 바로 이 경계에서 잡힌다. 변이 3/3.
+
+### 1-00. 2026-08-20 Sprint 236 신설 — `test_worker_batching.py`
+
+물건 단위 batching 이 **실제로** 이동을 줄이는지, 그러면서 큐 의미를 깨지 않는지.
+
+```
+python test_worker_batching.py       # 37검사, 서버 불필요
+```
+
+**진짜 `doc_worker.main()` 을 돌린다.** 브라우저와 수집기만 가짜고 claim / 순서 /
+페이지 재사용 / 종결 처리는 전부 제품 코드다. 가짜 워커를 만들어 "이동이 줄었다"고
+세면 아무것도 증명하지 못한다.
+
+측정: 물건 12개 x 4종 = 48행 -> **이동 12회**(예전 48회, 로그 실측 행/이동=1.00).
+
+깨지면 안 되는 것을 함께 고정한다 — 행마다 종결 / 행마다 재시도 예산 /
+행마다 refresh 의도 / 사진 정확일치(느슨한 페이지 재사용 금지) / 집은 행 방치 없음.
+
+변이 **7/7** 검출. 그중 사진 정확일치 변이는 `test_asset_pipeline.py` 와 함께
+돌려야 드러난다(정렬이 사진을 앞에 두어 batching 검사만으로는 잘 안 보인다).
+
+### 1-0. 2026-08-20 Sprint 230 신설 — `test_scheduler_longrun.py`
+
+Scheduler 가 붙었을 때의 **장시간 무인 운전**을 시뮬레이션한다(운영 DB 무접근).
+
+```bash
+python test_scheduler_longrun.py     # 121단언, 서버 불필요
+```
+
+- 실제 함수만 부른다 — `enqueue_documents` / `claim_next_item_rows` /
+  `mark_queue_done` / `mark_queue_failed` / `reset_stale_queue` /
+  `refresh_queue_priority`, 그리고 `run_daily.bat` 처럼 `upsert_batch` 다음에
+  `migrate_execute.execute()`.
+- 7일 연속을 돌리며 **매일** 불변식을 본다:
+  중복 큐 행 / 재시도 상한 / 고아 `document_status` / `done` 인데 화면은 `COLLECTING`.
+- 크래시는 **claim 후 무표시**로 만든다(프로세스 사망과 DB 에서 구별되지 않는다).
+
+> ★ 이 파일의 첫 판본은 **공허하게 통과**했다. `upsert_batch` 는 `auction` 에 쓰고
+> `auction_item` 은 `migrate_execute` 가 채우는데 그 단계를 빼먹어, `auction_item` 을
+> 조인하는 불변식 두 개가 **언제나 빈 결과**로 통과했다. 지금은
+> "auction_item 이 실제로 채워졌다"를 명시적으로 잠근다.
+
+---
+
+### ★ 실브라우저로 **이미지**를 잴 때의 규칙 (Sprint 230 에서 얻음)
+
+탭이 보이지 않으면(`document.visibilityState === 'hidden'`) Chrome 은
+`loading="lazy"` 이미지의 로드를 **미룬다.** 그 상태에서 잰 `naturalWidth` / `complete` 는
+**근거가 아니다** — 서버가 200 을 주는데도 0 으로 나온다.
+
+실제로 그렇게 잘못 볼 뻔했다(2026-08-20):
+
+```
+서버 직접 fetch    200 / image/jpeg / 235,194 B / FF D8 FF E0 (정상 JPEG)
+새 Image() 로 로드  성공 (522x700)
+페이지의 <img>      complete:false / naturalWidth:0 / **currentSrc 비어 있음**
+                    -> 브라우저가 요청을 **시작조차 하지 않았다**
+```
+
+**스크린샷 등으로 렌더를 강제한 뒤 재측정한다.**
+
+---
+
+### ★ 좁은 폭(모바일) 레이아웃을 재는 법 (Sprint 231 에서 얻음)
+
+뷰포트는 줄일 수 없다 — `resize_window` 는 성공을 반환하지만 `innerWidth` 가 안 바뀌고,
+iframe 은 앱 자신의 `X-Frame-Options: DENY` 에 막힌다. **매번 다시 시도하지 말 것.**
+
+대신 **서브트리를 고정 폭 컨테이너에 복제**해 브라우저에게 그 폭의 레이아웃을 계산시킨다.
+
+```js
+const box = document.createElement('div')
+box.style.cssText = `position:fixed;left:-9999px;top:0;width:${w}px`
+const clone = el.cloneNode(true)
+box.appendChild(clone); document.body.appendChild(box)
+const overflow = clone.scrollWidth - w      // > 0 이면 그 폭에서 넘친다
+box.remove()
+```
+
+**한계(반드시 함께 기억할 것)**: 복제본도 **실제 뷰포트**로 미디어쿼리를 평가한다.
+`md:` / `xl:` 로 열 수가 바뀌는 컨테이너에 쓰면 **오탐이 난다**
+(실제로 결과 그리드가 288px 에서 157px 초과로 나왔는데, 진짜 390px 화면에서는 1열이다).
+
+    쓸 수 있다   반응형 열 클래스를 자기 안에 갖지 않는 서브트리(카드 / 버튼 줄)
+    쓸 수 없다   md:/xl: 로 열이 바뀌는 컨테이너
+
+실측(2026-08-20): 검색목록 카드 20개 · 상세 카드 10개 · 내보내기 줄 —
+320 / 360 / 390px 전부 **초과 0**.
+Sprint 223 이 포커스에서 얻은 규칙(*"보이지 않는 탭에서 잰 포커스 값은 근거로 쓰지
+않는다"*)과 같은 계열이다.
+
 ### 1-A. Frontend 계약 테스트 (2026-08-10 Sprint 45 신규, 2026-08-11 Sprint 49~50 확장)
 
 ```bash
 python -m uvicorn api_server:app --host 127.0.0.1 --port 8000   # ① 백엔드 (필수)
 npm run dev                  # ② 먼저 서버를 띄운다 (npm run start도 가능)
-npm run test:frontend        # tests/**/*.test.mjs — 106 검사 (2026-08-13 Sprint 81 기준)
+npm run test:frontend        # tests/**/*.test.mjs — 137 검사 (2026-08-20 Sprint 227 기준)
+#   내역: frontend-contract 114(서버 필요) + source-contract 23 + export-list 23(서버 불필요)
+#
+# ★ 이 스위트는 **Next 서버 + FastAPI 백엔드가 둘 다** 떠 있어야 한다.
+#   그리고 **기본 검색에 물건이 있어야** 데이터를 보는 검사가 판정된다.
+#   기본 검색은 `auction_date >= 오늘` 이라, 크롤이 멈춘 채 날짜가 지나면 0건이 된다.
+#
+#   2026-08-20 Sprint 224 이전에는 그 상태에서 **50개 검사 전부**가 실패했다
+#   (전제가 최상위 before() 안의 assert 라 폭발 반경이 스위트 전체였다).
+#   지금은 전용 검사 **하나**만 실패하고, 데이터가 필요 없는 검사는 실제로 실행된다.
+#   데이터가 꼭 필요한 3건만 skip 된다 — **skip 은 통과가 아니다.**
+#
+#   실측 2026-08-20
+#     크롤이 멈춘 상태(기본 검색 0건)   pass 110 / fail 1 / skip 3
+#     데이터가 있는 상태(사본으로 검증)  pass 114 / fail 0 / skip 0
 ```
 
 **Python 회귀 스위트는 API 서버를 내리고 돌린다** (2026-08-13 Sprint 82 확인).
@@ -845,7 +967,7 @@ TODO/FIXME 재탐색: 소스 전체에 3건이며 전부 `TODO(API 미지원)` �
 
 ### `test_document_queue.py` §7~9 (17검사) — 큐 클레임/스킵
 
-`claim_next_queue_item()`은 Worker가 일감을 집는 **유일한 경로**이자 동시 클레임을 막는
+`claim_next_queue_item()`은 동시 클레임을 막는
 가드인데 검사가 0건이었다. `mark_queue_skipped_expired()`도 마찬가지였다.
 
 | 검사 | 내용 |
