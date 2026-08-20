@@ -17,6 +17,7 @@ DB를 근거로 삼는 대신, **DB가 가리키는 경로가 실제로 존재�
 """
 import os
 import logging
+import sqlite3
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -53,10 +54,19 @@ def get_item_image(item_id: int, seq: int, request: Request):
 
     conn = get_connection()
     try:
-        row = conn.execute(
-            "SELECT storage_path FROM auction_image WHERE item_id=? AND seq=?",
-            (item_id, seq),
-        ).fetchone()
+        # 2026-08-21 Sprint 239, BUGS #177: migration 020 미적용 환경에서는 이 테이블
+        # 자체가 없다. 호출자 입장에서 "테이블이 없다"와 "그 사진이 없다"는 구분할
+        # 이유가 없으므로 둘 다 같은 404로 합친다(500으로 새지 않는다).
+        try:
+            row = conn.execute(
+                "SELECT storage_path FROM auction_image WHERE item_id=? AND seq=?",
+                (item_id, seq),
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            if "no such table: auction_image" not in str(e):
+                raise
+            logger.warning("auction_image 테이블이 없다(migration 020 미적용) - 404로 응답한다: %s", e)
+            row = None
     finally:
         conn.close()
 

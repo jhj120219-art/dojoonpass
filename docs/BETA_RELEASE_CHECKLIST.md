@@ -27,6 +27,25 @@ Owner: Project Management
 
 ### P0-A. 데이터 공급이 2026-08-01부터 멈춰 있다 (스케줄러 미등록)
 
+> ## ★ [2026-08-20 Sprint 238 재실측] **등록은 있다. 그런데 최근 실행이 권한 거부로 실패한다.**
+>
+> 처음으로 "등록 0개"가 아닌 상태를 확인했다. `Get-ScheduledTask` 전수(254개) 중
+> `DOJOONPASS_DAILY` 1개가 이 저장소의 `run_daily.bat`을 가리키며 매일 03:00 트리거로
+> 등록돼 있다(DocWorker/PriorityRefresh는 여전히 0개, 변동 없음). 그런데:
+>
+> ```
+> LastRunTime      2026-08-20 22:01:17 (오늘, 그러나 03:00 트리거 시각이 아니다)
+> LastTaskResult   0x800710E0 -> net helpmsg 4320: "관리자 또는 운영자가 요청을 거부했습니다"
+> auction_item.crawl_date 최신값   2026-08-18 (오늘/어제 새 데이터 없음)
+> logs/daily_run.log 마지막 완료   "Finished at 2026-08-18 4:46:08"(그 이후 기록 없음)
+> ```
+>
+> `docs/SPRINT112_SCHEDULER_HANDOFF.md`가 경고한 `LogonType Interactive` 제약과 같은
+> 계열의 실패로 보인다 — 로그온 세션이 없으면 이 작업은 돌지 않는다. 08-18까지는
+> (로그온 상태였거나 수동 실행으로) 정상 수집됐고 그 이후 이틀치 공백이 실제로
+> 발생 중이다. 상세와 조치 3안은 `docs/SPRINT238_LIVE_REGRESSION_AND_BATCHING_CONFIRM.md`
+> §2 참고 — 전부 승인 영역이라 이 세션은 실행하지 않았다.
+
 > ## ★ [2026-08-20 Sprint 224~229 확정] **예고한 날이 왔다. 그대로 일어났다.**
 >
 > 아래 본문이 *"2026-08-20부터 기본 검색 결과가 0건이 된다"* 고 예고했다.
@@ -196,6 +215,57 @@ GET /api/v1/item/505/documents/APPRAISAL   -> 200  application/pdf 3,416,671B
 test_schema_hygiene.py §3                  -> PASS
 ```
 
+> ## ★ [2026-08-20 Sprint 238 재실측] **이 환경에서 다시 벌어졌다. P0로 되돌린다.**
+>
+> `*.db`는 gitignore 대상이라 환경마다 로컬 사본이 다르다는 경고가 바로 아래 문단에
+> 이미 있었는데, 그 경고가 그대로 실현됐다. 이번 세션의 로컬 `auction.db`에
+> `020_create_auction_image.sql`이 **다시** 미적용 상태다(`migration_history` 19행,
+> `auction_image` 테이블 없음). 진짜 서버 프로세스를 띄우고 curl로 재현했다(테스트
+> harness가 아니라 실제 `python api_server.py`):
+>
+> ```
+> GET /api/v1/search?limit=3   -> 500  {"detail":"검색 처리 중 오류가 발생했습니다"}
+> GET /api/v1/item/1           -> 500  Internal Server Error
+>    traceback: api/v1/item.py:56  sqlite3.OperationalError: no such table: auction_image
+> ```
+>
+> 세 개의 독립된 가드가 같은 결론에 도달했다: 라이브 curl 재현, `test_bootstrap.py`의
+> fresh-DB 컬럼/인덱스 드리프트 감지, `test_schema_hygiene.py` §3의 migration_history
+> 완전성 검사. **검색과 상세 둘 다 100% 500**이며, 이 결손 하나가 `run_python_tests.py`
+> 실패 12건 중 8건 + `node --test` 다수 실패의 공통 원인이다(상세는
+> `docs/SPRINT238_LIVE_REGRESSION_AND_BATCHING_CONFIRM.md` §1).
+>
+> 조치는 이전과 동일하고 여전히 승인 영역이라 이 세션은 실행하지 않았다:
+> ```
+> python -m storage.migrations.run_migrations
+> python test_schema_hygiene.py   # §3 통과 확인
+> ```
+> **배포/운영 환경의 `auction.db`는 이 세션 범위 밖이라 별도로 확인 필요.**
+>
+> ## ★ [2026-08-21 Sprint 239] **근본 원인은 그대로지만, 더 이상 API 전체를 죽이지 않는다**
+>
+> migration 020을 적용하지 않았다(여전히 승인 영역). 대신 `docs/BUGS.md` #177에서
+> `fetch_thumbnail_seqs()`(검색 썸네일) / `item.py`(상세 사진 목록) / `images.py`(사진
+> 서빙) 세 곳의 `sqlite3.OperationalError`를 narrow하게 흡수해, 이 결손이 있어도
+> 검색·상세가 "사진 없음"과 같은 모양으로 계속 동작하도록 고쳤다. 실제 프로세스로
+> 재확인(운영 방식 그대로 재현):
+>
+> ```
+> GET /api/v1/search?limit=3   -> 200  total 124  (이전: 500)
+> GET /api/v1/item/1           -> 200  images: []  (이전: 500)
+> GET /api/v1/item/53          -> 200  documents[].available: true, 실파일 다운로드 200
+> ```
+>
+> `python run_python_tests.py` 37→**45**, `node --test` **137/137 PASS**(이전 96 실패
+> 전부 이 결손의 파급이었다). 새 회귀 `test_asset_pipeline.py::test_missing_auction_image_table_degrades_not_crashes`
+> 가 이 동작과 narrow-catch 둘 다 mutation으로 검증한다(3개 파일 각각 try/except를
+> 제거해 재현 → FAIL 확인 → 원복 → PASS 확인, 이번 세션에서 직접 수행).
+>
+> **여전히 migration 020 적용 전까지는:** 썸네일/사진 자체는 나오지 않는다(사진이
+> DB에 없다는 사실은 바뀌지 않았다 — 이번 수정은 "결손이 있어도 안 죽는다"이지
+> "결손을 없앤다"가 아니다). `test_bootstrap.py`/`test_schema_hygiene.py` 드리프트
+> 가드는 의도대로 계속 FAIL로 남아 있다.
+
 아래 원문은 발견 당시 기록이다.
 
 ### P0-C. **[2026-08-17 신규, Sprint 187]** 이 환경의 `auction.db`에 마이그레이션
@@ -283,9 +353,32 @@ python test_schema_hygiene.py   # §3 통과 확인
   두 메서드는 인터페이스에만 있고 호출부가 없다
 - **승인/외부 절차 필요 → 코드로 해결 불가**
 
-### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — **2026-08-20 재실측: 다시 사라졌다. P0 로 되돌린다**
+### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — **2026-08-20 Sprint 238 재실측: 다시 돌아왔다**
 
-> ## ★ [2026-08-20 Sprint 233 재실측] **Admin API 전체가 다시 사용 불가다**
+> ## ★ [2026-08-20 Sprint 238 재실측] **바로 아래 Sprint 233(같은 날 이전 세션) 기록과 다르다 — 지금은 있다**
+>
+> `.env` 변동이 이 저장소에서 이미 여러 차례 관찰된 패턴 그대로 다시 일어났다. 비밀값은
+> 열람하지 않고 `python-dotenv`(실제 앱이 쓰는 로더)로 존재 여부와 길이만 확인했다:
+>
+> ```
+> ADMIN_API_KEY         PRESENT (75자)
+> SUPER_ADMIN_API_KEY   PRESENT (74자)
+> ```
+>
+> 실제 서버(진짜 `python api_server.py` 프로세스, curl)로 재확인:
+>
+> ```
+> GET /api/v1/admin/users     (토큰 없음)   -> 403  (500 이 아니다)
+> GET /api/v1/admin/payments  (토큰 없음)   -> 403
+> ```
+>
+> **Admin API는 지금 사용 가능하다** — 키를 아는 사람은 정상적으로 쓸 수 있고, 키 없는
+> 요청은 설정 오류(500)가 아니라 정상적인 권한 거부(403)를 받는다. 다만 이 값이 세션마다
+> 뒤집혀 온 이력을 볼 때 **다음 세션에 다시 사라져 있을 수 있다** — `.env`는 영속성이
+> 보장되지 않는 값으로 계속 취급해야 한다. `PAYMENT_WEBHOOK_SECRET`은 여전히 없어
+> Webhook 수신은 계속 fail-closed다(변동 없음).
+
+> ## ★ [2026-08-20 Sprint 233 재실측, 이 문서의 더 이전 세션 기록] **Admin API 전체가 다시 사용 불가다**
 >
 > 바로 아래 2026-08-16(Sprint 134) 기록은 *"둘 다 설정돼 있다 / 이제 403"* 이라고 적고
 > 있다. **오늘 다시 재니 그렇지 않다.** 이 저장소가 이미 두 번 겪은 `.env` 변동이

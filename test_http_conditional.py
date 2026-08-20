@@ -64,8 +64,14 @@ def _pick_targets(client):
     conn = sqlite3.connect("auction.db")
     conn.row_factory = sqlite3.Row
     try:
-        img = conn.execute(
-            "SELECT item_id, seq FROM auction_image ORDER BY item_id, seq LIMIT 1").fetchone()
+        try:
+            img = conn.execute(
+                "SELECT item_id, seq FROM auction_image ORDER BY item_id, seq LIMIT 1").fetchone()
+        except sqlite3.OperationalError as e:
+            if "no such table: auction_image" not in str(e):
+                raise
+            print("[SKIP] auction_image 테이블이 없다(migration 020 미적용) - 사진 대상 없이 진행한다:", e)
+            img = None
         doc = conn.execute(
             "SELECT item_id, doc_type FROM doc_raw WHERE doc_type IN ('SPEC','APPRAISAL','STATUS')"
             " ORDER BY item_id LIMIT 1").fetchone()

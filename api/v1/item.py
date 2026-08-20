@@ -1,4 +1,5 @@
 ﻿import logging
+import sqlite3
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
@@ -53,13 +54,23 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
         ).fetchall()
         doc_raw_by_type = {r["doc_type"]: r for r in doc_raw}
 
-        images = conn.execute(
-            """
-            SELECT seq, kind, file_size, width, height
-            FROM auction_image WHERE item_id = ? ORDER BY seq
-            """,
-            (item_id,)
-        ).fetchall()
+        # 2026-08-21 Sprint 239, BUGS #177: migration 020 미적용 환경에서
+        # `auction_image`가 없어도 상세페이지 전체를 500으로 잃지 않는다 — 사진 없는
+        # 물건과 같은 모양(빈 목록)으로 취급한다. 근본 원인은 스키마 드리프트 가드
+        # (`test_bootstrap.py`/`test_schema_hygiene.py`)가 별도로 잡는다.
+        try:
+            images = conn.execute(
+                """
+                SELECT seq, kind, file_size, width, height
+                FROM auction_image WHERE item_id = ? ORDER BY seq
+                """,
+                (item_id,)
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table: auction_image" not in str(e):
+                raise
+            logger.warning("auction_image 테이블이 없다(migration 020 미적용) - 사진 없이 응답한다: %s", e)
+            images = []
 
         tenants = conn.execute(
             "SELECT * FROM tenant_rights WHERE item_id = ?", (item_id,)

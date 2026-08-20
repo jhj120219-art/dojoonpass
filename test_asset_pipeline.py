@@ -4698,6 +4698,72 @@ def test_frontend_contract():
         check_true("프런트에 %s 라벨이 있다" % status, status in src)
 
 
+def test_missing_auction_image_table_degrades_not_crashes():
+    """`auction_image` 테이블이 없어도 검색/상세/사진 서빙이 500으로 죽지 않는다
+    (2026-08-21 Sprint 239, `docs/BUGS.md` #177).
+
+    migration 020 미적용 로컬 환경에서 검색 API 전체가 500이 되는 것을 진짜
+    프로세스 + curl로 재현했다(원인: `fetch_thumbnail_seqs()` / `item.py`의 사진 쿼리 /
+    `images.py`의 서빙 쿼리, 셋 다 `sqlite3.OperationalError`를 그대로 위로 흘려보냄).
+    여기서는 그 결손을 **의도적으로 재현**(DROP TABLE)해서 세 지점이 "사진 없음"과
+    같은 모양으로 되돌아가는지 확인하고, 동시에 **다른 종류의 OperationalError는
+    여전히 새어 나가는지**(narrow catch — 이 결손 하나만 흡수하고 다른 결함을 가리지
+    않는지)도 함께 잠근다.
+    """
+    print("\n--- 21. auction_image 결손이 API 전체를 죽이지 않는다 (Sprint 239) ---")
+    import sqlite3
+    from fastapi.testclient import TestClient
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1, case_no="2024타경1", item_no="1")
+        c = env.conn()
+        c.execute("UPDATE auction_item SET auction_date='2099-01-01', sido='서울',"
+                  " minimum_bid_price=1, appraisal_price=1, bid_rate=1, fail_count=0"
+                  " WHERE id=1")
+        c.commit()
+        # migration 020 미적용을 그대로 재현한다 — 다른 어떤 것도 손대지 않는다.
+        c.execute("DROP TABLE auction_image")
+        c.commit()
+        c.close()
+
+        from api_server import app
+        client = TestClient(app)
+
+        r = client.get("/api/v1/search?include_closed=true&size=50")
+        check("★ 테이블이 없어도 검색은 200", r.status_code, 200)
+        items = {i["id"]: i for i in r.json()["items"]}
+        check("★ 썸네일은 사진 없음과 같은 모양(null)", items[1]["thumbnail_url"], None)
+
+        r2 = client.get("/api/v1/item/1")
+        check("★ 테이블이 없어도 상세는 200", r2.status_code, 200)
+        check("★ images는 빈 목록", r2.json()["images"], [])
+
+        r3 = client.get("/api/v1/item/1/images/1")
+        check("★ 사진 서빙은 500이 아니라 404", r3.status_code, 404)
+
+        # ★ narrow catch 검증 — **실제 함수**를 그대로 부르되, 커넥션만 가짜로 바꿔
+        # auction_image가 아닌 다른 테이블 결손을 흉내낸다. 여기서 함수 자체를
+        # 몽키패치로 갈아치우면(이전 버전의 실수) 테스트가 진짜 코드의 분기를 전혀
+        # 지나가지 않아 mutation을 못 잡는 공허한 검사가 된다 — 실제로 그렇게 써서
+        # `except ... raise`를 지웠는데도 통과하는 것을 이번 세션에서 직접 확인했다.
+        import api.v1.thumbnails as th
+
+        class _FakeConnOtherTableMissing:
+            def execute(self, *a, **kw):
+                raise sqlite3.OperationalError("no such table: some_other_table")
+
+        try:
+            th.fetch_thumbnail_seqs(_FakeConnOtherTableMissing(), [1])
+            check_true("★ 다른 테이블 결손은 삼키지 않고 다시 던진다(narrow catch)",
+                       False, "예외 없이 반환됐다")
+        except sqlite3.OperationalError as e:
+            check_true("★ 다른 테이블 결손은 삼키지 않고 다시 던진다(narrow catch)",
+                       "some_other_table" in str(e), str(e))
+    finally:
+        env.close()
+
+
 if __name__ == "__main__":
     test_alt_parsing()
     test_image_format_edge_cases()
@@ -4758,6 +4824,7 @@ if __name__ == "__main__":
     test_photos_are_not_taken_from_the_wrong_item()
     test_url_rules_match_between_modules()
     test_frontend_contract()
+    test_missing_auction_image_table_degrades_not_crashes()
 
     print("\n" + "=" * 55)
     if failures:

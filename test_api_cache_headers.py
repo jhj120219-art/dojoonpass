@@ -110,6 +110,10 @@ def run():
                 "SELECT item_id, seq FROM auction_image ORDER BY item_id LIMIT 1").fetchone()
             if row:
                 target = "/api/v1/item/%d/images/%s" % (row[0], row[1])
+        except sqlite3.OperationalError as e:
+            if "no such table: auction_image" not in str(e):
+                raise
+            print("[SKIP] auction_image 테이블이 없다(migration 020 미적용) - 사진 304 검사를 건너뛴다:", e)
         finally:
             conn.close()
     if not target:

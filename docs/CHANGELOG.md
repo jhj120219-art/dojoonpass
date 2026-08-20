@@ -4990,3 +4990,54 @@ iframe 으로 진짜 viewport 를 만들려 했으나 앱의 `X-Frame-Options: D
 
 테스트: 통과 **46** / 실패 2 / 건너뜀 3 / 판정없음 1 (단언 **7,064건**, 7,007에서 +57).
 변이 **9/9**.
+
+---
+
+## Sprint 238 (2026-08-20)
+
+**재측정 결과 실패가 2건 -> 12건으로 늘어 있었다** - 전부 로컬 `auction.db`에
+`020_create_auction_image.sql` 재미적용 하나로 설명됨(진짜 서버 curl로 재현:
+`/search`/`/item` 100% 500). `docs/BETA_RELEASE_CHECKLIST.md` P0-C 재오픈.
+
+**스케줄러 - 처음으로 "등록은 있는데 실행이 실패한다"를 확인** - `DOJOONPASS_DAILY`
+1개 등록됨(과거 "0개"와 다름), 그러나 `LastTaskResult 0x800710E0`(권한 거부)로
+최근 실행 실패. DocWorker/PriorityRefresh는 여전히 등록 0개.
+
+**`test_doc_path_safety.py` 가드 수정** - `step11_report.py`/`step7_report.py`의
+인라인 `/`->`_` 치환을 `sanitize_path_segment()` 호출로 교체(동작 무변경).
+
+테스트: 통과 37 / 실패 11 / 건너뜀 3 / 판정없음 1. 상세는 `docs/SPRINT238_LIVE_REGRESSION_AND_BATCHING_CONFIRM.md`.
+
+---
+
+## Sprint 239 (2026-08-21)
+
+**BUGS #177 - `auction_image` 결손이 검색/상세/사진 API 전체를 500으로 끌고 갔다** -
+migration 020 미적용은 그대로지만, 원인 3곳(`fetch_thumbnail_seqs()` / `item.py` 사진
+목록 / `images.py` 서빙)에서 `sqlite3.OperationalError`를 narrow하게(정확히
+`"no such table: auction_image"` 메시지만) 흡수해 "사진 없음"과 같은 모양으로
+되돌리도록 고쳤다. 다른 종류의 `OperationalError`는 그대로 재던진다.
+
+```
+GET /api/v1/search?limit=3   500 -> 200  total 124
+GET /api/v1/item/1           500 -> 200  images: []
+GET /api/v1/item/53                200  documents[].available: true (실파일 다운로드 200 확인)
+```
+
+python `run_python_tests.py` 37 -> **45**, node `--test` **137/137 PASS**(이전 96 실패
+전부 이 결손의 파급이었다). 신규 회귀 `test_asset_pipeline.py::test_missing_auction_image_table_degrades_not_crashes` -
+3개 수정 파일 각각 try/except를 mutation으로 제거해 재현(FAIL 확인) -> 원복(PASS 확인)
+까지 이번 세션에서 직접 수행. narrow-catch도 실제 함수를 그대로 불러 별도 검증(처음에
+함수 자체를 몽키패치해 공허하게 통과하던 것을 mutation으로 잡아 직접 고쳤다).
+
+**doc_raw 백필 공백 재확인 (미해결, DB 쓰기라 승인 영역)** - `document_status` READY
+555행인데 `doc_raw` 0행(Sprint 144 때와 같은 증상 재발). 기존 `backfill_doc_raw.py`
+dry-run: 기록 예정 555 / 문제 0. 영향은 제한적 - 문서 열람(`available`/`viewer_url`)은
+정상, `page_count`/`file_size`/`doc_version`만 계속 null이라 문서 뷰어 페이지네비만 저하.
+
+**스케줄러 재확인** - `DOJOONPASS_DAILY`는 여전히 `LastTaskResult 0x800710E0`으로
+실패 상태(변동 없음). `register_scheduler_tasks.ps1`을 dry-run으로 재실행해 3개 작업
+전부 미등록·선행조건 OK·계정 함정(SYSTEM 등록 금지)을 도구로 재확인.
+
+테스트: 통과 **45** / 실패 3(의도된 드리프트 가드) / 건너뜀 3 / 판정없음 1
+(단언 **7,029건**). node **137/137 PASS**(0 FAIL, 종전 최고 133/137 대비 개선).

@@ -7816,3 +7816,65 @@ END=06:00 이면 06:00 크롤과 **실제로 겹친다.** 둘은 서로의 락�
 
 **[해결 검증]** 별도 인스턴스(8010)에서 확인 후 종료 - 사용자 서버는 건드리지 않았다.
 `test_api_cache_headers.py` 신설(12검사). 변이 **3/3**.
+
+--------
+
+#177
+
+**`auction_image` 테이블이 없는 환경에서 검색·상세·사진 API 전체가 500** — migration 020
+미적용이 단일 테이블 부재를 API 전면 장애로 증폭시키고 있었다
+
+해결 (2026-08-21, Sprint 239)
+
+**[실측]** 이 로컬 `auction.db`에 `020_create_auction_image.sql`이 미적용인 상태에서
+진짜 `api_server.py` 프로세스를 띄우고 curl로 재현:
+
+```
+GET /api/v1/search?limit=3   -> 500  {"detail":"검색 처리 중 오류가 발생했습니다"}
+GET /api/v1/item/1           -> 500  Internal Server Error
+   traceback: api/v1/item.py:56  sqlite3.OperationalError: no such table: auction_image
+```
+
+원인 경로 3곳: `api/v1/thumbnails.py:fetch_thumbnail_seqs()`(검색 목록 썸네일,
+`search.py`가 결과 페이지 전체를 감싸는 호출), `api/v1/item.py:get_item()`의 사진 목록
+쿼리, `api/v1/images.py:get_item_image()`의 파일 서빙 쿼리. 셋 다 `auction_image`가
+없으면 예외가 그대로 위로 새어 나가 **호출부 전체를 죽였다** — 사진은 이미
+`thumbnail_url: null`/빈 `images[]`로 "없음"을 표현할 수 있는 nullable 필드인데,
+테이블 부재가 그 nullable 경로를 타지 못하고 하드 크래시로 이어진 것이 문제였다.
+
+**[해결]** 세 곳 모두 `sqlite3.OperationalError`를 **narrow하게**(정확히
+`"no such table: auction_image"` 메시지만) 잡아 사진 없음과 같은 모양으로 되돌린다 —
+`fetch_thumbnail_seqs()`는 `{}`, `item.py`의 `images`는 `[]`, `images.py`는 404.
+그 외의 `OperationalError`(예: 문법 오류, 잠금)는 그대로 재던진다 — 이 결손 하나만
+narrow하게 흡수하고 다른 결함을 가리지 않기 위해서다.
+
+★ 근본 원인(migration 미적용)은 이 방어로 숨지 않는다 — `test_bootstrap.py`(fresh DB와의
+컬럼/인덱스 드리프트 감지)와 `test_schema_hygiene.py` §3(migration_history 완전성)이
+독립적으로 계속 이 결손을 잡는다. 여기서 고친 것은 "결손이 있어도 서비스는 죽지 않는다"
+뿐이다.
+
+**[증명]** 실제 프로세스로 재확인:
+
+```
+GET /api/v1/search?limit=3   -> 200  total 124  (thumbnail_url 전부 null, 검색 자체는 산다)
+GET /api/v1/item/1           -> 200  images: []
+GET /api/v1/item/53          -> 200  documents[].available: true (READY 문서는 계속 열람 가능)
+```
+
+`python run_python_tests.py`: 통과 37 -> **45**(같은 결손이 원인이던 9개 파일 회복,
+2개는 여전히 의도대로 FAIL — 아래 참고). `node --test tests/*.test.mjs`: **137/137 PASS**
+(이전 96개 실패 전부 이 결손의 파급이었다).
+
+**[의도적으로 안 고친 것]** `test_bootstrap.py`/`test_schema_hygiene.py`는 이 결손을
+정확히 잡아야 하는 가드라 **그대로 FAIL로 남겨 둔다.** 이걸 통과시키면 드리프트 감지
+자체가 무뎌진다.
+
+**[별도 발견, 미해결]** 같은 조사 중 `doc_raw`가 0행인데 `document_status`는
+READY 555행인 것을 확인했다 — 이미 Sprint 144가 같은 상태를 발견하고
+`backfill_doc_raw.py`(dry-run 기본, 안전: 파일 존재 확인 후에만 기록/기존 행 불변/삭제 없음)를
+만들어 둔 바로 그 상황이 이 로컬 DB에서 재발한 것이다. 2026-08-21 dry-run 재확인:
+`기록 예정 555 / READY인데 파일 없음(문제) 0`. **DB 쓰기(`--apply`)는 승인 영역이라
+실행하지 않았다.** 영향은 제한적이다 — `available`/`viewer_url`/`download_url`은
+`document_status`에서 오므로 문서 열람 자체는 정상 동작하고(item 53 SPEC 다운로드 200,
+402,328B 실파일 확인), `page_count`/`file_size`/`doc_version`만 계속 null이라
+문서 뷰어의 페이지 이동 UI가 그려지지 않는다.

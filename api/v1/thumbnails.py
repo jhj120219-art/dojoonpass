@@ -24,7 +24,21 @@
 사진이 없는 물건은 이 맵에 **키 자체가 없다.** 그래서 `thumbnail_url` 은 `None` 이
 되고, 프런트는 `null` 일 때 썸네일 자리를 아예 만들지 않는다(빈 회색 칸을 남기지
 않는다). 이 저장소의 사진 보유율은 아직 낮아서 이 구분이 화면 품질을 좌우한다.
+
+## `auction_image` 자체가 없을 때 (2026-08-21 Sprint 239, BUGS #177)
+
+migration 020이 아직 적용되지 않은 환경에서는 이 테이블이 존재하지 않는다. 그 상태에서
+검색 목록은 **썸네일 하나 때문에 결과 전체를 500으로 잃을 이유가 없다** — 사진 없는
+물건과 같은 모양(`thumbnail_url: None`)으로 취급하고 검색 자체는 살려 둔다. 근본 원인은
+여전히 migration 미적용이고, 그 사실은 `test_bootstrap.py`/`test_schema_hygiene.py`의
+스키마 드리프트 가드가 별도로 잡는다 — 여기서는 **사용자 화면이 죽지 않게** 하는 것만
+목적이다.
 """
+
+import logging
+import sqlite3
+
+logger = logging.getLogger(__name__)
 
 # 사진을 서빙하는 라우트는 `api/v1/images.py` 의 `@router.get("/item/{item_id}/images/{seq}")`
 # 하나뿐이다. 이 문자열을 바꾸면 그쪽도 같이 바뀌어야 한다 —
@@ -47,11 +61,17 @@ def fetch_thumbnail_seqs(conn, item_ids) -> dict:
     if not ids:
         return {}
     placeholders = ",".join("?" * len(ids))
-    rows = conn.execute(
-        f"SELECT item_id, MIN(seq) AS seq FROM auction_image "
-        f"WHERE item_id IN ({placeholders}) GROUP BY item_id",
-        ids,
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"SELECT item_id, MIN(seq) AS seq FROM auction_image "
+            f"WHERE item_id IN ({placeholders}) GROUP BY item_id",
+            ids,
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table: auction_image" not in str(e):
+            raise
+        logger.warning("auction_image 테이블이 없다(migration 020 미적용) - 썸네일 없이 응답한다: %s", e)
+        return {}
     return {r["item_id"]: r["seq"] for r in rows}
 
 
