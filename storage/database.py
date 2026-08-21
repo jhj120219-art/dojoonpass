@@ -6,13 +6,36 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "auction.db"
-
 # `auction_image.storage_path` 는 프로젝트 루트 기준 상대경로다
 # (`to_relative_storage_path()` 참고). 절대경로로 되돌릴 때 쓴다 —
 # `api/v1/images.py:resolve_stored_path()` 와 같은 규칙이어야 한다.
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(PROJECT_ROOT)
+
+# ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#
+#   예전에는 `DB_PATH = "auction.db"` 였다. 상대경로라 **cwd 기준**으로 열린다.
+#   그런데 `sqlite3.connect()` 는 파일이 없으면 **조용히 새로 만든다.** 그래서 저장소
+#   루트가 아닌 곳에서 서버를 띄우면:
+#
+#       그 폴더에 0바이트 `auction.db` 가 생기고
+#       모든 조회가 `no such table: auction_item` 으로 실패한다
+#
+#   실측(2026-08-21, 같은 코드를 cwd 만 바꿔 임포트):
+#       cwd = 저장소 루트  -> auction_item 1,876행
+#       cwd = 다른 폴더    -> 그 폴더에 0바이트 auction.db 생성 / no such table
+#
+#   같은 세션에 고친 `.env` cwd 의존(Sprint 245)과 **같은 계열**이고 더 나쁘다 —
+#   환경변수는 비면 500 으로 시끄럽게 실패하지만, 이쪽은 **빈 DB 를 만들어** 놓고
+#   "데이터가 없다"처럼 보이게 한다. 운영자가 크롤이 안 돈 줄로 오해한다.
+#
+#   `audit_schedule_health.py` 는 이미 `getattr(dbmod, "DB_PATH", os.path.join(ROOT, "auction.db"))`
+#   로 루트 기준 폴백을 두고 있었다 — 상대경로 기본값을 믿을 수 없다는 것을 그 파일은
+#   알고 있었다는 뜻이다. 기본값 자체를 고쳐 그 우회를 불필요하게 만든다.
+#
+#   ★ 모듈 변수라는 점은 그대로다. 테스트/도구가 `db.DB_PATH = ...` 로 갈아끼우는
+#     기존 방식은 **아무것도 바뀌지 않는다**(실제로 여러 회귀가 그렇게 쓴다).
+DB_PATH = os.path.join(PROJECT_ROOT, "auction.db")
 
 MAX_DOC_RETRY = 3
 RETRY_INTERVAL_MINUTES = 30

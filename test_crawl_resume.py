@@ -63,6 +63,31 @@ def test_no_checkpoint_starts_at_zero():
     check("resume_from=None", resume_start_idx(LIST_ITEMS, None), 0)
     check("resume_from='' (falsy)", resume_start_idx(LIST_ITEMS, ""), 0)
 
+    # ★ 2026-08-21 Sprint 246: 위 두 줄만으로는 **부족하다.**
+    #
+    # mutation 으로 확인했다 - `if not resume_from:` 를 `if resume_from is None:` 로
+    # 바꿔도 위 검사는 그대로 통과한다(생존). 정상 목록에서는 빈 문자열이 어느 항목과도
+    # 일치하지 않아 루프가 끝까지 돌고 결국 같은 0 을 내기 때문이다. 즉 **결과는 같고
+    # 경로만 다른** 상태라 위 검사가 두 구현을 구분하지 못한다.
+    #
+    # 목록에 빈 조각이 섞이면 갈린다. 크롤 목록의 `case_no` 는 " / " 로 이어 붙는데,
+    # 뒤가 잘리면 `"2026타경1005 / "` 처럼 되고 split 결과에 **빈 문자열이 들어간다.**
+    # 그러면 빈 체크포인트가 그 항목과 "일치"해 `idx + 1` 을 돌려준다 =
+    # **첫 물건을 통째로 건너뛴다.** 크롤 누락은 조용하다 - 아무 오류도 안 난다.
+    #
+    # 실측(2026-08-21): 현행 구현 0 / `is None` 구현 1.
+    BLANK_FRAGMENT = [
+        {"case_no": "2026타경1005 / "},   # 뒤가 잘려 빈 조각이 생긴 항목
+        {"case_no": "2026타경1006"},
+    ]
+    check("★ 빈 조각이 섞인 목록에서도 resume_from='' 는 처음부터다(물건을 건너뛰지 않는다)",
+          resume_start_idx(BLANK_FRAGMENT, ""), 0)
+    check("★ 같은 목록에서 resume_from=None 도 처음부터다",
+          resume_start_idx(BLANK_FRAGMENT, None), 0)
+    # 빈 조각이 정말 생기는지 자체를 고정한다(전제가 사라지면 위 검사가 공허해진다)
+    check("전제: '2026타경1005 / ' 는 빈 조각을 만든다",
+          "" in [c.strip() for c in "2026타경1005 / ".split(" / ")], True)
+
 
 def test_checkpoint_match_resumes_after_the_completed_item():
     print("\n--- 2. checkpoint matches an item -> resume right after it ---")

@@ -119,6 +119,9 @@ def _seed(db, n_items, doc_types, status="pending"):
     conn.close()
 
 
+NL = chr(10)
+
+
 def _queue_rows(db):
     conn = db.get_connection()
     rows = [dict(r) for r in conn.execute(
@@ -128,7 +131,8 @@ def _queue_rows(db):
     return rows
 
 
-def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True):
+def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True,
+                detail_ok=None):
     """진짜 `doc_worker.main()` 을 돌린다. 브라우저/수집기만 가짜.
 
     legacy=True 면 claim 을 **행 하나씩**으로 되돌려 예전 구조를 재현한다
@@ -167,7 +171,12 @@ def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True):
         "claim_next_item_rows": (legacy_claim if legacy else real_claim),
         "release_queue_rows": db.release_queue_rows,
         "go_to_case_detail": spy_go,
-        "wait_for_detail": lambda driver, case_no: True,
+        # ★ 기본은 True 지만 **고정이 아니다** (2026-08-21 Sprint 240).
+        #   여기가 상수로 박혀 있어서 `_ensure_detail_page()` 의 "재사용 전에
+        #   화면을 확인한다" 분기가 어떤 검사에도 걸리지 않았다 — mutation 으로
+        #   `if wait_for_detail(...)` 을 `if True:` 로 바꿔도 전 검사가 통과했다.
+        "wait_for_detail": (detail_ok if detail_ok is not None
+                            else (lambda driver, case_no: True)),
         "get_doc_button_id": lambda doc_type, item_no: "qa-btn",
         "collect_document": fake_collect,
         "mark_queue_done": db.mark_queue_done,
@@ -712,6 +721,245 @@ def test_window_end_leaves_margin_before_crawl():
           % (m.group(1), (mins(m.group(1)) - 5) // 60, (mins(m.group(1)) - 5) % 60))
 
 
+
+# ---------------------------------------------------------------------------
+# 13. 재사용하기 전에 **화면을 실제로 확인**하는가 (2026-08-21 Sprint 240)
+# ---------------------------------------------------------------------------
+def test_reuse_verifies_the_page_before_trusting_it():
+    """`_ensure_detail_page()` 는 "아까 들어갔으니 아직 그 페이지일 것"을 **믿지 않는다.**
+
+    ## 왜 이 검사가 새로 필요했나 — mutation 이 공백을 잡았다
+
+    2026-08-21 실측: `doc_worker.py` 의
+
+        if wait_for_detail(driver, case_no):
+
+    를 `if True:` 로 바꾸는 mutation 을 걸었더니 **`test_worker_batching.py`(268단언)
+    와 `test_doc_worker_recovery.py` 가 둘 다 그대로 통과했다.** 이유는 단순하다 —
+    두 파일의 모든 harness 가 `wait_for_detail` 을 `lambda: True` 상수로 스텁해서,
+    False 분기(= 화면을 벗어나 있다 -> 다시 이동한다)를 **한 번도 지나가지 않았다.**
+
+    Sprint 236 이 이 확인을 넣은 이유는 그 함수의 docstring 에 이미 적혀 있다:
+    문서 수집기는 새 창을 열고 닫은 뒤 원래 창으로 돌아오는데 그 복구가 전부
+    `try/except: pass` 다(`crawler/doc_crawler.py` 의 finally 두 곳). 돌아오지 못한
+    채 다음 종류를 처리하면 **엉뚱한 화면에서 남의 문서를 긁는다** — 이 저장소가
+    사진에서 겪은(Sprint 230) 것과 같은 계열의, 조용히 틀리는 결함이다.
+
+    즉 **가장 비싼 최적화(batching)가 가장 위험한 가정 위에 서 있는데, 그 가정을
+    지키는 유일한 가드에 검사가 없었다.** 지우면 아무도 울지 않는 가드는 없는 것과
+    같다. 그래서 여기서 False 분기를 실제로 태운다.
+    """
+    print(NL + "--- 13. 재사용 전에 화면을 실제로 확인하는가 (mutation 공백) ---")
+    import doc_worker as dw
+
+    # ── (A) 단위: 확인이 False 면 재사용하지 않고 다시 이동한다 ──────────────
+    navs = []
+    detail_answer = [True]
+    orig = (dw.go_to_case_detail, dw.wait_for_detail)
+    try:
+        dw.go_to_case_detail = lambda d, c, cn, i=None, require_exact_item=False: (
+            navs.append((cn, i, require_exact_item)) or True)
+        dw.wait_for_detail = lambda d, cn: detail_answer[0]
+
+        page = {}
+        dw._ensure_detail_page(object(), page, "B1", "2024타경1", "1", require_exact=False)
+        check("첫 진입은 이동한다", len(navs), 1)
+
+        # 화면이 그대로다 -> 이동하지 않는다 (최적화가 실제로 동작한다)
+        dw._ensure_detail_page(object(), page, "B1", "2024타경1", "1", require_exact=False)
+        check("화면이 그대로면 재사용한다(이동 없음)", len(navs), 1)
+
+        # ★ 화면을 벗어났다(수집기가 원래 창으로 못 돌아왔다) -> 반드시 다시 이동한다
+        detail_answer[0] = False
+        ok = dw._ensure_detail_page(object(), page, "B1", "2024타경1", "1",
+                                    require_exact=False)
+        check("★ 화면을 벗어나 있으면 재사용하지 않고 다시 이동한다", len(navs), 2)
+        check_true("다시 이동에 성공하면 True 를 돌려준다", ok, None)
+
+        # 확인이 계속 False 여도 **매번** 다시 이동한다 — 한 번 실패했다고
+        # 확인을 포기하고 재사용으로 떨어지면 안 된다.
+        dw._ensure_detail_page(object(), page, "B1", "2024타경1", "1", require_exact=False)
+        check("★ 확인 실패가 반복돼도 매번 다시 이동한다", len(navs), 3)
+
+        # ── (B) 확인이 False 이고 재이동도 실패하면 성공이라고 말하지 않는다 ──
+        navs2 = []
+        dw.go_to_case_detail = lambda d, c, cn, i=None, require_exact_item=False: (
+            navs2.append(1) or False)
+        page2 = {"key": ("B1", "2024타경9", "1"), "exact": True}
+        ok2 = dw._ensure_detail_page(object(), page2, "B1", "2024타경9", "1",
+                                     require_exact=False)
+        check_true("★ 재이동이 실패하면 False 를 돌려준다(빈 화면에서 긁지 않는다)",
+                   ok2 is False, "ok2=%r" % (ok2,))
+        check_true("★ 실패 후 페이지 기억을 남기지 않는다(다음 행이 재사용하지 못한다)",
+                   page2.get("key") is None,
+                   "page.key=%r 가 남았다" % (page2.get("key"),))
+    finally:
+        dw.go_to_case_detail, dw.wait_for_detail = orig
+
+    # ── (C) 워커 전체: 확인이 항상 False 면 batching 이 이동을 줄이지 못한다 ──
+    #   이것이 이 가드의 **의미**다 — 확인이 통과할 때만 이동이 줄어든다.
+    #   (확인 없이 무조건 재사용하면 아래 두 수가 같아진다 = mutation 이 살아난다)
+    import config.settings as cfg
+    types = list(cfg.DOC_TYPE_LIST)
+    N = 3
+
+    tmp = tempfile.mkdtemp(prefix="qa_batch_verify_ok_")
+    try:
+        db = _fresh_db(tmp)
+        _seed(db, N, types)
+        verified = _run_worker(db, detail_ok=lambda d, cn: True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    tmp = tempfile.mkdtemp(prefix="qa_batch_verify_drift_")
+    try:
+        db = _fresh_db(tmp)
+        _seed(db, N, types)
+        drifted = _run_worker(db, detail_ok=lambda d, cn: False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    n_rows = N * len(types)
+    print("    물건 %d개 x %d종 = 큐 %d행" % (N, len(types), n_rows))
+    print("    화면 확인 통과  이동 %3d회 / 수집 %3d회"
+          % (len(verified["navs"]), len(verified["collects"])))
+    print("    화면 벗어남     이동 %3d회 / 수집 %3d회"
+          % (len(drifted["navs"]), len(drifted["collects"])))
+
+    check("★ 확인이 통과하면 물건당 이동 1회", len(verified["navs"]), N)
+    check_true("★ 화면을 벗어나 있으면 행마다 다시 이동한다(맹신하지 않는다)",
+               len(drifted["navs"]) == n_rows,
+               "이동 %d회 != 큐 %d행 - 확인 없이 재사용했다"
+               % (len(drifted["navs"]), n_rows))
+    check_true("두 경우 모두 수집 자체는 정상 수행된다(가드가 기능을 죽이지 않는다)",
+               len(verified["collects"]) == n_rows == len(drifted["collects"]),
+               "수집 %d / %d (기대 %d)"
+               % (len(verified["collects"]), len(drifted["collects"]), n_rows))
+
+    # ── (D) 코드에 실제로 있는가 — 주석만 남고 코드가 사라지는 것을 막는다 ──
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "doc_worker.py"), encoding="utf-8-sig").read()
+    code = NL.join(l for l in src.splitlines()
+                   if not l.lstrip().startswith("#"))
+    check_true("★ 재사용 분기가 실제로 wait_for_detail 을 호출한다(코드)",
+               "if wait_for_detail(driver, case_no):" in code,
+               "주석이 아니라 코드에 있어야 한다")
+
+
+
+# ---------------------------------------------------------------------------
+# 14. 기존 큐(3종)에 image 가 뒤늦게 붙는 전환 상태 (2026-08-21 Sprint 242)
+# ---------------------------------------------------------------------------
+def test_image_row_added_later_to_an_already_done_item():
+    """spec/status/appraisal 이 **이미 done** 인 물건에 `image` 행만 새로 붙는 상태.
+
+    ## 왜 이것이 실제 상태인가
+
+    2026-08-21 운영 DB 실측:
+
+        document_queue doc_type 분포 = {appraisal: 1166, spec: 1166, status: 1166}
+        image = **0행**
+
+    즉 지금 큐에 쌓인 2,753 pending 행은 전부 `image` 가 `DOC_TYPE_LIST` 에 추가되기
+    **전에** 적재된 것이다. 그런데 `enqueue_documents()` 는 지금 4종을 넣는다
+    (`for doc_type in ("spec","status","appraisal","image")`). 따라서 크롤이 재개되면
+    **기존 물건 전부가 `image` 행 하나씩을 새로 받는다** — 그중 상당수는 나머지 3종이
+    이미 `done` 인 상태다.
+
+    그 전환 상태는 지금까지 어떤 검사도 지나가지 않았다. 기존 검사들은
+    "처음부터 4종이 함께 있는 물건"(2번/3번 검사)이나 "빈 큐에 새로 적재"
+    (`test_asset_pipeline.py` 15번)만 본다.
+
+    ## 무엇이 틀릴 수 있나
+
+        1. 새 enqueue 가 **이미 done 인 3종을 되살려** 헛수집을 만든다
+        2. 워커가 image 한 행만 든 묶음을 처리하지 못한다
+        3. image 단독인데 **느슨하게** 진입해 다른 물건의 사진을 가져온다(Sprint 230)
+        4. 이미 받아 둔 문서를 다시 받는다
+    """
+    print("\n--- 14. 이미 done 인 물건에 image 행만 뒤늦게 붙는다 (Sprint 242) ---")
+    import config.settings as cfg
+    from datetime import datetime as _dt, timedelta as _td
+
+    if "image" not in cfg.DOC_TYPE_LIST:
+        check_true("config 에 image 가 있다(이 검사가 의미 있으려면)", False, cfg.DOC_TYPE_LIST)
+        return
+
+    tmp = tempfile.mkdtemp(prefix="qa_img_transition_")
+    try:
+        db = _fresh_db(tmp)
+        future = (_dt.now() + _td(days=7)).strftime("%Y-%m-%d")
+        court, case_no, item_no = "B0002", "2025타경777", "1"
+
+        # --- 1단계: image 가 없던 시절의 큐를 재현한다 (3종, 전부 done) ---
+        conn = db.get_connection()
+        for t in ("spec", "status", "appraisal"):
+            conn.execute(
+                "INSERT INTO document_queue (court_code,case_no,item_no,doc_type,status,"
+                "retry_count,auction_date,priority,last_attempt_at) VALUES (?,?,?,?,'done',0,?,0,NULL)",
+                (court, case_no, item_no, t, future))
+        conn.commit()
+        before = {r["doc_type"]: r["status"] for r in conn.execute(
+            "SELECT doc_type,status FROM document_queue")}
+        conn.close()
+        check("전제: 옛 큐는 3종뿐이고 전부 done", sorted(before), ["appraisal", "spec", "status"])
+        check_true("전제: 전부 done", set(before.values()) == {"done"}, before)
+
+        # --- 2단계: 크롤 재개 = enqueue_documents 가 4종으로 다시 적재한다 ---
+        import contextlib, io as _io
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.enqueue_documents([{"court_code": court, "case_no": case_no,
+                                   "item_no": item_no, "auction_date": future}])
+
+        conn = db.get_connection()
+        after = {r["doc_type"]: r["status"] for r in conn.execute(
+            "SELECT doc_type,status FROM document_queue")}
+        conn.close()
+        print("    적재 후 큐:", after)
+        check_true("★ image 행이 새로 생긴다", "image" in after, str(after))
+        check("★ image 만 pending 이다", after.get("image"), "pending")
+        for t in ("spec", "status", "appraisal"):
+            check("★ 이미 받아 둔 %s 는 done 그대로다(되살아나지 않는다)" % t,
+                  after.get(t), "done")
+
+        # --- 3단계: 워커가 그 한 행을 어떻게 처리하는가 ---
+        s = _run_worker(db)
+        print("    이동 %d회 / 수집 %d회 / exit %s"
+              % (len(s["navs"]), len(s["collects"]), s["exit"]))
+
+        check("★ 이동은 **한 번**이다(묶음에 한 행뿐이다)", len(s["navs"]), 1)
+        check("★ 그 이동은 **엄격**하다(image 단독이어도 정확 일치를 요구한다)",
+              [bool(n[3]) for n in s["navs"]], [True])
+        check("★ 수집한 것은 image 하나뿐이다(done 문서를 다시 받지 않는다)",
+              [c[1] for c in s["collects"]], ["image"])
+
+        conn = db.get_connection()
+        final = {r["doc_type"]: r["status"] for r in conn.execute(
+            "SELECT doc_type,status FROM document_queue")}
+        conn.close()
+        check("★ image 가 종결된다", final.get("image"), "done")
+        check_true("★ 나머지 3종은 여전히 done(손대지 않았다)",
+                   all(final.get(t) == "done" for t in ("spec", "status", "appraisal")),
+                   final)
+
+        # --- 4단계: 다시 적재해도 아무 일도 일어나지 않는다(멱등) ---
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.enqueue_documents([{"court_code": court, "case_no": case_no,
+                                   "item_no": item_no, "auction_date": future}])
+        conn = db.get_connection()
+        again = {r["doc_type"]: r["status"] for r in conn.execute(
+            "SELECT doc_type,status FROM document_queue")}
+        n_rows = conn.execute("SELECT COUNT(*) c FROM document_queue").fetchone()["c"]
+        conn.close()
+        check("★ 재적재해도 행 수가 늘지 않는다(UNIQUE + OR IGNORE)", n_rows, 4)
+        check_true("★ 재적재가 done 을 되살리지 않는다(헛수집을 만들지 않는다)",
+                   all(v == "done" for v in again.values()), again)
+
+        s2 = _run_worker(db)
+        check("★ 재적재 후 워커가 할 일이 없다", len(s2["navs"]), 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def main():
     test_batching_reduces_navigations()
     test_image_still_requires_exact_item()
@@ -725,6 +973,8 @@ def main():
     test_terminated_row_does_not_take_the_batch_down()
     test_time_check_happens_per_row_not_per_batch()
     test_window_end_leaves_margin_before_crawl()
+    test_reuse_verifies_the_page_before_trusting_it()
+    test_image_row_added_later_to_an_already_done_item()
 
     print("\n" + "=" * 55)
     if FAILS:

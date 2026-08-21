@@ -26,6 +26,8 @@ Sprint 99에 실제로 안 된다는 것을 실측했다. 안내대로 `init_db(
 
 주의: 작업본 `auction.db`는 절대 건드리지 않는다. 전부 임시 디렉터리의 새 파일에 대고 돈다.
 """
+import io
+import re
 import os
 import sys
 import shutil
@@ -605,6 +607,90 @@ def test_claude_md_bootstrap_claims_are_true():
                        os.path.exists(os.path.join(REPO_ROOT, *rel.split("/"))), rel)
 
 
+
+
+def test_db_path_does_not_depend_on_cwd():
+    """DB 경로가 **작업 디렉터리에 의존하지 않는가** (2026-08-21 Sprint 246 신설).
+
+    ## 왜 생겼나
+
+    `storage/database.py` 는 예전에 `DB_PATH = "auction.db"` 였다. 상대경로라 **cwd 기준**
+    으로 열린다. 그런데 `sqlite3.connect()` 는 파일이 없으면 **조용히 새로 만든다.**
+    그래서 저장소 루트가 아닌 곳에서 서버를 띄우면:
+
+        그 폴더에 0바이트 `auction.db` 가 생기고
+        모든 조회가 `no such table: auction_item` 으로 실패한다
+
+    실측(2026-08-21, 같은 코드를 별도 프로세스로 cwd 만 바꿔 임포트):
+
+        cwd = 저장소 루트  -> auction_item 1,876행
+        cwd = 다른 폴더    -> 그 폴더에 0바이트 auction.db 생성 / no such table
+
+    같은 세션에 고친 `.env` cwd 의존(Sprint 245)과 같은 계열이고 **더 나쁘다** —
+    환경변수는 비면 500 으로 시끄럽게 실패하지만, 이쪽은 빈 DB 를 만들어 놓고
+    "데이터가 없다"처럼 보이게 한다. 운영자가 크롤이 안 돈 줄로 오해한다.
+
+    ## 검사 방법
+
+    **별도 프로세스를 다른 cwd 에서 띄운다.** 같은 프로세스 안에서는 이미 임포트된
+    모듈의 `DB_PATH` 가 남아 있어 재현되지 않는다 - 그러면 검사가 공허해진다.
+    """
+    print("\n--- DB 경로가 작업 디렉터리에 의존하지 않는가 (Sprint 246) ---")
+    import subprocess
+    import tempfile
+    import shutil
+
+    repo = os.path.dirname(os.path.abspath(__file__))
+    probe = (
+        "import os, storage.database as db;"
+        "c=db.get_connection();"
+        "n=list(c.execute('select count(*) from auction_item'))[0][0];"
+        "c.close();"
+        "print('ROWS=%d STRAY=%d' % (n, 1 if os.path.exists('auction.db') else 0))"
+    )
+
+    def run_in(cwd):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = repo
+        env["PYTHONIOENCODING"] = "utf-8"
+        r = subprocess.run([sys.executable, "-c", probe], cwd=cwd, env=env,
+                           capture_output=True, timeout=180)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        m = re.search(r"ROWS=(\d+) STRAY=(\d)", out)
+        return (int(m.group(1)), int(m.group(2))) if m else (None, (out + err)[:160])
+
+    root_rows, root_stray = run_in(repo)
+    check_true("저장소 루트에서 DB 를 연다(검사가 공허하지 않다)",
+               isinstance(root_rows, int) and root_rows > 0,
+               "-> %r" % (root_stray,))
+    if not isinstance(root_rows, int) or root_rows <= 0:
+        return
+
+    tmp = tempfile.mkdtemp(prefix="qa_dbcwd_")
+    try:
+        other_rows, other_stray = run_in(tmp)
+        check_true("다른 디렉터리에서도 임포트/조회가 성공한다",
+                   isinstance(other_rows, int), "-> %r" % (other_stray,))
+        if isinstance(other_rows, int):
+            check("★ 다른 디렉터리에서도 **같은 DB** 를 읽는다(cwd 비의존)",
+                  other_rows, root_rows)
+            check("★ 다른 디렉터리에 빈 auction.db 를 만들지 않는다",
+                  other_stray, 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 소스 수준 가드 - 편집 시점에 되돌리는 것을 잡는다(주석 제외)
+    src = io.open(os.path.join(repo, "storage", "database.py"),
+                  encoding="utf-8-sig").read()
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    check_true("★ DB_PATH 가 상대경로 리터럴이 아니다",
+               not re.search(r'^DB_PATH\s*=\s*["\'][^"\']*["\']\s*$', code, re.M),
+               "-> DB_PATH = \"auction.db\" 는 cwd 기준이다. PROJECT_ROOT 기준 절대경로를 써라")
+    check_true("★ DB_PATH 가 PROJECT_ROOT 기준으로 만들어진다",
+               re.search(r"DB_PATH\s*=\s*os\.path\.join\(\s*PROJECT_ROOT", code) is not None,
+               "-> 파일 위치 기준 절대경로여야 한다")
+
 def run():
     print("=" * 60)
     print("fresh clone 부트스트랩 검증 (Sprint 99)")
@@ -617,6 +703,7 @@ def run():
     test_batch_scripts_create_logs_before_redirecting()
     test_claude_md_bootstrap_claims_are_true()
     test_bootstrap_is_idempotent()
+    test_db_path_does_not_depend_on_cwd()
 
     print("\n" + "=" * 60)
     if failures:

@@ -24,6 +24,7 @@
 
     python test_admin_secret_contract.py
 """
+import io
 import os
 import secrets
 import sys
@@ -232,6 +233,130 @@ def test_admin_routes_all_share_the_same_guard():
     print("    검사한 Admin 라우트 %d개" % len(admin_paths))
 
 
+def test_boot_warns_when_admin_keys_are_missing():
+    """관리자 키가 없을 때 **부팅 시점에** 경고를 남기는가 (2026-08-21 Sprint 246).
+
+    ## 왜 필요한가
+
+    두 키가 모두 없으면 Admin API 16개가 전부 500 이다(위 `test_no_keys_is_500_not_403`
+    가 고정하는 의도된 동작). 문제는 **그걸 알게 되는 시점**이다 - 예전에는 운영자가
+    Admin 화면을 열어 500 을 볼 때까지 서버가 아무 말도 하지 않았다.
+
+    이번 세션에서 고친 것들과 같은 계열이다: **조용한 실패를 시끄럽게 만든다.**
+
+    ## 값이 새지 않는지도 함께 본다
+
+    키 값이 로그에 들어가면 로그 유출이 곧 관리자 권한 유출이다.
+    경고에는 **설정 여부만** 담겨야 한다.
+    """
+    print("\n--- 6. 키 미설정 시 부팅 경고 (Sprint 246) ---")
+    import logging
+    from api.v1 import admin as admin_mod
+
+    saved = (os.environ.pop("ADMIN_API_KEY", None),
+             os.environ.pop("SUPER_ADMIN_API_KEY", None))
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            logging.Handler.__init__(self)
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    grab = Grab()
+    lg = logging.getLogger(admin_mod.__name__)
+    lg.addHandler(grab)
+    prev_level = lg.level
+    lg.setLevel(logging.WARNING)
+    try:
+        # (1) 두 키 모두 없음 -> 경고한다
+        warned = admin_mod.warn_if_admin_keys_missing()
+        check("★ 두 키가 모두 없으면 경고를 남긴다", warned, True)
+        msgs = [r.getMessage() for r in grab.records if r.levelno >= logging.WARNING]
+        check("★ 경고가 실제로 로그로 나간다(반환값만 바꾼 게 아니다)", len(msgs), 1)
+        if msgs:
+            check_true("경고에 원인이 적혀 있다(어떤 환경변수인지)",
+                       "ADMIN_API_KEY" in msgs[0], msgs[0][:120])
+            check_true("경고에 결과가 적혀 있다(무엇이 깨지는지)",
+                       "500" in msgs[0], msgs[0][:120])
+
+        # (2) 키가 하나라도 있으면 조용하다 + 값이 새지 않는다
+        secret = "qa-boot-warn-not-a-real-key-000"
+        os.environ["ADMIN_API_KEY"] = secret
+        grab.records = []
+        warned2 = admin_mod.warn_if_admin_keys_missing()
+        check("★ 키가 하나라도 있으면 경고하지 않는다", warned2, False)
+        check("그때 로그도 남기지 않는다(잡음 방지)", len(grab.records), 0)
+
+        # (3) 값 자체가 로그에 절대 들어가지 않는다 - 두 키를 다시 비우고 재확인
+        del os.environ["ADMIN_API_KEY"]
+        os.environ["SUPER_ADMIN_API_KEY"] = secret
+        grab.records = []
+        admin_mod.warn_if_admin_keys_missing()
+        check("SUPER 키만 있어도 조용하다", len(grab.records), 0)
+
+        os.environ.pop("SUPER_ADMIN_API_KEY", None)
+    finally:
+        lg.removeHandler(grab)
+        lg.setLevel(prev_level)
+        for k, v in zip(("ADMIN_API_KEY", "SUPER_ADMIN_API_KEY"), saved):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    # --- 키 값이 로그로 새지 않는가 ------------------------------------------
+    #
+    # ★ 이건 **동작으로는 검사할 수 없다.** 이 함수는 두 키가 **모두 빌 때만** 경고하니,
+    #   경고가 나가는 순간에는 흘릴 값 자체가 존재하지 않는다. 처음엔 "로그에 키 값이
+    #   없다"를 런타임으로 확인하려 했는데, 그 시점엔 두 환경변수가 비어 있어 **무엇을
+    #   넣어도 통과하는 공허한 검사**였다(2026-08-21 mutation 으로 확인하고 걷어냈다).
+    #
+    #   그래서 소스를 AST 로 본다. 문자열 검색으로는 안 된다 - 경고 문구 자체가
+    #   "ADMIN_API_KEY" 라는 **이름**을 정당하게 포함하기 때문이다. 이름이 아니라
+    #   **값을 읽어 오는 호출**(`os.getenv`/`os.environ`)이 경고 인자에 있는지를 본다.
+    #   미래의 편집이 "친절하게" 현재 설정값을 끼워 넣는 것을 막는다.
+    import ast
+
+    src_admin = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "api", "v1", "admin.py"),
+                        encoding="utf-8-sig").read()
+    fn = None
+    for node in ast.walk(ast.parse(src_admin)):
+        if isinstance(node, ast.FunctionDef) and node.name == "warn_if_admin_keys_missing":
+            fn = node
+    check_true("검사가 공허하지 않다(함수를 찾았다)", fn is not None,
+               "-> 이름이 바뀌었으면 이 검사도 고쳐라")
+
+    warn_calls = []
+    if fn is not None:
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "warning"):
+                warn_calls.append(node)
+    check("검사가 공허하지 않다(경고 호출을 찾았다)", len(warn_calls), 1)
+
+    reads_value = []
+    for call in warn_calls:
+        for sub in ast.walk(call):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) \
+                    and sub.func.attr == "getenv":
+                reads_value.append("os.getenv")
+            if isinstance(sub, ast.Attribute) and sub.attr == "environ":
+                reads_value.append("os.environ")
+    check_true("★ 경고 인자에서 키 **값**을 읽지 않는다", not reads_value,
+               "-> %s 를 경고에 끼워 넣었다. 로그 유출이 곧 관리자 권한 유출이 된다"
+               % sorted(set(reads_value)))
+
+    # 부팅 경로가 실제로 이 함수를 부르는가 - 안 부르면 위 검사가 전부 무의미하다
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "api_server.py"), encoding="utf-8-sig").read()
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    check_true("★ api_server.py 가 부팅 시 이 함수를 호출한다",
+               "warn_if_admin_keys_missing()" in code,
+               "-> 함수만 있고 아무도 안 부르면 경고는 영원히 안 나온다")
+
+
 def run():
     print("=" * 62)
     print(" Admin Secret 계약 (Sprint 234)")
@@ -241,6 +366,7 @@ def run():
     test_role_separation_is_real()
     test_missing_admin_secret_does_not_break_user_apis()
     test_admin_routes_all_share_the_same_guard()
+    test_boot_warns_when_admin_keys_are_missing()
 
     print("\n" + "=" * 62)
     if failures:

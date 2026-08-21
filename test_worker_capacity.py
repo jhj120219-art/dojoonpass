@@ -371,6 +371,87 @@ def test_queue_growth_is_observable():
                set(types) <= set(cfg.DOC_TYPE_LIST), sorted(set(types) - set(cfg.DOC_TYPE_LIST)))
 
 
+
+def test_the_model_premise_still_holds_in_code():
+    """이 파일의 능력 계산이 **딛고 선 전제**가 코드에 아직 살아 있는가.
+
+    ## 왜 필요했나 - mutation 이 이 파일을 공허하게 만들 수 있었다
+
+    2026-08-21 실측: `storage/database.py` 의
+
+        def claim_next_item_rows(max_rows: int = QUEUE_BATCH_MAX_ROWS)
+        -> def claim_next_item_rows(max_rows: int = 1)
+
+    로 **batching 을 행 단위로 되돌리는** mutation 을 걸었더니
+    `test_worker_batching.py` 는 잡았지만 **이 파일은 그대로 통과했다.**
+    그런데 이 파일은 그 상태에서도 여전히 "처리량 1.97배", "하루 능력 153건" 이라고
+    출력한다 - 즉 **없어진 이득을 있다고 보고한다.**
+
+    이유는 단순하다: 5번 검사(`test_batching_gain_is_quantified`)는 `capacity()` 와
+    `legacy_capacity()` 라는 **상수 계산 두 개를 서로 비교**할 뿐, 제품 코드를 한 줄도
+    지나가지 않는다. 모델로서는 정직하지만, 그 모델이 **현실과 연결돼 있는지는**
+    아무도 확인하지 않았다.
+
+    ## 그래서 무엇을 잠그나
+
+    처리량 계산은 "물건 1건당 이동 1회"라는 전제 위에 있다. 그 전제를 실제로 만드는
+    코드는 둘이다.
+
+        (1) `claim_next_item_rows()` 가 한 물건의 **여러 행**을 집어 온다
+            -> 기본값이 1 이면 물건 단위가 아니라 행 단위다(= 예전 구조)
+        (2) `doc_worker` 가 그 함수와 페이지 재사용을 **실제로 쓴다**
+            -> 호출이 사라지면 claim 만 묶여 있고 이동은 그대로다
+
+    둘 중 하나라도 무너지면 이 파일의 숫자는 거짓이 된다. 여기서 그것을 잡는다.
+
+    ★ 이 검사는 `test_worker_batching.py` 를 대신하지 않는다. 그 파일은 **행동**을
+      본다(진짜 main() 을 돌려 이동 횟수를 센다). 이 검사는 **이 파일이 자기 전제를
+      잃은 채로 숫자를 계속 출력하는 것**을 막는다. 서로 다른 것을 본다.
+    """
+    print("\n--- 7. 능력 모델의 전제가 코드에 살아 있는가 ---")
+    import inspect
+    import storage.database as db
+    import doc_worker as dw
+
+    n = len(cfg.DOC_TYPE_LIST)
+
+    # (1) claim 이 물건 단위인가 - 기본값이 doc_type 수를 덮을 만큼 큰가
+    sig = inspect.signature(db.claim_next_item_rows)
+    default_rows = sig.parameters["max_rows"].default
+    print("    claim_next_item_rows(max_rows=%r) / doc_type %d종 / QUEUE_BATCH_MAX_ROWS=%r"
+          % (default_rows, n, getattr(db, "QUEUE_BATCH_MAX_ROWS", None)))
+    check_true("★ claim 기본값이 1보다 크다(행 단위로 되돌아가지 않았다)",
+               isinstance(default_rows, int) and default_rows > 1,
+               "max_rows 기본값이 %r 이면 물건 단위 claim 이 아니다 - 이 파일의 "
+               "처리량 계산(이동 1회/물건)이 거짓이 된다" % (default_rows,))
+    check_true("★ 한 물건의 모든 doc_type 을 한 묶음에 담을 수 있다",
+               isinstance(default_rows, int) and default_rows >= n,
+               "기본값 %r < doc_type %d종 - 물건 하나가 두 묶음으로 쪼개져 이동이 늘어난다"
+               % (default_rows, n))
+
+    # (2) 워커가 그 두 기계를 실제로 쓰는가 (주석이 아니라 코드에서)
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "doc_worker.py"),
+                  encoding="utf-8-sig").read()
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    check_true("★ 워커가 claim_next_item_rows() 를 실제로 호출한다(코드)",
+               "claim_next_item_rows()" in code,
+               "호출이 사라지면 묶음 claim 이 동작하지 않는다")
+    # ★ **정의**가 아니라 **호출**을 본다.
+    #   처음에는 `"_ensure_detail_page(" in code` 로 썼는데, 그러면 `def
+    #   _ensure_detail_page(...)` 라는 정의 줄이 검사를 통과시킨다. 실제로 호출부를
+    #   `go_to_case_detail(` 로 되돌리는 mutation 을 걸었더니 **그대로 통과했다**
+    #   (2026-08-21 실측). 함수는 남아 있는데 아무도 부르지 않는 상태 —
+    #   이 저장소가 "기능 존재 != 실행 경로 연결" 로 부르는 바로 그 모양이다.
+    call_lines = [l for l in code.splitlines()
+                  if "_ensure_detail_page(" in l and not l.lstrip().startswith("def ")]
+    check_true("★ 워커가 상세페이지 재사용(_ensure_detail_page)을 실제로 **호출**한다(코드)",
+               len(call_lines) > 0,
+               "정의만 남고 호출이 없다 - 묶어 집어도 행마다 이동해 이득이 0이 된다")
+    check_true("모듈에 두 기계가 모두 존재한다",
+               callable(getattr(dw, "_ensure_detail_page", None))
+               and callable(getattr(dw, "claim_next_item_rows", None)),
+               "이름이 바뀌었으면 이 검사를 갱신하라(검사가 공허해지지 않도록)")
+
 def run():
     print("=" * 62)
     print(" 문서 워커 처리 능력 계약 (Sprint 235 신설 / 236 재측정)")
@@ -381,6 +462,7 @@ def run():
     test_raising_max_items_would_break_capacity()
     test_batching_gain_is_quantified()
     test_queue_growth_is_observable()
+    test_the_model_premise_still_holds_in_code()
 
     print("\n" + "=" * 62)
     if failures:

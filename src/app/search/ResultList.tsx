@@ -1,42 +1,12 @@
 import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 import FavoriteButton from './FavoriteButton'
-import { formatPrice } from '@/lib/format'
+import { formatPrice, parseArea, formatArea } from '@/lib/format'
 import ResultThumbnail from '@/components/ResultThumbnail'
 
 function formatBidRate(bidRate: number) {
   if (bidRate === null || bidRate === undefined) return '-'
   return (bidRate * 100).toFixed(1) + '%'
-}
-
-// 1평 = 3.305785㎡(공식 환산값)
-const SQM_PER_PYEONG = 3.305785
-
-// full_address는 크롤러가 "...주소... [유형 구조 XX.XX㎡]" 형태로 저장한다(끝의 대괄호 세그먼트).
-// 다가구주택 등 일부(약 2%)는 "1층 X㎡ 2층 Y㎡ ..."처럼 층별 면적이 여러 개 나열되어 있어
-// 전체를 합산해 총 면적으로 표시한다. 차량/선박 등 면적 개념이 없는 물건(약 1%)은 매치되는
-// 숫자가 없으므로 null을 반환해 표시하지 않는다.
-function parseArea(fullAddress: string | null): { label: string; sqm: number } | null {
-  if (!fullAddress) return null
-  const bracketMatch = fullAddress.match(/\[([^\]]*)\]\s*$/)
-  if (!bracketMatch) return null
-  const inside = bracketMatch[1]
-  const areaRe = /([0-9]+(?:\.[0-9]+)?)\s*(?:㎡|m2|m²)/g
-  let total = 0
-  let count = 0
-  let m: RegExpExecArray | null
-  while ((m = areaRe.exec(inside)) !== null) {
-    total += Number(m[1])
-    count += 1
-  }
-  if (count === 0) return null
-  const label = inside.startsWith('토지') ? '토지' : '건물'
-  return { label, sqm: total }
-}
-
-function formatArea(area: { label: string; sqm: number }): string {
-  const pyeong = (area.sqm / SQM_PER_PYEONG).toFixed(2)
-  return `${area.label} ${area.sqm.toFixed(2)}㎡ (${pyeong}평)`
 }
 
 // 매각기일까지 남은 일수를 "오늘" 기준으로 계산한다. 절대 날짜(auction_date)는 그대로 유지하고
@@ -59,7 +29,19 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
   const dday = formatDday(item.auction_date)
 
   return (
-    <Link href={`/properties/${item.id}?${navQuery}`} className="block">
+    // ★ `min-w-0` — 이 Link 가 **grid 항목**이다 (2026-08-21 Sprint 240).
+    //
+    //   grid/flex 항목의 `min-width` 기본값은 `auto` 라서 트랙이 항목의 min-content
+    //   아래로 줄어들지 못한다. 카드 안에는 `truncate`(= white-space:nowrap) 문단이
+    //   있어 그 min-content 가 **문자열 전체 폭**이다. 그래서 좁은 화면에서 그리드
+    //   컨테이너는 257px 인데 트랙이 278px 로 벌어져 페이지가 가로로 스크롤됐다.
+    //
+    //   실측(2026-08-21, 실제 320px 창): 컨테이너 257px vs 트랙 277.6px,
+    //   카드 오른쪽 끝 294px vs 뷰포트 289px. `min-w-0` 을 주면 트랙이 컨테이너에
+    //   맞춰지고 `truncate` 가 제 역할(말줄임)을 한다 — 재측정 넘침 0.
+    //
+    //   같은 결함이 /favorites 와 /properties/recent 에도 그대로 있었다(같은 카드 구조).
+    <Link href={`/properties/${item.id}?${navQuery}`} className="block min-w-0">
     <div className="bg-white rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow border border-gray-100">
       {/* 물건 그룹: 물건종류를 가장 먼저 눈에 띄게, 그 다음 사건번호/주소/면적.
 
@@ -80,7 +62,29 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
              src/components/ 로 옮겼다 — 세 화면의 썸네일 규칙이 갈라지지 않게 한다.) */}
         {item.thumbnail_url && <ResultThumbnail url={item.thumbnail_url} />}
         <div className="min-w-0 flex-1">
-        <div className="flex items-start justify-between gap-2 mb-1">
+        {/* ★ `flex-wrap` — 좁은 화면에서 물건종류 배지가 **세로 한 글자씩** 쪼개지는 것을 막는다
+            (2026-08-21 Sprint 242).
+
+            이 줄은 `justify-between` 으로 [물건종류 배지] / [D-day + 하트] 를 양끝에 두는데,
+            오른쪽 묶음이 `shrink-0` 이라 줄어들지 않는다. 그래서 폭이 모자라면 **왼쪽 배지만**
+            계속 짜부라진다.
+
+            실제 320px 뷰포트 실측(audit_viewport.py, 2026-08-21):
+
+                가용 폭 147px  =  배지 37px + gap 8 + 오른쪽 묶음 110px(고정)
+                배지 37px 안에서 "연립주택,다세대,빌라" 가 **9줄**로 접힌다
+                -> 한 글자씩 세로로 늘어선 기둥이 되고 카드 높이가 403px 로 부푼다
+                -> 오른쪽 묶음은 부모 박스를 7px 넘어간다
+
+                360px -> 3줄 / 390px -> 2줄 / 430px -> 2줄  (좁을수록 급격히 나빠진다)
+
+            페이지가 가로로 스크롤되지는 않아서, "가로 넘침만" 보던 이전 검사들은
+            이것을 전부 놓쳤다. 부모 박스 넘침을 보게 되면서 드러났다.
+
+            고침은 **줄바꿈 허용뿐**이다 — 색·글자크기·간격(gap)은 그대로다. 한 줄에
+            들어가는 폭에서는 wrap 이 발동하지 않으므로 넓은 화면 렌더는 변하지 않는다.
+            같은 구조가 /favorites·/properties/recent 에도 있어 함께 고쳤다. */}
+        <div className="flex flex-wrap items-start justify-between gap-2 mb-1">
           <span className="text-sm font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg">
             {item.property_type || '-'}
           </span>

@@ -17,13 +17,20 @@ from normalizer.normalizer import normalize_batch
 from storage.database import init_db, upsert_batch, get_stats, enqueue_documents
 from storage.checkpoint import RunLock
 
-os.makedirs("logs", exist_ok=True)
+# ★ 로그/락 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 cwd 에서 띄웠을 때 그 폴더에 logs/ 가 새로 생긴다. 로그가 흩어지는 건
+#   그나마 낫고, **락 파일이 갈라지면 중복 실행 방지가 조용히 무력화된다** - 실측했다:
+#     A(저장소 루트) 락 획득 -> B(같은 cwd) 차단 O / C(다른 cwd) **획득됨**
+#   즉 doc_worker 두 개가 같은 큐/다운로드 폴더를 동시에 만진다.
+#   `.bat` 3개는 `cd /d %~dp0` 로 스스로를 보호하지만 수동 실행/서비스 등록은 아니다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/scraper.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(_HERE, "logs", "scraper.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ]
 )
@@ -42,7 +49,7 @@ logger = logging.getLogger(__name__)
 #
 # 예약 작업끼리는 기본 MultipleInstances=IgnoreNew 로 안 겹치지만, **운영자의 수동
 # 실행이 스케줄 실행과 겹치는 경우**는 막지 못한다 — doc_worker 가 락을 둔 것과 같은 이유다.
-LOCK_PATH = os.path.join("logs", "mvp_scraper.lock")
+LOCK_PATH = os.path.join(_HERE, "logs", "mvp_scraper.lock")
 # 전체 크롤 실측 3.1시간(Sprint 190)보다 넉넉하게. 이 시간이 지난 락은 죽은 실행으로 보고
 # 회수한다 — 비정상 종료가 다음 날 실행을 영원히 막으면 안 된다.
 LOCK_STALE_HOURS = 6
@@ -120,7 +127,7 @@ def run_courts(courts: List[CourtInfo], outcome: CrawlOutcome = None) -> list:
         return []
 
     # 1. 검증
-    engine = ValidationEngine(log_path="logs/validation.jsonl")
+    engine = ValidationEngine(log_path=os.path.join(_HERE, "logs", "validation.jsonl"))
     all_items = engine.validate_batch(all_items)
     print_validation_summary(engine, all_items)
 

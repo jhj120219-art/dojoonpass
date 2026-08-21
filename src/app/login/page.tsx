@@ -70,7 +70,13 @@ function LoginPageInner() {
           로그인 없이 둘러보기
         </Link>
       </div>
-      <p className="mt-10 text-xs text-gray-300 text-center">로그인 시 서비스 이용약관 및 개인정보처리방침에 동의하게 됩니다</p>
+      {/* ★ text-gray-300 -> text-gray-500 (2026-08-21 Sprint 247).
+          실측: 흰 배경 위 text-gray-300 은 **1.47:1** 로, 이 화면에서 가장 낮았다
+          (WCAG AA 기준 4.5:1). 그런데 이 문장은 "동의하게 됩니다"라는 **동의 고지**다
+          - 읽을 수 없는 동의 문구는 접근성 문제이자 고지 자체가 무의미해지는 문제다.
+          test_frontend_accessibility.py 의 상한 규칙이 "줄이는 것은 자유"라 이 한 곳만
+          내렸다. 나머지 text-gray-300 5곳은 로그인 화면 뒤라 아직 실측하지 못했다. */}
+      <p className="mt-10 text-xs text-gray-500 text-center">로그인 시 서비스 이용약관 및 개인정보처리방침에 동의하게 됩니다</p>
       </div>
     </main>
   )

@@ -23,7 +23,14 @@ from crawler.base_crawler import go_to_case_detail, wait_for_detail
 from models.crawl_outcome import DocWorkerOutcome
 from storage.checkpoint import RunLock
 
-os.makedirs("logs", exist_ok=True)
+# ★ 로그/락 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 cwd 에서 띄웠을 때 그 폴더에 logs/ 가 새로 생긴다. 로그가 흩어지는 건
+#   그나마 낫고, **락 파일이 갈라지면 중복 실행 방지가 조용히 무력화된다** - 실측했다:
+#     A(저장소 루트) 락 획득 -> B(같은 cwd) 차단 O / C(다른 cwd) **획득됨**
+#   즉 doc_worker 두 개가 같은 큐/다운로드 폴더를 동시에 만진다.
+#   `.bat` 3개는 `cd /d %~dp0` 로 스스로를 보호하지만 수동 실행/서비스 등록은 아니다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +51,7 @@ logger = logging.getLogger(__name__)
 # 막지 못한다. Selenium 다운로드 경로 자체를 프로세스별로 분리하는 것은 위험이 큰 변경이라
 # (crawler/doc_crawler.py 0% 커버리지, 실 브라우저 없이 안전하게 검증 불가) 하지 않는다 —
 # 대신 **동시 실행 자체를 막는** 가볍고 순수 파이썬-표준라이브러리인 잠금 파일을 둔다.
-LOCK_PATH = os.path.join("logs", "doc_worker.lock")
+LOCK_PATH = os.path.join(_HERE, "logs", "doc_worker.lock")
 # 예약 작업의 ExecutionTimeLimit(register_scheduler_tasks.ps1, 4시간)보다 여유 있게 잡는다 —
 # 정상 종료(finally에서 락 해제)를 못 하고 죽은 경우(프로세스 kill 등)에도 다음 날 실행이
 # 영원히 막히지 않도록, 이 시간이 지난 락은 죽은 락으로 간주하고 새로 가져간다

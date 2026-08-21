@@ -2,7 +2,10 @@
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
-load_dotenv()
+# ★ cwd 가 아니라 **이 파일 기준**으로 .env 를 찾는다 (2026-08-21 Sprint 245).
+#   저장소 루트가 아닌 곳에서 `uvicorn api_server:app` 을 띄우면 예전에는 환경변수를
+#   하나도 못 읽어 인증 전체가 500 이 됐다. 사유는 api/auth.py 의 같은 자리 주석 참고.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # 로깅 설정. 크롤러 계열(mvp_scraper.py / doc_worker.py / migrate_execute.py)은 전부
 # basicConfig를 직접 호출하는데 API 서버만 빠져 있었다 — 그 결과 root logger에 핸들러가
@@ -31,8 +34,14 @@ from api.v1.registry import router as registry_router
 from api.v1.documents import router as documents_router
 from api.v1.images import router as images_router
 from api.v1.payments import router as payments_router
-from api.v1.admin import router as admin_router
+from api.v1.admin import router as admin_router, warn_if_admin_keys_missing
 from api.v1.subscriptions import router as subscriptions_router
+
+# 설정 누락을 **부팅 시점에** 알린다 (2026-08-21 Sprint 246).
+#   여기여야 하는 이유: 위쪽 load_dotenv 와 logging.basicConfig 가 이미 끝난 자리다.
+#   더 위로 올리면 .env 를 읽기 전이라 멀쩡한 설정에도 거짓 경고가 나간다.
+#   키 값은 남기지 않는다 - 설정 여부만.
+warn_if_admin_keys_missing()
 
 app = FastAPI(
     title="도준패스 법원경매 API",

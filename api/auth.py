@@ -15,10 +15,33 @@ from api.constants import ErrorCode
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# ★ `.env` 경로를 **현재 작업 디렉터리가 아니라 이 파일 기준**으로 잡는다
+#   (2026-08-21 Sprint 245).
+#
+#   예전에는 `load_dotenv()` / `load_dotenv(".env.local")` 였다. 둘 다 **cwd 기준**이라
+#   저장소 루트가 아닌 곳에서 서버를 띄우면 **환경변수를 하나도 못 읽는다.**
+#
+#   실측(2026-08-21, 같은 코드를 cwd 만 바꿔 임포트):
+#       cwd = 저장소 루트   JWT_SECRET 88자 / SUPABASE_URL 40자   -> 정상
+#       cwd = 다른 폴더     JWT_SECRET  0자 / SUPABASE_URL  빈값  -> get_current_user() 가
+#                           "JWT 검증 설정 미비" **500** 을 던진다
+#
+#   그러면 로그인 사용자의 관심물건·최근본·검색조건·마이페이지·등기부가 전부 500 이 된다.
+#   게다가 오류 문구가 "설정 미비"라 **시크릿이 없는 줄 알고 .env 를 뒤지게 된다** -
+#   실제 원인은 작업 디렉터리다. 진단이 오래 걸리는 종류의 고장이다.
+#
+#   .bat 3개는 `cd /d %~dp0` 로 스스로를 보호하지만, 문서가 안내하는
+#   `uvicorn api_server:app --reload` 는 운영자가 있는 아무 디렉터리에서 실행되고,
+#   서비스 등록(NSSM/작업 스케줄러)도 작업 디렉터리를 따로 준다. 이 저장소는 실제로
+#   그 함정을 한 번 밟았다(Sprint 241, fixture API 를 다른 cwd 에서 띄워 인증 전부 실패).
+#
+#   파일 기준 절대경로로 바꾸면 **어디서 띄워도 같은 값을 읽는다.** cwd 가 이미
+#   저장소 루트인 경우 동작은 완전히 동일하다.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 # JWKS 주소를 만들려면 프로젝트 URL이 필요한데, 이 저장소에서 그 값은 `.env`가 아니라
 # `.env.local`의 NEXT_PUBLIC_SUPABASE_URL에만 있다. 값을 **읽기만** 한다(파일 수정 없음).
-load_dotenv(".env.local", override=False)
+load_dotenv(os.path.join(_REPO_ROOT, ".env.local"), override=False)
 
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")

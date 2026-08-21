@@ -25,6 +25,7 @@ api/v1/search.py의 /api/v1/search 엔드포인트 회귀 테스트.
 """
 import sys
 import os
+from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -442,6 +443,331 @@ def check_search_issues_a_constant_number_of_queries():
           % (counts[1][0], counts[9][0]))
 
 
+
+
+# ---------------------------------------------------------------------------
+# 선언된 필터 파라미터가 **실제로 결과를 바꾸는가** (2026-08-21 Sprint 244 신설)
+# ---------------------------------------------------------------------------
+def check_declared_filters_actually_filter():
+    """`Query(...)` 로 선언된 필터가 **동작까지** 하는지 본다.
+
+    ## 왜 필요했나 - 소스 검사만으로는 못 잡는 구멍이 있다
+
+    `tests/source-contract.test.mjs` 는 프런트가 보내는 키가 백엔드 선언을 벗어나지
+    않는지 보고, `KNOWN_UNSUPPORTED` 목록에 올린 것이 "실제로 아직 미지원"인지 확인한다.
+    좋은 가드지만 **선언만 보고 구현은 보지 않는다.**
+
+    2026-08-21 mutation 으로 그 구멍을 실증했다:
+
+        1단계  `min_building_area: float = Query(None)` 을 **선언만** 추가(WHERE 절 없음)
+               -> source-contract 가 "미지원 목록에 있는데 백엔드가 지원한다"고 실패한다 (잡힘)
+        2단계  개발자가 자연스럽게 `KNOWN_UNSUPPORTED` 에서 그 이름을 뺀다
+               -> **소스 검사 36건이 전부 통과한다.**
+               그런데 실제 동작은 그대로다: 전체 830건, 건물면적 99999 이상도 830건.
+               = 사용자는 필터를 걸었는데 걸리지 않은 결과를 본다.
+
+    즉 "선언했다"와 "거른다"는 다른 사실인데, 소스 검사는 앞의 것만 본다.
+    이 검사가 뒤의 것을 본다 - **극단값을 보내고 결과 수가 실제로 달라지는지** 센다.
+
+    ## 지금 알려진 미지원 파라미터
+
+    프런트는 면적/특수조건 필터 UI 를 갖고 있고 값을 실제로 **보낸다**. 백엔드는 그것을
+    받지 않는다(`auction_item` 에 면적 컬럼이 없다). 그래서 사용자가 면적을 걸어도
+    결과가 그대로다 - 2026-08-21 실측으로 확인했다. 이것은 **알려진 미구현**이며
+    이 검사는 그 사실을 고정한다(구현되면 이 목록에서 빼야 통과한다).
+    """
+    print("\n=== 선언된 필터가 실제로 거르는가 (Sprint 244) ===")
+    import re
+    import tempfile
+    import shutil
+    import contextlib
+    import io as _io
+
+    src = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "api", "v1", "search.py"), encoding="utf-8-sig").read()
+    declared = re.findall(r"^\s{4}(\w+)\s*:[^\n=]*=\s*Query\(", src, re.M)
+    # 필터가 아닌 것(표시 설정/페이지네이션)은 제외한다
+    NOT_FILTERS = {"sort_by", "sort_order", "page", "size"}
+    filters = [d for d in declared if d not in NOT_FILTERS]
+    check("검사가 공허하지 않다(필터 파라미터를 찾았다)", len(filters) >= 10,
+          "찾은 필터 %d개" % len(filters))
+
+    # 각 필터를 "아무것도 남지 않아야 하는" 극단값으로 호출한다
+    EXTREME = {
+        "case_no": "존재하지않는사건번호zzz",
+        "sido": "존재하지않는시도zzz",
+        "sigungu": "존재하지않는시군구zzz",
+        "dong": "존재하지않는동zzz",
+        "address_detail": "존재하지않는주소zzz",
+        "property_type": "존재하지않는종류zzz",
+        "court_name": "존재하지않는법원zzz",
+        "status": "존재하지않는상태zzz",
+        "auction_date_from": "2999-12-31",
+        "auction_date_to": "1900-01-01",
+        "min_appraisal": 10 ** 15,
+        "max_appraisal": 1,
+        "min_bid_price": 10 ** 15,
+        "max_bid_price": 1,
+        "min_bid_rate": 99.0,
+        "max_bid_rate": 0.0,
+        "min_fail_count": 9999,
+        "max_fail_count": -1,
+        # 미구현(프런트는 보내지만 백엔드가 안 받는다)
+        "min_building_area": 10 ** 9,
+        "max_building_area": 1,
+        "min_land_area": 10 ** 9,
+        "max_land_area": 1,
+        "special_conditions": "존재하지않는조건zzz",
+    }
+    # `include_closed` 는 **범위를 넓히는** 파라미터라 극단값 개념이 다르다 - 따로 본다.
+    SPECIAL = {"include_closed"}
+
+    # 2026-08-21 실측: 프런트는 보내지만 백엔드가 받지 않는 것들.
+    #
+    # ★ 목록을 여기서 **새로 적지 않는다.** `tests/source-contract.test.mjs` 의
+    #   `KNOWN_UNSUPPORTED` 를 읽어 온다. 두 벌로 두면 한쪽만 갱신되는 날이 오고,
+    #   그때 두 검사가 서로를 눈감아 준다 - 이 저장소가 "규칙이 두 벌"에서 반복해
+    #   겪은 사고다(BUGS #107/#112/#136/#161).
+    #
+    #   실제로 그 구멍을 mutation 으로 확인했다(2026-08-21): 파라미터를 선언만 하고
+    #   source-contract 목록에서 빼면 소스 검사 36건이 전부 통과하는데 필터는
+    #   여전히 아무것도 거르지 않았다. 아래 동기화 검사가 그 편집을 잡는다.
+    sc = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "tests", "source-contract.test.mjs"),
+                  encoding="utf-8").read()
+    m = re.search(r"const KNOWN_UNSUPPORTED = new Set\(\[(.*?)\]\)", sc, re.S)
+    check("source-contract 의 미지원 목록을 읽었다(검사가 공허하지 않다)", bool(m), None)
+    KNOWN_UNSUPPORTED = set(re.findall(r"['\"](\w+)['\"]", m.group(1))) if m else set()
+    print("    source-contract 가 선언한 미지원 목록: %s" % sorted(KNOWN_UNSUPPORTED))
+
+    tmp = tempfile.mkdtemp(prefix="qa_filter_")
+    try:
+        import storage.database as db
+        prev = db.DB_PATH
+        path = os.path.join(tmp, "auction.db")
+        db.DB_PATH = path
+        import storage.migrate_v4_1 as mig
+        import storage.migrations.run_migrations as runmig
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.init_db(); mig.migrate(); runmig.run()
+        conn = db.get_connection()
+        future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        cur = conn.execute("INSERT INTO auction_case (case_no,court_code,court_name)"
+                           " VALUES ('2025타경1','B1','서울중앙지방법원')")
+        conn.execute(
+            "INSERT INTO auction_item (case_id,case_no,item_no,court_name,property_type,"
+            "sido,sigungu,dong,full_address,appraisal_price,minimum_bid_price,bid_rate,"
+            "auction_date,status,fail_count,crawl_date)"
+            " VALUES (?,'2025타경1','1','서울중앙지방법원','아파트','서울','강남구','역삼동',"
+            "'서울특별시 강남구 역삼동 1 [집합건물 84.5㎡]',300000000,240000000,0.8,?,'유찰 1회',1,?)",
+            (cur.lastrowid, future, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit(); conn.close()
+
+        from fastapi.testclient import TestClient
+        from api_server import app
+        c = TestClient(app)
+        base = c.get("/api/v1/search?size=1").json()["total"]
+        check("표본이 검색된다(검사가 공허하지 않다)", base == 1, "total=%s" % base)
+
+        ineffective = []
+        for f in filters:
+            if f in SPECIAL:
+                continue
+            if f not in EXTREME:
+                check("극단값을 정의해 둔 파라미터인가: %s" % f, False,
+                      "EXTREME 에 없다 - 새 파라미터가 생겼으면 여기에 추가하라")
+                continue
+            r = c.get("/api/v1/search", params={f: EXTREME[f], "size": 1})
+            if r.status_code != 200:
+                check("%s 극단값이 200 이다" % f, False, "HTTP %s" % r.status_code)
+                continue
+            total = r.json()["total"]
+            if total == base:
+                ineffective.append(f)
+
+        print("    선언된 필터 %d개 중 극단값에도 결과가 그대로인 것: %d개"
+              % (len(filters) - len(SPECIAL), len(ineffective)))
+        if ineffective:
+            print("      %s" % sorted(ineffective))
+
+        # ① 알려진 미구현 목록 밖에서 무효한 필터가 나오면 실패다
+        unexpected = sorted(set(ineffective) - KNOWN_UNSUPPORTED)
+        check("★ 선언된 필터가 실제로 결과를 거른다(미구현 목록 밖)",
+              unexpected == [],
+              "선언만 돼 있고 거르지 않는다: %s - WHERE 절이 빠졌는지 확인하라" % unexpected)
+
+        # ② 미구현 목록에 있는데 **사실은 구현된** 것이 있으면 목록을 갱신해야 한다
+        now_working = sorted(KNOWN_UNSUPPORTED & set(filters) - set(ineffective))
+        check("★ 미구현 목록이 최신이다(구현된 것이 남아 있지 않다)",
+              now_working == [],
+              "이제 동작한다 - KNOWN_UNSUPPORTED 에서 빼라: %s" % now_working)
+
+        # ③ 프런트가 보내는데 백엔드가 안 받는 것이 실제로 존재한다는 사실을 고정한다
+        #    (0이 되면 이 검사와 프런트 TODO 주석을 함께 정리해야 한다)
+        front = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "src", "app", "search", "SearchForm.tsx"),
+                         encoding="utf-8").read()
+        sent_but_unsupported = sorted(
+            k for k in KNOWN_UNSUPPORTED if ("query.%s" % k) in front)
+        print("    프런트가 **보내는데** 백엔드가 안 받는 것: %s" % sent_but_unsupported)
+        check("★ 그 목록이 비어 있지 않다(현재 사용자 영향이 실재한다)",
+              len(sent_but_unsupported) > 0,
+              "비었다면 미구현이 해소된 것이다 - KNOWN_UNSUPPORTED 와 프런트 TODO 를 함께 정리하라")
+    finally:
+        db.DB_PATH = prev
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+# ---------------------------------------------------------------------------
+# 로그인이 필요한 화면들이 **같은 주소 원문**을 받는가 (2026-08-21 Sprint 250 신설)
+# ---------------------------------------------------------------------------
+def check_authed_screens_get_the_same_address():
+    """관심물건 / 최근 본 물건 / 상세가 DB 원문과 **글자 단위로 같은** 주소를 주는가.
+
+    ## 왜 필요했나
+
+    주소는 사용자가 물건을 판단하는 1차 정보다. 그런데 이 저장소의 감사는 로그인 뒤
+    화면에서 **번번이 막혀 있었다** - 헤드리스 브라우저에 Supabase 세션이 없어
+    `/favorites` 가 `/login` 으로 튕기기 때문이다. 그래서 "API 계약은 확인했고 화면은
+    못 봤다"가 반복됐다.
+
+    브라우저 렌더는 여전히 세션 쿠키가 필요하지만, **API 계약은 여기서 끝까지 확인할 수
+    있다** - fixture DB 를 만들고 앱이 실제로 쓰는 시크릿으로 토큰을 서명하면
+    제품의 실제 인증 경로(`get_current_user`)를 그대로 지난다. mock 이 아니다.
+
+    ## 무엇을 고정하는가
+
+    주소는 파싱하지 않고 **원문 그대로** 실려야 한다. 어느 화면이 대괄호를 잘라내거나
+    trim 하거나 이스케이프하면 화면마다 다른 주소가 보인다. 특히 아래 네 가지는
+    이 저장소가 실제로 밟았던 모양이라 그대로 넣는다:
+
+        중첩 대괄호      [토지 전[현황:묵전(죽림)] 105㎡ ...]
+        대지권 표기      [집합건물 ... 74.5482㎡ 대지권의 표시 ... 대 500㎡]
+        괄호 + 쉼표      (안락동,동래에코하임)
+        비부동산        사용본거지 : ... [카니발 2016년식 승용차]
+
+    운영 DB 는 건드리지 않는다 - 임시 DB 를 만들고 끝나면 지운다.
+    """
+    print("\n=== 로그인 화면이 같은 주소 원문을 받는가 (Sprint 250) ===")
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+    from datetime import datetime, timedelta
+
+    import storage.database as db
+    from jose import jwt as _jwt
+    import api.auth as auth_mod
+
+    if not auth_mod.SUPABASE_JWT_SECRET:
+        check("SUPABASE_JWT_SECRET 이 있다(없으면 이 검사는 공허하다)", False,
+              "길이 0")
+        return
+
+    ADDRS = [
+        "경기도 안성시 삼죽면 진촌리 107-5 [토지 전 2139㎡]",
+        "전라남도 함평군 손불면 학산리 661 [토지 전[현황:묵전(죽림)] 105㎡ "
+        "채무자겸소유자 백부덕 지분 36분의3 전부]",
+        "부산광역시 동래구 명안로10번길 34 9층901호 (안락동,동래에코하임) "
+        "[집합건물 철근콘크리트조 74.5482㎡ 대지권의 표시 토지의 표시 : "
+        "부산광역시 동래구 안락동 308 대 500㎡]",
+        "사용본거지 : 인천 부평구 백범로456번길 20-24 (십정동) [카니발 2016년식 승용차]",
+    ]
+
+    tmp = tempfile.mkdtemp(prefix="qa_addrctr_")
+    prev = db.DB_PATH
+    db.DB_PATH = os.path.join(tmp, "auction.db")
+    try:
+        import storage.migrate_v4_1 as mig
+        import storage.migrations.run_migrations as runmig
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.init_db()
+            mig.migrate()
+            runmig.run()
+
+        future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        now = datetime.now().isoformat()
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn = db.get_connection()
+        ids = []
+        for n, addr in enumerate(ADDRS, start=1):
+            cno = "2025타경%d" % n
+            cid = conn.execute(
+                "INSERT INTO auction_case (case_no,court_code,court_name)"
+                " VALUES (?,'B1','서울중앙지방법원')", (cno,)).lastrowid
+            cur = conn.execute(
+                "INSERT INTO auction_item (case_id,case_no,item_no,court_name,"
+                "property_type,sido,sigungu,dong,full_address,appraisal_price,"
+                "minimum_bid_price,bid_rate,auction_date,status,fail_count,crawl_date)"
+                " VALUES (?,?,'1','서울중앙지방법원','아파트','서울','강남구','역삼동',?,"
+                "300000000,240000000,0.8,?,'유찰 1회',1,?)",
+                (cid, cno, addr, future, today))
+            ids.append(cur.lastrowid)
+
+        user = "qa-addr-contract-user"
+        rcols = [r[1] for r in conn.execute("PRAGMA table_info(recent_items)")]
+        for iid in ids:
+            conn.execute("INSERT INTO favorites (user_id,item_id,created_at)"
+                         " VALUES (?,?,?)", (user, iid, now))
+            cols = ["user_id", "item_id"] + [c for c in ("viewed_at", "created_at")
+                                             if c in rcols]
+            conn.execute("INSERT INTO recent_items (%s) VALUES (%s)"
+                         % (",".join(cols), ",".join("?" * len(cols))),
+                         tuple([user, iid] + [now] * (len(cols) - 2)))
+        conn.commit()
+        conn.close()
+
+        from fastapi.testclient import TestClient
+        from api_server import app
+        client = TestClient(app)
+        hdr = {"Authorization": "Bearer " + _jwt.encode(
+            {"sub": user}, auth_mod.SUPABASE_JWT_SECRET, algorithm="HS256")}
+
+        # 전제 - 토큰이 실제로 통해야 아래가 의미가 있다
+        probe = client.get("/api/v1/favorites", headers=hdr)
+        check("전제: 토큰이 제품 인증 경로를 통과한다", probe.status_code == 200,
+              "-> %s %s" % (probe.status_code, probe.text[:120]))
+        check("전제: 인증 없이는 막힌다",
+              client.get("/api/v1/favorites").status_code == 401)
+        if probe.status_code != 200:
+            return
+
+        want = dict(zip(ids, ADDRS))
+
+        def rows_of(payload):
+            if isinstance(payload, dict):
+                for k in ("data", "items", "results"):
+                    v = payload.get(k)
+                    if isinstance(v, list):
+                        return v
+                    if isinstance(v, dict):
+                        for k2 in ("items", "results"):
+                            if isinstance(v.get(k2), list):
+                                return v[k2]
+            return payload if isinstance(payload, list) else []
+
+        for label, path in (("관심물건", "/api/v1/favorites"),
+                            ("최근 본 물건", "/api/v1/recent-items")):
+            rows = rows_of(client.get(path, headers=hdr).json())
+            check("%s 가 %d건을 돌려준다(검사가 공허하지 않다)" % (label, len(ids)),
+                  len(rows) == len(ids), "-> %d건" % len(rows))
+            mism = [(r.get("id"), r.get("full_address")) for r in rows
+                    if r.get("id") in want and r.get("full_address") != want[r["id"]]]
+            check("★ %s 의 주소가 DB 원문과 글자 단위로 같다" % label, not mism,
+                  "-> %r" % (mism[:2],))
+
+        mism = []
+        for iid in ids:
+            r = client.get("/api/v1/item/%d" % iid)
+            if r.status_code != 200 or r.json().get("full_address") != want[iid]:
+                mism.append((iid, r.status_code, r.json().get("full_address")))
+        check("★ 상세의 주소가 DB 원문과 글자 단위로 같다", not mism,
+              "-> %r" % (mism[:2],))
+    finally:
+        db.DB_PATH = prev
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def run():
     print("=" * 70)
     print(" /api/v1/search 주소 Intent 회귀 (건수 비의존)")
@@ -831,6 +1157,8 @@ def run():
     check_no_stale_read_path()
     check_every_list_screen_contract()
     check_search_issues_a_constant_number_of_queries()
+    check_declared_filters_actually_filter()
+    check_authed_screens_get_the_same_address()
 
     print()
     if FAILURES:

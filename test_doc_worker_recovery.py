@@ -12,6 +12,7 @@ go_to_case_detail/collect_document/restart_download_driver/build_download_driver
 """
 import contextlib
 import io
+import re
 import sys
 import os
 import time
@@ -861,12 +862,132 @@ def test_mvp_scraper_lock_flow():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+def test_lock_is_not_defeated_by_a_different_cwd():
+    """다른 작업 디렉터리에서 띄운 두 번째 인스턴스도 **락에 막히는가** (2026-08-21 Sprint 246).
+
+    ## 이 검사가 없던 동안 무엇이 조용히 깨져 있었나
+
+    `LOCK_PATH` 는 예전에 `os.path.join("logs", "doc_worker.lock")` 이었다. 상대경로라
+    **cwd 기준**으로 풀린다. 그래서 두 인스턴스의 작업 디렉터리가 다르면 서로 **다른
+    락 파일**을 보고, 둘 다 획득에 성공한다. 즉 중복 실행 방지가 무력화된다.
+
+    실측(2026-08-21, 고치기 전):
+
+        A(저장소 루트)에서 획득 -> True
+        B(같은 cwd)에서 획득    -> False   <- 정상적으로 막힘
+        C(다른 cwd)에서 획득    -> **True** <- 막히지 않는다
+
+    위 `test_lock_prevents_concurrent_run` 은 이걸 못 잡는다 - **같은 프로세스, 같은
+    cwd** 에서만 확인하기 때문이다. cwd 가 갈리는 순간이 바로 구멍이었다.
+
+    ## 왜 심각한가
+
+    `DOWNLOAD_DIR` 은 모든 실행이 공유한다(Sprint 142 참고). 두 워커가 동시에 돌면
+    한쪽이 받은 파일을 다른 쪽이 자기 것으로 착각하고, `document_queue` 도 이중으로
+    claim 된다. 그리고 이건 **로그에 아무 흔적도 남지 않는다** - 둘 다 "락 획득 성공"
+    이라고 정상 동작처럼 기록한다.
+
+    `.bat` 3개는 `cd /d %~dp0` 로 스스로를 보호하지만, 문서가 안내하는 수동 실행과
+    서비스 등록(NSSM/작업 스케줄러의 '시작 위치')은 그렇지 않다.
+
+    ## 검사 방법
+
+    **별도 프로세스 2개를 서로 다른 cwd 에서 띄운다.** 같은 프로세스 안에서는 이미
+    임포트된 `doc_worker.LOCK_PATH` 가 그대로라 재현되지 않는다 - 검사가 공허해진다.
+    크롤은 하지 않는다. `RunLock` 만 직접 잡는다.
+    """
+    print("\n--- 다른 cwd 의 두 번째 인스턴스도 락에 막히는가 (Sprint 246) ---")
+    import subprocess
+    import tempfile
+    import shutil
+
+    repo = os.path.dirname(os.path.abspath(__file__))
+    probe = (
+        "import os, sys, time;"
+        "sys.path.insert(0, os.environ['REPO']);"
+        "import doc_worker as w;"
+        "from storage.checkpoint import RunLock;"
+        "lk = RunLock(w.LOCK_PATH, w.LOCK_STALE_HOURS, label='qa-cwd-probe');"
+        "got = bool(lk.acquire());"
+        "print('ACQUIRED=%d ABS=%s' % (got, os.path.abspath(w.LOCK_PATH)));"
+        "sys.stdout.flush();"
+        "time.sleep(float(os.environ.get('HOLD','0')));"
+        "lk.release() if got else None"
+    )
+
+    def spawn(cwd, hold):
+        env = dict(os.environ)
+        env["REPO"] = repo
+        env["HOLD"] = str(hold)
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.Popen([sys.executable, "-c", probe], cwd=cwd, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def read(proc):
+        line = proc.stdout.readline().decode("utf-8", "replace").strip()
+        m = re.search(r"ACQUIRED=(\d) ABS=(.+)", line)
+        if not m:
+            return None, (line + proc.stderr.read().decode("utf-8", "replace"))[:200]
+        return m.group(1) == "1", m.group(2)
+
+    _clear_real_lock_files()
+    other = tempfile.mkdtemp(prefix="qa_lockcwd_")
+    holder = None
+    try:
+        holder = spawn(repo, 8)                       # A: 저장소 루트에서 잡고 유지
+        got_a, abs_a = read(holder)
+        check_true("저장소 루트에서 락을 잡는다(검사가 공허하지 않다)",
+                   got_a is True, "-> %r" % (abs_a,))
+        if got_a is not True:
+            return
+
+        b = spawn(repo, 0)                            # B: 같은 cwd -> 막혀야 정상
+        got_b, abs_b = read(b)
+        b.wait(timeout=120)
+        check_true("같은 cwd 의 두 번째 인스턴스는 막힌다(기존 계약)",
+                   got_b is False, "-> %r" % (abs_b,))
+
+        c = spawn(other, 0)                           # C: 다른 cwd -> 여기가 구멍이었다
+        got_c, abs_c = read(c)
+        c.wait(timeout=120)
+        check_true("★ **다른 cwd** 의 두 번째 인스턴스도 막힌다",
+                   got_c is False,
+                   "-> 획득됐다. LOCK_PATH 가 상대경로라 cwd 마다 다른 락 파일을 본다. "
+                   "doc_worker 두 개가 같은 큐/다운로드 폴더를 동시에 만진다")
+        check("★ 다른 cwd 에서도 **같은 락 파일**을 가리킨다", abs_c, abs_a)
+        check_true("★ 다른 폴더에 logs/ 를 새로 만들지 않는다",
+                   not os.path.exists(os.path.join(other, "logs")),
+                   "-> 로그와 락이 그 폴더로 흩어진다")
+    finally:
+        if holder is not None:
+            try:
+                holder.wait(timeout=60)
+            except Exception:
+                holder.kill()
+        shutil.rmtree(other, ignore_errors=True)
+        _clear_real_lock_files()
+
+    # 소스 수준 가드 - 편집 시점에 되돌리는 것을 잡는다(주석 제외)
+    for rel, names in (("doc_worker.py", ("LOCK_PATH",)),
+                       ("mvp_scraper.py", ("LOCK_PATH",))):
+        src = io.open(os.path.join(repo, rel), encoding="utf-8-sig").read()
+        code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+        for nm in names:
+            m = re.search(r"^%s\s*=\s*(.+)$" % nm, code, re.M)
+            check_true("★ %s 의 %s 가 파일 기준 절대경로다" % (rel, nm),
+                       m is not None and "_HERE" in m.group(1),
+                       "-> %r. cwd 기준 상대경로면 중복 실행 방지가 무력화된다"
+                       % (m.group(1) if m else None,))
+
 def run():
     test_driver_restart_failure_stops_run_instead_of_burning_retry_budget()
     test_driver_restart_success_continues_processing()
     test_case_not_reachable_does_not_restart_the_driver()
     test_real_exception_still_restarts_the_driver()
     test_lock_prevents_concurrent_run()
+    test_lock_is_not_defeated_by_a_different_cwd()
     test_stale_lock_is_taken_over()
     test_lock_released_after_normal_run()
     test_driver_startup_failure_releases_lock()

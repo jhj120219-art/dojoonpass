@@ -89,7 +89,12 @@ export default function FavoritesPage() {
         )}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 items-start">
         {!error && items && items.map((item) => (
-          <Link key={item.id} href={`/properties/${item.id}`} className="block">
+          // ★ `min-w-0` — grid 항목의 min-width 기본값 auto 때문에 트랙이 카드
+          //   min-content(= truncate 문단의 문자열 전체 폭)까지 벌어졌다.
+          //   실측(2026-08-21, 실제 320px 창): 컨테이너 257px vs 카드 728px,
+          //   오른쪽 끝 744px -> 페이지 전체 가로 스크롤. 자세한 사유는
+          //   src/app/search/ResultList.tsx 의 같은 자리 주석 참고.
+          <Link key={item.id} href={`/properties/${item.id}`} className="block min-w-0">
             <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
               {/* 대표 사진 (2026-08-20 Sprint 224).
 
@@ -103,7 +108,10 @@ export default function FavoritesPage() {
               <div className="min-w-0 flex gap-3">
                 {item.thumbnail_url && <ResultThumbnail url={item.thumbnail_url} />}
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-start justify-between mb-1">
+                  {/* ★ `flex-wrap` — 좁은 화면에서 물건종류 배지가 세로로 한 글자씩 쪼개지는 것을 막는다.
+                      실측 근거와 수치는 src/app/search/ResultList.tsx 의 같은 자리 주석 참고
+                      (2026-08-21 Sprint 242, 실제 320px 뷰포트에서 9줄 -> 카드 403px). */}
+                  <div className="flex flex-wrap items-start justify-between mb-1">
                     <span className="text-xs font-medium text-blue-500 bg-blue-50 px-2 py-1 rounded-lg">
                       {item.property_type || '-'}
                     </span>

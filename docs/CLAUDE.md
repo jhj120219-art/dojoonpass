@@ -80,12 +80,33 @@ python -c "import selenium, pandas, pdfplumber, webdriver_manager; print('OK')"
 
 `httpx`만은 **어떤 소스도 직접 import하지 않아** 안 쓰는 것처럼 보이지만 지우면 안 된다 — `fastapi.testclient.TestClient`가 내부에서 쓰므로 없으면 TestClient 기반 회귀가 통째로 실행되지 않는다(자세한 사유와 `httpx2` 전환 예고는 `requirements.txt`의 주석 참고). 새 패키지 설치는 여전히 승인 영역이다(위 프로젝트 규칙).
 
-### Daily crawl pipeline (`run_daily.bat`, Task Scheduler job `LawAuctionDailyCrawl`)
+### Daily crawl pipeline (`run_daily.bat`, Task Scheduler job `DojoonPass-DailyCrawl`)
 ```bash
 python mvp_scraper.py          # crawl all courts -> validate -> normalize -> upsert into `auction` table -> enqueue documents
 python migrate_execute.py      # copies new `auction` rows into `auction_item` (the table the API actually serves)
 ```
 Separately: `doc_worker.py` (~02:00, via `run_doc_worker.bat`) drains `document_queue` to download per-item PDFs/status docs. `refresh_priority.py` (~01:50, via `run_priority_refresh.bat`) recalculates queue priority as auction dates approach.
+
+**2026-08-21 Sprint 247 실측 — 이 파이프라인은 지금 자동으로 돌지 않는다.**
+작업 스케줄러 249개를 전수로 훑어 이 저장소를 가리키는 작업이 **0개**임을 확인했다.
+`register_scheduler_tasks.ps1` 이 정의하는 세 작업(`DojoonPass-PriorityRefresh` 01:50 /
+`DojoonPass-DocWorker` 02:00 / `DojoonPass-DailyCrawl` 06:00)이 **전부 미등록**이다.
+그 결과가 지금의 Release Blocker다:
+
+```
+마지막 크롤            2026-08-12
+auction_item           1,876행 (DB 는 비어 있지 않다)
+기일이 남은 물건        0건  (가장 늦은 기일 2026-08-19, 오늘 2026-08-21)
+기본 검색               total=0  /  include_closed=true 면 1,876
+document_queue         pending 2,753 / done 559 / SKIPPED_EXPIRED 186
+```
+
+`doc_worker` 는 2026-08-21 08:59 에 한 번 돌았지만 **실행 창(~04:00)이 지나
+브라우저를 띄우지 않고 즉시 종료**했다(설계대로다). 즉 "로그가 최근이다"를
+"수집이 돌고 있다"로 읽으면 안 된다.
+
+상태를 직접 재려면 `python audit_schedule_health.py` (읽기 전용, 아무것도 바꾸지 않는다).
+등록은 **승인 영역**이라 에이전트가 임의로 하지 않는다.
 
 ### DB schema setup (once, against a fresh `auction.db`, in order)
 ```bash
@@ -127,4 +148,13 @@ Quick orientation map — see the matching `docs/*.md` for depth and the current
 - **`storage/`는 더 이상 통째로 무시되지 않는다** (2026-08-13 Sprint 75 실측 정정). 예전에는 `.gitignore`에 `storage/` 한 줄이 있어 크롤 데이터와 함께 `storage/database.py` / `storage/migrate_v4_1.py` / `storage/migrations/*.sql` 같은 **실동작 소스까지 통째로 빠졌다.** 2026-08-11 Sprint 51에 규칙이 정밀화되어 (`storage/*` + `!storage/*.py` + `!storage/migrations/*.sql`) 지금은 **23개 파일이 정상적으로 추적된다**(`git ls-files storage/`로 확인). 데이터 산출물만 무시된다. 이 문서의 예전 서술("today none of it is tracked")은 stale했고, 그대로 믿으면 `storage/` 변경이 커밋에 안 담긴다고 오판하게 된다.
 - `.gitignore` also blanket-ignores `step*.py`, `patch_*.py`, `check_*.py`, `*.db`, `*.csv`, `*.log`, `logs/`, `downloads/`, `documents/` as scratch/output, even though some (e.g. `patch_registry.py`) look like recent working scripts.
 - **경로 통합 완료 (2026-07-26)**: 과거에 `run_daily.bat`/`run_doc_worker.bat`/`run_priority_refresh.bat`가 존재하지 않는 `C:\Users\Administrator\Desktop\dojun-pass` 경로를 하드코딩하고 있었고, Task Scheduler(`LawAuctionDailyCrawl`, `PDF우선순위갱신`)도 같은 잘못된 경로를 가리켜 매일 실행이 실패하던 문제가 있었다. 지금은 모두 `Desktop\dojoonpass`(이 저장소의 실제 위치)로 통일했다. `.bat` 3개는 `cd /d %~dp0`(배치파일 자기 위치 기준)로 바꿔 절대경로 하드코딩을 없앴고, **Task Scheduler의 Execute 필드만 OS 제약상 절대경로를 유지**한다. `Desktop\기타\dojun-pass`(스키마가 다른 구버전 `auction.db` 보유)는 여전히 존재하지만 자동 실행 경로와는 무관하다.
+
+  **2026-08-21 Sprint 247 정정 — 위 문단의 작업 이름은 stale 하고, 지금은 등록 자체가 없다.**
+  `LawAuctionDailyCrawl` / `PDF우선순위갱신` 은 **옛 이름**이다. 현재 등록 스크립트
+  (`register_scheduler_tasks.ps1`)가 쓰는 이름은 `DojoonPass-DailyCrawl` /
+  `DojoonPass-DocWorker` / `DojoonPass-PriorityRefresh` 다. 그리고 실측 결과 **셋 다
+  등록되어 있지 않다**(스케줄러 249개 중 이 저장소를 가리키는 작업 0개).
+  옛 이름으로 스케줄러를 뒤지면 "없으니 문제없나 보다"로 오판하게 되므로 이름부터 맞춰야 한다.
+  `test_schema_hygiene.py` 의 `test_claude_md_scheduler_claims_match_register_script()` 가
+  이 문서와 등록 스크립트의 이름이 어긋나면 실패한다.
 - Korean-language log/print output and comments are the norm throughout the Python codebase — match that style when touching these files.

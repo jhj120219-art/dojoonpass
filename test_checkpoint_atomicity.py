@@ -228,12 +228,155 @@ def cleanup():
     check_true("qa temp dir removed", not os.path.exists(QA_DIR), QA_DIR)
 
 
+
+
+# ===========================================================================
+# RunLock — 동시 실행 방지 (2026-08-21 Sprint 242 신설)
+#
+# ## 왜 뒤늦게 생겼나
+#
+# `RunLock` 은 `storage/checkpoint.py` 에 있는데 이 파일은 checkpoint 저장/조회만
+# 검사하고 있었다. 락 자체는 `test_doc_worker_recovery.py` 가 **간접적으로만** 지나갔다.
+#
+# mutation 으로 그 공백을 확인했다(2026-08-21):
+#
+#     O_EXCL 제거 (보고 나서 쓴다 = 경쟁 창 생성)
+#         -> doc_worker_recovery 만 잡는다. 이 파일은 통과.
+#     `age_hours < stale_hours` 를 항상 거짓으로 (신선한 락도 뺏는다)
+#         -> ★ **어떤 검사도 잡지 못했다.**
+#
+# 두 번째가 위험하다. 그 상태에서는 **지금 돌고 있는 워커의 락을 다음 실행이 빼앗는다.**
+# 그러면 doc_worker 두 개가 동시에 뜨고, 이 락이 애초에 막으려던 것 —
+# Selenium 다운로드 폴더 교차 오염(한쪽이 받은 파일을 다른 쪽이 자기 것으로 착각해
+# **엉뚱한 물건에 연결**) — 이 그대로 일어난다. 조용히 틀리는 데이터가 된다.
+#
+# 그래서 락의 **판정 경계**를 여기서 못 박는다.
+# ===========================================================================
+
+def _lock_env():
+    """락 검사용 임시 디렉터리와 RunLock 클래스."""
+    import tempfile
+    from storage.checkpoint import RunLock
+    return tempfile.mkdtemp(prefix="qa_runlock_"), RunLock
+
+
+def test_runlock_refuses_a_second_holder():
+    print("\n--- 5. RunLock: 두 번째 실행은 들어오지 못한다 ---")
+    import os
+    import shutil
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "x.lock")
+        a = RunLock(path, stale_hours=5, label="A")
+        b = RunLock(path, stale_hours=5, label="B")
+
+        check("첫 실행은 락을 잡는다", a.acquire(), True)
+        check_true("락 파일이 실제로 생긴다", os.path.exists(path), path)
+        check("★ 두 번째 실행은 잡지 못한다", b.acquire(), False)
+        check_true("두 번째가 실패해도 락 파일은 그대로다(남의 것을 지우지 않는다)",
+                   os.path.exists(path), path)
+
+        a.release()
+        check_true("해제하면 락 파일이 사라진다", not os.path.exists(path), path)
+        check("해제 뒤에는 두 번째가 잡을 수 있다", b.acquire(), True)
+        b.release()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_does_not_steal_a_fresh_lock():
+    """★ 이 검사가 없어서 mutation 이 살아남았다.
+
+    `age_hours < stale_hours` 판정을 없애면 **신선한 락도 회수 대상**이 되어
+    실행 중인 워커의 락을 다음 실행이 빼앗는다. 그 상태는 조용하다 — 로그도
+    "오래된 락 회수"라고만 남고, 두 워커가 같은 다운로드 폴더를 쓰기 시작한다.
+    """
+    print("\n--- 6. RunLock: 살아 있는 락을 빼앗지 않는다 (경계) ---")
+    import os
+    import shutil
+    import time
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "y.lock")
+        STALE = 5.0
+        owner = RunLock(path, stale_hours=STALE, label="owner")
+        other = RunLock(path, stale_hours=STALE, label="other")
+        check("소유자가 락을 잡는다", owner.acquire(), True)
+
+        # 방금 만든 락 — 절대 뺏기면 안 된다
+        check("★ 갓 만든 락은 빼앗기지 않는다", other.acquire(), False)
+
+        # 임계 **직전**: 아직 살아 있다고 봐야 한다
+        just_under = time.time() - (STALE - 0.5) * 3600
+        os.utime(path, (just_under, just_under))
+        check("★ 임계 직전(%.1f시간)에도 빼앗기지 않는다" % (STALE - 0.5),
+              other.acquire(), False)
+        check_true("빼앗지 못했으므로 회수 토큰도 남기지 않는다",
+                   not os.path.exists(path + ".reclaim"), "reclaim 토큰이 남았다")
+
+        # 임계 **초과**: 죽은 실행으로 보고 회수해야 한다
+        just_over = time.time() - (STALE + 1) * 3600
+        os.utime(path, (just_over, just_over))
+        check("★ 임계를 넘으면(%.1f시간) 회수한다" % (STALE + 1), other.acquire(), True)
+        check_true("회수 후 락 파일은 존재한다(새 소유자 것)", os.path.exists(path), path)
+        other.release()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_is_atomic_under_concurrency():
+    """동시에 들어와도 **정확히 하나만** 이긴다.
+
+    `os.path.exists()` 로 보고 나서 `open()` 으로 쓰면 그 사이가 열려 있어
+    동시에 들어온 실행이 전부 통과한다(이 저장소 실측: 스레드 8 x 200라운드에서
+    **200라운드 전부** 8개가 동시에 성공). `O_CREAT|O_EXCL` 은 커널이 한 번에
+    판정하므로 그 창이 없다.
+    """
+    print("\n--- 7. RunLock: 동시 진입에서 하나만 이긴다 ---")
+    import os
+    import shutil
+    import threading
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "z.lock")
+        ROUNDS, THREADS = 60, 8
+        multi = 0
+        for _ in range(ROUNDS):
+            winners = []
+            barrier = threading.Barrier(THREADS)
+            lock = threading.Lock()
+
+            def worker():
+                rl = RunLock(path, stale_hours=5, label="t")
+                barrier.wait()
+                if rl.acquire():
+                    with lock:
+                        winners.append(rl)
+
+            ts = [threading.Thread(target=worker) for _ in range(THREADS)]
+            for t in ts: t.start()
+            for t in ts: t.join()
+            if len(winners) != 1:
+                multi += 1
+            for w in winners:
+                w.release()
+            try: os.remove(path)
+            except OSError: pass
+
+        print("    %d라운드 x %d스레드: 동시 성공이 일어난 라운드 %d" % (ROUNDS, THREADS, multi))
+        check("★ 어떤 라운드에서도 둘 이상이 동시에 잡지 못한다", multi, 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def run():
     try:
         test_save_get_clear_roundtrip()
         test_atomic_write_survives_simulated_crash()
         test_corrupted_file_does_not_crash_get()
         test_write_failure_does_not_stop_the_crawl()
+        test_runlock_refuses_a_second_holder()
+        test_runlock_does_not_steal_a_fresh_lock()
+        test_runlock_is_atomic_under_concurrency()
     finally:
         cleanup()
 

@@ -27,8 +27,10 @@ except Exception:
 
 ## 운영 로그를 건드리지 않는다
 
-`log_error`는 `logs/errors.jsonl`에 **상대 경로로** 쓴다. 그래서 이 테스트는 임시
-디렉터리로 `chdir`한 뒤 실행하고 끝나면 되돌린다 — 저장소의 `logs/`는 손대지 않는다.
+`log_error`는 모듈 변수 `court_crawler.ERROR_LOG_PATH`(저장소 루트 기준 절대경로)에
+쓴다. 이 테스트는 그 변수를 임시 경로로 갈아끼우고 끝나면 되돌린다 — 저장소의
+`logs/`는 손대지 않는다. (2026-08-21 Sprint 246 이전에는 `chdir` 로 격리했는데,
+그건 경로가 **cwd 에 의존한다는 결함** 덕분에 통하던 방식이었다.)
 
     python test_crawl_error_log.py
 """
@@ -57,21 +59,36 @@ def check_true(name, cond, detail=""):
 
 
 class TempCwd:
-    """임시 디렉터리에서 실행한다 — 저장소의 logs/를 오염시키지 않기 위해서다."""
+    """기록 경로를 임시 디렉터리로 돌린다 — 저장소의 logs/를 오염시키지 않기 위해서다.
+
+    ## 2026-08-21 Sprint 246: chdir 을 그만뒀다
+
+    예전에는 임시 디렉터리로 `os.chdir` 했다. 그게 통했던 이유는
+    `log_error` 가 `open("logs/errors.jsonl")` 처럼 **상대 경로**를 썼기 때문이다 —
+    즉 **격리 수단이 제품 결함에 얹혀 있었다.** 그 결함(다른 cwd 로 크롤하면 오류
+    기록이 엉뚱한 폴더로 흩어진다)을 고치자 이 방식은 당연히 못 쓰게 됐다.
+
+    지금은 제품이 모듈 변수 `court_crawler.ERROR_LOG_PATH` 를 **호출 시점에** 읽는다
+    (`doc_worker.LOCK_PATH` 와 같은 규칙). 테스트는 그것을 갈아끼운다. 이름 그대로
+    `TempCwd` 를 유지하는 것은 호출부를 건드리지 않기 위해서다.
+    """
 
     def __enter__(self):
-        self.old = os.getcwd()
+        from crawler import court_crawler
+        self.mod = court_crawler
+        self.saved = court_crawler.ERROR_LOG_PATH
         self.dir = tempfile.mkdtemp(prefix="qa_errlog_")
-        os.chdir(self.dir)
+        court_crawler.ERROR_LOG_PATH = os.path.join(self.dir, "logs", "errors.jsonl")
         return self.dir
 
     def __exit__(self, *a):
-        os.chdir(self.old)
+        self.mod.ERROR_LOG_PATH = self.saved
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def _read_lines():
-    path = os.path.join("logs", "errors.jsonl")
+    from crawler import court_crawler
+    path = court_crawler.ERROR_LOG_PATH
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as f:
@@ -220,6 +237,61 @@ def test_single_caller_assumption_holds():
           sorted(callers), ["crawler/court_crawler.py"])
 
 
+
+
+# ---------------------------------------------------------------------------
+# 6. ★ 기록 위치가 **작업 디렉터리에 의존하지 않는다** (2026-08-21 Sprint 246)
+#
+# 예전에는 `open("logs/errors.jsonl")` 라 cwd 기준이었다. 그러면 저장소 루트가 아닌
+# 곳에서 크롤했을 때 오류 기록이 그 폴더로 흩어진다 — 그리고 `except Exception: pass`
+# 때문에 **아무도 모른다.** 이 파일의 §2가 막으려던 "조용한 실패"와 같은 계열이고,
+# 원인만 다르다(디렉터리 부재 -> 경로 자체가 다른 곳).
+#
+# 별도 프로세스를 다른 cwd 에서 띄워 확인한다 — 같은 프로세스에서는 이미 임포트된
+# 모듈 상수가 남아 재현되지 않는다.
+# ---------------------------------------------------------------------------
+def test_log_path_does_not_depend_on_cwd():
+    print("\n--- 6. 기록 위치가 작업 디렉터리에 의존하지 않는다 (Sprint 246) ---")
+    import subprocess
+
+    repo = os.path.dirname(os.path.abspath(__file__))
+    from crawler import court_crawler
+
+    check_true("기본 경로가 절대경로다", os.path.isabs(court_crawler.ERROR_LOG_PATH),
+               court_crawler.ERROR_LOG_PATH)
+    check_true("기본 경로가 저장소의 logs/ 아래다",
+               os.path.normcase(court_crawler.ERROR_LOG_PATH)
+               == os.path.normcase(os.path.join(repo, "logs", "errors.jsonl")),
+               court_crawler.ERROR_LOG_PATH)
+
+    probe = (
+        "import os, sys;"
+        "sys.path.insert(0, os.environ['REPO']);"
+        "from crawler import court_crawler as c;"
+        "print('PATH=' + c.ERROR_LOG_PATH)"
+    )
+    env = dict(os.environ)
+    env["REPO"] = repo
+    env["PYTHONIOENCODING"] = "utf-8"
+    other = tempfile.mkdtemp(prefix="qa_errcwd_")
+    try:
+        r = subprocess.run([sys.executable, "-c", probe], cwd=other, env=env,
+                           capture_output=True, timeout=180)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        got = out.split("PATH=", 1)[1].strip() if "PATH=" in out else None
+        check_true("다른 cwd 에서 임포트가 성공한다", got is not None,
+                   (out + (r.stderr or b"").decode("utf-8", "replace"))[:200])
+        if got:
+            check("★ 다른 cwd 에서도 **같은 경로**를 가리킨다",
+                  os.path.normcase(got),
+                  os.path.normcase(court_crawler.ERROR_LOG_PATH))
+        check_true("★ 다른 폴더에 logs/ 를 만들지 않는다",
+                   not os.path.exists(os.path.join(other, "logs")),
+                   "-> 임포트만으로 엉뚱한 폴더에 디렉터리가 생겼다")
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_writes_entry()
     test_creates_logs_dir_when_missing()
@@ -227,6 +299,7 @@ if __name__ == "__main__":
     test_message_truncation_and_unicode()
     test_never_raises()
     test_single_caller_assumption_holds()
+    test_log_path_does_not_depend_on_cwd()
 
     print("\n" + "=" * 55)
     if failures:

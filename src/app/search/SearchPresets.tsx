@@ -175,13 +175,29 @@ export default function SearchPresets() {
     }
   }
 
+  // ★ `min-w-0` 이 반드시 있어야 한다 (2026-08-21 Sprint 240).
+  //
+  //   flex 항목의 `min-width` 기본값은 `auto` 라서, `flex-1`(= flex:1 1 0%)을 줘도
+  //   **자기 min-content 아래로는 줄어들지 않는다.** `<input>` 은 기본 `size` 속성이
+  //   만드는 고유 폭(브라우저 기본 약 170~200px)을 min-content 로 들고 있어서,
+  //   옆의 `shrink-0` 저장 버튼과 합치면 좁은 화면에서 줄이 통째로 넘친다.
+  //
+  //   실측(2026-08-21, 실제 320px 창): 저장 버튼 오른쪽 끝 295px vs 뷰포트 289px
+  //   -> `documentElement.scrollWidth > clientWidth` = **페이지 전체가 가로 스크롤**된다.
+  //   `min-w-0` 을 주면 input 이 남는 폭까지 줄어들어 넘침이 사라진다(재측정 0).
+  //
+  //   색/크기/간격은 하나도 바꾸지 않는다 — 줄어들 수 있게만 만든다.
   const inputClass =
-    'flex-1 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-200'
+    'flex-1 min-w-0 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-200'
 
   return (
     <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 mb-4">
       <h2 className="text-sm font-bold text-gray-900 mb-2">검색조건 저장</h2>
-      <div className="flex gap-2">
+      {/* ★ flex-wrap: 큰 글씨에서 "저장" 버튼이 부모를 넘지 않게 한다
+          (2026-08-21 Sprint 247). 실측 - 320px + 글꼴 200% 에서 7px 넘쳤다.
+          입력칸은 이미 `flex-1 min-w-0` 라 줄어들 수 있는데도 넘쳤다 - shrink-0 인
+          버튼 자체가 116px 까지 커지기 때문이다. 사유는 SearchForm.tsx 의 같은 주석 참고. */}
+      <div className="flex flex-wrap gap-2">
         <input
           type="text"
           placeholder="검색조건 이름"

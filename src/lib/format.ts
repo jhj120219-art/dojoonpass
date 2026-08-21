@@ -35,3 +35,89 @@ export function formatPriceEok(price: number) {
 export function formatWon(amount: number) {
   return amount.toLocaleString() + '원'
 }
+
+
+// ---------------------------------------------------------------------------
+// 물건 면적 — `auction_item.full_address` 끝 대괄호에서 읽는다
+//
+// 크롤러는 주소를 "...주소... [유형 구조 XX.XX㎡]" 형태로 저장한다. 면적 전용 컬럼은
+// 없지만 **데이터는 여기 있다**(2026-08-21 Sprint 248 전수 실측: 1,876행 중 1,854행이
+// 이 대괄호에 면적을 담고 있다).
+//
+// 원래 `src/app/search/ResultList.tsx` 안에 있었다. 여기로 옮긴 이유는 두 가지다:
+//   1. `.tsx` 는 JSX 라 Node 의 타입 스트리핑으로 import 할 수 없어 **동작 테스트를
+//      붙일 수 없었다.** 화면 모든 카드에 찍히는 값인데 계약이 고정돼 있지 않았다.
+//   2. `format.ts` 는 이미 "공용 표시 포맷 함수"의 자리다(파일 첫 주석).
+// 동작은 아래 ★ 한 곳을 빼면 그대로다.
+// ---------------------------------------------------------------------------
+
+// 1평 = 3.305785㎡(공식 환산값)
+export const SQM_PER_PYEONG = 3.305785
+
+export type ParsedArea = { label: string; sqm: number }
+
+/**
+ * 주소 끝 대괄호에서 면적을 읽는다. 면적 개념이 없는 물건(차량/선박 등)은 null.
+ *
+ * 다층 건물은 "1층 X㎡ 2층 Y㎡ ..."처럼 층별 면적이 나열되므로 **합산**한다.
+ *
+ * ★ 2026-08-21 Sprint 248 — 중첩 대괄호 버그 수정.
+ *   예전 정규식은 `/\[([^\]]*)\]\s*$/` 였다. `[^\]]*` 가 안쪽 `]` 를 넘지 못해
+ *   **대괄호가 중첩된 주소에서 통째로 실패**했다. 실측 4건이 그랬고, 넷 다 면적이
+ *   멀쩡히 적혀 있는데 화면에 아무것도 안 나왔다:
+ *
+ *     [토지 전[현황:묵전(죽림)] 105㎡ ...]                    -> 105㎡
+ *     [토지 전[(현황:전 및 묵전(임야)] 694㎡ ...]              -> 694㎡
+ *     [토지 임야 6571㎡ ... [... 제외]]                       -> 6571㎡
+ *     [건물 ... 97.58㎡ ... 46.4㎡ [현황: 멸실]]               -> 143.98㎡
+ *
+ *   탐욕적 `(.*)` 로 바꾸면 **바깥 대괄호 전체**를 잡는다. 전체 1,876행으로 대조해
+ *   새로 파싱 4건 / 값이 달라진 행 0건 / 파싱을 잃은 행 0건을 확인했다.
+ *
+ * 알려진 한계(고치지 않았다 — 제품 판단 영역):
+ *   - 단위가 '평'인 주소 8건은 여전히 null 이다. 7건은 단순하지만 1건(id=6495)은
+ *     '192평6홉9작' 처럼 홉/작 하위 단위에 층 목록이 중복돼 있어, 일괄 환산하면
+ *     **틀린 숫자를 보여줄 위험**이 있다. 아무것도 안 보여주는 편이 낫다.
+ *   - 지분 물건은 대괄호의 면적이 **전체 면적**이다(예: "5178분의 4657"). 지분을
+ *     반영해 표시할지는 표기 정책이라 여기서 정하지 않는다.
+ */
+export function parseArea(fullAddress: string | null): ParsedArea | null {
+  if (!fullAddress) return null
+  const bracketMatch = fullAddress.match(/\[(.*)\]\s*$/)
+  if (!bracketMatch) return null
+  const inside = bracketMatch[1]
+  // ★ 2026-08-21 Sprint 249 — '대지권의 표시' 뒤는 **이 물건의 면적이 아니다.**
+  //
+  //   집합건물 등기에는 전유부분 면적 뒤에 대지권(그 건물이 깔고 앉은 **토지 전체**)이
+  //   함께 적히는 형식이 있다. 그대로 다 더하면 아파트 한 채가 토지 전체를 가진 것처럼 된다.
+  //
+  //   실측(id=6442): '집합건물 ... 74.5482㎡ 대지권의 표시 토지의 표시 : ... 대 500㎡
+  //   ... 대지권 비율 : 500분의 21.7849'
+  //       고치기 전  건물 574.55㎡ (173.80평)   <- 74.5482 + 500 을 더한 값. 7.7배 부풀었다
+  //       고친 뒤    건물  74.55㎡ ( 22.55평)   <- 전유부분 면적
+  //
+  //   층별 합산(아래 while 루프)은 그대로 둔다 - 다층 건물의 '1층 X㎡ 2층 Y㎡' 는
+  //   전부 이 물건의 면적이라 더하는 것이 맞다. 대지권만 성격이 다르다.
+  //
+  //   전체 1,876행 대조: 값이 바뀌는 행 1개(위 id=6442), 나머지 1,875행 동일,
+  //   파싱을 잃은 행 0개.
+  const landRightsAt = inside.search(/대지권|토지의\s*표시|대지의\s*표시/)
+  const areaScope = landRightsAt >= 0 ? inside.slice(0, landRightsAt) : inside
+  const areaRe = /([0-9]+(?:\.[0-9]+)?)\s*(?:㎡|m2|m²)/g
+  let total = 0
+  let count = 0
+  let m: RegExpExecArray | null
+  while ((m = areaRe.exec(areaScope)) !== null) {
+    total += Number(m[1])
+    count += 1
+  }
+  if (count === 0) return null
+  const label = inside.startsWith('토지') ? '토지' : '건물'
+  return { label, sqm: total }
+}
+
+/** "건물 84.50㎡ (25.56평)" */
+export function formatArea(area: ParsedArea): string {
+  const pyeong = (area.sqm / SQM_PER_PYEONG).toFixed(2)
+  return `${area.label} ${area.sqm.toFixed(2)}㎡ (${pyeong}평)`
+}

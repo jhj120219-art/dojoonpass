@@ -54,7 +54,20 @@ export default function SiteHeader({ current, title }: SiteHeaderProps) {
 
   return (
     <header className="bg-white border-b border-gray-100">
-      <div className={`${CONTAINER} py-4 flex items-center justify-between gap-4`}>
+      {/* ★ `flex-wrap` — 좁은 화면에서 헤더가 페이지를 가로로 밀어내지 않게 한다
+          (2026-08-21 Sprint 240).
+
+          실측(실제 320px 창, **로그인 상태**): 오른쪽 묶음(검색·최근 본 물건·관심물건·
+          마이페이지·로그아웃)이 276px 인데 CONTAINER 안쪽 가용 폭은 257px 다.
+          `shrink-0` 이라 줄어들지도 않아 오른쪽 끝이 308px -> 뷰포트 289px 를 넘고,
+          `documentElement.scrollWidth > clientWidth` 가 되어 **모든 화면이** 가로로
+          스크롤됐다(헤더는 전 화면 공용이다). 비로그인일 때는 '로그인' 한 줄이라
+          219px 로 들어가서 — 그동안 로그아웃 상태로만 보면 멀쩡해 보였다.
+
+          고치는 방식은 **줄바꿈 허용뿐**이다. 색·글자크기·간격(gap)은 하나도 바꾸지
+          않는다(제품 디자인 결정은 승인 영역). 한 줄에 들어가는 폭에서는 wrap 이
+          발동하지 않으므로 360/390/430px 및 데스크톱 렌더는 그대로다 — 재측정으로 확인. */}
+      <div className={`${CONTAINER} py-4 flex flex-wrap items-center justify-between gap-4`}>
         <div className="flex items-baseline gap-3 min-w-0">
           <Link href="/" className="text-lg font-bold text-gray-900 shrink-0">
             콕찰
@@ -64,7 +77,11 @@ export default function SiteHeader({ current, title }: SiteHeaderProps) {
               (Sprint 47 접근성 감사에서 발견). 시각적 크기는 그대로 두고 시맨틱만 복구한다. */}
           {title && <h1 className="text-sm font-normal text-gray-400 truncate hidden sm:block">{title}</h1>}
         </div>
-        <div className="flex items-center gap-3 shrink-0">
+        {/* `shrink-0` -> `min-w-0` + `flex-wrap`: 이 묶음 자체도 줄어들고 접힐 수 있어야
+            한다. `shrink-0` 이면 CONTAINER 보다 넓어도 그대로 버텨 페이지를 밀어낸다.
+            `justify-end` 는 접혔을 때도 지금처럼 오른쪽 정렬을 유지하기 위한 것이다
+            (한 줄에 들어갈 때는 바깥 `justify-between` 이 이미 오른쪽에 붙이므로 변화 없음). */}
+        <div className="flex flex-wrap items-center justify-end gap-3 min-w-0">
           <PrimaryNav current={current} />
           {authChecked &&
             (email ? (

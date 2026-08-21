@@ -671,7 +671,14 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
       </div>
       </div>
 
-      <div className="py-4 flex gap-2">
+      {/* ★ flex-wrap: 큰 글씨에서 버튼이 부모를 넘지 않게 한다 (2026-08-21 Sprint 247).
+          실측 - 320px 폭 + 루트 글꼴 200%: "초기화"(shrink-0)가 커지면서 옆의 "검색"
+          (flex-1, min-width:auto)을 밀어 부모 175px 를 8px 넘겼다.
+          줄바꿈을 허용하면 두 버튼이 위아래로 쌓이고 **글자는 그대로 다 보인다.**
+          shrink-0 를 떼거나 min-w-0 를 주는 방법도 넘침은 없앴지만, 그쪽은 버튼이
+          찌그러져 라벨이 잘린다 - WCAG 1.4.4 는 확대 시 "내용 손실 없음"을 요구한다.
+          글꼴이 보통 크기일 때는 두 버튼이 한 줄에 들어가므로 화면이 바뀌지 않는다. */}
+      <div className="py-4 flex flex-wrap gap-2">
         <button
           type="button"
           onClick={resetForm}

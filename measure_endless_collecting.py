@@ -34,7 +34,11 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DB_PATH = "auction.db"
+# ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
+#   "no such table" 로 죽는다(실측). 운영 도구가 엉뚱한 DB 를 보는 것보다 낫지만,
+#   찌꺼기 파일이 남고 오류 문구가 원인을 가린다.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
 
 # 2026-08-18 Sprint 189: 여기 있던 하드코딩 집합 {"pending","processing","in_progress"}는
 # (1) 실제로 없는 값("processing")을 세고 (2) 새로 생긴 재수집 어휘를 못 셌다.

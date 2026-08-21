@@ -486,3 +486,369 @@ describe('응답 보안 헤더 (Sprint 127) — 소스 계약', () => {
     )
   })
 })
+
+describe('좁은 폭 가로 넘침 (Sprint 240) — 소스 계약', () => {
+  // ────────────────────────────────────────────────────────────────
+  // 2026-08-21 Sprint 240. **실제 320px 창**에서 처음으로 재현했다.
+  //
+  // 그동안 이 저장소는 뷰포트를 줄이지 못해(Sprint 219/223/224/231) 좁은 폭을
+  // 간접적으로만 쟀다. 이번에 `window.open(..., 'width=320')` 으로 진짜 320px
+  // 창을 띄우니 미디어쿼리까지 정상 평가됐고(`matchMedia('(min-width: 768px)')`
+  // = false), 그 창에서 두 곳이 실제로 넘쳤다:
+  //
+  //   /search        검색조건 저장의 저장 버튼   오른쪽 끝 295px vs 뷰포트 289px
+  //   전 화면(헤더)   로그인 상태의 우측 메뉴 묶음  오른쪽 끝 308px vs 뷰포트 289px
+  //
+  // 둘 다 `documentElement.scrollWidth > clientWidth` 를 만들어 **페이지 전체가
+  // 가로로 스크롤**됐다. 헤더는 전 화면 공용이라 파급이 컸고, 비로그인일 때는
+  // 메뉴가 짧아 들어가서 — 로그아웃 상태로만 보면 멀쩡해 보였다.
+  //
+  // 여기서 소스로 고정하는 이유: CI/테스트 러너에는 브라우저가 없어 실제 렌더를
+  // 다시 잴 수 없다. 그래서 **고침을 되돌리는 편집**을 잡는 것으로 대신한다.
+  // (실제 렌더 재측정 결과는 docs/SPRINT240_*.md 에 수치로 남겼다.)
+  // ────────────────────────────────────────────────────────────────
+  async function read(file) {
+    const { promises: fs } = await import('node:fs')
+    return fs.readFile(file, 'utf8')
+  }
+  /** 주석을 걷어낸 "실제 코드"만 본다 — 이유를 적은 주석이 스스로를 통과시키면 안 된다. */
+  function codeOnly(src) {
+    return src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*')
+      })
+      .join('\n')
+  }
+
+  test('검색조건 저장 입력이 min-w-0 을 갖는다 (flex min-width:auto 넘침)', async () => {
+    const code = codeOnly(await read('src/app/search/SearchPresets.tsx'))
+    const m = code.match(/const inputClass\s*=\s*\n?\s*'([^']*)'/)
+    assert.ok(m, 'SearchPresets.tsx 에서 inputClass 를 찾지 못했습니다(검사가 공허해졌습니다)')
+    const cls = m[1]
+    assert.ok(cls.includes('flex-1'), `inputClass 가 flex-1 이 아닙니다: ${cls}`)
+    assert.ok(
+      cls.includes('min-w-0'),
+      'SearchPresets 의 입력에 min-w-0 이 없습니다 — flex 항목은 min-width 기본값이 auto 라 ' +
+        'input 의 고유 폭 아래로 줄지 않고, 320px 에서 옆의 저장 버튼과 함께 줄을 넘깁니다 ' +
+        '(실측: 저장 버튼 오른쪽 끝 295px vs 뷰포트 289px).'
+    )
+  })
+
+  test('공통 헤더가 좁은 폭에서 접힐 수 있다 (flex-wrap + 우측 묶음이 shrink-0 이 아니다)', async () => {
+    const code = codeOnly(await read('src/components/SiteHeader.tsx'))
+
+    // (1) 바깥 줄이 접힐 수 있어야 한다
+    const rowMatch = code.match(/\$\{CONTAINER\}\s+py-4\s+([^`]*)`/)
+    assert.ok(rowMatch, 'SiteHeader 의 헤더 줄 className 을 찾지 못했습니다(검사가 공허해졌습니다)')
+    assert.ok(
+      rowMatch[1].includes('flex-wrap'),
+      `헤더 줄에 flex-wrap 이 없습니다 — 320px 로그인 상태에서 페이지 전체가 가로 스크롤됩니다: ${rowMatch[1]}`
+    )
+
+    // (2) 우측 메뉴 묶음이 shrink-0 으로 버티면 안 된다
+    const rightMatch = code.match(/className="flex[^"]*justify-end[^"]*"/)
+    assert.ok(
+      rightMatch,
+      'SiteHeader 의 우측 묶음(justify-end) 을 찾지 못했습니다(검사가 공허해졌습니다)'
+    )
+    const right = rightMatch[0]
+    assert.ok(
+      !/\bshrink-0\b/.test(right),
+      `헤더 우측 묶음이 shrink-0 입니다 — 줄어들지 못해 CONTAINER 밖으로 밀려납니다: ${right}`
+    )
+    assert.ok(
+      /\bflex-wrap\b/.test(right) && /\bmin-w-0\b/.test(right),
+      `헤더 우측 묶음에 flex-wrap 과 min-w-0 이 둘 다 있어야 합니다: ${right}`
+    )
+  })
+
+  // -------------------------------------------------------------------------
+  // 큰 글씨(루트 글꼴 200%)에서 버튼 줄이 부모를 넘지 않는가 — 2026-08-21 Sprint 247
+  //
+  // ## 왜 생겼나 — 접근성 검사가 소스만 세고 있었다
+  //
+  // `test_frontend_accessibility.py` 는 1,143줄이지만 `text-xs` 가 몇 개인지 같은
+  // **문자열만 센다.** "rem 을 쓰니 루트 글꼴을 키우면 따라 커진다"는 가정은 적혀
+  // 있었지만, 키웠을 때 레이아웃이 견디는지는 **한 번도 렌더링해서 재지 않았다.**
+  //
+  // 실제 브라우저로 320/360/390/430 × 글꼴 100/150/200% = 36칸을 재니 2칸이 깨졌다:
+  //
+  //     /        320px 글꼴 200%  ->  DIV.py-4 flex gap-2 > BUTTON.flex-1  (+8px, 부모 175)
+  //     /search  320px 글꼴 200%  ->  DIV.flex gap-2 > BUTTON.shrink-0     (+7px, 부모 175)
+  //
+  // 원인은 이 저장소가 이미 여러 번 밟은 flex `min-width:auto` 다. `shrink-0` 버튼이
+  // 글꼴을 따라 커지는데 옆의 형제는 자기 콘텐츠 폭 아래로 줄지 못해 부모를 넘긴다.
+  //
+  // ## 왜 flex-wrap 인가 (min-w-0 이 아니라)
+  //
+  // 둘 다 넘침은 없앤다(브라우저에서 실측). 그런데 `min-w-0`/`shrink-0` 제거 쪽은
+  // 버튼이 찌그러져 **라벨이 잘린다**. WCAG 1.4.4 는 200% 확대에서 "내용 손실 없음"을
+  // 요구하므로, 줄을 바꿔 글자를 온전히 보여 주는 `flex-wrap` 이 맞다.
+  // 보통 크기에서는 두 버튼이 한 줄에 들어가 화면이 달라지지 않는다.
+  //
+  // 이 검사는 그 두 줄이 접힐 수 있는 상태로 남아 있는지 고정한다.
+  // -------------------------------------------------------------------------
+  test('큰 글씨에서 검색 버튼 줄이 접힐 수 있다 (SearchForm)', async () => {
+    const code = codeOnly(await read('src/app/search/SearchForm.tsx'))
+    const row = code.match(/<div className="py-4 flex([^"]*)"/)
+    assert.ok(
+      row,
+      'SearchForm 의 버튼 줄(py-4 flex ...) 을 찾지 못했습니다(검사가 공허해졌습니다)'
+    )
+    assert.ok(
+      /\bflex-wrap\b/.test(row[1]),
+      '검색/초기화 버튼 줄에 flex-wrap 이 없습니다 — 루트 글꼴 200% + 320px 에서 ' +
+        'shrink-0 인 "초기화" 가 커지며 "검색"(flex-1, min-width:auto)을 밀어 ' +
+        `부모 175px 를 8px 넘깁니다: ${row[1]}`
+    )
+  })
+
+  test('큰 글씨에서 검색조건 저장 줄이 접힐 수 있다 (SearchPresets)', async () => {
+    const code = codeOnly(await read('src/app/search/SearchPresets.tsx'))
+    // 저장 버튼을 품은 줄을 찾는다
+    const row = code.match(/<div className="flex([^"]*)">\s*<input/)
+    assert.ok(
+      row,
+      'SearchPresets 의 입력+저장 줄을 찾지 못했습니다(검사가 공허해졌습니다)'
+    )
+    assert.ok(
+      /\bflex-wrap\b/.test(row[1]),
+      '검색조건 저장 줄에 flex-wrap 이 없습니다 — 입력칸이 이미 min-w-0 인데도 ' +
+        'shrink-0 인 "저장" 버튼 자체가 글꼴 200% 에서 116px 까지 커져 ' +
+        `부모 175px 를 7px 넘깁니다: ${row[1]}`
+    )
+  })
+
+  test('주요 메뉴(PrimaryNav)가 접힐 수 있다', async () => {
+    const code = codeOnly(await read('src/components/PrimaryNav.tsx'))
+    const nav = code.match(/<nav[^>]*className="([^"]*)"/)
+    assert.ok(nav, 'PrimaryNav 의 nav className 을 찾지 못했습니다(검사가 공허해졌습니다)')
+    assert.ok(
+      nav[1].includes('flex-wrap'),
+      `PrimaryNav 에 flex-wrap 이 없습니다 — 메뉴 4개가 한 줄에 안 들어가면 화면을 밀어냅니다: ${nav[1]}`
+    )
+    // 접근성 랜드마크는 그대로여야 한다(이 고침이 다른 것을 망가뜨리지 않았는지)
+    assert.ok(/aria-label="주요 메뉴"/.test(code), 'PrimaryNav 의 nav 랜드마크 이름이 사라졌습니다')
+  })
+})
+
+describe('목록 카드가 grid 트랙을 밀어내지 않는다 (Sprint 240) — 소스 계약', () => {
+  // ────────────────────────────────────────────────────────────────
+  // 2026-08-21 실측(실제 320px 창). 세 목록 화면이 **같은 카드 구조**를 쓰는데,
+  // grid 항목인 `<Link className="block">` 의 `min-width` 가 기본값 `auto` 였다.
+  //
+  //   grid 트랙은 항목의 min-content 아래로 줄지 않는다. 카드 안에는 `truncate`
+  //   (= white-space:nowrap) 문단이 있어 그 min-content 가 **문자열 전체 폭**이다.
+  //   -> 컨테이너는 257px 인데 트랙이 그보다 넓어져 페이지가 가로로 스크롤됐다.
+  //
+  //   /search             컨테이너 257px vs 트랙 277.6px (카드 오른쪽 끝 294 vs 289)
+  //   /favorites          컨테이너 257px vs 트랙 727.7px (카드 오른쪽 끝 744 vs 289)
+  //   /properties/recent  같은 구조 — 같은 결함
+  //
+  // `min-w-0` 을 준 뒤 세 화면 모두 트랙 257px, 넘침 0, 가로 스크롤 없음으로
+  // 재측정됐고, 900px/1400px 에서 2열/3열이 그대로 나오는 것도 확인했다.
+  //
+  // ★ 이 검사가 잡는 것은 "min-w-0 을 지우는 편집"이다. 실제 렌더 재측정은
+  //   브라우저가 필요해 CI 에서 못 한다(수치는 docs/SPRINT240_*.md 에 남겼다).
+  // ────────────────────────────────────────────────────────────────
+  const LIST_FILES = [
+    'src/app/search/ResultList.tsx',
+    'src/app/favorites/page.tsx',
+    'src/app/properties/recent/page.tsx',
+  ]
+
+  async function read(file) {
+    const { promises: fs } = await import('node:fs')
+    return fs.readFile(file, 'utf8')
+  }
+  function codeOnly(src) {
+    return src
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*')
+      })
+      .join('\n')
+  }
+
+  for (const file of LIST_FILES) {
+    test(`${file} 의 카드 Link 가 min-w-0 을 갖는다`, async () => {
+      const code = codeOnly(await read(file))
+
+      // 먼저 이 파일이 실제로 반응형 grid 를 쓰는지 확인한다 —
+      // 구조가 바뀌었는데 검사만 남아 조용히 통과하는 것을 막는다.
+      assert.ok(
+        /grid[^"'`]*md:grid-cols-2/.test(code),
+        `${file} 에서 반응형 grid(md:grid-cols-2) 를 찾지 못했습니다 — 검사가 공허해졌습니다`
+      )
+
+      const links = code.match(/<Link[^>]*className="block[^"]*"/g)
+      assert.ok(
+        links && links.length > 0,
+        `${file} 에서 카드 Link(className="block...") 를 찾지 못했습니다 — 검사가 공허해졌습니다`
+      )
+      for (const l of links) {
+        assert.ok(
+          /className="block[^"]*\bmin-w-0\b/.test(l),
+          `${file} 의 카드 Link 에 min-w-0 이 없습니다 — grid 항목의 min-width 기본값 auto ` +
+            `때문에 좁은 화면에서 트랙이 카드 min-content 만큼 벌어져 페이지가 가로로 ` +
+            `스크롤됩니다(실측 320px): ${l}`
+        )
+      }
+    })
+  }
+})
+
+describe('물건종류 배지가 세로로 쪼개지지 않는다 (Sprint 242) — 소스 계약', () => {
+  // ────────────────────────────────────────────────────────────────
+  // 2026-08-21, `audit_viewport.py` 가 **실제 320px 뷰포트**에서 처음 잡았다.
+  //
+  //   카드의 [물건종류 배지] / [D-day + 하트] 줄은 justify-between 인데
+  //   오른쪽 묶음이 shrink-0 이라 줄어들지 않는다. 그래서 폭이 모자라면
+  //   **왼쪽 배지만** 계속 짜부라진다.
+  //
+  //     320px  가용 147px = 배지 37px + gap 8 + 오른쪽 110px(고정)
+  //            "연립주택,다세대,빌라" 가 37px 안에서 **9줄**로 접힌다
+  //            -> 한 글자씩 세로로 늘어선 기둥, 카드 높이 403px
+  //     360px  3줄 / 390px 2줄 / 430px 2줄
+  //
+  //   페이지가 가로로 스크롤되지는 않아서 "가로 넘침만" 보던 검사들은 전부 놓쳤다.
+  //   `flex-wrap` 을 준 뒤 전 폭에서 **1줄**(144px)로 회복됐다.
+  //
+  // 여기서 소스로 잠그는 이유: 실제 렌더 재측정은 브라우저가 필요해 CI 에서 못 한다.
+  // (재현 도구는 저장소에 있다 — `python audit_viewport.py`)
+  // ────────────────────────────────────────────────────────────────
+  const CARD_FILES = [
+    'src/app/search/ResultList.tsx',
+    'src/app/favorites/page.tsx',
+    'src/app/properties/recent/page.tsx',
+  ]
+
+  async function read(file) {
+    const { promises: fs } = await import('node:fs')
+    return fs.readFile(file, 'utf8')
+  }
+  function codeOnly(src) {
+    return src.split('\n').filter((l) => {
+      const t = l.trim()
+      return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*') && !t.startsWith('{/*')
+    }).join('\n')
+  }
+
+  for (const file of CARD_FILES) {
+    test(`${file} 의 배지 줄이 접힐 수 있다`, async () => {
+      const code = codeOnly(await read(file))
+      const rows = code.match(/className="[^"]*items-start justify-between[^"]*"/g)
+      assert.ok(
+        rows && rows.length > 0,
+        `${file} 에서 배지 줄(items-start justify-between)을 찾지 못했습니다 — 검사가 공허해졌습니다`
+      )
+      for (const r of rows) {
+        assert.ok(
+          /\bflex-wrap\b/.test(r),
+          `${file} 의 배지 줄에 flex-wrap 이 없습니다 — 좁은 화면에서 물건종류 배지가 ` +
+            `세로 한 글자씩 쪼개집니다(실측 320px: 9줄, 카드 높이 403px): ${r}`
+        )
+      }
+    })
+  }
+
+  test('재현 도구가 저장소에 있다(주석만 남고 도구가 사라지지 않도록)', async () => {
+    const src = await read('audit_viewport.py')
+    assert.ok(/Emulation\.setDeviceMetricsOverride/.test(src),
+      'audit_viewport.py 가 진짜 뷰포트를 만들지 않습니다')
+    assert.ok(/parentOverflow/.test(src),
+      'audit_viewport.py 에 부모 넘침 탐지가 없습니다 — 이 결함을 잡은 검사입니다')
+    assert.ok(!/--hide-scrollbars/.test(src.replace(/#[^\n]*/g, '')),
+      'audit_viewport.py 가 스크롤바를 숨깁니다 — 가용 폭이 넓어져 결함이 안 보입니다')
+  })
+})
+
+describe('사진 상태를 화면이 구분해서 말한다 (Sprint 243) — 소스 계약', () => {
+  // ────────────────────────────────────────────────────────────────
+  // 사진 상태는 네 가지이고, 사용자가 **할 일이 서로 다르다**:
+  //
+  //     READY       볼 사진이 있다
+  //     NO_IMAGE    법원이 사진을 안 준다        -> 기다려도 안 생긴다
+  //     FAILED      재시도가 소진된 진짜 실패     -> 다음 수집에서 다시 시도된다
+  //     COLLECTING  아직 수집 전                 -> 기다리면 된다
+  //
+  // API 쪽 판정(`api/v1/item.py:_images_status`)은 mutation 3종으로 잠겨 있다
+  // (test_asset_pipeline.py). 그런데 **화면이 그 구분을 그리는지는 아무도 보지 않았다.**
+  //
+  // 2026-08-21 실측: 상세페이지의 `FAILED` 분기를 `false` 로 죽였더니
+  //   tsc 0 / node 전 검사 통과 / frontend_accessibility 통과 / document_status_sync 통과
+  // — **아무도 울지 않았다.** 그러면 재시도가 소진된 실패가 "사진 수집 중입니다"로 보인다.
+  // 이 저장소의 함정 목록 "이미지 없음과 이미지 실패를 혼동하지 않는다"가 화면에서 깨진다.
+  //
+  // ★ 문구는 고정하지 않는다(제품 결정이다). **분기의 존재와 상호 구별**만 고정한다.
+  //
+  // ★ 이 검사를 처음 쓸 때 두 번 틀렸고, 그 경위를 남긴다:
+  //     (1) 어휘 출처를 `api/v1/item.py` 로 잡았는데 그 파일에는 NO_IMAGE 가 **주석에만**
+  //         있다. API 는 `row["status"]` 를 그대로 흘려보내므로 값의 출처는
+  //         `storage/database.py`(DOC_STATUS_HAS_ARTIFACT / doc_worker.py)다.
+  //     (2) `new RegExp("...\\s*...")` 를 셸 heredoc 으로 쓰다가 역슬래시가 한 겹
+  //         사라져 `s*` 가 됐다. 정규식 대신 **공백을 지운 문자열 포함 검사**로 바꿨다.
+  // ────────────────────────────────────────────────────────────────
+  const DETAIL = 'src/app/properties/[id]/page.tsx'
+
+  async function read(file) {
+    const { promises: fs } = await import('node:fs')
+    return fs.readFile(file, 'utf8')
+  }
+  /** 주석을 걷어내고 공백을 지운다 — 들여쓰기/줄바꿈에 흔들리지 않게. */
+  function normalized(src) {
+    const code = src.split('\n').filter((l) => {
+      const t = l.trim()
+      return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*') && !t.startsWith('{/*')
+    }).join('\n')
+    return code.replace(/\s+/g, '')
+  }
+
+  test('사진 상태 어휘가 제품 코드에 실제로 있다(검사가 공허하지 않다)', async () => {
+    // 값을 만들어내는 곳들. 여기가 바뀌면 이 검사의 전제가 무너진 것이므로 알려야 한다.
+    const dw = await read('doc_worker.py')
+    const db = await read('storage/database.py')
+    assert.ok(/"NO_IMAGE"/.test(dw), 'doc_worker.py 가 NO_IMAGE 를 만들지 않습니다')
+    assert.ok(/"NO_IMAGE"/.test(db), 'storage/database.py 에 NO_IMAGE 어휘가 없습니다')
+    const api = await read('api/v1/item.py')
+    assert.ok(/_images_status/.test(api), 'api/v1/item.py 에 _images_status 가 없습니다')
+  })
+
+  test('상세페이지가 NO_IMAGE 와 FAILED 를 각각 따로 분기한다', async () => {
+    const flat = normalized(await read(DETAIL))
+    for (const state of ['NO_IMAGE', 'FAILED']) {
+      assert.ok(
+        flat.includes(`images_status==='${state}'`),
+        `${DETAIL} 가 images_status === '${state}' 를 분기하지 않습니다 — ` +
+          `그 상태의 사용자가 다른 상태의 안내를 보게 됩니다 ` +
+          `(NO_IMAGE=법원이 안 준다 / FAILED=재시도 소진: 사용자가 할 일이 다릅니다)`
+      )
+    }
+  })
+
+  test('두 분기가 서로 다른 **문구**를 말한다(구분한 의미가 있다)', async () => {
+    // ★ 조건문을 뺀 **본문 문구**만 비교한다.
+    //   처음에는 매치 지점부터 200자를 잘라 비교했는데, 그 조각은 늘
+    //   `images_status==='NO_IMAGE'` / `...'FAILED'` 로 **시작이 달라서**
+    //   문구를 똑같이 바꿔도 통과했다(2026-08-21 mutation 으로 확인 - 공허한 단언이었다).
+    //   그래서 `<p ...> 여기 </p>` 안의 글자만 뽑아 비교한다.
+    const flat = normalized(await read(DETAIL))
+    const message = (state) => {
+      const i = flat.indexOf(`images_status==='${state}'`)
+      if (i < 0) return ''
+      const seg = flat.slice(i, i + 400)
+      const m = seg.match(/>([^<>]{4,})</)          // 첫 텍스트 노드
+      return m ? m[1] : ''
+    }
+    const a = message('NO_IMAGE'), b = message('FAILED')
+    assert.ok(a && b, `분기 문구를 읽지 못했습니다(검사가 공허해졌습니다): a=${a} b=${b}`)
+    assert.notEqual(
+      a, b,
+      `NO_IMAGE 와 FAILED 가 같은 문구입니다(${a}) — 구분한 의미가 없습니다. ` +
+        `NO_IMAGE 는 "기다려도 안 생긴다", FAILED 는 "다시 시도된다" 여서 안내가 달라야 합니다`
+    )
+  })
+})

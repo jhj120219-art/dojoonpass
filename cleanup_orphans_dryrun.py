@@ -28,13 +28,18 @@
 
     python cleanup_orphans_dryrun.py
 """
+import datetime
 import os
 import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DB_PATH = "auction.db"
+# ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
+#   "no such table" 로 죽는다(실측). 운영 도구가 엉뚱한 DB 를 보는 것보다 낫지만,
+#   찌꺼기 파일이 남고 오류 문구가 원인을 가린다.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
 DOCUMENT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "documents")
 
 
@@ -119,6 +124,87 @@ def main() -> int:
                     for f in files)
         print("    %s / %s / %s -> %s (%.1f KB)"
               % (court, case, item_no, files, total / 1024))
+
+
+    # ------------------------------------------------------------------
+    # 3-b. 고아 큐 행이 실제로 **얼마를** 낭비하는가 (2026-08-21 Sprint 241 신설)
+    #
+    # 이 스크립트는 지금까지 고아 큐 행을 "해를 끼치지 않고 낭비만 한다"고만 적었다.
+    # **얼마를** 낭비하는지가 없으면 정리 우선순위를 정할 수 없다. 그래서 잰다.
+    #
+    # 비용 모델은 추정이 아니라 **진짜 `doc_worker.main()` 을 돌려 관측한 것**이다
+    # (2026-08-21, 브라우저만 가짜. 고아 사건에 대해 `go_to_case_detail()` 이 False 를
+    #  돌려주는 실제 상황을 재현):
+    #
+    #     30분 간격 cycle1  이동 12회  retry 1  -> pending
+    #     30분 간격 cycle2  이동 12회  retry 2  -> pending
+    #     30분 간격 cycle3  이동 12회  retry 3  -> failed (종결)
+    #     cycle4~6          이동  0회           (종결됐으므로 그날은 더 안 돈다)
+    #     ★ 다음 날         이동 12회           reset_stale_queue() 가 failed 를 되살린다
+    #
+    # 즉 **기일이 남은 고아 1행 = 하루 MAX_DOC_RETRY(3)회 이동**이고,
+    # 그것이 **기일이 지날 때까지 매일 반복**된다.
+    #
+    # 반대로 **기일이 이미 지난 고아는 공짜다.** 만료 가드가 브라우저를 열기 전에
+    # SKIPPED_EXPIRED 로 종결하고, 그 상태는 reset_stale_queue() 가 되살리지 않는다
+    # (같은 실측에서 이동 0회 확인).
+    # ------------------------------------------------------------------
+    head("3-b. 고아 큐 행의 워커 시간 비용 (실측 모델)")
+
+    NAV_SECONDS = 10.9          # Sprint 235 실측 중앙값 (go_to_case_detail)
+    MAX_RETRY = 3               # storage.database.MAX_DOC_RETRY
+    today = datetime.date.today().isoformat()
+
+    claimable = {"pending", "failed", "refresh", "refresh_pending"}
+    costly, free, terminal = [], [], []
+    for r in rows:
+        if r["status"] not in claimable:
+            terminal.append(r)
+        elif r["auction_date"] and r["auction_date"] < today:
+            free.append(r)
+        else:
+            costly.append(r)
+
+    daily_navs = len(costly) * MAX_RETRY
+    daily_seconds = daily_navs * NAV_SECONDS
+    try:
+        import config.settings as _cfg
+        sh, sm = map(int, _cfg.DOC_WORKER_START_TIME.split(":"))
+        eh, em = map(int, _cfg.DOC_WORKER_END_TIME.split(":"))
+        window_min = (eh * 60 + em) - (sh * 60 + sm)
+    except Exception:
+        window_min = 120
+
+    print("  고아 큐 행 %d행을 비용으로 나누면:" % len(rows))
+    print("    종결 상태(더 안 돈다)            %3d행   비용 0" % len(terminal))
+    print("    기일 경과(만료 가드가 막는다)     %3d행   비용 0 (브라우저 안 연다)" % len(free))
+    print("    ★ 기일이 남았다(매일 재시도)      %3d행   비용 있음" % len(costly))
+    print()
+    print("  기일이 남은 고아의 하루 비용:")
+    print("    이동 %d행 x %d회 = %d회 x %.1f초 = %.1f초 (%.1f분)"
+          % (len(costly), MAX_RETRY, daily_navs, NAV_SECONDS, daily_seconds, daily_seconds / 60))
+    print("    실행 창 %d분 대비 %.1f%%" % (window_min, 100.0 * daily_seconds / (window_min * 60)))
+    print("    ※ 기일이 지날 때까지 **매일** 반복된다(reset_stale_queue 가 되살린다).")
+    if not costly:
+        print()
+        print("  -> 지금은 기일이 남은 고아가 **0행**이라 실제 낭비는 없다.")
+        print("     정리의 시급성은 낮다. 다만 크롤이 재개되면 새 고아는 위 비용을 곧바로 쓴다.")
+    else:
+        print()
+        print("  -> 지금 이 %d행이 매일 %.1f분을 먹고 있다. 정리하면 그만큼이 회수된다."
+              % (len(costly), daily_seconds / 60))
+
+    print("""
+  안전한 처리 방안 (이 스크립트는 실행하지 않는다)
+
+    1순위  기일이 남은 고아만 손댄다. 기일 경과분은 이미 공짜라 지울 실익이 없다.
+    2순위  지우기 전에 2절("진짜 고아인가")을 반드시 통과시킨다 - migrate_execute 가
+           auction_item 을 재작성하는 중이면 **정상 물건도 잠깐 고아로 보인다.**
+           그 순간에 지우면 살아 있는 물건의 큐를 지우는 것이 된다.
+    3순위  지우는 대신 `mark_queue_unsupported()` 로 **종결**시키는 선택지도 있다.
+           그 상태는 reset_stale_queue() 가 되살리지 않으므로 매일 반복이 끊긴다.
+           행이 남으므로 되돌릴 수 있다(삭제보다 안전하다). 다만 이것도 큐를 바꾸는
+           운영 변경이라 승인 영역이다.""")
 
     head("4. 삭제 기준 제안 (실행하지 않는다 - 사람이 판단할 근거)")
     print("""  안전한 순서로만 적는다. 각 단계는 **되돌릴 수 없다.**

@@ -99,6 +99,36 @@ def resolve_admin_role(x_admin_key: Optional[str]) -> Optional[str]:
     return None
 
 
+def warn_if_admin_keys_missing() -> bool:
+    """두 관리자 키가 모두 없으면 **부팅 시점에** 경고를 남긴다. 남겼으면 True.
+
+    ## 왜 필요한가 - 지금은 첫 admin 호출까지 아무도 모른다
+
+    `_require_role()` 은 두 키가 모두 없으면 500 "관리자 키 미설정" 을 낸다.
+    의도된 동작이지만, **그걸 알게 되는 시점이 너무 늦다** - 운영자가 Admin 화면을
+    열어 500 을 볼 때까지 서버는 아무 말도 하지 않는다. 그때 오류 문구만 보면
+    코드 문제인지 설정 문제인지도 바로 알기 어렵다.
+
+    로그 한 줄이면 서버를 띄우는 순간 안다. 이번 세션에서 고친 결함들과 같은 계열이다 -
+    **조용한 실패를 시끄럽게 만든다.**
+
+    ## 값은 절대 남기지 않는다
+
+    키 값이 로그에 들어가면 로그 유출이 곧 관리자 권한 유출이다.
+    `_require_role()` 의 기존 규칙(값 대신 "미제공"/"불일치"만 기록)을 그대로 따라
+    **설정 여부만** 남긴다.
+    """
+    if os.getenv("ADMIN_API_KEY", "") or os.getenv("SUPER_ADMIN_API_KEY", ""):
+        return False
+    logger.warning(
+        "ADMIN_API_KEY / SUPER_ADMIN_API_KEY 가 모두 미설정이다 - "
+        "Admin API %d개 라우트가 전부 500(관리자 키 미설정)으로 응답한다. "
+        ".env 설정을 확인하라.",
+        len(router.routes),
+    )
+    return True
+
+
 def _require_role(x_admin_key: Optional[str], minimum: str) -> str:
     if not os.getenv("ADMIN_API_KEY", "") and not os.getenv("SUPER_ADMIN_API_KEY", ""):
         # 두 키 모두 없으면 Admin API 자체를 쓸 수 없다(기존 동작 유지: 500).

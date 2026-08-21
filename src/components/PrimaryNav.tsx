@@ -25,7 +25,11 @@ export default function PrimaryNav({ current }: PrimaryNavProps) {
   // 스크린리더가 주요 메뉴 영역으로 건너뛸 수 있도록 nav 랜드마크를 쓴다
   // (Sprint 47 접근성 감사: 문서에 nav 랜드마크가 0개였다).
   return (
-    <nav aria-label="주요 메뉴" className="flex items-center gap-3">
+    // `flex-wrap`: 좁은 화면(320px)이나 브라우저 글자 확대에서 메뉴 4개가 한 줄에
+    // 들어가지 않을 때 접히게 한다. 접히지 않으면 화면 전체가 가로로 스크롤된다
+    // (2026-08-21 Sprint 240 실측 — SiteHeader.tsx 주석 참고).
+    // 간격(gap-3)·글자크기(text-xs)·색은 그대로다.
+    <nav aria-label="주요 메뉴" className="flex flex-wrap items-center gap-3">
       {NAV_ITEMS.map((item) => (
         <Link
           key={item.key}

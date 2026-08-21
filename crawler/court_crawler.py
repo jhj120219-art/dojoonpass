@@ -18,6 +18,12 @@ from crawler.base_crawler import (
 
 logger = logging.getLogger(__name__)
 
+# 크롤 오류 기록 파일. **이 파일 위치 기준**이라 어느 cwd 에서 띄워도 같은 곳에 쌓인다.
+# 회귀 테스트가 갈아끼우는 공개 표면이므로 이름을 바꾸지 않는다.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ERROR_LOG_PATH = os.path.join(_REPO_ROOT, "logs", "errors.jsonl")
+
+
 def log_error(case_no: str, step: str, error: Exception, retry: int) -> None:
     entry = {
         "case_no": case_no,
@@ -32,8 +38,16 @@ def log_error(case_no: str, step: str, error: Exception, retry: int) -> None:
         # 삼키므로, 디렉터리가 없으면 **크롤 오류 기록이 통째로 조용히 사라진다** — 정작
         # 가장 필요한 순간에 남는 게 없다(2026-08-13 Sprint 98).
         # 저장소의 다른 진입점(`doc_worker.py:20` 등)이 쓰는 것과 같은 한 줄이다.
-        os.makedirs("logs", exist_ok=True)
-        with open("logs/errors.jsonl", "a", encoding="utf-8") as f:
+        # 경로는 cwd 가 아니라 **저장소 루트 기준**이다 (2026-08-21 Sprint 246).
+        # 상대경로면 다른 cwd 에서 크롤했을 때 오류 기록이 엉뚱한 폴더로 흩어진다.
+        #
+        # ★ 모듈 변수를 **호출 시점에** 읽는다. `doc_worker.LOCK_PATH` 와 같은 규칙이다 -
+        #   회귀 테스트가 `court_crawler.ERROR_LOG_PATH = <임시경로>` 로 갈아끼워
+        #   운영 `logs/` 를 건드리지 않고 검증할 수 있어야 한다. 기본값을 함수 안에서
+        #   계산해 버리면 그 seam 이 사라진다(예전에는 테스트가 chdir 로 우회했는데,
+        #   그건 **경로가 cwd 에 의존한다는 결함 덕분에** 동작하던 방식이다).
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+        with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass

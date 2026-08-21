@@ -2529,6 +2529,371 @@ def test_no_live_unreachable_claim_about_version_log():
     check_true("대조군: 정정이 붙은 원문이 남아 있다 (%d곳)" % total, total >= 2, total)
 
 
+
+
+def test_no_cwd_relative_paths_in_product_code():
+    """추적되는 제품 코드가 **cwd 기준 상대경로**로 파일을 열지 않는가 (2026-08-21 Sprint 246).
+
+    ## 왜 이 검사가 생겼나 - 같은 결함이 한 세션에 4건 나왔다
+
+    상대경로는 **현재 작업 디렉터리** 기준으로 풀린다. 저장소 루트에서 띄우면 멀쩡하니
+    개발 중에는 절대 드러나지 않고, 배포 방식이 바뀌는 순간 터진다. 실측한 4건:
+
+        Sprint 245  api/auth.py   load_dotenv()          -> 다른 cwd 에서 인증 API 전부 500
+        Sprint 246  storage/database.py DB_PATH          -> 0바이트 auction.db 를 만들고
+                                                            "데이터 없음"처럼 보인다
+        Sprint 246  doc_worker.py LOCK_PATH              -> ★ 중복 실행 방지가 조용히 무력화
+        Sprint 246  운영 도구 8개 DB_PATH                 -> 찌꺼기 DB + 원인을 가리는 오류
+
+    셋째가 가장 나쁘다 - 두 워커가 같은 큐/다운로드 폴더를 동시에 만지는데
+    **양쪽 로그 모두 "락 획득 성공"** 이라 흔적이 없다.
+
+    `.bat` 3개는 `cd /d %~dp0` 로 보호되지만, 문서가 안내하는 수동 실행
+    (`uvicorn api_server:app --reload`)과 서비스 등록은 그렇지 않다.
+
+    ## 무엇을 보는가
+
+    문자열 grep 이 아니라 **AST** 로 본다. 두 가지를 잡는다:
+
+      (A) 모듈 최상위 상수 할당    `DB_PATH = "auction.db"`
+      (B) 경로 인자를 받는 호출     `open("logs/x.jsonl")`, `sqlite3.connect("a.db")`
+
+    (A) 가 없으면 이 검사는 자기가 찾으려던 결함에 눈이 먼다 - 2026-08-21 에 실제로
+    그랬다. (B) 만 있던 초기 버전은 고치기 전 `storage/database.py` 를 "0건"으로
+    통과시켰다. 도구가 이상하면 제품보다 도구를 먼저 의심하라는 원칙 그대로,
+    **알려진 결함 상태를 잡는지 먼저 확인**하고 확장했다. 이 검사도 그 확인을 내장한다
+    (아래 "자기 검증").
+    """
+    print("\n--- cwd 기준 상대경로를 쓰는 제품 코드가 없는가 (Sprint 246) ---")
+    import ast
+    import io as _io
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if out.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+
+    # 테스트/감사 도구는 스스로 임시 디렉터리를 만들어 쓰므로 대상이 아니다.
+    SKIP_PREFIX = ("test_", "audit_", "step", "check_", "patch_", "debug_")
+    files = [f.replace("\\", "/") for f in out.stdout.split()
+             if f.endswith(".py")
+             and not os.path.basename(f).startswith(SKIP_PREFIX)]
+
+    PATH_CALLS = {"open", "makedirs", "mkdir", "connect", "remove", "listdir",
+                  "isfile", "isdir", "exists", "glob", "rmtree", "FileHandler"}
+
+    def relative_literal(node, path_context=False):
+        """상대경로 **문자열 리터럴**이면 그 값을 준다.
+
+        `path_context=True` 는 "이 인자는 경로가 확실하다"는 뜻이다
+        (`open(...)` / `os.path.join(...)` 의 첫 인자 등). 그때는 확장자도
+        구분자도 없는 **맨 디렉터리 이름**(`"logs"`)까지 잡는다 -
+        `LOCK_PATH = os.path.join("logs", "doc_worker.lock")` 이 정확히 그
+        모양이었고, 확장 전 판본은 이걸 놓쳤다(자기 검증이 잡아냈다).
+
+        할당 문맥에서는 그렇게 넓히지 않는다 - 아무 짧은 문자열이나
+        경로로 오해하게 된다.
+        """
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return None
+        v = node.value
+        if not v or v in (".", "..", "-") or "\n" in v or " " in v:
+            return None                      # 여러 줄/공백 = SQL 등. 경로가 아니다.
+        if os.path.isabs(v) or v.startswith(("~", "http://", "https://", ":memory:")):
+            return None
+        if "/" in v or "\\" in v:
+            return v
+        base = os.path.basename(v)
+        if "." in base and len(v) < 60:
+            return v
+        return v if (path_context and len(v) < 60) else None
+
+    def scan(src):
+        """(줄번호, 종류, 값) 목록. 파싱 실패하면 None."""
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return None
+        hits = []
+        for node in tree.body:                       # (A) 최상위 상수 할당
+            if isinstance(node, ast.Assign):
+                v = relative_literal(node.value)
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if v and names:
+                    hits.append((node.lineno, "할당:" + names[0], v))
+        for node in ast.walk(tree):                  # (B) 경로 인자를 받는 호출
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else (
+                f.attr if isinstance(f, ast.Attribute) else None)
+            if name in PATH_CALLS or name == "join":
+                # 맨 디렉터리 이름(`"logs"`)까지 잡는 것은 **디렉터리를 확실히
+                # 받는 호출**로 제한한다. `remove`/`exists` 같은 이름은 리스트
+                # 메서드와 구분되지 않아, 넓히면 `cols.remove("has_status_pdf")`
+                # 같은 것을 경로로 오해한다(2026-08-21 실제 오탐).
+                v = relative_literal(
+                    node.args[0],
+                    path_context=(name in ("makedirs", "mkdir", "join")))
+                if v:
+                    hits.append((node.lineno, name, v))
+        return hits
+
+    # --- 자기 검증: 알려진 결함 모양을 실제로 잡는가 -------------------------
+    #     이게 없으면 "0건 통과"가 **결함이 없다**는 뜻인지 **검사가 눈멀었다**는
+    #     뜻인지 구분할 수 없다.
+    KNOWN_BAD = (
+        'import os\n'
+        'DB_PATH = "auction.db"\n'
+        'LOCK_PATH = os.path.join("logs", "doc_worker.lock")\n'
+        'with open("logs/errors.jsonl", "a") as f:\n'
+        '    pass\n'
+    )
+    KNOWN_GOOD = (
+        'import os\n'
+        '_HERE = os.path.dirname(os.path.abspath(__file__))\n'
+        'DB_PATH = os.path.join(_HERE, "auction.db")\n'
+        'LOCK_PATH = os.path.join(_HERE, "logs", "doc_worker.lock")\n'
+        'SQL = """\nCREATE TABLE t (a TEXT);\n"""\n'
+    )
+    bad_hits = scan(KNOWN_BAD)
+    check_true("자기 검증: 알려진 결함 3종을 전부 잡는다",
+               bad_hits is not None and len(bad_hits) == 3,
+               "-> %r. 못 잡으면 아래 '0건'은 아무 의미가 없다" % (bad_hits,))
+    good_hits = scan(KNOWN_GOOD)
+    check_true("자기 검증: 고쳐진 모양과 SQL 문자열을 오탐하지 않는다",
+               good_hits == [], "-> %r" % (good_hits,))
+
+    # --- 본 검사 ------------------------------------------------------------
+    findings = []
+    scanned = 0
+    for rel in files:
+        p = os.path.join(root, rel)
+        try:
+            src = _io.open(p, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        hits = scan(src)
+        if hits is None:
+            continue
+        scanned += 1
+        for ln, kind, val in hits:
+            findings.append("%s:%d  %s -> %r" % (rel, ln, kind, val))
+
+    check_true("검사가 공허하지 않다(추적 제품 .py 를 실제로 훑었다)", scanned >= 40,
+               "-> %d개" % scanned)
+    print("    훑은 추적 제품 .py: %d개" % scanned)
+    if findings:
+        for f in findings:
+            print("      %s" % f)
+    check_true("★ cwd 기준 상대경로를 쓰는 제품 코드가 없다",
+               not findings,
+               "-> %d건. 다른 폴더에서 실행하면 엉뚱한 파일을 만들거나 연다. "
+               "`os.path.dirname(os.path.abspath(__file__))` 기준으로 바꿔라" % len(findings))
+
+
+
+def test_claude_md_scheduler_claims_match_register_script():
+    """`docs/CLAUDE.md` 의 스케줄러 작업 이름이 **등록 스크립트와 일치하는가**
+    (2026-08-21 Sprint 247 신설).
+
+    ## 왜 생겼나 - 항상 로드되는 문서가 틀려 있었다
+
+    `docs/CLAUDE.md` 는 세션마다 컨텍스트로 들어가는 색인 문서다. 거기 적힌 것이
+    틀리면 **그 오류가 이후 모든 판단에 전파된다.**
+
+    2026-08-21 실측에서 두 군데가 틀렸다:
+
+        제목    "Task Scheduler job `LawAuctionDailyCrawl`"
+        본문    "Task Scheduler(`LawAuctionDailyCrawl`, `PDF우선순위갱신`)도 ...
+                 지금은 모두 Desktop\\dojoonpass 로 통일했다"
+
+    두 이름 다 **옛 이름**이다. `register_scheduler_tasks.ps1` 이 실제로 등록/조회하는
+    이름은 `DojoonPass-DailyCrawl` / `DojoonPass-DocWorker` / `DojoonPass-PriorityRefresh`
+    다. 게다가 문장이 "통일했다"로 끝나 **지금 정상 동작 중인 것처럼 읽힌다** -
+    실측하면 셋 다 미등록이고, 그게 지금의 Release Blocker다.
+
+    옛 이름으로 스케줄러를 뒤지면 아무것도 안 나오고, 그걸 "원래 그런가 보다"로
+    넘기게 된다. 이름이 맞아야 "없다"가 **결함 신호**로 읽힌다.
+
+    ## 무엇을 고정하는가
+
+    등록 여부는 **검사하지 않는다** - 등록은 승인 영역이고, 기계마다 다르며,
+    미등록이 곧 코드 결함은 아니다. 대신 **문서와 등록 스크립트의 이름이 어긋나는
+    것**을 잡는다. 이건 순수한 저장소 내부 일관성이라 어느 기계에서나 판정이 같다.
+    """
+    print("\n--- CLAUDE.md 의 스케줄러 이름이 등록 스크립트와 맞는가 (Sprint 247) ---")
+    import io as _io
+    import re as _re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    ps1 = os.path.join(root, "register_scheduler_tasks.ps1")
+    md = os.path.join(root, "docs", "CLAUDE.md")
+
+    if not os.path.exists(ps1):
+        check_true("등록 스크립트가 있다", False, ps1)
+        return
+
+    ps_src = _io.open(ps1, encoding="utf-8-sig", errors="replace").read()
+    # PowerShell 정의: @{ Name = 'DojoonPass-XXX'; ... }
+    defined = set(_re.findall(r"Name\s*=\s*'([^']+)'", ps_src))
+    check_true("검사가 공허하지 않다(등록 스크립트에서 이름을 읽었다)",
+               len(defined) >= 3, "-> %s" % sorted(defined))
+    if len(defined) < 3:
+        return
+
+    md_src = _io.open(md, encoding="utf-8-sig", errors="replace").read()
+
+    # (1) 등록 스크립트가 정의한 이름이 문서에 **하나라도** 나와야 한다.
+    #     (세 개 전부를 요구하지는 않는다 - 문서가 대표 이름만 쓸 수도 있다.)
+    mentioned = sorted(n for n in defined if n in md_src)
+    check_true("★ CLAUDE.md 가 현재 작업 이름을 쓴다",
+               len(mentioned) > 0,
+               "-> 등록 스크립트는 %s 를 쓰는데 문서에는 하나도 없다. "
+               "옛 이름으로 스케줄러를 뒤지면 '없음'을 정상으로 오해한다"
+               % sorted(defined))
+
+    # (2) 옛 이름을 **정정 없이** 쓰고 있지 않은가.
+    #     역사적 기록으로 남기는 것은 괜찮다 - 다만 "옛 이름"이라고 밝혀야 한다.
+    STALE = ["LawAuctionDailyCrawl", "PDF우선순위갱신"]
+    for old in STALE:
+        if old not in md_src:
+            continue
+        # 그 이름이 나오는 문단 근처에 정정 표시가 있는가
+        idx = md_src.index(old)
+        window = md_src[max(0, idx - 400): idx + 1200]
+        corrected = ("옛 이름" in window) or ("stale" in window.lower())
+        check_true("★ 옛 이름 %s 가 나오면 '옛 이름'이라고 밝힌다" % old,
+                   corrected,
+                   "-> 정정 없이 쓰이면 지금도 그 이름으로 등록돼 있다고 읽힌다")
+
+    # (3) 실제 상태를 재는 도구를 안내하는가 - 문서 숫자를 믿지 말고 재라는 뜻이다
+    check_true("★ 상태를 직접 재는 방법을 안내한다(audit_schedule_health.py)",
+               "audit_schedule_health.py" in md_src,
+               "-> 문서에 박힌 숫자는 언제든 stale 해진다. 재는 법을 알려줘야 한다")
+
+
+
+def test_root_scripts_do_not_write_db_without_apply():
+    """저장소 루트의 스크립트가 **묻지도 않고** 운영 DB 를 고치지 않는가
+    (2026-08-21 Sprint 248 신설).
+
+    ## 왜 생겼나 - 두 개가 무방비였다
+
+    이 저장소의 데이터 수정 도구는 관례가 확실하다. `backfill_*.py` / `repair_*.py` /
+    `reset_failures.py` / `unlock_retry.py` 는 **기본이 dry-run 이고 `--apply` 를 줘야
+    실제로 쓴다.** 그런데 두 파일만 예외였다:
+
+        fix_validator.py    `python fix_validator.py`   -> 곧바로 UPDATE + commit
+        add_test_queue.py   `python add_test_queue.py`  -> 곧바로 큐에 INSERT
+
+    둘 다 과거 디버깅 세션의 일회성 스크립트가 그대로 커밋된 것이다. 파일 이름만 보고
+    "확인용이겠지" 하고 실행하면 운영 데이터가 바뀐다. 되돌릴 방법도 없다.
+
+    ## 무엇을 보는가
+
+    **저장소 루트의** 추적 `.py` 만 본다. `api/v1/*.py` 같은 패키지 모듈은 대상이 아니다 -
+    거기 쓰기는 함수(라우트 핸들러) 안에 있고 서버가 부르는 것이지, 파일을 실행해서
+    벌어지는 일이 아니다. 처음에 그 구분 없이 훑었다가 라우터 10개를 오탐했다.
+
+    "모듈 최상위에서 쓰기가 일어나는가"를 AST 로 본다 - `def`/`class` 안이나
+    `if __name__ == "__main__":` 안은 제외한다. 그런 자리에서 쓰기가 보이면
+    소스에 `--apply` 가 있어야 한다.
+    """
+    print("\n--- 루트 스크립트가 확인 없이 운영 DB 를 고치지 않는가 (Sprint 248) ---")
+    import ast
+    import io as _io
+    import re as _re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if out.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+
+    SKIP_PREFIX = ("test_", "audit_", "step", "check_", "patch_", "debug_")
+    WRITE_SQL = _re.compile(r"\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+TABLE)\b",
+                            _re.I)
+    # 함수 이름으로 쓰는 경우(SQL 문자열이 안 보인다) - 실제로 이것 때문에 하나를 놓칠 뻔했다
+    WRITE_CALLS = ("enqueue_documents", "commit")
+
+    def module_level_writes(src):
+        """모듈 최상위(함수/클래스/__main__ 블록 밖)에서 쓰기가 일어나면 True."""
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return None
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                 ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.If):
+                t = ast.dump(node.test)
+                if "__main__" in t or "__name__" in t:
+                    continue          # `if __name__ == "__main__":` 은 실행 진입점이다
+            seg = ast.get_source_segment(src, node) or ""
+            if WRITE_SQL.search(seg):
+                return True
+            for call in WRITE_CALLS:
+                if _re.search(r"\b%s\s*\(" % call, seg):
+                    return True
+        return False
+
+    # --- 자기 검증: 알려진 모양을 실제로 잡는지 먼저 본다 -----------------------
+    BAD = ("from storage.database import enqueue_documents\n"
+           "enqueue_documents([{'case_no': 'x'}])\n")
+    BAD2 = ("import sqlite3\n"
+            "conn = sqlite3.connect('a.db')\n"
+            "conn.execute(\"UPDATE auction SET validation_status = 'PASS'\")\n")
+    GOOD = ("import sys\n"
+            "APPLY = '--apply' in sys.argv\n"
+            "def main():\n"
+            "    conn.execute('UPDATE auction SET x = 1')\n"
+            "    conn.commit()\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n")
+    check_true("자기 검증: 함수 호출로 쓰는 모양을 잡는다", module_level_writes(BAD) is True)
+    check_true("자기 검증: SQL 로 쓰는 모양을 잡는다", module_level_writes(BAD2) is True)
+    check_true("자기 검증: 함수/__main__ 안의 쓰기는 오탐하지 않는다",
+               module_level_writes(GOOD) is False)
+
+    # --- 본 검사 --------------------------------------------------------------
+    offenders = []
+    scanned = 0
+    for rel in out.stdout.split():
+        rel = rel.replace("\\", "/")
+        if "/" in rel:
+            continue                                   # 루트 스크립트만
+        if os.path.basename(rel).startswith(SKIP_PREFIX):
+            continue
+        try:
+            src = _io.open(os.path.join(root, rel), encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        scanned += 1
+        w = module_level_writes(src)
+        if w and "--apply" not in src:
+            offenders.append(rel)
+
+    check_true("검사가 공허하지 않다(루트 스크립트를 실제로 훑었다)", scanned >= 15,
+               "-> %d개" % scanned)
+    print("    훑은 루트 스크립트: %d개" % scanned)
+    check_true("★ 확인(--apply) 없이 운영 DB 를 고치는 루트 스크립트가 없다",
+               not offenders,
+               "-> %s. 이 저장소 관례대로 기본 dry-run + --apply 로 바꿔라 "
+               "(backfill_*/repair_*/reset_failures 참고)" % offenders)
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -2556,6 +2921,9 @@ def run():
     test_no_escape_corrupted_text()
     test_crlf_blobs_are_not_rewritten_as_lf()
     test_no_live_unreachable_claim_about_version_log()
+    test_no_cwd_relative_paths_in_product_code()
+    test_claude_md_scheduler_claims_match_register_script()
+    test_root_scripts_do_not_write_db_without_apply()
 
     print("\n" + "=" * 55)
     if failures:

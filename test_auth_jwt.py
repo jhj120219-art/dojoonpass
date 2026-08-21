@@ -13,7 +13,9 @@ Supabase가 ES256(비대칭 서명)으로 전환된 뒤 백엔드가 HS256만 �
 
 실행: python test_auth_jwt.py
 """
+import io
 import os
+import re
 import secrets
 import sys
 import time
@@ -452,6 +454,267 @@ finally:
     auth_mod.SUPABASE_JWT_SECRET, auth_mod.SUPABASE_URL = _saved_secret, _saved_url
 
 check("정리 후 시크릿이 복원됐다", auth_mod.SUPABASE_JWT_SECRET == _saved_secret)
+
+
+# ===========================================================================
+# .env 로딩이 **작업 디렉터리에 의존하지 않는가** (2026-08-21 Sprint 245 신설)
+#
+# ## 왜 생겼나
+#
+# `api/auth.py` 는 예전에 `load_dotenv()` / `load_dotenv(".env.local")` 를 썼다.
+# 둘 다 **cwd 기준**이라, 저장소 루트가 아닌 곳에서 서버를 띄우면 환경변수를 하나도
+# 못 읽었다. 실측(2026-08-21, 같은 코드를 cwd 만 바꿔 임포트):
+#
+#     cwd = 저장소 루트   JWT_SECRET 88자 / SUPABASE_URL 40자  -> 정상
+#     cwd = 다른 폴더     JWT_SECRET  0자 / SUPABASE_URL 빈값  -> 인증 API 전부 500
+#
+# 그 상태에서 `GET /api/v1/favorites` 는 401 이 아니라 **500 "JWT 검증 설정 미비"** 다.
+# 로그인 사용자의 관심물건·최근본·검색조건·마이페이지·등기부가 전부 죽는다.
+# 게다가 문구가 "설정 미비"라 시크릿을 의심하게 되는데 진짜 원인은 작업 디렉터리다.
+#
+# `.bat` 3개는 `cd /d %~dp0` 로 보호되지만, 문서가 안내하는
+# `uvicorn api_server:app --reload` 와 서비스 등록(NSSM/작업 스케줄러)은 그렇지 않다.
+# 이 저장소는 실제로 그 함정을 한 번 밟았다(Sprint 241).
+#
+# ## 검사 방법
+#
+# **별도 프로세스를 다른 cwd 에서 띄운다.** 같은 프로세스 안에서는 이미 로드된
+# `os.environ` 이 남아 있어 cwd 를 바꿔도 재현되지 않는다 - 그러면 검사가 공허해진다.
+# ===========================================================================
+import subprocess as _sp
+import tempfile as _tf
+import shutil as _sh
+
+_REPO = os.path.dirname(os.path.abspath(__file__))
+
+_PROBE = (
+    "import api.auth as a;"
+    "print('SECRET=%d URL=%d' % (len(a.SUPABASE_JWT_SECRET), len(a.SUPABASE_URL)))"
+)
+
+
+def _probe_from(cwd):
+    """`cwd` 에서 별도 프로세스로 api.auth 를 임포트하고 (secret길이, url길이) 를 얻는다."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _REPO
+    env["PYTHONIOENCODING"] = "utf-8"
+    # 부모 프로세스가 이미 읽어 둔 값이 상속되면 검사가 공허해진다 - 지우고 띄운다.
+    for k in ("SUPABASE_JWT_SECRET", "SUPABASE_URL", "SUPABASE_ANON_KEY",
+              "NEXT_PUBLIC_SUPABASE_URL"):
+        env.pop(k, None)
+    r = _sp.run([sys.executable, "-c", _PROBE], cwd=cwd, env=env,
+                capture_output=True, timeout=120)
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    m = re.search(r"SECRET=(\d+) URL=(\d+)", out)
+    if not m:
+        return None, (out + (r.stderr or b"").decode("utf-8", "replace"))[:200]
+    return (int(m.group(1)), int(m.group(2))), out
+
+
+print()
+print("--- .env 로딩이 작업 디렉터리에 의존하지 않는가 (Sprint 245) ---")
+
+_root_vals, _root_raw = _probe_from(_REPO)
+check("저장소 루트에서 설정을 읽는다(검사가 공허하지 않다)",
+      _root_vals is not None and _root_vals[0] > 0,
+      f"-> {_root_raw}")
+
+if _root_vals and _root_vals[0] > 0:
+    _tmp = _tf.mkdtemp(prefix="qa_cwd_")
+    try:
+        _other_vals, _other_raw = _probe_from(_tmp)
+        check("다른 디렉터리에서도 임포트가 성공한다",
+              _other_vals is not None, f"-> {_other_raw}")
+        if _other_vals:
+            check("★ 다른 디렉터리에서도 JWT 시크릿을 읽는다(cwd 비의존)",
+                  _other_vals[0] == _root_vals[0],
+                  f"-> 루트 {_root_vals[0]}자 vs 다른 폴더 {_other_vals[0]}자. "
+                  "load_dotenv 가 cwd 기준이면 0자가 된다")
+            check("★ 다른 디렉터리에서도 SUPABASE_URL 을 읽는다(JWKS/ES256 경로)",
+                  _other_vals[1] == _root_vals[1],
+                  f"-> 루트 {_root_vals[1]}자 vs 다른 폴더 {_other_vals[1]}자")
+    finally:
+        _sh.rmtree(_tmp, ignore_errors=True)
+
+# 소스 수준 가드 - 편집 시점에 되돌리는 것을 잡는다(주석은 제외하고 코드만 본다)
+for _f in ("api/auth.py", "api_server.py"):
+    _src = io.open(os.path.join(_REPO, _f), encoding="utf-8-sig").read()
+    _code = "\n".join(l for l in _src.splitlines() if not l.lstrip().startswith("#"))
+    _bare = re.findall(r"load_dotenv\(\s*\)", _code)
+    check(f"★ {_f} 가 인자 없는 load_dotenv() 를 쓰지 않는다(cwd 의존)",
+          not _bare,
+          "-> load_dotenv() 는 cwd 기준이다. __file__ 기준 절대경로를 넘겨라")
+    _rel = re.findall(r"load_dotenv\(\s*['\"]\.env", _code)
+    check(f"★ {_f} 가 상대경로 문자열로 .env 를 찾지 않는다",
+          not _rel,
+          "-> 상대경로도 cwd 기준이다")
+
+
+# ---------------------------------------------------------------------------
+# 설정이 비었을 때의 **실패 방식** (2026-08-21 Sprint 246 신설)
+#
+# ## 왜 필요한가
+#
+# Sprint 245 에서 `.env` 로딩의 cwd 의존을 고쳤다. 그때 확인한 것은 "제대로 읽는가"였다.
+# 남은 절반은 **못 읽었을 때 어떻게 무너지는가**다. 배포 환경이 바뀌거나 시크릿이
+# 아직 주입되지 않은 순간은 실제로 생기고, 그때의 동작이 다음 두 가지여야 한다:
+#
+#   (1) 시크릿과 무관한 **공개 API 는 계속 살아 있다.**
+#       검색/상세/사진/요금제는 로그인이 필요 없다. 이것들이 500 이 되면
+#       "설정 하나 빠졌다"가 **서비스 전면 장애**로 번진다.
+#   (2) 보호 API 는 **거부**한다. 조용히 통과시키면 그게 인증 우회다.
+#
+# 그리고 **틀린 시크릿**은 무토큰보다 위험하다 - 값이 있으니 검증을 시도하는데,
+# 여기서 실패를 삼키면 위조 토큰이 로그인으로 취급된다.
+#
+# ## 검사 방법
+#
+# 앱이 실제로 읽는 그 모듈 변수(`api.auth.SUPABASE_JWT_SECRET` / `SUPABASE_URL`)를
+# 비우고/틀리게 바꾼다. 라우트는 요청 시점에 이 값을 보므로 **실제 설정 경로 그대로**다.
+# 값 자체는 절대 출력하지 않는다 - 길이와 상태만 본다.
+# ---------------------------------------------------------------------------
+print()
+print("--- 설정이 비었을 때의 실패 방식 (Sprint 246) ---")
+
+_PUBLIC_PATHS = [
+    "/",
+    "/api/v1/search?size=1",
+    "/api/v1/search/regions?sido=%EC%84%9C%EC%9A%B8",
+    "/api/v1/stats",
+    "/api/v1/plans",
+]
+_PROTECTED_PATHS = [
+    "/api/v1/favorites",
+    "/api/v1/recent-items",
+    "/api/v1/search-presets",
+]
+
+# 공개 상세/사진은 DB 에 물건이 있어야 의미가 있다 - 있으면 붙인다(없으면 건너뛴다).
+_probe_items = client.get("/api/v1/search?size=1")
+_sample_id = None
+if _probe_items.status_code == 200:
+    _its = _probe_items.json().get("items", [])
+    if _its:
+        _sample_id = _its[0].get("id") or _its[0].get("item_id")
+if _sample_id:
+    _PUBLIC_PATHS.append(f"/api/v1/item/{_sample_id}")
+
+_env_saved = (auth_mod.SUPABASE_JWT_SECRET, auth_mod.SUPABASE_URL)
+check("검사가 공허하지 않다(정상 상태에서 시크릿이 실제로 있다)",
+      len(_env_saved[0]) > 0, "-> 길이 0. 이 상태로는 아래 검사가 아무것도 구분하지 못한다")
+check("검사가 공허하지 않다(공개 경로 표본을 확보했다)", len(_PUBLIC_PATHS) >= 5,
+      f"-> {len(_PUBLIC_PATHS)}개")
+
+# 진짜 시크릿으로 서명한 토큰을 **바꾸기 전에** 만들어 둔다(아래 (2)에서 쓴다).
+_good_token = hs256({"sub": USER})
+
+try:
+    # --- (1) 시크릿이 통째로 없을 때 -------------------------------------
+    auth_mod.SUPABASE_JWT_SECRET = ""
+    auth_mod.SUPABASE_URL = ""
+
+    _broken = []
+    for _p in _PUBLIC_PATHS:
+        _r = client.get(_p)
+        if _r.status_code >= 500:
+            _broken.append((_p, _r.status_code))
+    check("★ 시크릿이 없어도 공개 API 가 500 이 되지 않는다",
+          not _broken,
+          f"-> {_broken}. 공개 경로가 인증 설정에 묶여 있다 - 설정 누락이 전면 장애가 된다")
+
+    _passed_through = []
+    for _p in _PROTECTED_PATHS:
+        _r = client.get(_p)
+        if _r.status_code < 400:
+            _passed_through.append((_p, _r.status_code))
+    check("★ 시크릿이 없으면 보호 API 는 통과시키지 않는다",
+          not _passed_through,
+          f"-> {_passed_through}. 설정이 없는데 인증이 성공했다 = 우회다")
+
+    # 실패하더라도 **시크릿/내부 경로를 흘리지 않아야** 한다
+    _leaks = []
+    for _p in _PROTECTED_PATHS:
+        _body = client.get(_p).text
+        if _env_saved[0] and _env_saved[0] in _body:
+            _leaks.append((_p, "secret"))
+        if "Traceback (most recent call last)" in _body:
+            _leaks.append((_p, "traceback"))
+    check("★ 실패 응답이 시크릿이나 스택트레이스를 노출하지 않는다",
+          not _leaks, f"-> {_leaks}")
+
+    # --- (1b) ★ 시크릿만 비고 URL 은 살아 있을 때 = **빈 키 위조** ------------
+    #
+    #     이게 이 절에서 가장 위험한 경우다. HMAC-SHA256 은 **빈 키도 정상 키**라
+    #     `jwt.decode(token, "", algorithms=["HS256"])` 가 그냥 **통과한다**
+    #     (2026-08-21 실측: 빈 키로 서명한 sub=attacker 토큰이 빈 키 검증을 통과).
+    #
+    #     그래서 시크릿이 비면 "아무도 로그인 못 한다"가 아니라
+    #     **"누구나 아무 사용자로 로그인된다"** 가 될 수 있다.
+    #     `api/auth.py` 의 `if not SUPABASE_JWT_SECRET: raise JWTError(...)` 가 그걸 막는다.
+    #
+    #     `get_current_user` 의 "둘 다 없으면 500" 가드는 **이 경우를 막지 못한다** -
+    #     `SUPABASE_URL` 이 살아 있으면(지금 저장소의 실제 상태다) 그 가드는 통과한다.
+    #     즉 이 검사가 없으면 그 한 줄을 지워도 아무도 모른다(mutation 으로 확인했다).
+    auth_mod.SUPABASE_JWT_SECRET = ""
+    auth_mod.SUPABASE_URL = _env_saved[1] or "https://example.supabase.co"
+
+    _empty_key_token = jwt.encode({"sub": "attacker"}, "", algorithm="HS256")
+    _r = client.get("/api/v1/favorites",
+                    headers={"Authorization": f"Bearer {_empty_key_token}"})
+    check("★ 시크릿이 비었을 때 **빈 키로 서명한 위조 토큰**을 거부한다",
+          _r.status_code in (401, 403),
+          f"-> {_r.status_code}. 빈 키 HMAC 은 검증에 성공한다 - "
+          "시크릿이 비면 누구나 아무 사용자로 로그인된다")
+
+    _rejected_empty = False
+    try:
+        decode_supabase_jwt(_empty_key_token)
+    except JWTError:
+        _rejected_empty = True
+    check("★ 검증 함수 자체가 빈 시크릿으로 HS256 을 검증하지 않는다",
+          _rejected_empty, "-> 빈 키 검증을 시도했고 통과시켰다")
+
+    # --- (2) 시크릿이 **틀린** 값일 때 ------------------------------------
+    #     길이는 정상인데 내용이 다르다 = 배포에서 가장 흔한 잘못된 설정.
+    #
+    #     ★ 토큰은 **바꾸기 전에** 진짜 시크릿으로 미리 만들어 둔다.
+    #       `hs256()` 은 호출 시점의 모듈 값으로 서명하므로, 바꾼 뒤에 만들면
+    #       틀린 시크릿으로 서명하고 틀린 시크릿으로 검증해 **항상 통과한다**
+    #       - 검사가 공허해진다(2026-08-21 실제로 이 함정을 밟고 잡았다).
+    auth_mod.SUPABASE_JWT_SECRET = "z" * len(_env_saved[0])
+    auth_mod.SUPABASE_URL = ""          # JWKS 경로도 막아 HS256 만 남긴다
+
+    _r = client.get("/api/v1/favorites",
+                    headers={"Authorization": f"Bearer {_good_token}"})
+    check("★ 시크릿이 틀리면 정상 토큰도 거부한다(조용히 통과 금지)",
+          _r.status_code in (401, 403), f"-> {_r.status_code}")
+
+    _r = client.get("/api/v1/search?size=1",
+                    headers={"Authorization": f"Bearer {_good_token}"})
+    check("★ 시크릿이 틀려도 선택적 인증 API 는 200 이다(검색을 막지 않는다)",
+          _r.status_code == 200, f"-> {_r.status_code}")
+
+    # 선택적 인증이 그 토큰을 **로그인으로 취급하지 않는지**를 직접 본다.
+    #   `is_favorited` 로는 판정할 수 없다 - 이 사용자는 관심물건이 없어서
+    #   로그인이든 아니든 False 다(= 공허한 검사가 된다).
+    #   대신 검증 함수 자체가 거부하는지를 본다.
+    _rejected = False
+    try:
+        decode_supabase_jwt(_good_token)
+    except JWTError:
+        _rejected = True
+    check("★ 시크릿이 틀리면 검증 함수가 예외로 거부한다(삼키지 않는다)",
+          _rejected, "-> 서명 불일치를 통과시켰다")
+finally:
+    auth_mod.SUPABASE_JWT_SECRET, auth_mod.SUPABASE_URL = _env_saved
+
+check("정리 후 설정이 복원됐다",
+      auth_mod.SUPABASE_JWT_SECRET == _env_saved[0]
+      and auth_mod.SUPABASE_URL == _env_saved[1])
+_r = client.get("/api/v1/favorites",
+                headers={"Authorization": f"Bearer {hs256({'sub': USER})}"})
+check("복원 후 정상 토큰이 다시 통한다(검사가 뒤를 오염시키지 않았다)",
+      _r.status_code == 200, f"-> {_r.status_code}")
 
 print("=" * 70)
 print(f" 결과: {PASS} PASS / {FAIL} FAIL")

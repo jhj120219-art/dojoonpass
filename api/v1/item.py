@@ -1,4 +1,5 @@
 ﻿import logging
+import os
 import sqlite3
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -132,7 +133,7 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             # ★ 기존 계약 유지: `doc_type`/`status`는 그대로 있고 **키만 늘었다**.
             #    프런트의 기존 코드(`property.documents.some(d => d.doc_type==='SPEC' ...)`)는
             #    무변경으로 계속 동작한다.
-            "documents": [_document_entry(item_id, d, doc_raw_by_type) for d in doc_status],
+            "documents": [_document_entry(item_id, d, doc_raw_by_type, row) for d in doc_status],
             "images": [_image_entry(item_id, im) for im in images],
             "image_count": len(images),
             # 대표 이미지 = 순번이 가장 앞선 사진. 법원 캐러셀의 첫 장이 곧 대표 전경도다
@@ -155,7 +156,62 @@ def _document_url(item_id: int, doc_type: str) -> str:
     return "/api/v1/item/%d/documents/%s" % (item_id, doc_type)
 
 
-def _document_entry(item_id: int, row, doc_raw_by_type) -> dict:
+def _served_file_size(item_row, doc_type: str):
+    """`download_url` 이 **실제로 내려주는 파일**의 크기. 못 구하면 None.
+
+    ## 왜 doc_raw 의 크기를 그대로 쓰면 안 되나 (2026-08-21 Sprint 241)
+
+    `doc_raw` 는 **구조화 산출물**을 실체로 기록한다. STATUS(현황조사서)의 경우
+    `doc_raw.storage_path` 가 `status.json` 이다(변경 감지 지문을 그 파일에서 뜬다).
+    그런데 `/api/v1/item/{id}/documents/STATUS` 가 내려주는 것은 `status.html` 이다
+    (`api/v1/documents.py: DOC_TYPE_FILES`).
+
+    즉 예전에는 **`file_size` 가 `download_url` 과 다른 파일을 설명하고 있었다.**
+    2026-08-21 실측(READY 문서 45건 전수):
+
+        SPEC/APPRAISAL   doc_raw 파일 == 서빙 파일  -> 크기 일치 (33건)
+        STATUS           doc_raw=status.json vs 서빙=status.html
+                         12건 **전부 불일치** (예: 광고 12,827B / 실제 45,747B, 약 3.6배)
+
+    지금은 화면이 이 값을 그리지 않아 사용자에게 보이지는 않는다. 그러나 필드 이름과
+    바로 옆의 `download_url` 이 "이 주소로 받으면 이만큼"이라고 말하고 있으므로,
+    값이 다른 파일의 것이면 그것은 **API 가 거짓말을 하는 상태**다. 쓰는 쪽이 생기는
+    순간(용량 표시, 진행률, 사전 할당) 조용히 틀린다.
+
+    ## 어떻게 고치나
+
+    크기를 **서빙 경로에서 직접 잰다.** 파일명 매핑과 디렉터리 규칙은
+    `api/v1/documents.py` 의 것을 그대로 가져다 쓴다 — 같은 어휘를 두 벌로 만들지
+    않는다(이 저장소가 BUGS #50/#64 로 반복해 겪은 어긋남의 원인이 그것이었다).
+
+    비용은 READY 문서당 `os.stat` 1회다(물건당 최대 3회). 같은 엔드포인트가 이미
+    SQL 쿼리 6개를 돌리므로 상대적으로 무시할 수 있고, 사진 서빙(`images.py`)도
+    같은 방식으로 stat 한다.
+
+    실패하면(파일 없음/권한) None 을 돌려준다 — "모른다"는 정직한 값이고,
+    `page_count` 가 이미 같은 규약을 쓴다. 여기서 예외를 올려 상세 응답 전체를
+    500으로 만들지 않는다.
+    """
+    try:
+        from api.v1.documents import DOC_TYPE_FILES, get_doc_dir
+        entry = DOC_TYPE_FILES.get((doc_type or "").upper())
+        if not entry:
+            return None
+        filename = entry[0]
+        court_name, case_no = item_row["court_name"], item_row["case_no"]
+        if not court_name or not case_no:
+            return None
+        path = os.path.join(get_doc_dir(court_name, case_no, item_row["item_no"]), filename)
+        size = os.path.getsize(path)
+        return size if size > 0 else None
+    except (OSError, ValueError, TypeError):
+        # 파일 없음 / 권한 / 경로 오류만 흡수한다. **bare Exception 을 쓰지 않는다** —
+        # 그러면 이 함수 안의 NameError(예: import 누락) 같은 코딩 실수까지 삼켜
+        # 모든 file_size 가 조용히 None 이 된다. 이 저장소가 "거짓 성공"이라 부르는 모양이다.
+        return None
+
+
+def _document_entry(item_id: int, row, doc_raw_by_type, item_row=None) -> dict:
     """문서 1건의 화면용 정보.
 
     `page_count`가 None인 것과 0인 것은 다르다 — None은 "아직 모른다"(수집 전이거나
@@ -165,6 +221,12 @@ def _document_entry(item_id: int, row, doc_raw_by_type) -> dict:
     doc_type = row["doc_type"]
     status = row["status"]
     raw = doc_raw_by_type.get(doc_type)
+    # ★ `file_size` 는 **`download_url` 이 주는 파일**의 크기여야 한다.
+    #   READY 가 아니면 URL 자체를 주지 않으므로 크기도 재지 않는다(잴 대상이 없다).
+    #   서빙 파일을 못 재면 doc_raw 값으로 떨어지지 않는다 — 그것이 바로 다른 파일을
+    #   설명하던 예전 동작이다. 모르면 None 이라고 말한다.
+    served_size = (_served_file_size(item_row, doc_type)
+                   if (status == "READY" and item_row is not None) else None)
     return {
         "doc_type": doc_type,
         "status": status,
@@ -172,7 +234,7 @@ def _document_entry(item_id: int, row, doc_raw_by_type) -> dict:
         # 하지 않도록 서버가 한 번만 판단한다.
         "available": status == "READY",
         "page_count": raw["page_count"] if raw else None,
-        "file_size": raw["file_size"] if raw else None,
+        "file_size": served_size,
         "doc_version": raw["doc_version"] if raw else None,
         # READY가 아니면 URL을 주지 않는다. 열 수 없는 주소를 건네고 프런트가 404를
         # 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다.

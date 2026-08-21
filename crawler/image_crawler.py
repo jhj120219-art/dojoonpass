@@ -184,11 +184,39 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
     # 같은 순번을 두 요소가 주장하면(캐러셀이 썸네일까지 같은 id 규칙으로 그리는 경우 등)
     # 먼저 나온 것을 쓴다. 순번은 `UNIQUE(item_id, seq)`의 키라 조용히 덮어쓰면
     # 어느 사진이 남았는지 알 수 없게 된다.
-    seen_seq = set()
-    attempted = 0
     written = 0        # 이번에 **실제로 디스크에 쓴** 장수
     unchanged = 0      # 바이트가 같아 건드리지 않은 장수
     saved_images: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # 1차 통과 — 후보를 모으고 **순번마다 가장 큰 것**을 고른다
+    #
+    # ## 왜 "먼저 나온 것"이 아니라 "가장 큰 것"인가 (2026-08-21 Sprint 243)
+    #
+    # 예전에는 같은 순번이 두 번 나오면 **먼저 나온 것을 쓰고 뒤엣것을 버렸다.**
+    # 그런데 이 파일의 옛 주석이 그 위험을 이미 적어 두고 있었다 —
+    # *"캐러셀이 썸네일까지 같은 id 규칙으로 그리는 경우"*. 그 경우 DOM 순서상
+    # **썸네일이 먼저** 나오는 것이 자연스럽고, 그러면 우리는 큰 사진을 눈앞에 두고
+    # 작은 것을 저장한다. 조용히, 로그도 남기지 않고.
+    #
+    # 크기 비교로 고르면 그 위험이 사라진다. 후보가 하나뿐이면 동작은 **완전히 같다**
+    # (지금 운영 데이터가 그 상태다 - 2026-08-21 실측 45장 전부 긴 변 700px 단일 후보).
+    #
+    # ## 동시에 이것은 **증거 수집기**다
+    #
+    # "법원이 더 큰 원본을 주는데 우리가 썸네일을 받는가?"(B/C 가설)는 지금 저장된
+    # 파일만으로는 판정할 수 없다. 실제 법원 페이지를 다시 열어야 하는데 그것은
+    # 승인 영역이다. 그래서 **다음 실크롤이 스스로 답하게** 만든다 —
+    # 순번마다 후보가 둘 이상이면 각각의 해상도를 로그에 남긴다.
+    # ------------------------------------------------------------------
+    candidates = {}          # seq -> list of dict(가장 큰 것을 고른다)
+    # ★ `attempted` 는 **alt 가 사진으로 파싱된 순번의 수**다 - 디코드/저장 실패까지
+    #   포함한다. 이것이 `partial`(= 저장한 장수 < 시도한 장수)의 분모이기 때문이다.
+    #   후보 수(`len(candidates)`)로 세면 **디코드에 실패한 장이 시도에서 빠져**
+    #   5장 중 3장만 저장돼도 partial=False 가 된다(2026-08-21 회귀로 확인).
+    seen_seq = set()
+    skipped_alt = []         # alt 규칙에 안 맞아 건너뛴 요소(형태만 기록)
+    skipped_src = []         # data URI 가 아니어서 건너뛴 요소
 
     for el in els:
         try:
@@ -201,20 +229,19 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
         parsed = parse_image_alt(alt)
         if not parsed:
             # 캐러셀 밖의 아이콘 등. 사진이 아니므로 시도 횟수에도 세지 않는다.
+            # ★ 다만 **무엇을 건너뛰었는지는 남긴다** - 법원이 더 큰 사진을 다른 alt
+            #   규칙으로 붙이기 시작하면 그 사실이 로그에 드러나야 한다.
+            if src.startswith("data:image") and len(src) > 5000:
+                skipped_alt.append((alt[:40], len(src)))
             continue
         kind, seq = parsed
-
-        if seq in seen_seq:
-            logger.warning("[%s-%s] 사진 순번 중복(seq=%d, alt=%r) - 뒤엣것을 무시",
-                           case_no, item_no, seq, alt)
-            continue
         seen_seq.add(seq)
-        attempted += 1
 
         data = decode_image_data_uri(src)
         if data is None:
             logger.warning("[%s-%s] 사진 %d: data URI가 아니거나 디코드 실패(앞 40자=%r)",
                            case_no, item_no, seq, src[:40])
+            skipped_src.append((seq, src[:40]))
             continue
 
         if len(data) < MIN_IMAGE_BYTES:
@@ -229,6 +256,36 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
             logger.warning("[%s-%s] 사진 %d: 알 수 없는 이미지 형식 - 저장하지 않는다",
                            case_no, item_no, seq)
             continue
+
+        w, h = read_image_dimensions(data)
+        candidates.setdefault(seq, []).append(
+            {"kind": kind, "data": data, "ext": ext, "alt": alt,
+             "w": w or 0, "h": h or 0, "area": (w or 0) * (h or 0)})
+
+    if skipped_alt:
+        logger.warning("[%s-%s] alt 규칙에 맞지 않는 **큰 data:image 요소** %d개를 건너뛰었다 "
+                       "(법원 DOM 변경/고해상도 변형 가능성): %s",
+                       case_no, item_no, len(skipped_alt), skipped_alt[:3])
+
+    attempted = len(seen_seq)
+    chosen = {}
+    for seq, cands in candidates.items():
+        # 가장 큰 면적 -> 같으면 바이트가 큰 것. 결정적으로 고른다(DOM 순서에 의존하지 않는다).
+        best = max(cands, key=lambda c: (c["area"], len(c["data"])))
+        chosen[seq] = best
+        if len(cands) > 1:
+            logger.warning(
+                "[%s-%s] 사진 %d: 후보 %d개 - **가장 큰 것을 고른다** %s -> %dx%d(%dB)",
+                case_no, item_no, seq, len(cands),
+                ["%dx%d(%dB)" % (c["w"], c["h"], len(c["data"])) for c in cands],
+                best["w"], best["h"], len(best["data"]))
+
+    # ------------------------------------------------------------------
+    # 2차 통과 — 고른 것만 디스크에 쓴다 (아래 로직은 종전과 동일)
+    # ------------------------------------------------------------------
+    for seq in sorted(chosen):
+        best = chosen[seq]
+        kind, data, ext = best["kind"], best["data"], best["ext"]
 
         dest = image_path(court_code, case_no, item_no, seq, ext)
         if not overwrite and os.path.isfile(dest) and os.path.getsize(dest) >= MIN_IMAGE_BYTES:
@@ -267,7 +324,7 @@ def collect_images(driver, court_code: str, case_no: str, item_no: str,
             continue
         written += 1
 
-        w, h = read_image_dimensions(data)
+        w, h = best["w"], best["h"]
         saved_images.append({
             "seq": seq,
             "kind": kind,

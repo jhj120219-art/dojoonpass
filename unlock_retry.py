@@ -25,11 +25,16 @@
     python unlock_retry.py 서울중앙지방법원 2024타경1775 --apply         # 실제 반영
     python unlock_retry.py 서울중앙지방법원 2024타경1775 --doc-type appraisal --item-no 1
 """
+import os
 import argparse
 import sqlite3
 import sys
 
-DB_PATH = "auction.db"
+# ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
+#   "no such table" 로 죽는다(실측). 운영 도구가 엉뚱한 DB 를 보는 것보다 낫지만,
+#   찌꺼기 파일이 남고 오류 문구가 원인을 가린다.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
 
 
 def build_where(court, case_no, doc_type, item_no):

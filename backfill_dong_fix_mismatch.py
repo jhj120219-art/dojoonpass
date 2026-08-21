@@ -17,11 +17,16 @@ STEP5(빈 dong 채우기, 491건)와는 대상 선정 기준이 다르다 — �
 실제 반영하려면 --apply 옵션을 명시적으로 줘야 한다:
     python backfill_dong_fix_mismatch.py --apply
 """
+import os
 import sys
 import sqlite3
 from normalizer.normalizer import normalize_address
 
-DB_PATH = "auction.db"
+# ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
+#   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
+#   "no such table" 로 죽는다(실측). 운영 도구가 엉뚱한 DB 를 보는 것보다 낫지만,
+#   찌꺼기 파일이 남고 오류 문구가 원인을 가린다.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
 
 
 def find_mismatches(conn: sqlite3.Connection, table: str):

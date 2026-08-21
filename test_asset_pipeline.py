@@ -1183,19 +1183,56 @@ def test_bad_payloads_are_rejected():
         env.close()
 
 
+NL = chr(10)
+
+
 def test_duplicate_seq_defense():
-    print("\n--- 9. 같은 순번 중복 방어 ---")
+    """같은 순번의 후보가 여럿이면 **가장 큰 것**을 쓴다 (2026-08-21 Sprint 243 규칙 변경).
+
+    ## 왜 "먼저 나온 것"에서 바꿨나
+
+    예전 규칙은 "먼저 나온 것을 쓰고 뒤엣것을 버린다"였다. 그런데 이 파일이 검사하는
+    수집기(`crawler/image_crawler.py`)의 주석이 그 위험을 이미 적어 두고 있었다 -
+    "캐러셀이 썸네일까지 같은 id 규칙으로 그리는 경우".
+
+    그 경우 DOM 순서상 **썸네일이 먼저** 오는 것이 자연스럽다. 즉 옛 규칙은
+    **큰 사진을 눈앞에 두고 작은 것을 저장**할 수 있었고, 그것이 조용히 일어났다
+    (로그도 "뒤엣것을 무시"라고만 남았다).
+
+    크기로 고르면 그 위험이 사라진다. 후보가 하나뿐인 경우 동작은 완전히 같다 -
+    2026-08-21 실측에서 운영 사진 45장은 전부 단일 후보였고 전부 긴 변 700px 였다.
+
+    ## 이 검사가 잠그는 것
+
+    "중복이면 하나만"(옛 계약)은 그대로 유지하면서, **어느 것을 남기는가**를
+    크기 기준으로 고정한다. DOM 순서에 의존하지 않는다는 뜻이기도 하다.
+    """
+    print(NL + "--- 9. 같은 순번 중복: 가장 큰 것을 채택 ---")
     from crawler.image_crawler import collect_images
     env = Env()
     try:
         court, case_no, item_no = env.seed_item()
-        a, b = make_jpeg(100, 100), make_jpeg(200, 200)
-        driver = FakeDriver([img_el("전경도", 1, a), img_el("위치도", 1, b)])
+        small, big = make_jpeg(100, 100), make_jpeg(200, 200)
+        # (1) 작은 것이 **먼저** 와도 큰 것을 남긴다 (옛 규칙이라면 작은 것을 남겼다)
+        driver = FakeDriver([img_el("전경도", 1, small), img_el("위치도", 1, big)])
         res = collect_images(driver, court, case_no, item_no)
         check("순번 중복은 하나만 채택", res["image_count"], 1)
-        check("먼저 나온 것을 쓴다", res["images"][0]["kind"], "전경도")
-        check("먼저 나온 것의 크기", (res["images"][0]["width"], res["images"][0]["height"]),
-              (100, 100))
+        check("★ 작은 것이 먼저 와도 **큰 것**을 남긴다",
+              (res["images"][0]["width"], res["images"][0]["height"]), (200, 200))
+        check("남긴 것의 종류도 큰 쪽의 것이다", res["images"][0]["kind"], "위치도")
+    finally:
+        env.close()
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item()
+        small, big = make_jpeg(100, 100), make_jpeg(200, 200)
+        # (2) 순서를 뒤집어도 결과가 같다 - DOM 순서에 의존하지 않는다
+        driver = FakeDriver([img_el("위치도", 1, big), img_el("전경도", 1, small)])
+        res = collect_images(driver, court, case_no, item_no)
+        check("순번 중복은 하나만 채택(역순)", res["image_count"], 1)
+        check("★ 순서를 뒤집어도 큰 것을 남긴다(DOM 순서 비의존)",
+              (res["images"][0]["width"], res["images"][0]["height"]), (200, 200))
     finally:
         env.close()
 
@@ -4764,6 +4801,252 @@ def test_missing_auction_image_table_degrades_not_crashes():
         env.close()
 
 
+
+
+def test_file_size_describes_what_download_url_serves():
+    """`file_size` 는 **`download_url` 이 주는 바로 그 파일**의 크기여야 한다.
+
+    ## 무엇이 틀려 있었나 (2026-08-21 Sprint 241)
+
+    `_document_entry()` 는 `file_size` 를 `doc_raw` 에서 그대로 퍼왔다. 그런데
+    `doc_raw` 가 실체로 기록하는 파일과 API 가 **서빙하는** 파일이 STATUS 에서 다르다.
+
+        doc_raw.storage_path   status.json    <- 구조화 산출물(변경 감지 지문의 출처)
+        서빙 파일               status.html    <- api/v1/documents.py DOC_TYPE_FILES
+
+    운영 데이터 실측(READY 문서 45건 전수, 2026-08-21):
+
+        SPEC / APPRAISAL   33건  doc_raw 파일 == 서빙 파일  -> 크기 일치
+        STATUS             12건  **전부 불일치**  (예: 광고 12,827B / 실제 45,747B ≈ 3.6배)
+
+    즉 API 가 `download_url` 옆에서 **다른 파일의 크기**를 광고하고 있었다.
+    지금은 화면이 이 값을 그리지 않아 사용자에게 보이지 않지만, 쓰는 쪽이 생기는
+    순간(용량 표시·진행률·사전 할당) 조용히 틀린다.
+
+    ## 이 검사가 잠그는 것
+
+    STATUS 를 **반드시 포함**한다 — SPEC 만 검사하면 두 파일이 같아서 통과해 버리고,
+    그것이 이 결함이 오래 살아남은 이유다(검사가 공허해지는 지점을 여기서 못 박는다).
+    """
+    print("\n--- 41. file_size 가 download_url 이 주는 파일을 설명하는가 (Sprint 241) ---")
+    from fastapi.testclient import TestClient
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        doc_dir = os.path.join(env.docs, court, case_no, item_no)
+        os.makedirs(doc_dir, exist_ok=True)
+
+        # 서빙되는 파일과 doc_raw 가 가리키는 파일을 **일부러 다른 크기로** 만든다.
+        spec_bytes = b"%PDF-1.4 " + b"S" * 500
+        html_bytes = b"<html><body>" + b"H" * 4000 + b"</body></html>"
+        json_bytes = b'{"fields":{}}' + b" " * 100          # html 과 크기가 확연히 다르다
+        with open(os.path.join(doc_dir, "spec.pdf"), "wb") as f:
+            f.write(spec_bytes)
+        with open(os.path.join(doc_dir, "status.html"), "wb") as f:
+            f.write(html_bytes)
+        with open(os.path.join(doc_dir, "status.json"), "wb") as f:
+            f.write(json_bytes)
+
+        c = env.conn()
+        c.execute("INSERT INTO document_status (item_id,doc_type,status) VALUES (1,'SPEC','READY')")
+        c.execute("INSERT INTO document_status (item_id,doc_type,status) VALUES (1,'STATUS','READY')")
+        c.execute("INSERT INTO document_status (item_id,doc_type,status)"
+                  " VALUES (1,'APPRAISAL','COLLECTING')")
+        # doc_raw 는 **구조화 산출물**을 가리킨다 - 이것이 실제 규약이다
+        c.execute("INSERT INTO doc_raw (item_id,doc_type,storage_path,file_size,doc_version,page_count)"
+                  " VALUES (1,'SPEC',?,?,1,7)",
+                  (os.path.join(doc_dir, "spec.pdf"), len(spec_bytes)))
+        c.execute("INSERT INTO doc_raw (item_id,doc_type,storage_path,file_size,doc_version,page_count)"
+                  " VALUES (1,'STATUS',?,?,1,NULL)",
+                  (os.path.join(doc_dir, "status.json"), len(json_bytes)))
+        c.commit()
+        c.close()
+
+        from api_server import app
+        client = TestClient(app)
+        body = client.get("/api/v1/item/1").json()
+        docs = {d["doc_type"]: d for d in body["documents"]}
+
+        # 전제: 두 파일 크기가 실제로 다르다(검사가 공허하지 않다)
+        check_true("★ status.html 과 status.json 의 크기가 다르다(전제)",
+                   len(html_bytes) != len(json_bytes),
+                   "%d vs %d" % (len(html_bytes), len(json_bytes)))
+
+        for doc_type in ("SPEC", "STATUS"):
+            d = docs[doc_type]
+            check("%s available" % doc_type, d["available"], True)
+            served = client.get(d["download_url"])
+            check("%s 서빙 200" % doc_type, served.status_code, 200)
+            check("★ %s file_size == download_url 이 준 바이트 수" % doc_type,
+                  d["file_size"], len(served.content))
+
+        # ★ 핵심: STATUS 는 doc_raw 값(status.json)을 그대로 쓰면 안 된다
+        check_true("★ STATUS file_size 가 doc_raw(status.json) 값이 아니다",
+                   docs["STATUS"]["file_size"] != len(json_bytes),
+                   "doc_raw 값 %d 를 그대로 퍼왔다 - 다른 파일을 설명하고 있다"
+                   % len(json_bytes))
+        check("★ STATUS file_size 는 서빙되는 status.html 의 크기다",
+              docs["STATUS"]["file_size"], len(html_bytes))
+
+        # READY 가 아니면 URL 도 크기도 주지 않는다(잴 대상이 없다).
+        #
+        # ★ 이 검사가 공허해지지 않도록 **파일을 실제로 만들어 둔다.**
+        #   재수집(overwrite) 중에는 상태가 COLLECTING 인데 **옛 파일이 디스크에 그대로**
+        #   남아 있다 - 실제로 자주 있는 상태다. 파일이 없으면 어느 구현이든 None 이
+        #   나와서, "READY 일 때만 잰다"는 규칙을 지우는 mutation 이 통과해 버린다.
+        with open(os.path.join(doc_dir, "appraisal.pdf"), "wb") as f:
+            f.write(b"%PDF-1.4 " + b"A" * 2000)
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check_true("재수집 중인 문서의 옛 파일이 디스크에 있다(전제)",
+                   os.path.getsize(os.path.join(doc_dir, "appraisal.pdf")) > 0)
+        check("수집중 문서는 URL 없음", docs["APPRAISAL"]["download_url"], None)
+        check_true("★ 수집중 문서는 옛 파일이 있어도 file_size 를 주지 않는다",
+                   docs["APPRAISAL"]["file_size"] is None,
+                   "file_size=%r - 받을 수 없는(URL 없는) 문서의 크기를 광고하고 있다"
+                   % (docs["APPRAISAL"]["file_size"],))
+
+        # doc_raw 는 건드리지 않았다 - 변경 감지의 실체 기록은 그대로여야 한다
+        c = env.conn()
+        raw = {r[0]: r[1] for r in c.execute(
+            "SELECT doc_type, file_size FROM doc_raw WHERE item_id=1")}
+        c.close()
+        check("doc_raw 의 STATUS 크기는 여전히 status.json 것이다(의미 불변)",
+              raw["STATUS"], len(json_bytes))
+
+        # ★ 0바이트 서빙 파일은 "있다"가 아니다 - `documents.py` 가 그런 파일에
+        #   404 를 주기 때문이다(Sprint 98: "있다의 기준을 크롤러와 같게 맞춘다").
+        #   그 상태에서 크기를 0으로 광고하면 "받을 수 있는데 0바이트"라는 뜻이 되어
+        #   실제 동작(404)과 어긋난다. 두 모듈의 기준을 하나로 유지한다.
+        with open(os.path.join(doc_dir, "status.html"), "wb") as f:
+            f.write(b"")
+        body0 = client.get("/api/v1/item/1").json()
+        st0 = {d["doc_type"]: d for d in body0["documents"]}["STATUS"]
+        check("0바이트 서빙 파일은 실제로 404 다(전제)",
+              client.get("/api/v1/item/1/documents/STATUS").status_code, 404)
+        check_true("★ 0바이트면 file_size 는 0 이 아니라 None 이다(404 와 같은 판정)",
+                   st0["file_size"] is None,
+                   "file_size=%r - 받을 수 없는 문서에 크기를 광고하고 있다"
+                   % (st0["file_size"],))
+        with open(os.path.join(doc_dir, "status.html"), "wb") as f:
+            f.write(html_bytes)
+
+        # 서빙 파일이 사라지면 크기는 None 이 된다 - doc_raw 값으로 되돌아가지 않는다
+        os.remove(os.path.join(doc_dir, "status.html"))
+        body2 = client.get("/api/v1/item/1").json()
+        st2 = {d["doc_type"]: d for d in body2["documents"]}["STATUS"]
+        check_true("★ 서빙 파일이 없으면 file_size 는 None(옛 값으로 되돌아가지 않는다)",
+                   st2["file_size"] is None,
+                   "file_size=%r - doc_raw 로 폴백하면 다시 거짓말이 된다" % (st2["file_size"],))
+    finally:
+        env.close()
+
+
+
+def test_stored_resolution_is_never_lower_than_the_source():
+    """저장된 사진의 해상도가 **원본 후보보다 낮아지지 않는다** (2026-08-21 Sprint 243).
+
+    ## 왜 이 검사가 필요했나
+
+    "검색목록/상세의 사진이 왜 작은가"라는 질문에 답하려면 먼저 **우리가 줄이고
+    있지 않다**는 것을 코드로 못 박아야 한다. 그래야 남은 원인(법원이 그 크기만 준다)
+    을 근거 있게 말할 수 있다.
+
+    2026-08-21 실측으로 확인한 사실들:
+
+        운영 사진 45장  긴 변이 **전부 정확히 700px**
+        우리 코드       `700` 리터럴 없음 / resize·thumbnail 호출 없음
+        수집 경로       법원이 base64 data URI 로 바이트를 그대로 준다 -> 우리는 그대로 쓴다
+        EXIF            45장 전부 없음 -> 법원 서버가 재인코딩한 산출물이다
+        양자화테이블 합   64(거의 무손실) 와 1858(보통) 두 종류가 섞여 있다
+                        -> 썸네일 파이프라인이라면 하나로 통일됐을 것이다
+
+    즉 700px 는 **법원이 정한 크기**이지 우리가 만든 것이 아니다. 이 검사는 그 사실이
+    앞으로도 유지되게 한다 — 누군가 파이프라인에 리사이즈를 넣으면 여기서 운다.
+
+    ## 무엇을 잠그나
+
+        1. 저장 파일의 해상도 == 원본 바이트의 해상도  (한 픽셀도 줄이지 않는다)
+        2. 저장 파일의 바이트 == 원본 바이트           (재인코딩하지 않는다)
+        3. DB(auction_image) 의 width/height == 실제 파일의 해상도
+        4. 후보가 여럿이면 **가장 큰 것**이 저장된다
+    """
+    print(NL + "--- 42. 저장 해상도가 원본보다 낮아지지 않는다 (Sprint 243) ---")
+    import hashlib
+    from crawler.image_crawler import collect_images
+    from crawler.image_assets import read_image_dimensions
+
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        # 서로 다른 해상도의 원본들 - 세로/가로/정사각을 섞는다
+        sources = {1: make_jpeg(1600, 1200), 2: make_jpeg(900, 1600),
+                   3: make_jpeg(1024, 1024), 4: make_jpeg(640, 480)}
+        driver = FakeDriver([img_el("전경도", s, b) for s, b in sorted(sources.items())])
+        res = collect_images(driver, court, case_no, item_no)
+        check("네 장 모두 저장", res["image_count"], 4)
+
+        for im in res["images"]:
+            seq = im["seq"]
+            src = sources[seq]
+            sw, sh = read_image_dimensions(src)
+            # (1) 파이프라인이 보고한 해상도 == 원본 해상도
+            check("★ seq%d 보고 해상도가 원본과 같다" % seq, (im["width"], im["height"]), (sw, sh))
+            # (2) 디스크 파일을 실제로 읽어 다시 잰다 (보고를 믿지 않는다).
+            #     제품이 쓰는 판독기를 그대로 쓴다 - 이 검사의 표본은 합성 JPEG 헤더라
+            #     범용 디코더(PIL)로는 열리지 않는다. 재는 대상은 **해상도**이므로
+            #     SOF 마커를 읽는 제품 판독기가 정확히 맞는 도구다.
+            dw, dh = read_image_dimensions(open(im["path"], "rb").read())
+            check("★ seq%d 디스크 파일 해상도가 원본과 같다" % seq, (dw, dh), (sw, sh))
+            # (3) 바이트까지 동일 - 재인코딩하지 않는다
+            disk = open(im["path"], "rb").read()
+            check("★ seq%d 저장 바이트가 원본과 동일(재인코딩 없음)" % seq,
+                  hashlib.sha256(disk).hexdigest(), hashlib.sha256(src).hexdigest())
+
+        # (4) DB 기록도 실제 파일과 같아야 한다
+        from storage.database import save_auction_images
+        save_auction_images(court, case_no, item_no, res["images"])
+        c = env.conn()
+        try:
+            rows = list(c.execute("SELECT seq,width,height,storage_path FROM auction_image"
+                                  " ORDER BY seq"))
+        finally:
+            c.close()
+        check("DB 에 네 행", len(rows), 4)
+        for r in rows:
+            dw, dh = read_image_dimensions(open(r["storage_path"], "rb").read())
+            check("★ DB seq%d 해상도가 실제 파일과 같다" % r["seq"],
+                  (r["width"], r["height"]), (dw, dh))
+    finally:
+        env.close()
+
+    # (5) 후보가 여럿일 때 가장 큰 것이 저장된다 - 축소 저장을 만들지 않는다
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        thumb, full = make_jpeg(200, 150), make_jpeg(2000, 1500)
+        # 썸네일이 **먼저** 오는 배치 - 옛 규칙이었다면 썸네일이 저장됐다
+        driver = FakeDriver([img_el("전경도", 1, thumb), img_el("전경도", 1, full)])
+        res = collect_images(driver, court, case_no, item_no)
+        check("한 장만 저장", res["image_count"], 1)
+        fw, fh = read_image_dimensions(full)
+        check("★ 썸네일이 먼저 와도 큰 원본이 저장된다",
+              (res["images"][0]["width"], res["images"][0]["height"]), (fw, fh))
+        check_true("★ 저장 해상도가 썸네일보다 크다(축소 저장이 아니다)",
+                   res["images"][0]["width"] > 200 and res["images"][0]["height"] > 150,
+                   (res["images"][0]["width"], res["images"][0]["height"]))
+    finally:
+        env.close()
+
+    # (6) 수집기 코드에 리사이즈 도구가 들어오지 않았는가 (주석이 아니라 코드)
+    src_files = ["crawler/image_crawler.py", "crawler/image_assets.py"]
+    for f in src_files:
+        raw = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), f),
+                      encoding="utf-8-sig").read()
+        code = NL.join(l for l in raw.splitlines() if not l.lstrip().startswith("#"))
+        for banned in (".resize(", ".thumbnail(", "LANCZOS", "BICUBIC"):
+            check_true("★ %s 에 %s 가 없다(파이프라인이 축소하지 않는다)" % (f, banned),
+                       banned not in code, banned)
+
 if __name__ == "__main__":
     test_alt_parsing()
     test_image_format_edge_cases()
@@ -4825,6 +5108,8 @@ if __name__ == "__main__":
     test_url_rules_match_between_modules()
     test_frontend_contract()
     test_missing_auction_image_table_degrades_not_crashes()
+    test_file_size_describes_what_download_url_serves()
+    test_stored_resolution_is_never_lower_than_the_source()
 
     print("\n" + "=" * 55)
     if failures:
