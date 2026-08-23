@@ -20,7 +20,16 @@ config/, normalizer/, validator/, search/, filter/, intent/, models/ 및 루트�
 """
 import io, os, re, subprocess, sys, json
 
-REPO = r"C:\Users\jhj12\OneDrive\Desktop\dojoonpass"
+# ★ 2026-08-22 수정 — 예전에는 다른 컴퓨터의 사용자 프로필 경로가 하드코딩돼 있었다
+# (`C:\Users\jhj12\OneDrive\Desktop\dojoonpass`). 이 저장소가 여러 기기를 오가며
+# 개발된 흔적이다. 이 머신에는 그 경로가 **OneDrive가 동기화해 둔 빈 폴더**로
+# 우연히 존재해서(`.next/` 하나만 든 빈 껍데기, 실제 코드 0개) `os.chdir()`/
+# `os.listdir()`가 예외 없이 조용히 성공하고 `files`가 빈 목록이 되어, 이 도구가
+# **"의심 목록 없음"을 계속 출력하면서 실제로는 아무 test_*.py도 한 번도 돌리지
+# 않고 있었다** — 이 저장소가 반복 경계하는 바로 그 "CWD/경로 의존성" 결함이
+# 정작 그것을 감시해야 할 감사 도구 자신에게 있었다(같은 패턴이 `api/auth.py`
+# 등에서 이미 Sprint245/246에 고쳐진 방식 그대로 여기도 고친다).
+REPO = os.path.dirname(os.path.abspath(__file__))
 os.chdir(REPO)
 
 PRODUCT_DIRS = ("api", "storage", "crawler", "config", "normalizer",

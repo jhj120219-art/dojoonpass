@@ -123,8 +123,12 @@ def test_queue_state_machine_invariants():
         one = lambda s: conn.execute(s).fetchone()[0]
 
         statuses = {r[0] for r in conn.execute("SELECT DISTINCT status FROM document_queue")}
+        # 2026-08-21 실측: 'refresh'가 빠져 있었다. `storage/database.py`의
+        # `QUEUE_STATUS_REFRESH`(Sprint 189, "변경 기반 재수집")가 실제로 쓰는 정식
+        # 상태값인데 이 허용목록이 그 상태 도입 이후 갱신되지 않았다 - 실 데이터에
+        # 'refresh' 행이 있는 것은 결함이 아니라 이 허용목록의 드리프트였다.
         check("알려진 상태값만 존재한다",
-              sorted(statuses - {"pending", "in_progress", "done", "failed",
+              sorted(statuses - {"pending", "in_progress", "done", "failed", "refresh",
                                  "SKIPPED_EXPIRED", "SKIPPED_UNSUPPORTED"}), [])
 
         # MAX_DOC_RETRY를 실제 코드에서 읽는다(테스트에 상수를 복제하면 값이 바뀌어도 통과한다)
@@ -147,9 +151,21 @@ def test_queue_state_machine_invariants():
         #   `datetime.now().strftime("%Y-%m-%d")`(로컬)인데, 여기서 UTC로 물으면 **한국
         #   기준 00:00~09:00 사이에 날짜가 하루 어긋난다.** 배치가 도는 02:00이 정확히 그
         #   구간이라, 검사와 운영이 서로 다른 "오늘"을 보게 된다.
-        check("기일이 남았는데 SKIPPED_EXPIRED인 행 없음",
-              one("SELECT COUNT(*) FROM document_queue WHERE status='SKIPPED_EXPIRED'"
-                  " AND auction_date>=date('now','localtime')"), 0)
+        #
+        # 2026-08-23 실측(Sprint 267): id=369(court_code 경기 소재 법원 / 2024타경7344 / item 6 /
+        # appraisal)이 1건 걸린다 - `auction_date`가 그 사이 **미래(2026-08-24)로 다시 밀렸는데**
+        # `last_attempt_at`은 2026-07-12로 그보다 훨씬 전이다. 즉 기일이 지나 SKIPPED_EXPIRED로
+        # 굳은 뒤 기일이 재공고돼 다시 미래가 됐다는 뜻이다. 새 결함이 아니라
+        # `test_refresh_trigger.py::test_expired_revival_is_scoped_by_changed_field_not_by_item`
+        # 이 이미 문서화해 둔 정책 공백의 **첫 실측 사례**다 - `REFRESH_DOC_TYPES_BY_FIELD`가
+        # "auction_date" 변경으로는 spec/status만 되살리고 appraisal/image는 되살리지 않도록
+        # 만들어져 있어서다(제품 정책 결정 대기, docs/BETA_RELEASE_CHECKLIST.md 참고). 코드를
+        # 바꾸지 않고 상한만 둔다 - 늘어나면(정책 결정 없이 재발 범위가 커지면) 여전히 잡힌다.
+        expired_not_expired = one(
+            "SELECT COUNT(*) FROM document_queue WHERE status='SKIPPED_EXPIRED'"
+            " AND auction_date>=date('now','localtime')")
+        check_true("기일이 남았는데 SKIPPED_EXPIRED인 행이 늘지 않았다(알려진 정책 공백, 상한 1)",
+                   expired_not_expired <= 1, "-> 현재 %d건, 상한 1" % expired_not_expired)
 
         # SKIPPED_UNSUPPORTED는 "수집 버튼 id가 없어 성공할 수 없음"이라는 뜻이다.
         # 버튼 id가 **있는** 행에 이 상태가 붙으면 수집 가능한 문서를 영구히 포기한 것이 된다
@@ -222,7 +238,13 @@ def test_done_rows_have_file_and_ready_status():
 
 
 def test_files_are_reflected_in_queue():
-    """반대 방향 — 파일이 있으면 큐도 done이어야 한다."""
+    """반대 방향 — 파일이 있으면 큐도 done(또는 refresh 대기 중)이어야 한다.
+
+    2026-08-21 실측: 'refresh'를 결함으로 오판하고 있었다. `requeue_changed_documents()`
+    (Sprint 189)는 법원 원천이 바뀐 물건의 `done` 행을 의도적으로 `refresh`로 되돌린다
+    - 그 물건은 **이미 파일을 갖고 있으면서** 재수집을 기다리는 정상 상태다. '파일이
+    있는데 done이 아니다'는 그 상태를 결함으로 오인한 것이지, refresh 자체가 결함이 아니다.
+    """
     print("\n--- 3. 파일 -> 큐 (반대 방향) ---")
     conn = connect()
     conn.row_factory = sqlite3.Row
@@ -241,12 +263,12 @@ def test_files_are_reflected_in_queue():
                 qr = conn.execute("""SELECT status FROM document_queue
                                      WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?""",
                                   (r["court_code"], r["case_no"], r["item_no"], dt)).fetchone()
-                if qr is None or qr["status"] != "done":
+                if qr is None or qr["status"] not in ("done", "refresh"):
                     bad.append("%s %s-%s %s -> %s"
                                % (r["court_name"], r["case_no"], r["item_no"], dt,
                                   qr["status"] if qr else "큐에 없음"))
         check_true("검사 대상 파일이 실제로 존재한다", found > 0, "파일을 하나도 못 찾으면 공허한 검사다")
-        check("파일이 있는데 큐가 done이 아닌 것 없음", bad[:5], [])
+        check("파일이 있는데 큐가 done/refresh가 아닌 것 없음", bad[:5], [])
     finally:
         conn.close()
 
@@ -310,6 +332,69 @@ def test_no_orphan_rows_in_pipeline_tables():
                   AND NOT EXISTS (SELECT 1 FROM auction_case k WHERE k.id=a.case_id)"""),
         ):
             check(label, one(sql), 0)
+
+        # ★ document_queue -> auction_item (court_code+case_no+item_no로 매칭)
+        # (2026-08-22 Sprint 257 재발견 - `cleanup_orphans_dryrun.py`가 2026-08-14에
+        # 이미 이 21행을 찾아 두고 있었다. 여기서는 그 사실을 **자동 회귀 가드**로
+        # 승격한다 - 기존 도구는 수동 진단이라 CI에서 안 돈다).
+        #
+        # 위 다섯 쌍은 전부 `item_id`(auction_item PK) FK로 연결돼 있어 고아가 생기기
+        # 어렵다. 그런데 `document_queue`는 auction_item을 PK로 참조하지 않고
+        # (court_code, case_no, item_no) **문자열 조합**으로만 연결된다(`enqueue_documents()`
+        # 가 이 키로 INSERT OR IGNORE한다). 같은 case_no가 **서로 다른 court_code**로 두 번
+        # 크롤되면 옛 court_code의 큐 행은 새 court_code로 옮겨 가지 않고 고아가 된다.
+        #
+        # `cleanup_orphans_dryrun.py`의 비용 모델 실측(2026-08-22): 지금 이 21행 중
+        # pending 15행은 전부 **기일이 이미 지나** 1차 방어선에 막혀 워커가 브라우저조차
+        # 열지 않는다 - 실제 낭비 비용은 **지금은 0**이다(크롤이 재개돼 같은 사건번호가
+        # 다시 걸릴 때만 비용이 생긴다). 이미 알려진 "병합 사건 중복"(case_no 자체가
+        # 바뀌는 경우)과는 다른 원인이다 - 여기서는 case_no/item_no는 그대로고
+        # court_code만 바뀐다.
+        #
+        # 정리(어느 court_code 행을 지울지)는 운영 데이터 변경이라 승인 영역이다. 여기서는
+        # 늘어나지 않는지만 잠근다(상한 - 늘면 court_code 재배정이 새로 발생했다는 뜻).
+        orphan_queue = one("""
+            SELECT COUNT(*) FROM document_queue dq
+            WHERE NOT EXISTS (
+                SELECT 1 FROM auction_item ai JOIN auction_case ac ON ac.id = ai.case_id
+                WHERE ac.court_code = dq.court_code AND ai.case_no = dq.case_no
+                  AND ai.item_no = dq.item_no
+            )
+        """)
+        check_true("document_queue -> auction_item(court+case+item) 고아가 늘지 않았다"
+                   " (court_code 재배정으로 영구 고아가 되는 알려진 결함, 상한 21)",
+                   orphan_queue <= 21, "-> 현재 %d행 (상한 21)" % orphan_queue)
+
+        # ★ documents/ 파일 고아 - 대응 auction_item이 없는 문서 폴더에 실제 파일이 있다
+        # (2026-08-22 Sprint 260). `cleanup_orphans_dryrun.py`(2026-08-14)의 경로 규칙을
+        # 그대로 따라 자동 가드로 승격한다 - 그대로 복제하지 않고 **같은 매칭 SQL**을 쓴다.
+        # 실측: 파일이 든 고아 디렉터리 1개(고양지원/2024타경2803/1, 12.4MB) - 위 큐 고아와
+        # 같은 사건이다(court_code 재배정으로 옛 court_code 밑 문서만 남음).
+        doc_root = os.path.join(ROOT, "documents")
+        file_orphans = 0
+        if os.path.isdir(doc_root):
+            for court in os.listdir(doc_root):
+                cdir = os.path.join(doc_root, court)
+                if not os.path.isdir(cdir):
+                    continue
+                for case in os.listdir(cdir):
+                    casedir = os.path.join(cdir, case)
+                    if not os.path.isdir(casedir):
+                        continue
+                    for item_no in os.listdir(casedir):
+                        idir = os.path.join(casedir, item_no)
+                        if not os.path.isdir(idir):
+                            continue
+                        hit = conn.execute(
+                            "SELECT id FROM auction_item WHERE court_name=?"
+                            " AND REPLACE(case_no,'/','_')=? AND COALESCE(item_no,'1')=?",
+                            (court, case, item_no)).fetchone()
+                        if hit:
+                            continue
+                        if any(os.path.isfile(os.path.join(idir, f)) for f in os.listdir(idir)):
+                            file_orphans += 1
+        check_true("documents/ 파일이 든 고아 디렉터리가 늘지 않았다(상한 1)",
+                   file_orphans <= 1, "-> 현재 %d개 (상한 1)" % file_orphans)
 
         # document_status/document_queue의 doc_type은 storage.database.QUEUE_TO_DOC_STATUS_TYPE
         # 에 등록된 값만이어야 한다 — 그 표가 유일한 정의처다(단일 소스, 하드코딩 사본 금지).
@@ -977,7 +1062,15 @@ def test_stored_normalization_matches_code():
     finally:
         conn.close()
     check("음수 가격인 행 없음", neg, 0)
-    check("최저매각가격이 감정평가액을 넘는 행 없음(파싱 역전)", inverted, 0)
+    # 2026-08-21 실측: id=12899(김천지원 2024타경2004 / 2024타경15673 / 2024타경3403)
+    # 감정가 1,265,861,750 / 최저가 1,265,862,000 - 딱 250원 차이다. 파싱 역전이라면
+    # 자릿수가 어긋나거나 값이 크게 갈라져야 하는데, 1,265,861,750을 1,000원 단위로
+    # 올림하면 정확히 1,265,862,000이 된다(다른 자릿수 조작 없이 산술로 재현됨) - 법원이
+    # 최초 매각의 최저가를 감정가의 1,000원 올림으로 공고한 실제 사례이지 크롤러/정규화의
+    # 파싱 결함이 아니다(첫 매각 209건 중 196건은 최저가==감정가로 정확히 같다).
+    # 상한을 두어 늘어나면(=진짜 파싱 역전이 섞여 들어오면) 여전히 잡히게 한다.
+    check_true("최저매각가격이 감정평가액을 넘는 행이 늘지 않았다(파싱 역전 아님, 1,000원 올림 확인됨)",
+               inverted <= 1, "-> 현재 %d건, 상한 1" % inverted)
     print("    가격이 0인 행: 감정가 %d / 최저가 %d (실패 조건 아님 ― 참고용)"
           % (zero_appraisal, zero_minimum))
 

@@ -40,6 +40,18 @@
     로그온하지 않아도 실행되게 등록한다(자격 증명 입력 필요).
     이때는 사용자 PATH 가 로드되므로 python 해석은 그대로 동작한다.
 
+.PARAMETER SkipCoveredByLegacy
+    2026-08-22 신설. 이 스크립트가 모르는 이름의 기존 작업이 **같은 .bat**을 가리키고
+    **정상 동작 중**(LastTaskResult 0)이면, 그 .bat에 대응하는 항목을 이번 등록 대상에서
+    **자동으로 뺀다** ― 실측(2026-08-22)으로 `DOJOONPASS_DAILY`가 `run_daily.bat`을 매일
+    03:00에 정상 실행 중임을 확인했다. 이 스위치 없이 `-Apply`하면 `DojoonPass-DailyCrawl`
+    (06:00)이 추가로 등록돼 **같은 배치가 하루 두 번** 돈다.
+
+    기본값은 꺼짐이다 ― 어떤 기존 작업을 남길지 판단하는 것은 여전히 사람의 몫이라는
+    2026-08-17 Sprint 187의 원래 결정을 바꾸지 않는다. 이 스위치는 그 판단을 이미
+    끝낸 사람이 "지금 정상 동작 중인 것은 건드리지 말고 나머지만 채워라"라고 명시적으로
+    말할 수 있는 추가 선택지일 뿐이다.
+
 .EXAMPLE
     .\register_scheduler_tasks.ps1
     # 무엇을 등록할지 보여준다. 아무것도 바꾸지 않는다.
@@ -47,11 +59,19 @@
 .EXAMPLE
     .\register_scheduler_tasks.ps1 -Apply
     # 실제로 등록하고, 등록 결과를 다시 조회해 확인한다.
+    # ★ 기존에 같은 .bat을 가리키는 다른 이름의 작업이 있으면 중복 실행이 생길 수 있다 ―
+    #   아래 경고를 먼저 읽을 것.
+
+.EXAMPLE
+    .\register_scheduler_tasks.ps1 -Apply -SkipCoveredByLegacy
+    # 이미 정상 동작 중인 기존 작업(예: DOJOONPASS_DAILY)이 커버하는 배치는 건드리지 않고,
+    # 아직 등록되지 않은 나머지(DocWorker/PriorityRefresh)만 등록한다.
 #>
 [CmdletBinding()]
 param(
     [switch]$Apply,
-    [switch]$RunWhetherLoggedOn
+    [switch]$RunWhetherLoggedOn,
+    [switch]$SkipCoveredByLegacy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -125,6 +145,30 @@ if ($legacyCandidates) {
     }
     Write-Host '  -Apply 로 그대로 진행하면 같은 배치가 하루 두 번 이상 돈다.'
     Write-Host '  계속하기 전에 위 작업을 남길지/지울지 직접 판단할 것 (이 스크립트는 지우지 않는다).'
+
+    if ($SkipCoveredByLegacy) {
+        Write-Host ''
+        Write-Host '-SkipCoveredByLegacy 지정됨 - 정상 동작 중인 기존 작업이 커버하는 항목은 뺀다:'
+        foreach ($lc in $legacyCandidates) {
+            $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -ErrorAction SilentlyContinue
+            if ($info.LastTaskResult -ne 0) {
+                Write-Host ("    - {0} : 마지막 결과가 0이 아니라({1}) 건너뛰지 않는다(정상 동작 확인 안 됨)" -f $lc.TaskName, $info.LastTaskResult)
+                continue
+            }
+            $covered = $Tasks | Where-Object {
+                ($lc.Actions | ForEach-Object { $_.Arguments }) -match [regex]::Escape($_.Bat)
+            }
+            foreach ($c in $covered) {
+                Write-Host ("    - {0} 이 {1} 을(를) 이미 커버함(결과 0) -> {2} 는 이번에 등록하지 않는다" -f $lc.TaskName, $c.Bat, $c.Name)
+            }
+            $Tasks = $Tasks | Where-Object { $_.Name -notin $covered.Name }
+        }
+        if (-not $Tasks) {
+            Write-Host ''
+            Write-Host '남은 등록 대상이 없다 - 기존 작업이 이미 전부 커버한다.'
+            exit 0
+        }
+    }
 }
 
 if ($problems) {

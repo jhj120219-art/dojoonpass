@@ -3940,23 +3940,25 @@ webhook 경로(`_apply_webhook_event`)도 마찬가지로 결제 상태만 바�
 
 **[더 근본적인 문제 ― 이건 정책이 아니다]**
 
-고치려 해도 **대상을 찾을 수 없다.** 결제와 구독을 잇는 열쇠가 아예 없다.
+~~고치려 해도 **대상을 찾을 수 없다.** 결제와 구독을 잇는 열쇠가 아예 없다.~~
+→ **해소 확인 (2026-08-23 Sprint 267 재실측) - 이 열쇠는 이미 만들어져 있다.**
 
 ```
-registry_requests   payment_id 있음      결제 <-> 등기부 신청이 이어진다
-subscriptions       payment_id 없음      결제 <-> 구독은 이어지지 않는다
-payments            subscription_id 없음
-payments.metadata   {"plan": "BASIC"}    플랜만 있고 구독 id는 없다
+migration_history          019_add_subscription_payment_id.sql  적용됨(2026-08-13)
+subscriptions 스키마        payment_id INTEGER REFERENCES payments(id)  실제 컬럼 존재
+api/v1/payments.py:440      create_subscription(..., payment_id=payment_id)로 실제로 채운다
+                            (SUBSCRIPTION 결제 생성 시 같은 트랜잭션 안에서 함께 커밋)
 ```
 
-지금 두 행을 맞춰 볼 유일한 방법은 `(user_id, 금액, 생성 시각)` 어림짐작이고,
-그것은 식별이 아니다. **어떤 정책을 고르든 이 열쇠가 먼저 있어야 한다** ―
-"즉시 해지"든 "기간 만료 시 해지"든 "해지하지 않고 표시만"이든,
-전부 "이 결제가 산 구독이 무엇인가"에 답할 수 있어야 실행된다.
+이 문단이 적힌 시점(Sprint 96, 2026-08-13)에 이미 같은 세션/그 직후에 이 컬럼이
+추가된 것으로 보인다 - `create_subscription()`의 docstring 자체가 "이 인자는 BUGS #94
+때문에 추가했다"고 적어 두었는데, 이 문서의 문단만 갱신되지 않은 채 "열쇠가 없다"로
+남아 있었다. **정책 결정(아래)과 혼동하지 말 것 - 식별자 인프라는 이미 완료됐고,
+"환불 시 무엇을 할지"만 정책 결정 대기다.**
 
-**[정책 결정이 필요한 부분]** 전액 환불 시 구독을 어떻게 할 것인가 ―
+**[정책 결정이 필요한 부분 - 이것만 남았다]** 전액 환불 시 구독을 어떻게 할 것인가 ―
 즉시 해지 / 결제 주기 끝까지 유지 / 일할 계산. 부분 환불은 또 다르다.
-`docs/roadmap.md`에 선택지를 정리했다. **임의로 정하지 않았다.**
+`docs/roadmap.md`에 선택지를 정리했다(이 문서도 함께 정정함). **임의로 정하지 않았다.**
 
 **[노출 범위]** Admin 환불은 SUPER_ADMIN 전용이고, 사용자 셀프 환불 경로는 없다.
 그래서 오늘 임의의 사용자가 이 상태를 만들 수는 없다. 다만 **정상 운영 절차
@@ -5452,7 +5454,22 @@ dest exists=True  -> COPY   (비원자적)   <- 재수집이 항상 여기로 �
 **[운영 환경 실측 — Release Blocker] 이 저장소를 가리키는 예약 작업이 0개다.
 매일 수집이 실제로는 돌지 않는다**
 
-미해결 — 승인 필요 (2026-08-18, Sprint 189)
+~~미해결 — 승인 필요~~ → **부분 해소 확인 (2026-08-23 Sprint 267 재실측)** (2026-08-18, Sprint 189 발견)
+
+> ### ★ [2026-08-23 재실측] 크롤/마이그레이션 축은 지금 실제로 돈다 — 아래 #124부터는 그대로 유효
+>
+> 이 문서 자신의 "교훈"(바로 아래 문단, "정상 동작 중은 매번 다시 재는 대상이지 상수가
+> 아니다")을 따라 다시 쟀다. `DOJOONPASS_DAILY`라는(이 문서/`register_scheduler_tasks.ps1`이
+> 기대하는 이름과 다른) 작업이 매일 03:00에 등록되어 실제로 돌고 있다:
+> ```
+> Get-ScheduledTaskInfo DOJOONPASS_DAILY   LastRunTime 2026-08-23 03:00:01, 결과 0
+> logs/daily_run.log   [SUCCESS] Finished 2026-08-23 04:35:15 — 수집 273건, 신규 16건
+> auction_item 기일 남은 물건   275→291건(당시 9건과 다름)
+> ```
+> 이 세션이 등록한 것이 아니다 — 다른 세션/사람이 이미 등록해 둔 것을 재발견했을 뿐이다.
+> **DocWorker(`DojoonPass-DocWorker`)/PriorityRefresh는 여전히 미등록**이라 사진/문서
+> 파이프라인은 그대로 막혀 있다(`docs/BETA_RELEASE_CHECKLIST.md` "활성 물건의 89%가
+> 상세 화면에서 문서/사진이 전부 비어 있다" 절 참고, 등록은 여전히 승인 영역).
 
 **[경위]** Sprint 189의 재수집 트리거가 "다음 수집 주기"에 실제로 도달하는지 확인하려고
 스케줄러를 직접 조회했다. `docs/CURRENT_STATE.md`의 Sprint 187 기록은
@@ -7878,3 +7895,108 @@ READY 555행인 것을 확인했다 — 이미 Sprint 144가 같은 상태를 �
 `document_status`에서 오므로 문서 열람 자체는 정상 동작하고(item 53 SPEC 다운로드 200,
 402,328B 실파일 확인), `page_count`/`file_size`/`doc_version`만 계속 null이라
 문서 뷰어의 페이지 이동 UI가 그려지지 않는다.
+
+--------
+
+#178
+
+**법원이 나중에 정정한 사건은 옛 `court_code` 밑에 큐 행이 영구 고아로 남는다** —
+"병합 사건 중복"과는 다른, 새로운 원인의 같은 계열 결함
+
+미해결 (2026-08-22 Sprint 257 발견)
+
+**[경위]** `test_pipeline_integrity.py`의 "파이프라인 테이블의 고아 행" 검사는
+`document_status`/`tenant_rights`/`rights_summary`/`document_collect_failures`가
+전부 `auction_item.id` **FK**로 연결되는 것만 검사하고 있었다 - 그런데 `document_queue`는
+`auction_item`을 PK로 참조하지 않고 `(court_code, case_no, item_no, doc_type)` **문자열
+조합**으로만 연결된다(`enqueue_documents()`의 `INSERT OR IGNORE`). 이 연결을 실제로
+검사하는 곳이 하나도 없었다.
+
+**[실측, 2026-08-22 운영 `auction.db` 읽기 전용]**
+```
+document_queue 전체                                     5,619행
+(court_code, case_no, item_no)가 auction_item에 없는 행    21행 (=7사건 x 3종: spec/status/appraisal)
+
+2024타경2803  고양지원(옛, 2026-07-10 적재) vs 춘천지방법원(현재)
+2024타경8092  고양지원(옛)                 vs 창원지방법원(현재)
+2025타경712   대구지방법원(옛)              vs 고양지원(현재)
+(외 4건 - cleanup_orphans_dryrun.py 실행 결과 참고)
+```
+7사건 전부 **완전히 다른 지역의 두 법원**이 짝지어져 있다(예: 고양지원↔춘천지방법원,
+대구지방법원↔고양지원) - 인접 관할 정정이 아니라, **같은 사건번호를 우연히 공유하는
+서로 다른 법원의 별개 사건**을 이 저장소가 한 시점엔 A 법원으로, 다른 시점엔 B 법원으로
+크롤한 것으로 보인다(사건번호는 법원별 독립 채번이라 이런 우연한 중복 자체는 정상이다 -
+문제는 큐가 옛 법원 밑의 행을 청소하지 않는 것이다).
+
+**[왜 영구인가]** `enqueue_documents()`는 기존 행을 지우지 않고 새 court_code로 새 행만
+추가한다. 옛 court_code 밑의 행은 그 뒤 어떤 크롤에서도 다시 일치할 수 없다. 대상 사건은
+이미 다른 court_code 밑에 정상적으로 존재하므로 실사용자 피해(잘못된 물건 노출)는 없다.
+
+**[병합 사건 중복과의 차이]** `detect_merged_case_duplicates_dryrun.py`(Sprint249)는
+**case_no 문자열 자체가 바뀌는** 경우다(법원의 사건 병합 공고). 이번 건은 case_no/item_no는
+그대로고 **court_code만** 바뀐다 - 식별키의 다른 절반이 흔들리는, 원인이 다른 결함이다.
+
+**[정정 - 2026-08-22 Sprint 260, 같은 세션 안에서 스스로 바로잡음]** 위 "발견"은 사실
+**재발견이었다.** `cleanup_orphans_dryrun.py`가 **2026-08-14**(Sprint257보다 8일 앞서)에
+이미 이 정확히 같은 21행(고양지원/2024타경2803 포함 동일 7사건)을 찾아 훨씬 더 깊이
+분석해 두고 있었다 - 처음에 새 탐지 스크립트(`detect_orphaned_queue_court_dryrun.py`)를
+만들기 전에 기존 `*_dryrun.py` 전체를 먼저 찾아 읽었어야 했는데 그러지 않았다. 그 스크립트를
+찾은 뒤 **중복 도구를 지웠다**(추적된 적 없는 파일이라 삭제가 아니라 미작성 취소에 가깝다).
+
+기존 도구가 이번 조사보다 실제로 더 정확했던 두 지점:
+
+1. **실제 낭비 비용이 0이다.** 21행을 상태별로 나누면 done 3 / pending 15 /
+   SKIPPED_EXPIRED 3인데, pending 15행 전부 **기일이 이미 지나** 2차 방어선(`is_time_up`
+   이전에 `auction_date < today` 검사)에 막혀 **브라우저를 열지 않는다.** "매일 사건
+   매칭 실패로 드라이버 재시작 비용을 쓴다"는 처음 서술은 **과장이었다** - 지금은 비용
+   0이고, 크롤이 재개돼 이 사건들과 우연히 같은 번호의 새 사건이 다시 걸릴 때만
+   비용이 발생한다.
+2. **문서 파일까지 고아로 남아 있다.** `documents/고양지원/2024타경2803/1/`에 실제
+   문서 4개(appraisal.pdf/spec.pdf/status.html/status.json, 12.4MB)가 그대로 있다 -
+   이번 조사는 큐 행만 보고 디스크 파일 고아는 놓쳤다.
+
+**[조치, 최종]** 새 도구를 만드는 대신 **기존 `cleanup_orphans_dryrun.py`를 그대로
+쓴다.** `test_pipeline_integrity.py`의 고아 행 검사에 추가한 "document_queue ->
+auction_item(court+case+item)" 자동 회귀 가드(상한 21, mutation 검증 완료)는 **그대로
+유지한다** - 기존 도구는 수동 진단 스크립트라 CI에서 안 도는데, 이 가드는 그것을
+`run_python_tests.py`가 매번 자동으로 확인하게 만든 것이라 여전히 새로운 가치다.
+정리(큐 행 삭제 또는 `mark_queue_unsupported()`, 문서 파일 삭제)는 여전히 운영 데이터
+변경이라 승인 영역이다.
+
+--------
+
+#179
+
+**`favorites`/`recent_items`가 `auction_item` INNER JOIN이라, 행이 없어지면
+사용자에게 아무 신호 없이 항목이 사라진다** — #98(admin.py 등기부 신청 목록)과
+같은 계열, 사용자 화면 두 곳에서 재발
+
+해결 (2026-08-23 Sprint 267 발견·수정)
+
+**[경위]** `api/v1/admin.py`가 Sprint 97에 registry_requests 목록의 `JOIN auction_item`을
+`LEFT JOIN`으로 고치면서 "INNER JOIN이면 auction_item 행이 사라진 신청이 관리자
+목록에서 아무 신호 없이 사라진다"는 원인을 문서화해 뒀는데, **같은 `auction_item.id`
+참조 패턴**을 쓰는 `api/v1/favorites.py:get_favorites()`와
+`api/v1/recent_items.py:get_recent_items()`는 그 수정에서 빠져 있었다. 발생 조건은
+동일하다 - `auction_item`을 직접 지우는 경로는 없지만, 011~013처럼 **FK를 끄고 도는
+재작성 마이그레이션**이 UNIQUE 정리로 행을 떨어뜨리면 이 상태가 된다.
+
+**[영향 차이]** admin.py 케이스는 운영자가 신청 존재 자체를 모르게 되는 문제였다.
+이쪽은 **일반 사용자의 관심물건/최근 본 물건이 본인도 모르게 사라지는** 문제라 노출
+범위가 더 넓다 - 사용자는 자신이 즐겨찾기한 적 없다고 오해하게 된다.
+
+**[실측]** 이 환경의 `favorites`/`recent_items`는 현재 둘 다 0행이라 실제 고아는
+없다(`SELECT COUNT(*) FROM favorites f WHERE NOT EXISTS (SELECT 1 FROM auction_item ai
+WHERE ai.id=f.item_id)` → 0). 즉 지금 당장 사용자가 겪고 있는 결함은 아니고, admin.py와
+같은 잠재적 재발 경로였다.
+
+**[조치]** 두 쿼리 모두 `LEFT JOIN`으로 바꾸되, admin.py처럼 깨진 카드를 화면에 그대로
+보여주지는 않는다(사용자 화면에 전부 null인 카드를 보이는 것은 더 나쁜 UX) - 화면에
+보이는 목록에서는 그대로 걸러내되, 걸러진 사실은 `logger.warning(user_id, 건수)`로
+남겨 admin.py의 "조용한 영구 방치 방지" 취지를 사용자 화면 특성에 맞게 유지한다.
+신규 회귀 `test_favorites_and_recent_items_survive_orphaned_auction_item()`이 실제로
+고아 행을 심어(FK OFF) 200 응답 + 목록에서 제외 + 로그 기록을 함께 검증하고,
+INNER JOIN으로 되돌리는 mutation으로 "로그 없이 조용히 사라짐"이 재현되는 것도
+확인했다. `api/v1/*.py` 전체를 `JOIN auction_item` 패턴으로 재검색해 다른 인스턴스가
+없음을 확인했다(admin.py 3곳 / registry.py 2곳은 이미 LEFT JOIN).
+

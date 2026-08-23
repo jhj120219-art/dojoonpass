@@ -1,4 +1,5 @@
-﻿import sqlite3
+﻿import logging
+import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
@@ -7,6 +8,7 @@ from api.auth import get_current_user, success, error_response
 from api.constants import ErrorCode, is_sqlite_int
 from api.v1.thumbnails import fetch_thumbnail_seqs, thumbnail_url
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 class FavoriteRequest(BaseModel):
@@ -93,13 +95,25 @@ def get_favorites(user_id: str = Depends(get_current_user)):
     try:
         # get_item_summary()를 즐겨찾기 개수만큼 반복 호출하던 N+1 쿼리를 단일 JOIN으로 교체
         # (recent_items.py:get_recent_items()와 동일한 패턴). 응답 필드/순서는 기존과 동일하게 유지.
+        # ★ LEFT JOIN이어야 한다 (2026-08-23 Sprint 267, api/v1/admin.py:320의 registry_requests
+        #   LEFT JOIN과 동일한 이유). INNER JOIN이면 `auction_item` 행이 없어진 관심물건이
+        #   **아무 신호도 없이** 사라진다 - 지금은 FK가 걸려 있어 발생하지 않지만, 011~013처럼
+        #   FK를 끄고 도는 재작성 마이그레이션 중 대상 행이 빠지면 이 상태가 된다(admin.py가
+        #   이미 이 시나리오로 실측한 사례). 화면에 깨진 카드(전부 null)를 보여줄 필요는 없으므로
+        #   사용자에게 보이는 목록은 그대로 걸러내되, 걸러진 사실 자체는 로그에 남긴다.
         rows = conn.execute("""
             SELECT ai.*, f.created_at AS favorited_at
             FROM favorites f
-            JOIN auction_item ai ON f.item_id = ai.id
+            LEFT JOIN auction_item ai ON f.item_id = ai.id
             WHERE f.user_id = ?
             ORDER BY f.created_at DESC, f.id DESC
         """, (user_id,)).fetchall()
+        orphaned = [r for r in rows if r["id"] is None]
+        if orphaned:
+            logger.warning(
+                "favorites가 삭제된 auction_item을 가리킨다 (user_id=%s, %d건)",
+                user_id, len(orphaned))
+        rows = [r for r in rows if r["id"] is not None]
         # 대표 사진 순번을 **쿼리 1회**로 (2026-08-20 Sprint 224).
         # 검색목록에서 사진을 보고 담았는데 관심물건에서는 사진이 사라지던 공백을 메운다.
         # 물건마다 따로 물으면 곧바로 N+1이고, 그때도 화면은 똑같이 잘 보인다 —

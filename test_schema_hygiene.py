@@ -2605,7 +2605,14 @@ def test_no_cwd_relative_paths_in_product_code():
         v = node.value
         if not v or v in (".", "..", "-") or "\n" in v or " " in v:
             return None                      # 여러 줄/공백 = SQL 등. 경로가 아니다.
-        if os.path.isabs(v) or v.startswith(("~", "http://", "https://", ":memory:")):
+        if os.path.isabs(v) or v.startswith(("~", "http://", "https://", ":memory:", "/")):
+            # ★ 맨 앞 "/" 는 `os.path.isabs()` 만으로는 못 잡는다 - `ntpath.isabs()`는
+            #   드라이브 문자가 없으면 "/api/..." 를 **상대경로로 오판**한다(Windows 전용
+            #   실측: `os.path.isabs('/api/v1/x')` == False). 그런데 이 저장소에서 맨
+            #   앞이 "/"인 최상위 문자열 리터럴은 지금까지 전부 URL 라우트 템플릿이었다
+            #   (예: `api/v1/thumbnails.py`의 `IMAGE_URL_TEMPLATE`) - cwd 에 좌우되는
+            #   파일시스템 경로가 아니다. POSIX 에서는 애초에 절대경로라 `isabs()`가 잡고,
+            #   Windows 에서는 이 줄이 대신 잡는다.
             return None
         if "/" in v or "\\" in v:
             return v
@@ -2661,6 +2668,9 @@ def test_no_cwd_relative_paths_in_product_code():
         'DB_PATH = os.path.join(_HERE, "auction.db")\n'
         'LOCK_PATH = os.path.join(_HERE, "logs", "doc_worker.lock")\n'
         'SQL = """\nCREATE TABLE t (a TEXT);\n"""\n'
+        # URL 라우트 템플릿 - 맨 앞이 "/"라 파일시스템 경로처럼 보이지만 cwd 와 무관하다
+        # (2026-08-21 실측: api/v1/thumbnails.py의 IMAGE_URL_TEMPLATE 을 오탐했었다).
+        'IMAGE_URL_TEMPLATE = "/api/v1/item/%d/images/%d"\n'
     )
     bad_hits = scan(KNOWN_BAD)
     check_true("자기 검증: 알려진 결함 3종을 전부 잡는다",
@@ -2894,6 +2904,100 @@ def test_root_scripts_do_not_write_db_without_apply():
                "-> %s. 이 저장소 관례대로 기본 dry-run + --apply 로 바꿔라 "
                "(backfill_*/repair_*/reset_failures 참고)" % offenders)
 
+
+def test_no_hardcoded_foreign_machine_paths():
+    """★ 다른 컴퓨터의 사용자 프로필 절대경로가 코드에 하드코딩돼 있지 않은가
+    (2026-08-22 Sprint 266, `audit_test_reality.py` 실제 발견).
+
+    ## 왜
+
+    `audit_test_reality.py`의 `REPO` 상수가 다른 컴퓨터의 사용자 프로필 경로(OneDrive
+    Desktop 밑, 이 파일의 git 이력에 그 리터럴이 남아 있다)로 하드코딩돼 있었다 -
+    **다른 컴퓨터의 경로**였다. 이 머신에서는 그 경로가 OneDrive가 동기화해 둔 빈 폴더로
+    우연히 존재해서(`.next/`만 든 껍데기) `os.chdir()`/`os.listdir()`가 예외 없이 조용히
+    성공하고, 그 도구는 **"의심 목록 없음"을 계속 출력하면서 실제로는 test_*.py를 단 한 번도
+    실행하지 않고 있었다.** 예외도, 경고도 없었다 - 정상적으로 보이는 빈 출력뿐이었다.
+
+    `test_no_cwd_relative_paths_in_product_code()`는 이 결함을 잡지 못한다 - 그 검사는
+    **cwd-상대경로**(`"auction.db"` 같은 맨 이름)만 보고, **절대경로**는 `os.path.isabs()`가
+    참이면 바로 안전하다고 판정한다(cwd 에 안 흔들리니까). 그런데 이번 결함은 절대경로
+    자체가 **다른 사람의 컴퓨터에서만 유효**해서 생겼다 - 절대/상대의 문제가 아니라
+    **이식성**의 문제다. 그래서 별도 검사로 잠근다.
+
+    그 검사는 `audit_*`/`check_*` 같은 도구 스크립트를 의도적으로 건너뛴다("스스로 임시
+    디렉터리를 만들어 쓰므로 대상이 아니다") - 그 가정이 이번에 깨졌다. 그래서 여기서는
+    **건너뛰지 않는다.**
+    """
+    print("\n--- 다른 컴퓨터의 사용자 프로필 절대경로가 하드코딩돼 있지 않은가 (Sprint 266) ---")
+    import ast
+    import io as _io
+    import re as _re
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if out.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+
+    # 이 저장소 안에서 실제로 봐도 되는 사용자 프로필 경로 하나 - 실행 중인 이 머신 것.
+    # 다른 사람 이름이 나오면 그건 이 검사가 잡으려는 바로 그 결함이다.
+    # 문자열 리터럴의 **실제 값**(파싱 후, 백슬래시 한 겹)에 매칭하므로 패턴도 한 겹이면 된다.
+    FOREIGN_USER_PATH = _re.compile(r"[A-Za-z]:\\Users\\([A-Za-z0-9_.\-]+)\\")
+    this_user = os.environ.get("USERNAME", "")
+
+    def hardcoded_foreign_paths(src):
+        """모듈 안 문자열 리터럴 중 다른 사용자 프로필 경로가 있으면 그 사용자명 목록."""
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return None
+        found = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            for m in FOREIGN_USER_PATH.finditer(node.value):
+                found.append(m.group(1))
+        return found
+
+    # --- 자기 검증 -------------------------------------------------------------
+    BAD = 'REPO = r"C:\\Users\\someoneelse\\OneDrive\\Desktop\\dojoonpass"\n'
+    GOOD = ('import os\n'
+            'REPO = os.path.dirname(os.path.abspath(__file__))\n'
+            '# C:\\Users\\someoneelse\\OneDrive\\Desktop\\dojoonpass 는 예전에 여기 있었다\n')
+    check_true("자기 검증: 하드코딩된 다른 사용자 경로를 잡는다",
+               hardcoded_foreign_paths(BAD) == ["someoneelse"])
+    check_true("자기 검증: 주석 속 과거 경로 언급은 코드가 아니므로 오탐하지 않는다",
+               hardcoded_foreign_paths(GOOD) == [])
+
+    # 이 검사 파일 자신은 뺀다 - 바로 위 자기검증 픽스처(BAD/GOOD)가 예시로 만든
+    # "다른 사용자 이름"이 든 문자열을 그대로 갖고 있어, 빼지 않으면 자기 자신을
+    # 결함으로 잡는다(실제로 처음 구현에서 그랬다).
+    _self = os.path.basename(__file__)
+    files = [f for f in out.stdout.split() if f.endswith(".py") and os.path.basename(f) != _self]
+    check_true("검사가 공허하지 않다(추적 .py 를 실제로 찾았다)", len(files) >= 100, len(files))
+
+    offenders = []
+    for rel in files:
+        try:
+            src = _io.open(os.path.join(root, rel.replace("/", os.sep)),
+                           encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        users = hardcoded_foreign_paths(src)
+        for u in users:
+            if this_user and u == this_user:
+                continue          # 지금 이 머신의 실제 사용자 - 정상
+            offenders.append("%s (user=%s)" % (rel, u))
+
+    check_true("★ 다른 컴퓨터의 사용자 프로필 절대경로가 하드코딩된 곳이 없다",
+               not offenders,
+               "-> %s. os.path.dirname(os.path.abspath(__file__)) 기준으로 바꿔라" % offenders)
+
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -2924,6 +3028,7 @@ def run():
     test_no_cwd_relative_paths_in_product_code()
     test_claude_md_scheduler_claims_match_register_script()
     test_root_scripts_do_not_write_db_without_apply()
+    test_no_hardcoded_foreign_machine_paths()
 
     print("\n" + "=" * 55)
     if failures:

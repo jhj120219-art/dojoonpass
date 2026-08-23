@@ -1061,6 +1061,89 @@ def test_recent_items():
     check("recent items response capped at 20", len(capped), 20)
     check("capped response has no duplicate items", len({x["id"] for x in capped}), 20)
 
+    # (4) 저장 자체도 20건으로 잘린다 (2026-08-22 신설) — (3)은 화면 응답(SELECT LIMIT)만
+    # 본다. 그런데 예전에는 `record_view()`가 정리 없이 INSERT만 해서, 화면은 항상 20건만
+    # 보여줘도 `recent_items` 테이블 자체는 사용자가 서로 다른 물건을 볼 때마다 한 행씩
+    # **무한정** 쌓였다(28행 = 위에서 심은 3 + 여기서 새로 본 25). 화면 뒤에서 저장공간이
+    # 계속 느는 것은 기능 결함은 아니지만 방치하면 커진다 - 저장 쪽도 같은 상한으로 잠근다.
+    conn = get_connection()
+    try:
+        raw_count = conn.execute(
+            "SELECT COUNT(*) FROM recent_items WHERE user_id=?", (TEST_USER,)).fetchone()[0]
+    finally:
+        conn.close()
+    check("recent_items 원본 테이블도 20건으로 정리된다(무한정 누적 안 함)", raw_count, 20)
+
+
+def test_favorites_and_recent_items_survive_orphaned_auction_item():
+    """`auction_item` 행이 없어져도 favorites/recent_items 조회가 조용히 항목을 지우지
+    않고, 대신 로그로 남긴다 (2026-08-23 Sprint 267).
+
+    admin.py:320이 이미 registry_requests에 대해 이 문제를 고쳤다 — INNER JOIN이던
+    시절 `auction_item` 행이 사라진 신청이 관리자 목록에서 **아무 신호 없이** 사라졌다
+    (011~013처럼 FK를 끄고 재작성하는 마이그레이션 중 대상 행이 빠지면 이 상태가 됨).
+    같은 `auction_item.id` 참조 패턴을 쓰는 favorites/recent_items는 그 수정에서
+    빠져 있었다 — 이 검사가 없으면 그 공백이 재발해도 아무도 모른다.
+    """
+    print("\n--- 6-b. favorites/recent_items가 삭제된 auction_item에도 안전하다 (Sprint 267) ---")
+    import logging as _logging
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    captured = []
+
+    fav_user = "qa-reg-orphanfav-" + uuid.uuid4().hex[:6]
+    ri_user = "qa-reg-orphanri-" + uuid.uuid4().hex[:6]
+    ghost_id = 900000000  # 실제 auction_item에 존재하지 않는 id (FK 없이 직접 심는다)
+
+    conn = get_connection()
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "INSERT INTO favorites (user_id, item_id, created_at) VALUES (?, ?, datetime('now','localtime'))",
+            (fav_user, ghost_id))
+        conn.execute(
+            "INSERT INTO recent_items (user_id, item_id, viewed_at) VALUES (?, ?, datetime('now','localtime'))",
+            (ri_user, ghost_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    fav_handler, ri_handler = _Capture(), _Capture()
+    fav_logger = _logging.getLogger("api.v1.favorites")
+    ri_logger = _logging.getLogger("api.v1.recent_items")
+    fav_logger.addHandler(fav_handler)
+    ri_logger.addHandler(ri_handler)
+    try:
+        r_fav = client.get("/api/v1/favorites", headers=auth_headers(fav_user))
+        r_ri = client.get("/api/v1/recent-items", headers=auth_headers(ri_user))
+    finally:
+        fav_logger.removeHandler(fav_handler)
+        ri_logger.removeHandler(ri_handler)
+
+    check("고아 favorite이 있어도 목록 조회는 200", r_fav.status_code, 200)
+    check("고아 recent_item이 있어도 목록 조회는 200", r_ri.status_code, 200)
+    check_true("고아 favorite은 목록에 안 보인다(깨진 카드 노출 안 함)",
+               all(i["id"] != ghost_id for i in r_fav.json()["data"]))
+    check_true("고아 recent_item은 목록에 안 보인다(깨진 카드 노출 안 함)",
+               all(i["id"] != ghost_id for i in r_ri.json()["data"]))
+    check_true("★ favorites 고아가 조용히 사라지지 않고 로그에 남는다",
+               any(fav_user in m for m in captured),
+               "조용히 삼키면 원인 추적이 불가능하다: %r" % captured)
+    check_true("★ recent_items 고아가 조용히 사라지지 않고 로그에 남는다",
+               any(ri_user in m for m in captured),
+               "조용히 삼키면 원인 추적이 불가능하다: %r" % captured)
+
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM favorites WHERE user_id=?", (fav_user,))
+        conn.execute("DELETE FROM recent_items WHERE user_id=?", (ri_user,))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # 7. Search presets
@@ -6039,6 +6122,7 @@ def run():
         test_authentication()
         test_favorites()
         test_recent_items()
+        test_favorites_and_recent_items_survive_orphaned_auction_item()
         test_search_presets()
         test_payment_and_subscription()
         test_registry()

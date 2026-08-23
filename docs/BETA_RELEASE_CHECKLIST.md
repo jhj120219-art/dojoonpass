@@ -14,12 +14,12 @@ Owner: Project Management
 
 | 항목 | 문서 상태 | **2026-08-21 실측** | 판정 |
 |---|---|---|---|
-| P0-A 데이터 공급 정지 | P0 | 스케줄러 등록 **0개**, `auction_item` 최신 수집일 **2026-08-12**, 기일 남은 물건 **0건** | **P0 유지** |
+| P0-A 데이터 공급 정지 | P0 | 스케줄러 등록 **0개**, `auction_item` 최신 수집일 **2026-08-12**, 기일 남은 물건 **0건** | ~~P0 유지~~ → **2026-08-23 Sprint 267 재실측: "검색 결과 0건"은 해소, 그러나 새 P0급 결함 발견 (아래 참고)** |
 | P0-B 커밋 시 API 부팅 불가 | P0 | `from api_server import app` **성공**, OpenAPI 엔드포인트 **42개** 정상 노출 | **해소** |
-| P0-C migration 020 누락 → 검색/상세 500 | P0 | `auction_image` 테이블 **존재**(45행), `migration_history` 에 `020_create_auction_image.sql` **기록됨** | **해소** |
-| P0-2 ADMIN_API_KEY / SUPER_ADMIN_API_KEY | P0 | `.env` 에 **두 키 모두 없음**. admin 라우트 5종 호출 → 전부 **500 `관리자 키 미설정`** | **P0 유지**(단, 아래 등급 재분류) |
+| P0-C migration 020 누락 → 검색/상세 500 | P0 | `auction_image` 테이블 **존재**(45행), `migration_history` 에 `020_create_auction_image.sql` **기록됨** | ~~해소~~ → **2026-08-23 Sprint 267 재실측: 다시 미적용 (500은 아님, 아래 참고)** |
+| P0-2 ADMIN_API_KEY / SUPER_ADMIN_API_KEY | P0 | `.env` 에 **두 키 모두 없음**. admin 라우트 5종 호출 → 전부 **500 `관리자 키 미설정`** | ~~P0 유지~~ → **2026-08-23 Sprint 267 재실측: 둘 다 있다(75/74자), 실제 200/403 재현 - 정상(아래 등급 재분류 논의는 유효)** |
 | P0-3 Supabase Site URL / Redirect URLs | P0 | 이 세션에서 확인 불가(외부 콘솔 = 승인 영역) | **판정 보류** |
-| P0-4 `.env` 에 `SUPABASE_JWT_SECRET` 없음 | P0 | **설정돼 있다**(88자). 런타임 `api.auth` 에서 HS256 시크릿 + JWKS URL 둘 다 해석됨 | **해소** |
+| P0-4 `.env` 에 `SUPABASE_JWT_SECRET` 없음 | P0 | **설정돼 있다**(88자). 런타임 `api.auth` 에서 HS256 시크릿 + JWKS URL 둘 다 해석됨 | ~~해소~~ → **2026-08-23 Sprint 267 재실측: 다시 없다 (아래 참고)** |
 
 ### P0-4 관련 추가 실측 — `.env` 의 다른 두 값은 **비어 있다**
 
@@ -36,9 +36,96 @@ Owner: Project Management
 즉 `.env` 의 빈 두 줄은 **오해를 부르지만 동작을 깨뜨리지는 않는다.**
 `.env` 수정은 승인 영역이라 손대지 않았다.
 
+### ★★ [2026-08-23 Sprint 267] P0-4 재실측 — `SUPABASE_JWT_SECRET` 항목 자체가 다시 사라졌다
+
+`test_auth_jwt.py`/`test_search.py`를 이 세션에서 그냥 돌렸을 뿐인데(코드를 건드리지
+않았다) 둘 다 새로 FAIL이 났다. 원인을 `dotenv_values('.env')`로 직접 확인했다:
+
+```
+현재 .env 의 키 구성 (값은 출력하지 않음, 길이만)
+  SUPABASE_JWT_SECRET   → 키 자체가 없음 (2026-08-21 Sprint 244 측정 88자 대비)
+  SUPABASE_URL          → 키 자체가 없음 (NEXT_PUBLIC_SUPABASE_URL 로 폴백 - 49자, 정상)
+  SUPABASE_ANON_KEY     → 키 자체가 없음
+  ADMIN_API_KEY         → 있음 (75자) - Sprint 244가 "둘 다 없음"이라 했던 것과 반대
+  SUPER_ADMIN_API_KEY   → 있음 (74자)
+  JWT_SECRET            → 있음 (32자, SUPABASE_JWT_SECRET 과는 다른 이름/다른 용도)
+  NEXTAUTH_SECRET       → 있음 (75자)
+  그 외 GOOGLE/NAVER/YOUTUBE/REDDIT/GITHUB/FIRECRAWL/BROWSERBASE/JINA/KG_* 등
+  프로젝트와 무관해 보이는 키 다수
+```
+
+`*.env`도 `*.db`와 마찬가지로 gitignore 대상이라 세션(또는 컴퓨터)마다 로컬 사본이
+달라진다 — 이 문서가 이미 `.db`에 대해 반복 확인한 바로 그 취약점이 `.env`에도
+그대로 있다는 뜻이다. 지금 이 `.env`는 DojoonPass 전용 설정이 아니라 **여러
+프로젝트/서비스 키가 섞인 파일처럼 보인다.**
+
+**실제 영향(재확인)**: `api/auth.py:46`은 `SUPABASE_JWT_SECRET`를 다른 이름으로
+폴백하지 않는다 — 없으면 HS256 레거시 토큰 검증 경로가 전부 거부된다(`raise
+JWTError(...)`, 47행). `ADMIN_API_KEY`/`SUPER_ADMIN_API_KEY`는 오히려 이번엔 **둘 다
+있어서** admin 라우트 500이 재현되지 않는다(P0-2도 이 김에 재확인 - 지금은 정상,
+`X-Admin-Key` 헤더로 실제 200 재현함).
+
+`.env` 수정은 이번에도 승인 영역이라 손대지 않았다. **다음 세션이 또 "SECRET=0"을
+보게 되면, 새 결함이 아니라 이 문단이 이미 설명해 둔 로컬 `.env` 드리프트인지부터
+확인할 것.**
+
+### ★★★ [2026-08-23 Sprint 267 후속] "ES256 주 경로는 살아 있다"는 위 문장 — **직접 실행해서 재확인했더니 틀렸다. 코드로 고쳤다**
+
+`.env`의 `NEXT_PUBLIC_SUPABASE_URL`이 폴백으로 쓰인다는 것까지만 확인하고 "그러니 살아
+있다"고 적었는데, **실제로 그 값을 읽어 실행까지 해보지 않았다.** 값을 그대로 열어 보니:
+
+```
+.env          NEXT_PUBLIC_SUPABASE_URL = https://pdjtfbhzxdrnrqhtytfm.supabase.co/rest/v1/
+.env.local    NEXT_PUBLIC_SUPABASE_URL = https://pdjtfbhzxdrnrqhtytfm.supabase.co
+              (같은 프로젝트, .env 쪽에만 REST API 베이스 경로가 잘못 붙어 있다)
+```
+
+`api/auth.py`는 `.env`를 먼저 읽고 `.env.local`은 `override=False`로 읽으므로(43-45행,
+"그 값은 `.env`가 아니라 `.env.local`에만 있다"는 옛 가정 때문에 이렇게 짜여 있었다),
+`.env`가 같은 키를 잘못된 값으로 **먼저** 채우면 `.env.local`의 정상 값이 뒤에서 덮어쓰지
+못한다. 그 결과 실제로 구성되는 JWKS 주소는:
+
+```
+(수정 전) https://pdjtfbhzxdrnrqhtytfm.supabase.co/rest/v1/auth/v1/.well-known/jwks.json
+          -> 실제로 GET 해봤다: 401
+(정상)    https://pdjtfbhzxdrnrqhtytfm.supabase.co/auth/v1/.well-known/jwks.json
+          -> 실제로 GET 해봤다: 200, keys 1개
+```
+
+`_get_jwk()`가 401을 `except Exception`으로 삼키고 `logger.warning`만 남기므로(서버가
+죽지 않는다) 겉으로는 조용하지만, 결과적으로 **JWKS 캐시가 항상 비고 모든 ES256 토큰이
+"공개키를 찾지 못했습니다"로 거부된다** - HS256(위 문단)과 ES256(이 문단) 둘 다 막혀
+**로그인 사용자 인증이 사실상 전부 실패하는 상태**였다(비로그인 검색/상세는 선택적 인증이라
+영향 없음). "ES256은 살아 있다"는 이전 문단은 재실행 없이 폴백 존재만 보고 내린 성급한
+결론이었다 - 이 문서 6절의 "실행으로 검증" 원칙을 스스로 어긴 사례라 정정해 둔다.
+
+**조치(승인 불필요 - `.env`를 건드리지 않는 코드 견고화)**: `api/auth.py`에
+`_project_origin()`을 추가해 `SUPABASE_URL`을 만들 때 어떤 값이 오든 scheme+host만
+남기도록 했다(`urllib.parse.urlsplit` 사용, 경로/쿼리/프래그먼트를 전부 버림). `.env`를
+고치지 않고도 이 오타 형태의 값에 견딘다.
+
+```
+수정 전 SUPABASE_URL = 'https://pdjtfbhzxdrnrqhtytfm.supabase.co/rest/v1'
+수정 후 SUPABASE_URL = 'https://pdjtfbhzxdrnrqhtytfm.supabase.co'
+수정 후 JWKS 실제 조회 -> kid ['487c69e7-e70b-4217-84b3-8fe11bdbab1d'] 캐시 성공 (실행 확인)
+```
+
+`test_auth_jwt.py`에 `_project_origin()` 자체를 검증하는 4개 검사를 신설하고
+mutation으로 확인했다(정규화 로직을 원래대로 되돌리면 새 검사가 즉시 FAIL, 복원하면
+다시 PASS). 전체 회귀는 그대로 `55→59 PASS / 1 FAIL`(남은 1건은 `SUPABASE_JWT_SECRET`
+자체가 `.env`에 없다는, 코드로 고칠 수 없는 별개의 사실 - 위 문단). `run_python_tests.py`
+전체 재실행으로도 다른 회귀 없음을 확인했다(44 PASS 그대로).
+
+**남은 것(승인 영역)**: `.env`에 정확한 이름 `SUPABASE_JWT_SECRET`으로 진짜 값을 넣는
+것은 여전히 사용자 몫이다. 이번 코드 수정은 "URL에 경로가 섞여도 죽지 않는다"는
+견고성이지, 빠진 시크릿 자체를 만들어주지 않는다.
+
 ### P0-2 등급 재분류 제안 — **베타 사용자 동선은 막지 않는다**
 
-admin 500 은 사실이다. 다만 이 문서가 정의한 P0 는 *"핵심 동선이 깨진다"* 인데,
+~~admin 500 은 사실이다.~~ (2026-08-23 Sprint 267 재실측: 지금은 아니다 - 두 키 다
+있고 200/403 정상. 다만 이 값이 세션마다 사라졌다 나타났다 한 이력이 있으므로,
+"지금 500이 아니다"가 "앞으로도 그렇다"를 보장하지 않는다 - 아래 재분류 논리
+자체는 키 존재 여부와 무관하게 유효하다.) 이 문서가 정의한 P0 는 *"핵심 동선이 깨진다"* 인데,
 베타의 핵심 동선은 검색 → 목록 → 상세 → 사진/문서 → 관심물건/최근본 → 마이리스트다.
 admin 16개 라우트는 **운영자 도구**이고 웹 UI 자체가 없다(아래 연결 감사 참고).
 따라서 **"베타 출시 차단(P0)"이 아니라 "출시 후 운영 불가(P1)"** 로 보는 것이 정확하다.
@@ -115,6 +202,145 @@ mutation 으로 확인했다 — `mark_queue_skipped_expired()` 가 `document_st
 ```
 
 나머지 P0 표기 3건은 해소됐고, P0-2 는 운영자 도구 범위다.
+
+> ~~위 결론은 2026-08-23 Sprint 267에서 낡은 것으로 확인됐다~~ → **최신 결론은 아래
+> Sprint 267 절 참고: "검색 결과 0건"은 사라졌지만 "DocWorker 미등록으로 상세 화면
+> 사진/문서의 89%가 비어 있다"는 같은 뿌리의 다른 증상이 P0로 남아 있다.**
+
+---
+
+## ★★ [2026-08-23 Sprint 267] P0-A 재실측 — **더 이상 사실이 아니다**
+
+위 결론("기본 검색이 빈 화면")을 이 세션에서 다시 실행해서 쟀다. 결과가 다르다:
+
+```
+auction_item 총 행               2,360 (Sprint 244 측정 1,876 대비 +484)
+auction_date >= 오늘(2026-08-23)   275건
+GET /api/v1/search (필터 없음)     200  total 275   <- "빈 화면" 아님
+GET /api/v1/search?include_closed=true  200  total 2360
+GET /api/v1/search?sido=서울       200  total 49
+
+Get-ScheduledTask "DOJOONPASS_DAILY"
+  State           Ready
+  LastRunTime     2026-08-22 오전 3:00:01
+  LastTaskResult  0 (성공)
+  NextRunTime     2026-08-23 오전 3:00:00
+
+logs/daily_run.log 마지막 줄        [SUCCESS] Finished at 2026-08-22  4:48:34
+logs/migrate_execute.log 마지막 실행  법원 7건 갱신, 2건 done->refresh, 2건 SKIPPED_EXPIRED->pending
+```
+
+**원인**: 이전 회차(Sprint 244/247)가 "스케줄러 등록 0개"를 잰 시점 이후, 이 저장소를
+가리키는 작업이 `DOJOONPASS_DAILY`라는 **다른 이름**으로(`register_scheduler_tasks.ps1`이
+기대하는 `DojoonPass-DailyCrawl`이 아니다) 이미 등록되어 매일 03:00에 정상 실행되고
+있었다(직전 세션에서 이 사실 자체는 이미 발견해 두었으나, "기본 검색 결과 0건"이라는
+결론 문장은 그 발견 이후 갱신되지 않은 채 남아 있었다). `run_daily.bat`가
+`mvp_scraper.py` -> `migrate_execute.py`를 순서대로 돌려 매일 새 물건을 `auction_item`에
+반영해 왔고, 그 결과 기일이 남은 물건이 275건으로 다시 채워졌다.
+
+**DocWorker(`DojoonPass-DocWorker`)/PriorityRefresh(`DojoonPass-PriorityRefresh`)는
+여전히 별도 예약 작업으로 등록돼 있지 않다** (`Get-ScheduledTask` 필터 재확인, `DOJOONPASS_DAILY`
+하나만 나온다).
+
+**주의 — 문서에 그대로 두면 안 되는 것은 "0건" 이라는 숫자이지, 위 P0-A 절 전체가 아니다.**
+스케줄러 등록 여부/이름 불일치라는 근본 원인 서술은 여전히 유효하고, 승인 없이 이 세션이
+등록을 대신 해주지도 않았다(그 작업이 이미 다른 이름으로 살아있었을 뿐이다). 따라서:
+
+- **재분류**: "기본 검색이 빈 화면" -> **더 이상 사실이 아니다.**
+- ~~격하 유지~~ → **바로 아래 절에서 다시 P0으로 되돌린다 — DocWorker 미등록의 실제 파급이
+  "검색 결과 0건"보다 더 심각한 것으로 이번 세션에 새로 측정됐다.**
+
+### ★★★ [2026-08-23 Sprint 267 후속] 재측정 중 발견 — **활성 물건의 89%가 상세 화면에서 문서/사진이 전부 비어 있다**
+
+DocWorker 미등록의 실제 사용자 영향을 처음으로 **수치로** 쟀다(읽기 전용, DB/API 그대로):
+
+```
+현재 활성(기일 미도래) 물건                    275건
+그중 READY 상태 문서가 하나라도 있는 물건       31건 (11.3%)
+그중 READY 상태 문서가 0건인 물건              244건 (88.7%)
+document_status 상세: COLLECTING 741행 / READY 84행 (활성 물건 기준)
+document_queue 전체: pending 4,883 / done 549 / SKIPPED_EXPIRED 178 / refresh 9
+  pending 최초 적재 2026-07-08, 최근 적재 2026-08-22 -> 매일 계속 쌓이기만 한다
+
+실제 API 재현 (item id=173, 2024타경2981, 기일 2026-09-02, 승인 없이 읽기만 함):
+  GET /api/v1/item/173
+    documents: SPEC/STATUS/APPRAISAL 셋 다 status="COLLECTING", available=false
+    images: []   (auction_image 테이블 자체가 없다 - 위 P0-C 절)
+```
+
+**원인**: `doc_worker.py`(문서/사진 수집)를 실행하는 스케줄 작업이 시스템에 전혀 없다
+(`Get-ScheduledTask`로 이 저장소를 가리키는 작업을 액션 문자열까지 훑었다 - `run_daily.bat`
+하나만 걸린다, `run_doc_worker.bat`/`run_priority_refresh.bat`는 0건). `migrate_execute.py`는
+새 물건을 큐에 밀어 넣기만 하고 아무도 큐를 비우지 않으므로 `document_queue`의 `pending`이
+매일 순증가만 한다(2026-07-08 이후 계속). 이 문서가 정의하는 P0 기준("핵심 동선이 깨진다",
+동선 = 검색→목록→**상세→사진/문서**→관심물건...)에 정확히 해당한다 - 검색/목록은 정상이지만
+**상세 화면의 핵심 구성요소인 사진·문서가 물건 10개 중 9개꼴로 통째로 비어 있다.**
+
+- **재분류(정정)**: DocWorker/PriorityRefresh 미등록 -> ~~P1~~ **P0로 되돌린다.** "검색 결과
+  0건"이라는 낡은 증상은 사라졌지만, 그 자리를 "상세 화면 사진/문서 89% 공백"이라는 더 넓은
+  범위의 같은 근본 원인(스케줄러 미등록)이 대신하고 있다.
+- 조치는 동일하고 여전히 승인 영역이다: `register_scheduler_tasks.ps1 -Apply
+  -SkipCoveredByLegacy`(Sprint 260/265에 스크래치로 검증 완료, 즉시 적용 가능). 실제
+  라이브 크롤링을 이 세션이 대신 돌리지도 않았다(승인 영역).
+- migration 020(P0-C, 위 절)과는 **원인이 다르다** — `document_status`/`document_queue`는
+  이미 존재하는 테이블이라 사진(`auction_image`)과 달리 마이그레이션과 무관하며, 순수하게
+  "아무도 큐를 비우지 않는다"는 스케줄러 문제다. 두 결손이 동시에 사진 커버리지를 0으로
+  만들고 있을 뿐 서로 다른 조치가 필요하다.
+- **등록만 하면 회복된다(용량 재확인)**: `test_worker_capacity.py`(기존 검사, 이번 세션에
+  다시 그대로 실행) 실측 - 대기 물건(고유) **1,539개**, item 배치 시 물건당 평균
+  **47.2초**(사진 없이 이동 1회 + 문서 3종). 02:00~04:00 실행창(7,200초) 기준
+  하루 약 150개씩 처리 가능 -> **약 10일**이면 지금 쌓인 적체를 전부 소진하고 이후로는
+  매일 새로 들어오는 양(하루 수십 건 수준)만 처리하면 되는 정상 상태로 돌아온다. 즉 이
+  조치는 "당장 막힌 것" 하나뿐 아니라 "그대로 두면 격차가 점점 벌어지는 것"까지 함께
+  해결한다 - 승인이 늦어질수록 회복 시간만 늘어난다.
+
+### ★ [2026-08-23 오전, 다음 날 크롤 이후 재측정] 하루 만에 실제로 벌어졌다
+
+이 세션이 시작하자마자 "오늘 크롤이 실행됐는가"부터 실제 로그로 확인했다:
+
+```
+Get-ScheduledTaskInfo DOJOONPASS_DAILY   LastRunTime 2026-08-23 03:00:01, 결과 0
+logs/daily_run.log   [SUCCESS] Finished at 2026-08-23 4:35:15
+  수집 273건, 검증 PASS 273/273 (100%), DB 신규 16 / 갱신 257 / 실패 0
+logs/migrate_execute.log
+  auction_item 완료(신규 16건, 갱신 2360건) -> 총 2,376건 [OK]
+  document_status 완료 7,128건 [OK]
+샘플 점검(신규 16건 직접 조회) - sido/sigungu/dong/lot_number/가격 역전 전부 정상
+  (예: "1층에이동(오피스텔동)109호"처럼 건물동 표기가 섞인 주소도 dong="오산동"으로
+  정확히 분리됨 - 행정동과 건물 내 동 표기를 혼동하지 않는다)
+```
+
+**크롤·정규화 파이프라인 자체는 오늘도 정상이다(파싱 오류 0건).** 그러나 바로 그 정상
+동작이 위에서 지적한 문제를 매일 키우고 있다는 것도 같은 측정으로 확인된다:
+
+```
+                        어제(2026-08-23 새벽 이전)   오늘(같은 날 크롤 이후)
+활성 물건(기일 미도래)         275건                    291건 (+16)
+대기 문서(고유 물건)          1,539개                  1,555개 (+16)
+READY 문서 있는 활성 물건      31건                     31건 (변화 없음)
+문서 커버리지                 11.3%                    10.6%  (하락)
+document_queue pending        4,883행                  4,947행 (+64)
+```
+
+DocWorker가 여전히 돌지 않으므로 새로 들어오는 물건은 전부 그대로 적체에 더해지고,
+커버리지 비율은 매일 조금씩 나빠진다. 위 "등록만 하면 회복된다" 문단의 예측(약 10일)이
+그대로 유효하다 - 다만 시작점이 매일 미뤄지고 있다.
+
+```
+migration_history                19행 (020_create_auction_image.sql 없음)
+auction_image 테이블              없음
+test_schema_hygiene.py §3         FAIL: ['020_create_auction_image.sql']
+GET /api/v1/search, /item/1       200 (500 아님 — Sprint 239 방어적 저하가 여전히 동작)
+로그: "auction_image 테이블이 없음(migration 020 미적용) - 사진 없이 진행한다"
+```
+
+Sprint 244가 "해소"라고 적었던 것(`auction_image` 45행 존재)은 **그 시점엔 사실이었지만
+지속되지 않았다** — `*.db`가 gitignore 대상이라 로컬 사본이 세션마다 달라진다는, 이
+문서가 스스로 이미 경고해 둔 바로 그 이유다(위 386행대 Sprint 238 절 참고, 세 번째
+반복). 실행에는 영향이 없다(Sprint 239의 narrow catch가 여전히 유효 — 사진 없이
+200으로 계속 동작). **migration 020 실제 적용은 여전히 승인 영역이라 이 세션에서도
+실행하지 않았다.** 스크래치 사본 검증은 Sprint 260에서 이미 완료돼 있다(즉시 적용 가능,
+승인만 남음).
 
 ---
 
@@ -742,19 +968,20 @@ CTO 승인 하에 Migration 012/013 실행. `auction` → `UNIQUE(court_code, ca
 `auction_item` → `UNIQUE(case_id, item_no)`. id·전 컬럼 100% 보존, 충돌 시 두 법원 공존 확인.
 회귀 방어: `test_api_regression.py` 22번, `test_subscription_policy.py` 7번.
 
-### P1-1. `/properties` 첫 화면의 id 체계 불일치 (`docs/BUGS.md` #17)
+### ~~P1-1. `/properties` 첫 화면의 id 체계 불일치~~ → **2026-08-11 Sprint 51 해결 (2026-08-22 재확인)**
 
-- `/`가 로그인 사용자를 `/properties`로 보내는데, 그 화면은 Supabase `properties` 테이블을
-  조회하면서 링크는 FastAPI `auction_item` id 기준인 `/properties/{id}`로 건다 —
-  **로그인 직후 첫 화면에서 물건을 클릭하면 엉뚱한 물건이 열리거나 404.**
-- 우회 동선은 있다(`PrimaryNav`의 "검색" → `/search`는 정상).
-- 처리 방향(FastAPI 전환 vs 화면 폐지 후 `/`를 `/search`로)이 **Spec 결정 사항**.
+`src/app/properties/page.tsx`를 직접 읽어 재확인 — Supabase `properties` 테이블을 조회하던
+원래 구현은 사라졌고, 지금은 `redirect('/')` 하나뿐인 레거시 리다이렉트 화면이다(파일
+자체의 주석이 "Sprint 51, docs/BUGS.md #34"로 경위를 기록해 두었다). id 체계 불일치는
+구조적으로 재현 불가 — 이 화면이 더 이상 어떤 데이터도 조회하지 않는다.
 
-### P1-2. 로그아웃 노출 경로가 1곳뿐 (`docs/BUGS.md` #15)
+### ~~P1-2. 로그아웃 노출 경로가 1곳뿐~~ → **해결 확인 (2026-08-22 재확인)**
 
-- `/search`, `/favorites`, `/properties/recent`에서는 로그아웃 불가(`PrimaryNav`에 없음).
-- 하필 유일한 경로가 P1-1의 문제 화면이다.
-- 배치 위치가 **Spec 결정 사항**.
+`src/components/SiteHeader.tsx`(검색/관심물건/최근본/마이페이지/상세가 공유하는 단일
+헤더)가 `LogoutButton`을 직접 포함하고 있음을 코드로 확인 — 이 헤더를 쓰는 모든 화면에서
+로그아웃이 노출된다. 언제 이 통합이 이뤄졌는지 커밋 이력까지는 추적하지 않았으나(문서
+갱신이 목적이지 히스토리 고고학이 아니다), **지금 코드가 문제 서술과 다르다**는 사실만
+확정한다.
 
 ### P1-3. Admin 화면(UI) 부재
 
@@ -778,20 +1005,52 @@ CTO 승인 하에 Migration 012/013 실행. `auction` → `UNIQUE(court_code, ca
 
 ## P2 — 출시 후 처리
 
-- `src/login/`이 라우팅되지 않는 죽은 코드로 남아 있고, 금지된 옛 브랜드명
-  "도준 경매 패스"를 사용 중 — **삭제 승인 필요**
-- `properties/page.tsx`의 지역 `formatPrice`가 공용 구현과 다르게 동작(`0` → `"0.0억"`).
-  P1-1과 같은 화면이라 함께 처리하는 것이 맞다
+- ~~`src/login/`이 라우팅되지 않는 죽은 코드로 남아 있고...~~ → **해결 확인 (2026-08-22)**.
+  `find src/login` 결과 디렉터리 자체가 존재하지 않는다 — 이미 삭제됐다(시점 불명, 이
+  세션에서 삭제하지 않았음을 `git status`로도 확인). 문서만 갱신한다.
+- ~~`properties/page.tsx`의 지역 `formatPrice`가 공용 구현과 다르게 동작...~~ → **해결
+  확인 (2026-08-22)**. P1-1과 같은 화면 — 지금은 `redirect('/')` 하나뿐이라 그 화면
+  자체가 없다.
 - `LIKE` 필터의 `%`/`_` 이스케이프 미처리 — 보안 문제는 아니고 와일드카드 의미론.
-  `search.py` 전체 검색 동작이 바뀌므로 PM 확인 후
-- Admin 목록의 `JOIN auction_item`이 INNER — 물건이 사라진 신청이 목록에서 통째로 빠진다
-  (현재 DELETE 경로가 없어 실제 발생은 안 함)
-- **[2026-08-07 신규]** 활성 구독 조회·초과결제 대상 선택 쿼리가 `user_id` 인덱스가 아니라
-  `status` 인덱스를 타고 TEMP B-TREE 정렬을 만든다(실행계획 실측). `(user_id, status)` 복합
-  인덱스가 적합하나 **스키마 변경 승인 필요**
-- **[2026-08-07 신규]** `favorites` / `payments` / `registry-requests` 목록에 **LIMIT이 없다.**
-  현재 사용자당 최대 보유 행이 0건이라 실제 문제는 없지만 구조적으로 무제한이다.
-  페이지네이션 도입은 응답 구조 변경(Breaking Change)이라 승인 필요
+  `search.py` 전체 검색 동작이 바뀌므로 PM 확인 후 (2026-08-22 재확인: 여전히 미처리)
+- ~~Admin 목록의 `JOIN auction_item`이 INNER...~~ → **해결 확인 (2026-08-22)**.
+  `api/v1/admin.py`의 세 곳(등기부 신청 목록 관련 쿼리) 전부 지금은 `LEFT JOIN`이다.
+- **[2026-08-23 Sprint 267 발견·수정]** 같은 INNER JOIN 패턴이 admin.py의 수정에서
+  빠진 채 **사용자 화면 두 곳**(`api/v1/favorites.py`, `api/v1/recent_items.py`)에
+  그대로 남아 있었다 - `auction_item` 행이 없어지면(011~013처럼 FK를 끄고 도는
+  재작성 마이그레이션 중 UNIQUE 정리로 행이 빠지는 경우, admin.py가 이미 실측한
+  시나리오) 관심물건/최근본 항목이 **사용자에게도 아무 신호 없이** 사라진다. 관리자
+  케이스보다 사용자에게 직접 노출되는 문제라 더 심각할 수 있었다. `LEFT JOIN` +
+  (화면에는 깨진 카드를 보이지 않도록 걸러내되 `logger.warning`으로 남기는) 처리로
+  수정 - admin.py처럼 화면에 노출하는 대신, 사용자 화면 특성에 맞춰 "안 보이되 로그엔
+  남는다"로 구현했다. 신규 회귀
+  `test_favorites_and_recent_items_survive_orphaned_auction_item()`을 두 파일 모두에
+  대해 mutation 검증(INNER JOIN으로 되돌리면 로그 없이 조용히 사라짐 → FAIL 확인 →
+  복원 → PASS 확인). `run_python_tests.py` 전체 재실행으로 다른 회귀 없음 확인.
+- **[2026-08-07 신규]** ~~활성 구독 조회·초과결제 대상 선택 쿼리가 `user_id` 인덱스가 아니라
+  `status` 인덱스를 탄다~~ → **2026-08-23 Sprint 267 재실측: 그 부분은 이미 해소됐다.**
+  `EXPLAIN QUERY PLAN`으로 `api/v1/registry.py`의 실제 쿼리(`WHERE user_id=? AND status
+  IN (?,?) ORDER BY started_at DESC, id DESC`)를 다시 재보니 지금은
+  `idx_subscriptions_user_id`를 탄다(`sqlite_master` 확인 결과 이 인덱스는 물론
+  `idx_subscriptions_status`/`idx_subscriptions_payment_id`도 이미 존재 - 2026-08-07 이후
+  어느 시점에 추가됨, 이 문서에 반영되지 않았을 뿐). **남은 것은 `ORDER BY`의 TEMP B-TREE
+  하나뿐이고**, 사용자당 구독 행 수가 원래 적어(플랜 변경 이력 정도) 실제 영향은 미미하다.
+  `(user_id, started_at, id)` 복합 인덱스면 이마저 없앨 수 있으나 여전히 **스키마 변경
+  승인 필요**(우선순위는 원래 서술보다 낮음 - "잘못된 인덱스"가 아니라 "정렬 최적화 여지").
+- **[2026-08-07 신규, 2026-08-22 재확인 — 여전히 유효]** `favorites` / `payments` /
+  `registry-requests` 목록에 **LIMIT이 없다.** 재측정: 세 테이블 전부 지금도 0행(사용자당
+  최대 보유 행 0건) — 실제 문제는 여전히 없다. `favorites`/`payments`는 사용자의 명시적
+  액션(즐겨찾기 추가, 결제)이 쌓이는 **의도된 무제한 목록**이라 자동 정리 대상이 아님을
+  Sprint263에 코드로 재확인했다(recent_items와 다른 성격 — 아래 참고). 페이지네이션
+  도입은 응답 구조 변경(Breaking Change)이라 승인 필요, 지금은 승인 없이 인덱스만
+  확인했다(`favorites`/`payments`/`registry_requests` 전부 `user_id` 인덱스 보유,
+  카운트 없이도 조회 성능 자체는 문제없음).
+- **[2026-08-22 Sprint 263 발견·수정]** `recent_items`(최근 본 물건, 자동 추적)는 위
+  셋과 달리 **화면은 항상 20건만 보여주면서 저장은 무제한으로 쌓이는** 실제 결함이었다 —
+  사용자가 명시적으로 추가하는 목록이 아니라 조회할 때마다 자동 기록되기 때문에
+  `favorites`처럼 "무제한이 의도"라고 볼 수 없었다. `record_view()`에 정리(pruning)를
+  추가해 저장도 20건으로 맞췄다(실행+mutation 검증 완료, `test_api_regression.py` 신규
+  검사로 회귀 방어).
 - **[2026-08-07 신규]** 외부 로그/예외 수집(Sentry 등) 없음 — 서버 로깅 설정은 2026-08-07
   신설했으나 stdout 스트림뿐이라 운영에서 과거 로그를 되짚기 어렵다 (**CTO 보류 지정**)
 - ~~`PRAGMA foreign_keys = 0`~~ → **2026-08-07 해결**(Sprint 28)
@@ -880,6 +1139,20 @@ python audit_asset_integrity.py --selftest # 감사기가 눈이 멀지 않았�
 **승인 필요**: 이 파일은 아직 **미추적**이다. `git add` 전까지는 회귀 스위트가 참조하지
 못한다(추적 파일이 미추적 파일을 import하면 커밋 시 부팅이 깨진다 — BUGS #105).
 
+### 운영 점검 도구: `audit_auth_health.py` (2026-08-23 Sprint 267 신설)
+
+`.env`의 `SUPABASE_JWT_SECRET`/`SUPABASE_URL`이 **실제로 로그인 인증을 동작시키는지**
+읽기 전용으로 잰다. HS256 시크릿 길이만 보는 게 아니라 JWKS 주소를 실제로 만들어
+**진짜 네트워크 GET을 보내고** 공개키가 오는지까지 확인한다 - 이 세션에서 "값은
+있는데 주소가 깨져 있어 조용히 401만 나는" 사고를 겪은 뒤 만들었다(위 P0-4 절 참고).
+
+```bash
+python audit_auth_health.py            # 0=ES256 정상 / 1=주 경로 실패
+python audit_auth_health.py --selftest # _project_origin() 정규화 로직 자체 검증
+```
+
+2026-08-23 실측: ES256(JWKS) 정상(200, 공개키 1개) / HS256 시크릿 없음(0자,
+`.env` 승인 필요 - 코드로 못 고침). 이 파일도 아직 **미추적**이다(위와 같은 이유).
 
 ---
 
@@ -1045,4 +1318,124 @@ MAX_ITEMS 의 두 가지 의미를 계약으로 고정
                           카드 31개 전부 넘침 0 확인.
 관심물건 카드 레이아웃      favorites 0건. **최근본 실데이터**로 같은 컴포넌트를 태워 대체 검증.
 batching 이후 실제 처리시간  크롤이 멈춰 있어 잴 수 없다. 지금 상수는 2026-08-02 이전 값이다.
+```
+
+---
+
+## 2026-08-22 Sprint 255 — DocWorker 체인을 **실제로 실행해서** 증명했다 (등록은 하지 않음)
+
+### P0-A 정정 — 크롤은 이미 매일 돈다, 남은 것은 DocWorker/PriorityRefresh 등록뿐이다
+
+`Get-ScheduledTask`로 실제 등록 내용을 직접 조회했다(등록/수정 없음, 조회만):
+
+```
+TaskName          DOJOONPASS_DAILY
+Execute           cmd.exe /c "...\dojoonpass\run_daily.bat"     <- run_daily.bat를 정확히 가리킨다
+Trigger           매일 03:00 (StartBoundary 2026-08-04T03:00:00)
+Principal         RunLevel=Highest / UserId=진영 / LogonType=Interactive
+LastRunTime       2026-08-22 03:00:01 / LastTaskResult 0 (성공)
+```
+`register_scheduler_tasks.ps1`이 등록하는 세 이름과 다른 것도, 실행 커맨드 자체는 저장소의
+`run_daily.bat`를 그대로 가리키는 것도 확인했다 — **크롤 경로는 건강하다.**
+
+★ **StartBoundary가 2026-08-04다.** `run_doc_worker.bat` 자신의 주석이 적어 둔
+"2026-08-03~08-11 Anaconda 제거로 크롤 정지" 사건과 날짜가 겹친다 — 그 복구 때
+크롤(`DOJOONPASS_DAILY`)만 새 이름으로 재등록되고 **DocWorker/PriorityRefresh는
+재등록되지 않은 채 남겨진 것**으로 보인다(추정 — 등록 스크립트 실행 이력은 남아있지 않다).
+
+### ★★ DocWorker 진입 사슬을 승인 없이 **실제로 실행**해서 끝까지 확인했다
+
+등록/실크롤 없이 "실행되면 될지"를 증명하는 방법: 지금 시각(06:02)이 이미 실행 창(~04:00)을
+지났다는 것을 이용했다 — `doc_worker.py`는 브라우저를 띄우기 **전에** 창 마감을 확인하고
+끝내므로, 지금 실행해도 실제 수집(운영 데이터 생성)은 절대 발생하지 않는다. 이 성질을
+확인한 뒤 `run_doc_worker.bat`를 실제로 실행했다:
+
+```
+PS> .\run_doc_worker.bat   (등록/수정 없이 1회 수동 실행, 실행 창 밖이라 무해함을 사전 확인)
+logs/doc_run.log (18일 만에 갱신):
+  2026-08-22 06:02:17 [INFO] ===== PDF 수집 Worker 시작 (종료 예정: 04:00) =====
+  2026-08-22 06:02:17 [INFO] 실행 창(04:00)이 이미 지났다 - 브라우저를 띄우지 않고 종료
+  [SUCCESS] doc_worker.py finished at 2026-08-22 6:02:17
+```
+`where python`이 실제 Python 3.13(selenium 4.47.0 설치됨)을 WindowsApps 스텁보다
+먼저 찾는 것, `.env` 로딩, DB 연결, lock 파일(`logs/doc_worker.lock`, 없음 확인),
+lock→창확인 순서, 성공 마커 기록까지 **전부 실제로 통과했다.** doc_run.log 안쪽의
+바로 이전 기록(2026-08-04 23:17, `ModuleNotFoundError: No module named 'selenium'`)과
+비교하면 — 그때는 selenium이 없는 환경이었고 지금은 있다. **이 환경은 지금 당장 DocWorker를
+등록해도 정상 동작할 준비가 돼 있다.** 등록 자체만 승인 영역으로 남는다.
+
+`run_priority_refresh.bat`는 **실행하지 않았다** — `refresh_priority.py`는 창 확인 없이 곧바로
+`document_queue.priority`를 갱신한다(운영 DB 쓰기). doc_worker와 달리 무해하게 끝나는
+사전 조건이 없어 코드 검토로만 확인했다(§Sprint253/254와 동일 코드, 재확인 결과 무변화).
+
+### 남은 유일한 조치
+
+```
+1. .\register_scheduler_tasks.ps1 -Apply   (또는 DOJOONPASS_DAILY와 같은 방식으로
+   DocWorker/PriorityRefresh 두 개만 등록) — 승인 영역, 이 세션에서 하지 않았다.
+```
+
+---
+
+## 2026-08-22 Sprint 260 — 승인 3건을 **스크래치 복사본으로 미리 실행 검증**했다 (실DB 무변경)
+
+이번 세션은 "승인이 필요하다"에서 멈추지 않고, **승인이 떨어지는 순간 그대로 실행하면
+되는 상태**까지 만들었다. 셋 다 운영 `auction.db`는 건드리지 않고 임시 복사본에서만
+실행했다(끝나면 즉시 삭제, 전후 실 DB 행수 대조 완료).
+
+### ① register_scheduler_tasks.ps1 — 새 안전장치 추가 + 실제 dry-run 재확인
+
+`-SkipCoveredByLegacy` 스위치를 신설했다. 기존 스크립트는 `DOJOONPASS_DAILY`(다른 이름의
+기존 작업)가 `run_daily.bat`을 이미 정상 실행 중임을 **경고만 하고 지나쳤다** — 그대로
+`-Apply`하면 같은 배치가 하루 두 번(03:00 기존 + 06:00 신규) 돈다. 새 스위치는 정상
+동작 중인(`LastTaskResult 0`) 기존 작업이 커버하는 항목을 등록 대상에서 자동으로 뺀다.
+**실제 dry-run으로 확인**(등록 없음, exit 0):
+```
+스위치 없이: DojoonPass-PriorityRefresh(신규) + DojoonPass-DocWorker(신규) +
+             DojoonPass-DailyCrawl(신규, ★ DOJOONPASS_DAILY와 중복 위험)
+-SkipCoveredByLegacy: DojoonPass-PriorityRefresh(신규) + DojoonPass-DocWorker(신규)만
+                      (DailyCrawl은 기존 작업이 커버하므로 자동 제외)
+```
+기존 원본 설계(Sprint187 — "어떤 기존 작업을 지울지는 사람이 정한다")는 바꾸지 않았다 —
+새 스위치는 그 판단을 이미 끝낸 사람을 위한 추가 선택지일 뿐, 기본 동작은 그대로다.
+
+### ② migration 020 — 실제 운영 DB 복사본(5.85MB, 전체 스키마 그대로)에 실행 성공
+
+```
+storage.migrations.run_migrations.run() 을 스크래치 복사본(auction.db 전체 복사)에 실행
+결과: [OK] 020_create_auction_image.sql 적용 완료 (4ms)
+      테이블 26 -> 27, auction_image 스키마(FK+UNIQUE 포함) 정상 생성
+      기존 데이터 전부 무변화(auction_item 2,360 / document_queue 5,619 그대로)
+실 auction.db: 실행 전후 완전 동일(테이블 26개, auction_image 없음) 확인
+```
+**지금 승인만 나면 그대로 적용해도 안전하다는 것을 실제 실행으로 증명했다.**
+
+### ③ backfill_doc_raw.py --apply — 실제 문서 파일 555개 기준으로 실행 성공
+
+```
+스크래치 복사본에서 --apply 실행(실제 documents/ 폴더의 실 파일을 읽기만 함, 쓰지 않음)
+결과: doc_raw 555행 생성, 그중 page_count 확보 394행, 예외 0건
+실 auction.db: 실행 전후 doc_raw 0행 그대로(무변화) 확인
+```
+**여기도 승인만 나면 그대로 적용 가능함을 실제 실행으로 증명했다.**
+
+### ★ 자기 정정 — Sprint257 "신규 발견"은 사실 재발견이었다
+
+Sprint257이 새로 만든 탐지 스크립트(`detect_orphaned_queue_court_dryrun.py`)는 삭제했다.
+`cleanup_orphans_dryrun.py`가 **2026-08-14**(8일 앞서)에 이미 같은 21행을 찾아 두었고,
+"매일 워커 비용을 낭비한다"는 Sprint257의 서술도 과장이었다(실측 비용은 지금 0 —
+15건이 이미 기일 경과라 1차 방어선이 막는다) — 그리고 그 도구는 **문서 파일 자체가
+고아로 남은 것**(고양지원/2024타경2803/1, 12.4MB)까지 찾아냈는데 Sprint257은 놓쳤다.
+`test_pipeline_integrity.py`의 자동 회귀 가드(상한 21)는 유지하고, 여기에 파일 고아
+가드(상한 1, mutation 검증 완료)를 추가로 승격했다 — 기존 도구를 대체하지 않고 CI에
+자동으로 걸리게만 만들었다.
+
+### 남은 유일한 조치 (갱신)
+
+```
+1. .\register_scheduler_tasks.ps1 -Apply -SkipCoveredByLegacy   (DocWorker/PriorityRefresh만
+   안전하게 등록 — 새 스위치로 DailyCrawl 중복 위험 자동 회피)
+2. python -m storage.migrations.run_migrations   (migration 020 — 스크래치 검증 완료)
+3. python backfill_doc_raw.py --apply            (doc_raw 555행 — 스크래치 검증 완료)
+셋 다 승인 영역이라 이 세션에서 실 DB에는 실행하지 않았다.
 ```

@@ -716,6 +716,25 @@ _r = client.get("/api/v1/favorites",
 check("복원 후 정상 토큰이 다시 통한다(검사가 뒤를 오염시키지 않았다)",
       _r.status_code == 200, f"-> {_r.status_code}")
 
+print()
+print("--- SUPABASE_URL 값에 경로가 섞여 있어도 JWKS 주소가 안 깨지는가 (Sprint 267) ---")
+# 실측(2026-08-23): 이 환경의 .env가 NEXT_PUBLIC_SUPABASE_URL에 REST API 베이스 URL
+# (".../rest/v1/")을 프로젝트 URL 자리에 잘못 넣어 두고 있었다. 예전 코드(.rstrip("/")만
+# 적용)는 이 경로를 그대로 남겨 JWKS 주소가 ".../rest/v1/auth/v1/.well-known/jwks.json"이
+# 되고, 그 주소는 401을 반환한다(실제 프로젝트로 직접 확인함) - ES256(주 인증 경로) 검증이
+# 전부 실패했다. `_project_origin()`이 scheme+host만 남기도록 고쳤다 - 그 정규화 자체를 고정한다.
+check("★ REST API 베이스 URL이 섞여도 origin만 남는다",
+      auth_mod._project_origin("https://abcxyz.supabase.co/rest/v1/")
+      == "https://abcxyz.supabase.co")
+check("★ 경로 없는 정상 값은 그대로 유지된다",
+      auth_mod._project_origin("https://abcxyz.supabase.co")
+      == "https://abcxyz.supabase.co")
+check("★ 끝 슬래시만 있는 값도 정리된다(기존 동작 유지)",
+      auth_mod._project_origin("https://abcxyz.supabase.co/")
+      == "https://abcxyz.supabase.co")
+check("★ 빈 값은 빈 값 그대로다(JWKS 조회 스킵 경로 유지)",
+      auth_mod._project_origin("") == "")
+
 print("=" * 70)
 print(f" 결과: {PASS} PASS / {FAIL} FAIL")
 print("=" * 70)

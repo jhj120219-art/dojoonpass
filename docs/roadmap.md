@@ -1599,22 +1599,18 @@ init_db / checkpoint / 상태조회  완료  BUGS #89  "조용한 실패"에 근
 
 부분 환불(`PARTIAL_REFUND`)은 또 다른 문제다 ― A/B/C 어디에도 자연스럽게 들어맞지 않는다.
 
-### 정책과 무관하게 먼저 해야 하는 일 (승인 불필요)
+### 정책과 무관하게 먼저 해야 하는 일 (승인 불필요) — ★ 완료 (2026-08-23 Sprint 267 확인)
 
-**결제와 구독을 잇는 열쇠가 없다.** `subscriptions`에 `payment_id`가 없고
-`payments`에도 `subscription_id`가 없다. `payments.metadata`는 `{"plan": ...}`뿐이다.
-비교하면 `registry_requests`는 `payment_id`를 갖고 있어 결제와 이어진다.
-
-```
-지금 두 행을 맞출 유일한 방법:  (user_id, 금액, 생성 시각) 어림짐작
-```
+~~결제와 구독을 잇는 열쇠가 없다.~~ → **이미 만들어져 있다.** `019_add_subscription_payment_id.sql`이
+적용되어 `subscriptions.payment_id INTEGER REFERENCES payments(id)`가 실제로 존재하고,
+`api/v1/payments.py:create_subscription()`이 `SUBSCRIPTION` 결제 생성 시 이 값을 실제로
+채운다(같은 트랜잭션 안, `payments.py:440`). 이 항목을 적었던 바로 그 Sprint(96) 안에서
+이미 닫혔는데 이 문단만 갱신되지 않았다 - `docs/BUGS.md` #94도 함께 정정함.
 
 **어떤 선택지를 고르든 이 열쇠가 먼저 있어야 실행된다.** A/B/C/D 전부
 "이 결제가 산 구독이 무엇인가"에 답할 수 있어야 한다. D조차 그렇다 ―
-표시를 남기려면 어디에 남길지 알아야 한다.
-
-그래서 **열쇠를 먼저 만드는 것은 정책 선택을 앞지르지 않는다.** 이것만 승인 없이
-진행하고, 환불 시 무엇을 할지는 결정을 기다린다.
+표시를 남기려면 어디에 남길지 알아야 한다. **그 전제조건은 충족됐다** -
+남은 것은 아래 정책 결정 자체뿐이다.
 
 ### 결정 전까지의 상태
 

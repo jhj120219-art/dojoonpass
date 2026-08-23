@@ -793,3 +793,36 @@ describe('로그인 성공 후 복귀 계약 (MASTER_SPEC §3.4)', () => {
   // 보내는가"는 서버 액션 소스에 고정할 수 있고, 그것이 이 계약의 핵심이다.
 
 })
+
+describe('예상치 못한 오류/404가 Next 기본 화면이 아니다 (2026-08-22 신설)', () => {
+  // src/app/error.tsx / not-found.tsx (Next.js App Router 규약 파일)가 없으면
+  // 렌더링 중 예외나 없는 경로 요청에서 사용자가 스타일 없는 Next 기본 화면을 본다.
+  // 2026-08-22 실측: 이 저장소 src/app 전체에 이 두 파일이 **0개**였다. 코드/기존 스타일
+  // 관례(properties/[id]/page.tsx의 loadError 분기)를 그대로 재사용해 신설했다 - 이
+  // 검사는 그 신설이 나중에 조용히 사라지지 않게 잠근다.
+
+  test('존재하지 않는 경로는 커스텀 404를 보여준다(Next 기본 화면이 아니다)', async () => {
+    const { res, body } = await getText('/이런-경로는-절대-존재하지-않는다-xyz-2026')
+    assert.equal(res.status, 404, `없는 경로가 404가 아닙니다 (${res.status})`)
+    assert.ok(
+      body.includes('페이지를 찾을 수 없습니다'),
+      'not-found.tsx의 문구가 응답에 없습니다 - Next 기본 404로 되돌아간 것으로 보입니다'
+    )
+    assert.ok(
+      !/This page could not be found/.test(body),
+      'Next.js 기본 404 문구가 그대로 보입니다 - not-found.tsx가 적용되지 않았습니다'
+    )
+  })
+
+  test('src/app/error.tsx / not-found.tsx 소스 파일이 실제로 존재한다', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const root = path.join(import.meta.dirname, '..')
+    for (const rel of ['src/app/error.tsx', 'src/app/not-found.tsx']) {
+      assert.ok(fs.existsSync(path.join(root, rel)), `${rel}가 없습니다`)
+    }
+    const errorSrc = fs.readFileSync(path.join(root, 'src/app/error.tsx'), 'utf8')
+    assert.ok(errorSrc.startsWith("'use client'"), 'error.tsx는 Client Component여야 한다(Next.js 규약)')
+    assert.ok(/reset\s*\(\s*\)/.test(errorSrc), 'error.tsx가 reset()을 호출하지 않습니다(다시 시도 불가)')
+  })
+})

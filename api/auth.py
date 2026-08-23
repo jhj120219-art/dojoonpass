@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 from dotenv import load_dotenv
@@ -43,8 +44,24 @@ load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 # `.env.local`의 NEXT_PUBLIC_SUPABASE_URL에만 있다. 값을 **읽기만** 한다(파일 수정 없음).
 load_dotenv(os.path.join(_REPO_ROOT, ".env.local"), override=False)
 
+def _project_origin(url: str) -> str:
+    """Supabase 프로젝트 URL에서 scheme+host만 남긴다 (2026-08-23 Sprint 267).
+
+    실측: 이 환경의 `.env`에 `NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co/rest/v1/`
+    (REST API 베이스 URL을 프로젝트 URL 자리에 잘못 붙여 넣은 값)이 들어 있었다. 예전 코드는
+    `.rstrip("/")`만 하므로 `/rest/v1` 경로가 그대로 남아 JWKS 주소가
+    `.../rest/v1/auth/v1/.well-known/jwks.json`이 되고, 그 주소는 401을 반환한다
+    (`.../auth/v1/.well-known/jwks.json`만 200) - ES256(주 인증 경로) 검증이 전부
+    실패했다. 경로가 붙어 있어도 origin만 남기면 이런 오타에도 견딘다.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
+SUPABASE_URL = _project_origin(os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "")
 bearer_scheme = HTTPBearer()
 
 # ---------------------------------------------------------------------------

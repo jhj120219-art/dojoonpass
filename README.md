@@ -13,7 +13,7 @@ DojoonPass(콕찰) — 법원경매 검색/상세조회/관심물건/등기부 �
 | Frontend | Next.js (App Router) | `src/app/` |
 | Backend | FastAPI | `api_server.py` + `api/v1/*.py` |
 | Database | SQLite | `auction.db` (`storage/database.py`) |
-| Auth | Supabase Auth (JWT) | `api/auth.py`, `src/middleware.ts` |
+| Auth | Supabase Auth (JWT) | `api/auth.py`, `src/proxy.ts` |
 | Crawler | Selenium | `mvp_scraper.py` → `migrate_execute.py` |
 
 인증만 Supabase를 쓰고, 경매 데이터는 전부 SQLite에서 FastAPI를 거쳐 나온다.

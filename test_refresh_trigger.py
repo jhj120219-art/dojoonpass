@@ -280,6 +280,63 @@ def test_requeue_revives_expired_only_when_date_moved_forward():
         check("기일이 과거면 그대로", s.status_of(dead), "SKIPPED_EXPIRED")
 
 
+def test_expired_revival_is_scoped_by_changed_field_not_by_item():
+    """★ SKIPPED_EXPIRED 부활은 **doc_type이 아니라 '어떤 필드가 바뀌었나'**로 갈린다
+    (2026-08-21 Sprint 252 실측, 운영 auction.db에서 재현).
+
+    `REFRESH_DOC_TYPES_BY_FIELD["auction_date"] = ("spec", "status")`다 - appraisal/image가
+    빠져 있다. 그런데 `requeue_changed_documents()`의 SKIPPED_EXPIRED->pending 부활 경로는
+    `doc_types_for_changed_fields(fields)`가 돌려주는 **그 목록 안의 doc_type만** 되살린다.
+    즉 유찰 후 재매각(=auction_date만 바뀌는 흔한 경우)으로는 **appraisal/image가
+    SKIPPED_EXPIRED에서 절대 못 빠져나온다** - "기일이 미래로 돌아오면 되살린다"는
+    §3(위 테스트)의 계약이 spec/status에는 적용되고 appraisal/image에는 적용되지 않는다.
+
+    운영에서 실제로 걸린 사례(id=921/927/930, 광주지방법원 2024타경2065/4887/5217,
+    전부 유찰 2~4회): appraisal만 2026-07-12에 SKIPPED_EXPIRED로 종결된 뒤, 기일이
+    2026-08-21로 다시 잡혀도(spec/status는 정상 pending) appraisal만 여전히
+    SKIPPED_EXPIRED에 갇혀 있다 - 그 물건의 감정평가서를 영구히 못 받는다.
+
+    **이 검사는 정책을 바꾸지 않는다** - appraisal/image도 되살려야 하는지는 재수집
+    정책(docs/roadmap.md 결정 대기, `test_document_queue.py:495-497` 참고)이라 제품
+    판단이다. 이 검사는 **지금 실제로 이렇게 동작한다**는 사실만 잠근다 - 아무도 모르는
+    사이에 이 경계가 넓어지거나 좁아지면(의도했든 실수든) 반드시 이 검사가 먼저 반응해야
+    하고, 그러면 그 변경이 "정책 결정"이었는지 확인하는 계기가 된다.
+    """
+    print("\n--- 3-B. 부활은 doc_type이 아니라 바뀐 필드로 갈린다 (Sprint 252) ---")
+    import storage.database as db
+
+    future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    with ScratchDB() as s:
+        s.seed_item()
+        spec = s.queue_row("B000210", "2024타경1", "1", "spec", "SKIPPED_EXPIRED",
+                           auction_date=future)
+        status = s.queue_row("B000210", "2024타경1", "1", "status", "SKIPPED_EXPIRED",
+                             auction_date=future)
+        appraisal = s.queue_row("B000210", "2024타경1", "1", "appraisal", "SKIPPED_EXPIRED",
+                                auction_date=future)
+        image = s.queue_row("B000210", "2024타경1", "1", "image", "SKIPPED_EXPIRED",
+                            auction_date=future)
+
+        # 실제 재매각에서 가장 흔한 변경 - auction_date만 바뀐다(감정가는 그대로).
+        out = db.requeue_changed_documents([{
+            "court_code": "B000210", "case_no": "2024타경1", "item_no": "1",
+            "fields": ["auction_date"],
+        }])
+
+        check("부활한 행 수 (spec+status만)", out["revived_expired"], 2)
+        check("spec은 되살아난다", s.status_of(spec), "pending")
+        check("status도 되살아난다", s.status_of(status), "pending")
+        check_true("★ appraisal은 기일이 미래인데도 SKIPPED_EXPIRED에 갇혀 있다"
+                   " (auction_date 변경이 appraisal을 트리거하지 않는다)",
+                   s.status_of(appraisal) == "SKIPPED_EXPIRED",
+                   "-> %r (재수집 정책이 바뀌었다면 이 검사를 의도적으로 갱신할 것)"
+                   % s.status_of(appraisal))
+        check_true("★ image도 같은 이유로 갇혀 있다",
+                   s.status_of(image) == "SKIPPED_EXPIRED",
+                   "-> %r" % s.status_of(image))
+
+
 def test_claim_returns_overwrite_and_separate_in_progress():
     print("\n--- 4. claim: refresh 는 overwrite=True + 별도 진행상태로 간다 ---")
     import storage.database as db
@@ -1490,6 +1547,7 @@ def main():
     test_requeue_only_touches_done()
     test_requeue_skips_items_whose_date_already_passed()
     test_requeue_revives_expired_only_when_date_moved_forward()
+    test_expired_revival_is_scoped_by_changed_field_not_by_item()
     test_claim_returns_overwrite_and_separate_in_progress()
     test_refresh_intent_survives_retry_and_stale_recovery()
     test_max_retry_still_terminates_refresh()
