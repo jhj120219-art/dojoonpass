@@ -8362,3 +8362,65 @@ warning 을 남긴다** ― 조용히 False 를 돌려주면 매일 아무 일�
 (`143-145` 가 있다 없다 한다). 원인은 `test_doc_worker_recovery.py` 의 스레드 8개
 검사가 그 경로를 "가끔" 밟기 때문이었다. 가끔 밟는 것은 방어선이 아니므로
 결정적 검사(11번)를 따로 만들어 고정했다 ― #130 에서 배운 것과 같은 교훈이다.
+
+--------
+
+#184
+
+**운영에 실제로 등록된 유일한 스케줄러 작업(`DOJOONPASS_DAILY` → `run_daily.bat`)은
+DB migration 을 절대 적용하지 않는다** (등록 여부와 무관하게 영원히 안 걸린다)
+
+발견 (2026-08-24 야간, 코드로 원인 확정 — 이전 "DB 가 백업으로 되돌아갔다" 추정은 철회)
+
+**[경위]** Sprint 254 문서가 오늘 아침 `auction_image 45행 / doc_raw 556행`으로 기록해
+둔 값이, 같은 날 야간 재실측에서 `auction_image` 테이블 자체가 없고 `doc_raw` 는 0행으로
+나왔다. 처음에는 이 저장소가 migration 020(Sprint 144, `doc_raw` 를 556행까지 채운 것과
+같은 스프린트) 이전 시점의 백업으로 되돌아갔다고 추정했다. 그런데 실제로 유일하게 등록된
+작업이 도는 `run_daily.bat` 를 읽으면 추정할 필요가 없다 — 원인이 코드에 그대로 있다.
+
+**[실측]**
+
+```bat
+"%PY%" mvp_scraper.py >> logs\daily_run.log 2>&1        REM init_db() 만 호출 (레거시 3테이블)
+"%PY%" migrate_execute.py >> logs\migrate_execute.log 2>&1
+```
+
+`storage.migrations.run_migrations` 를 부르는 줄이 **어디에도 없다.** `migration_history`
+에 001~019 가 이미 적용돼 있는 것도 이 배치 덕이 아니다 — 타임스탬프(07-20, 07-21, 07-25,
+07-28, 08-08×3, 08-11×2, 08-13)가 매일 규칙적이지 않고 개발 세션 시각에 몰려 있다. 즉
+그때그때 사람이 `python -m storage.migrations.run_migrations` 를 수동으로 돌렸다는 뜻이고,
+Sprint 144(08-17) 이후로는 아무도 그렇게 하지 않았다. **매일 자동으로 도는 유일한 작업은
+애초에 그 일을 하지 않으므로, 020 도 앞으로 생길 어떤 migration 도 스케줄러 등록 여부와
+무관하게 영원히 자동 적용되지 않는다.**
+
+**[영향]** `auction_image` 테이블이 없어 사진 파이프라인이 통째로 죽어 있다(API 는
+Sprint 239 이래 이 상태를 우아하게 처리해 500 은 안 나지만, "사진 없는 화면"으로만
+보여 사용자가 결함으로 인지하기 어렵다 — 더 위험한 종류다). `document_status` 는 READY
+555건인데 그중 `doc_raw` 로 뒷받침되는 것이 **0건**이라, 재수집 없이는 쪽수/크기/버전이
+영원히 null 이다(BUGS #144 의 재발이 아니라 지속 — Sprint 144 의 수정 자체는 여전히 코드에
+있다, 위 mark_queue_done()/`_record_doc_raw()` 확인). 이 결함은 새 migration 을 추가하는
+모든 미래 Sprint 에 반복된다 — 코드로 아무리 잘 고쳐도 운영에 자동으로 안 실린다.
+
+**[doc_raw 0행의 별개 원인]** `document_queue.last_attempt_at` 최댓값이 **2026-07-12**
+에서 41일째 정체돼 있다(`enqueued_at` 은 오늘까지 계속 늚 — `audit_schedule_health.py` 의
+새 `queue_stall_signal()` 이 이번 세션부터 이것을 직접 잰다). `doc_raw` 를 쓰는 유일한
+경로(`mark_queue_done()`)는 DocWorker 안에 있고, `DojoonPass-DocWorker` 는 스케줄러에
+등록된 적이 없다(여러 Sprint 가 이미 기록). `logs/doc_run.log` 의 "2026-08-22 06:02
+[SUCCESS]" 는 큐를 실제로 비웠다는 뜻이 아니라 — 실행 창(~04:00)이 지난 뒤 브라우저 없이
+곧바로 종료하는, 설계된 그 SUCCESS 로 보인다(`last_attempt_at` 이 그 날 전혀 안 움직인
+것이 근거) — #47 계열의 "배치가 성공으로 끝나는데 아무 일도 안 했다"가 여기서도 그대로다.
+
+**[해결하지 않음 — 승인 영역]** 정확한 수정안(마이그레이션 1회 수동 실행 /
+`run_daily.bat` 에 러너 호출 추가 / DocWorker 등록)은 `docs/BETA_RELEASE_CHECKLIST.md`
+2026-08-24 야간 절에 [권장 조치]로 남겼다. `run_daily.bat` 는 내일 03:00 에 사람 검토 없이
+그대로 실행되는 운영 스크립트라, 그 내용을 고치는 것 자체가 "무인으로 운영 DB 에 migration
+을 적용하는 것"과 같다 — `docs/CLAUDE.md` 프로젝트 원칙(DB 스키마 변경은 승인 후)과 이
+세션의 SKIP 목록 둘 다에 걸려 코드를 고치지 않았다.
+
+**[회귀]** `audit_schedule_health.py` 에 `queue_stall_signal()` 신설 + selftest 6건
+(ISO 타임스탬프 파싱 / 정체 없음 대조군 / 문턱 초과 지목 / moot 비율 보고 / 처리 이력
+전무 지목 / 재료 없으면 판정 보류). `test_audit_selftests.py` 로 재확인 — 그대로 통과.
+
+**[남긴 것]** 이 결함의 근본 수정(마이그레이션 자동화 + DocWorker 등록)은 전부 승인
+영역이다. 다음 세션은 이 문서의 [권장 조치] 3단계를 그대로 따르면 된다 — 원인 재조사가
+필요하지 않다.

@@ -153,14 +153,32 @@ def stray_image_files(keys):
 
 
 def audit_images(conn):
-    """auction_image 행 <-> 디스크 파일."""
-    rows = conn.execute("""
-        SELECT ai.id AS item_id, ac.court_code, ai.case_no, ai.item_no,
-               img.seq, img.storage_path
-        FROM auction_image img
-        JOIN auction_item ai ON img.item_id = ai.id
-        JOIN auction_case ac ON ai.case_id = ac.id
-    """).fetchall()
+    """auction_image 행 <-> 디스크 파일.
+
+    ★ migration 020 미적용 DB 를 대상으로 돌 수 있다 — `api/v1/item.py` /
+      `images.py` / `thumbnails.py` 가 이미 이 상태를 "사진 없음"으로 우아하게
+      내려받는 것과 같은 이유다(2026-08-24 실측: 이 저장소의 운영 `auction.db`
+      자체가 지금 이 상태다). 여기만 그 방어가 없어서 감사기가 통째로 죽고
+      있었다 — 종료코드도 문서가 약속한 2(실행 자체 실패)가 아니라 파이썬
+      기본 1(uncaught exception)이라 "어긋남 발견"과 구별되지 않았다.
+    """
+    table_missing = False
+    try:
+        rows = conn.execute("""
+            SELECT ai.id AS item_id, ac.court_code, ai.case_no, ai.item_no,
+                   img.seq, img.storage_path
+            FROM auction_image img
+            JOIN auction_item ai ON img.item_id = ai.id
+            JOIN auction_case ac ON ai.case_id = ac.id
+        """).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table: auction_image" not in str(e):
+            raise
+        # 행이 전혀 없는 것과 같은 모양으로 다룬다 - 아래 [2] 의 disk-vs-DB
+        # 비교는 여전히 유효하다(테이블이 없으면 모든 물건의 DB 쪽 집합이
+        # 공집합이라는 뜻이고, 디스크에 파일이 있다면 그것 자체가 진짜 신호다).
+        table_missing = True
+        rows = []
 
     # (1) DB 가 가리키는 파일이 없다 -> 화면은 있다는데 열면 404
     missing = [r for r in rows
@@ -200,6 +218,8 @@ def audit_images(conn):
             orphan_count += len(disk - db)
 
     _head("[1] auction_image -> 파일")
+    if table_missing:
+        print("    auction_image 테이블이 없다(migration 020 미적용) - 사진 레코드 감사를 건너뛴다")
     print("    행 %d개 / 파일이 없는 행 %d개" % (len(rows), len(missing)))
     for r in missing[:SAMPLE]:
         print("      %s %s-%s seq=%s  %s"

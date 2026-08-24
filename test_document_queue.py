@@ -228,6 +228,58 @@ def test_reset_stale_queue():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_reset_stale_queue_recovers_whole_item_batch():
+    """`reset_stale_queue()`가 **같은 물건의 여러 doc_type 행**을 전부 회수하는가
+    (2026-08-25 신설).
+
+    위 `test_reset_stale_queue()`는 시나리오마다 case_no가 전부 달라 사실상
+    "행 1개짜리 물건"만 검사한다. 그런데 `claim_next_item_rows()`(Sprint 236,
+    물건 단위 배치)는 **한 물건의 여러 doc_type 행을 한꺼번에** in_progress로
+    바꾼다 — 사진/현황조사서/감정평가서 등 3~4행이 같은 물건 아래 동시에 잡힌다.
+    그 상태로 프로세스가 죽으면(`main()`의 정상 종료 경로를 전혀 거치지 못하고
+    강제 종료되면), 다음 실행이 기동 시 부르는 `reset_stale_queue()` 혼자서
+    그 배치 전체를 회수해야 한다.
+
+    `reset_stale_queue()`의 회수 UPDATE는 `WHERE status='in_progress' AND
+    last_attempt_at < ...`처럼 **행 단위 집합 연산**이라 물건 단위 개념이 아예
+    없다 — 코드를 읽으면 부분 회수가 구조적으로 불가능해 보인다. 그 판단을
+    코드 읽기로만 남기지 않고 실제로 심어서 확인한다.
+    """
+    print("\n--- 6-b. reset_stale_queue: 물건 배치 전체가 회수되는가 (Sprint 신설) ---")
+    import storage.database as dbmod
+
+    d, conn = make_db()
+    real_path = dbmod.DB_PATH
+    try:
+        doc_types = ["spec", "status", "appraisal", "image"]
+        for doc_type in doc_types:
+            conn.execute(
+                "INSERT INTO document_queue (court_code, case_no, item_no, doc_type,"
+                " priority, auction_date, status, retry_count, enqueued_at, last_attempt_at)"
+                " VALUES ('B000210','2025타경999','1',?,3,'2099-01-01','in_progress',0,"
+                "         '2026-08-01T00:00:00', datetime('now','localtime','-30 minutes'))",
+                (doc_type,))
+        conn.commit()
+        conn.close()
+
+        dbmod.DB_PATH = os.path.join(d, "t.db")
+        dbmod.reset_stale_queue()
+
+        check_conn = sqlite3.connect(dbmod.DB_PATH)
+        check_conn.row_factory = sqlite3.Row
+        rows = check_conn.execute(
+            "SELECT doc_type, status FROM document_queue"
+            " WHERE case_no='2025타경999' ORDER BY doc_type").fetchall()
+        check_conn.close()
+
+        check_true("검사가 공허하지 않다(배치 4행이 실제로 들어갔다)", len(rows), 4)
+        stuck = [r["doc_type"] for r in rows if r["status"] != "pending"]
+        check("★ 물건 배치 4행 전부 회수된다(부분 회수 없음)", stuck, [])
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _seed_queue(conn, rows):
     """(case_no, item_no, doc_type, status, priority, auction_date, retry, last_attempt_sql)"""
     for case_no, item_no, doc_type, status, prio, adate, retry, last in rows:
@@ -1239,6 +1291,7 @@ def run():
     test_live_schema_matches()
     test_migration_preserves_rows()
     test_reset_stale_queue()
+    test_reset_stale_queue_recovers_whole_item_batch()
     test_claim_next_queue_item()
     test_claim_is_atomic_under_concurrency()
     test_mark_queue_skipped_expired()

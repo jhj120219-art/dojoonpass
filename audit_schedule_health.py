@@ -233,6 +233,22 @@ def db_state():
             st["doc_raw"] = con.execute("SELECT COUNT(*) FROM doc_raw").fetchone()[0]
         except sqlite3.Error:
             st["doc_raw"] = None
+        # ★ 2026-08-25 추가 - "등록 0개"는 이미 알려져 있었지만, 그것이 실제로
+        #   큐에 어떤 결과를 남기는지는 이 감사기가 재지 않았다. `enqueued_at`(크롤이
+        #   매일 새로 쌓는 값)과 `last_attempt_at`(DocWorker 가 그 행을 만졌을 때만
+        #   찍는 값)의 최댓값을 나란히 재면 "쌓이기만 하고 안 빠진다"를 직접 보여줄
+        #   수 있다 - 실측(2026-08-24)으로 이 값이 6주 넘게 벌어져 있는 것을 확인했다.
+        st["queue_enqueued_max"] = con.execute(
+            "SELECT MAX(enqueued_at) FROM document_queue").fetchone()[0]
+        st["queue_last_attempt_max"] = con.execute(
+            "SELECT MAX(last_attempt_at) FROM document_queue"
+            " WHERE last_attempt_at IS NOT NULL").fetchone()[0]
+        row = con.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN auction_date < ? AND TRIM(auction_date) <> ''"
+            " THEN 1 ELSE 0 END) FROM document_queue WHERE status='pending'",
+            (today,)).fetchone()
+        st["queue_pending_total"] = row[0] or 0
+        st["queue_pending_moot"] = row[1] or 0
         return st
     finally:
         con.close()
@@ -275,6 +291,57 @@ def contradictions(hits, logs, db):
                 "%s 이후 갱신된 적이 없다. 다른 사본을 가리키거나 즉시 종료했을 수 있다."
                 % (name, last.strftime("%Y-%m-%d %H:%M"),
                    newest.strftime("%Y-%m-%d %H:%M") if newest else "(로그 없음)"))
+    return out
+
+
+# 큐가 "쌓이기만 하고 안 빠지는" 상태를 판정하는 문턱. `run_daily.bat`(크롤)는
+# 매일 돌지만 doc_worker 는 별도 등록이라 없어도 되는 값이라, 하루 이틀의 자연스러운
+# 지연과 "몇 주째 정지"를 가르는 여유를 넉넉히 둔다.
+QUEUE_STALL_DAYS = 3
+
+
+def _parse_db_ts(text):
+    """`document_queue.enqueued_at`/`last_attempt_at` 은 `datetime.isoformat()`로
+    쓰인다(`storage/database.py`) - schtasks 출력과 형식이 다르므로 `_parse_last_run`
+    (schtasks 전용)을 재사용하지 않고 따로 둔다. 못 읽으면 None(추측하지 않는다)."""
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
+
+
+def queue_stall_signal(db):
+    """`queue_enqueued_max`(크롤이 쌓은 최신 시각) 대비 `queue_last_attempt_max`
+    (DocWorker 가 마지막으로 큐를 만진 시각)가 `QUEUE_STALL_DAYS` 이상 뒤처지면
+    지목한다. 순수 함수라 selftest 가 스케줄러/DB 없이도 이 판정을 검증할 수 있다.
+
+    ★ 두 값 중 하나라도 없으면(파싱 실패 포함) 판정하지 않는다 - "모른다"를
+      "정상"으로 읽지 않는다(이 파일 전체의 원칙, `contradictions()`와 동일).
+    """
+    if not db:
+        return []
+    enq = _parse_db_ts(db.get("queue_enqueued_max"))
+    att = _parse_db_ts(db.get("queue_last_attempt_max"))
+    if enq is None:
+        return []
+    if att is None:
+        return ["document_queue 에 last_attempt_at 이 찍힌 행이 하나도 없다"
+                " (DocWorker 가 이 큐를 한 번도 만지지 않았다) - 최신 적재 %s"
+                % enq.strftime("%Y-%m-%d")]
+    gap = enq - att
+    if gap <= timedelta(days=QUEUE_STALL_DAYS):
+        return []
+    out = ["document_queue: 최신 적재 %s / DocWorker 마지막 처리 %s - %d일째 정체"
+           " (크롤은 계속 쌓는데 아무도 빼지 않는다)"
+           % (enq.strftime("%Y-%m-%d"), att.strftime("%Y-%m-%d"), gap.days)]
+    total = db.get("queue_pending_total") or 0
+    moot = db.get("queue_pending_moot") or 0
+    if total and moot:
+        out.append("pending %d건 중 %d건(%.0f%%)은 기일이 이미 지나 이제 수집해도"
+                    " 의미가 없다 - 정체가 길어질수록 이 비율만 늘어난다"
+                    % (total, moot, 100.0 * moot / total))
     return out
 
 
@@ -347,10 +414,12 @@ def run_report():
               % (db["future_items"], db["last_auction_date"]))
         print("      document_queue            : %s" % (db["queue"] or "{}"))
         print("      doc_raw                   : %s" % db["doc_raw"])
+        print("      큐 최신 적재/최근 처리     : %s / %s"
+              % (db.get("queue_enqueued_max") or "-", db.get("queue_last_attempt_max") or "-"))
 
     print()
     print("[4] 축 사이의 모순")
-    bad = contradictions(hits, logs, db)
+    bad = contradictions(hits, logs, db) + queue_stall_signal(db)
     if not bad:
         print("      모순 없음 (또는 판정할 재료가 없다)")
     for b in bad:
@@ -450,6 +519,30 @@ def selftest():
     check("헤더를 못 찾으면 None(조회 실패)이다",
           parse_schtasks_csv('"쓰레기","줄"' + chr(10) + '"a","b"'), None)
     check("출력이 비면 None 이다", parse_schtasks_csv(""), None)
+
+    # (9) 큐 정체 판정 (2026-08-25 신설) - 실제로 6주 뒤처진 상태를 이 세션에서
+    #     발견하고서야 이 감사기에 판정 자체가 없다는 것을 알았다.
+    now_iso = datetime.today().isoformat()
+    stale_iso = (datetime.today() - timedelta(days=45)).isoformat()
+    check("ISO 타임스탬프를 읽는다(schtasks 형식이 아니다)",
+          _parse_db_ts(now_iso) is not None, True)
+    check("빈 값은 None(추측하지 않는다)", _parse_db_ts(""), None)
+    check("깨진 문자열도 None", _parse_db_ts("어제쯤"), None)
+
+    check("정체 없음(문턱 안쪽)이면 지목하지 않는다",
+          len(queue_stall_signal({"queue_enqueued_max": now_iso,
+                                  "queue_last_attempt_max": now_iso})), 0)
+    stalled = queue_stall_signal({"queue_enqueued_max": now_iso,
+                                  "queue_last_attempt_max": stale_iso,
+                                  "queue_pending_total": 100,
+                                  "queue_pending_moot": 40})
+    check("45일 뒤처지면 지목한다", len(stalled) >= 1, True)
+    check("moot 비율도 함께 보고한다", any("40" in s and "%" in s for s in stalled), True)
+    check("last_attempt_at 이 아예 없으면(한 번도 안 만짐) 그것도 지목한다",
+          len(queue_stall_signal({"queue_enqueued_max": now_iso,
+                                  "queue_last_attempt_max": None})), 1)
+    check("둘 다 없으면 판정하지 않는다(재료 없음)",
+          len(queue_stall_signal({})), 0)
 
     print()
     if fails:

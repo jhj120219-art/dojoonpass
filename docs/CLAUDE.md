@@ -108,6 +108,47 @@ document_queue         pending 2,753 / done 559 / SKIPPED_EXPIRED 186
 상태를 직접 재려면 `python audit_schedule_health.py` (읽기 전용, 아무것도 바꾸지 않는다).
 등록은 **승인 영역**이라 에이전트가 임의로 하지 않는다.
 
+**2026-08-24 정정 — 위 "0개 등록"은 더 이상 사실이 아니다.** `audit_schedule_health.py`
+재실측: 이 저장소를 가리키는 작업이 **1개** 등록돼 있다(`\DOJOONPASS_DAILY`, 마지막 실행
+2026-08-24 03:00:01 결과 0(성공), 다음 2026-08-25 03:00). 다만 이름이 `register_scheduler_tasks.ps1`
+이 정의하는 `DojoonPass-DailyCrawl`/`DojoonPass-DocWorker`/`DojoonPass-PriorityRefresh` 중
+**어느 것과도 일치하지 않는다** — 이 스크립트가 모르는 이름으로 **누군가 수동 등록**한 것으로
+보인다(등록은 승인 영역이라 에이전트가 하지 않았다). 그 결과:
+
+```
+auction_item 최신 수집일   2026-08-24 (오늘도 돌았다)
+앞으로 남은 기일 물건      291건 (마지막 기일 2026-09-02)
+logs/daily_run.log        오늘 04:35 [SUCCESS] — DOJOONPASS_DAILY 가 크롤+migrate_execute 를 도는 것과 일치
+logs/doc_run.log          2026-08-22 06:02 [SUCCESS] 이후 갱신 없음 — doc_worker 는 이 등록에 없다
+```
+
+즉 **크롤(P0-A)은 실질적으로 해소됐지만 DocWorker/PriorityRefresh 는 여전히 안 돈다.**
+그리고 크롤이 도는데도 `doc_raw` 는 **0행**이고 `auction_image` 테이블도 **없다**
+(`migration_history` 최신이 019 — 020 미적용, Sprint 144). `document_status` 는 READY
+555건인데 그중 다수가 `doc_raw` 없이 READY 다(BUGS #144 계열). 크롤/migrate_execute 만
+도는 등록으로는 사진·문서원문 파이프라인이 채워지지 않는다.
+
+**★ 원인을 코드로 확정했다(2026-08-24 야간, "백업 복원" 추정은 철회한다).** `run_daily.bat`
+를 직접 읽으면 `mvp_scraper.py`(→ `init_db()`, 레거시 3테이블만) 와 `migrate_execute.py`
+만 부르고 **`storage.migrations.run_migrations` 는 어디서도 부르지 않는다** — 001~019 가
+이미 적용된 것은 이 배치 덕이 아니라 그 사이 사람이 수동으로 러너를 돌렸기 때문이고,
+Sprint 144(08-17) 이후로는 아무도 수동으로 돌리지 않았을 뿐이다. **매일 자동으로 도는
+이 배치는 애초에 migration 을 적용하는 일을 하지 않으므로, 020 도 앞으로 생길 어떤
+migration 도 등록 상태와 무관하게 영원히 자동 적용되지 않는다.**
+
+`doc_raw` 0행은 별개의, 더 단순한 원인이다 — `document_queue.last_attempt_at` 최댓값이
+**2026-07-12 에서 41일째 정체**돼 있다(`enqueued_at` 은 오늘까지 계속 늚). `doc_raw` 를
+쓰는 유일한 경로(`mark_queue_done()`)는 DocWorker 안에 있고 DocWorker 는 애초에 등록된
+적이 없다(위 문단 그대로) — `logs/doc_run.log` 의 "2026-08-22 06:02 [SUCCESS]" 도 큐를
+실제로 처리했다는 뜻이 아니라, 실행 창(~04:00)이 지난 뒤 브라우저를 띄우지 않고 곧바로
+종료하는 그 SUCCESS(설계대로, 위 08-21 사례와 같은 모양)로 보인다 — `last_attempt_at`
+이 그 날짜에 전혀 움직이지 않은 것이 그 증거다.
+
+`audit_schedule_health.py` 가 이번 세션부터 이 "쌓이기만 하고 안 빠지는" 정체를 직접
+판정한다(`queue_stall_signal()`, 큐 최신 적재 대비 마지막 처리 시각 격차 + moot 비율).
+자세한 실측/권장 조치는 `docs/BETA_RELEASE_CHECKLIST.md` 2026-08-24 절 참고. migration
+적용/DocWorker 등록은 둘 다 승인 영역이라 이 세션은 원인만 확정하고 손대지 않았다.
+
 ### DB schema setup (once, against a fresh `auction.db`, in order)
 ```bash
 python -c "from storage.database import init_db; init_db()"   # creates the legacy auction, document_queue, document_version_log tables

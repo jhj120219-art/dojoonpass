@@ -6,6 +6,94 @@ Owner: Project Management
 
 ---
 
+## ★★★★ [2026-08-24 야간 재실측] P0-A 는 지금 이 순간 RESOLVED — 그러나 그 아래가 더 심각하다
+
+이 문서는 오늘 하루에만 P0-A 실측이 최소 세 번 갈렸다(Sprint 251 아침 08:45 "0건" →
+Sprint 254 "0건, 그대로" → 지금 22:15 "291건"). 어느 쪽도 거짓말한 것이 아니다 —
+`DOJOONPASS_DAILY`(등록 스크립트가 모르는 이름, 승인 없이 이 세션이 등록한 적 없음)가
+매일 03:00 에 크롤 + `migrate_execute.py` 를 돌리고, 그 결과로 "기일 남은 물건" 수는
+**크롤이 새로 채워 넣는 물건과 기일이 지나가 버리는 물건 사이의 순간적인 줄다리기**라
+같은 날 안에서도 재는 시각에 따라 0 근처로 떨어졌다 다시 올라왔다 할 수 있다. 지금
+이 순간의 실측(직접 `sqlite3.connect`, 테스트 픽스처 경유 없음):
+
+```
+auction_item 총 행                 2,376  (Sprint 254 아침 1,876 대비 +500)
+auction_date >= 오늘(2026-08-24)    291건 (마지막 기일 2026-09-02)
+migration_history 최신              019_add_subscription_payment_id (020 미적용)
+scheduled task                     \DOJOONPASS_DAILY, 마지막 2026-08-24 03:00:01 결과 0, 다음 08-25 03:00
+logs/daily_run.log                 오늘 04:35 [SUCCESS]
+logs/doc_run.log                   2026-08-22 06:02 [SUCCESS] (그 뒤로 갱신 없음 - DocWorker 미등록 그대로)
+```
+
+**판정: 위 토큰을 RESOLVED 로 되돌린다** — `test_checklist_p0a_verdict_matches_reality()`
+가 요구하는 것은 "이 순간 검색이 비어 있지 않다"이지 "매일 그렇다는 보장"이 아니다.
+이 검사는 원래도 하루짜리 스냅숏이었다(Sprint 267 이 이미 그렇게 썼다) — 다음 세션이
+다시 쟀을 때 0으로 떨어져 있어도 그것은 이 판정이 틀렸다는 뜻이 아니라 **이 항목이
+근본적으로 안정적이지 않다는 뜻**이다. 안정시키려면 DocWorker/PriorityRefresh 도 함께
+등록해 공급 주기를 촘촘히 해야 하는데, 등록은 승인 영역이라 이 세션은 손대지 않는다.
+
+**그리고 P0-A 보다 지금 더 심각한 것 — 크롤이 매일 도는데도 자산 파이프라인은 완전히
+멈춰 있다:**
+
+```
+doc_raw            0행   (Sprint 254 아침 556행 → 지금 0. 원인 미확정, 아래 참고)
+auction_image      테이블 자체가 없다 (migration 020 미적용 — Sprint 244 는 "해소, 45행"이라고 적었다)
+document_status    READY 555건 인데 그중 doc_raw 로 뒷받침되는 것이 실측상 0건
+```
+
+**★ 2026-08-24 야간 정정 — 위 "백업으로 되돌아갔다" 추정은 틀렸다. 원인을 코드로 확정했다.**
+처음에는 `doc_raw` 0행과 migration 020 미적용이 **같은 스프린트(144) 산물**이라 백업 복원을
+의심했지만, 실제로 `run_daily.bat`(`DOJOONPASS_DAILY`, 이 저장소에서 유일하게 살아 등록된
+작업)의 소스를 읽으면 원인이 갈린다는 것이 바로 드러난다:
+
+```bat
+"%PY%" mvp_scraper.py >> logs\daily_run.log 2>&1      REM init_db() 만 부른다(레거시 3테이블)
+"%PY%" migrate_execute.py >> logs\migrate_execute.log 2>&1
+```
+
+`run_daily.bat` 는 **`storage.migrations.run_migrations` 를 어디서도 부르지 않는다.**
+001~019 가 이미 적용돼 있는 것은 이 배치 덕이 아니라 — 그 사이(07-20~08-13) 사람이 그때그때
+수동으로 `python -m storage.migrations.run_migrations` 를 돌렸기 때문이다(타임스탬프가
+매일 규칙적이지 않고 개발 세션 시각에 몰려 있는 것이 그 증거). Sprint 144(08-17) 이후로는
+아무도 수동으로 돌리지 않았고, **매일 자동으로 도는 이 배치는 애초에 그 일을 하지 않는다**
+— 그러니 020 은 (그리고 020 다음에 생길 어떤 새 migration 도) **영원히 자동 적용되지 않는다.**
+DB 복원이 아니라 배포 스크립트의 구조적 공백이다.
+
+`doc_raw` 0행은 **별개의, 더 간단한 원인이다.** `document_queue.last_attempt_at` 의
+최댓값이 **2026-07-12** 에서 멈춰 있다(오늘 실측, `audit_schedule_health.py` 에 이번 세션에
+새로 넣은 정체 판정 — 아래 참고) — `enqueued_at` 은 오늘까지 계속 늘어나는데 말이다.
+`doc_raw` 를 쓰는 유일한 경로(`mark_queue_done()`)가 DocWorker 안에 있고, `DojoonPass-DocWorker`
+는 (이미 여러 Sprint 가 기록했듯) 애초에 스케줄러에 등록된 적이 없다. 즉 DocWorker 는
+**41일째 이 큐를 한 번도 만지지 않았다** — 백업 복원이 아니라 "등록되지 않은 작업이 계속
+등록되지 않은 채로 있다"는, 이미 알려진 원인이 그대로 지속된 것뿐이다.
+
+두 원인 다 **코드/배포 스크립트 수정으로 고칠 수 있다**(migration 호출을 `run_daily.bat`
+또는 다른 곳에 추가, DocWorker 등록) — 그러나 `run_daily.bat` 는 내일 03:00 에 **사람 검토
+없이 그대로 실행되는 운영 스크립트**이므로, 그 내용을 바꾸는 것은 사실상 "내일 새벽 운영
+DB 에 무인으로 migration 을 적용하는 것"과 같다. `docs/CLAUDE.md` 프로젝트 원칙("DB 스키마
+변경은 반드시 사용자 승인 후")과 이 세션의 SKIP 목록(migration 실제 적용) 둘 다에 걸려
+**코드를 고치지 않고 원인만 못박아 둔다.** 정확한 수정안은 아래 [권장 조치] 참고.
+`api/v1/item.py`/`images.py`/`thumbnails.py` 는 `auction_image` 없음을 이미 우아하게
+처리하므로 500 은 나지 않는다(그래서 "빈 화면"이 아니라 "사진 없는 화면"으로만 보인다 —
+사용자가 못 보고 지나칠 수 있는 종류의 결함이라 더 위험하다). `audit_asset_integrity.py`
+의 같은 결함(테이블 없음 crash)은 이번 세션에서 고쳤다(아래 코드 변경 절 참고).
+
+**[권장 조치 — 승인 후 실행할 사람을 위해 남긴다, 이 세션은 실행하지 않는다]**
+1. `python -m storage.migrations.run_migrations` 를 한 번 수동 실행 → `auction_image`
+   생성(무손실, `CREATE TABLE IF NOT EXISTS`뿐). 이후 사진 파이프라인이 다시 의미를 갖는다.
+2. `run_daily.bat` 에 `migrate_execute.py` 다음 줄로 마이그레이션 러너 호출을 추가해
+   앞으로 생길 migration 도 자동 적용되게 한다(Breaking 변경이 아니라 멱등 러너 호출 추가라
+   위험은 낮지만, 무인 실행 스크립트 수정이라 승인 후 진행).
+3. `DojoonPass-DocWorker` 스케줄러 등록 — 이게 없으면 1을 해도 `doc_raw` 는 계속 0이다
+   (마이그레이션은 테이블을 만들 뿐, 채우는 것은 DocWorker 다).
+
+**결론: P0-A 토큰은 RESOLVED 로 고치되, "출시 차단"에서 완전히 빼지 않는다.** 자산
+파이프라인(doc_raw/auction_image) 문제를 새 항목으로 유지한다 — 이것이 지금 실제로
+사용자가 겪는 "상세 화면에 사진/문서가 없다"의 근본 원인이고, Sprint 267 이 처음 수치화한
+"활성 물건의 89%가 문서 없음"보다 지금 더 넓다(READY 로 뜨는 555건조차 실체가 없다).
+
+---
+
 ## ★★ [2026-08-21 Sprint 244] P0 전 항목 재실측 — **3건은 이미 해소됐다**
 
 이 문서의 P0 목록을 이번 세션에 **하나씩 실제로 실행해서** 확인했다. 문서가 아니라
@@ -346,7 +434,7 @@ tsc 0 / eslint 0 / 운영 DB 무변경
 
 ---
 
-<!-- P0A-VERDICT: OPEN -->
+<!-- P0A-VERDICT: RESOLVED -->
 <!-- 위 한 줄이 P0-A(기본 검색이 빈 화면)의 **기계 판독용 판정**이다.
      OPEN = 지금 제품이 깨져 있다 / RESOLVED = 지금 정상이다.
      test_pipeline_integrity.py 의 `test_checklist_p0a_verdict_matches_reality()` 가
