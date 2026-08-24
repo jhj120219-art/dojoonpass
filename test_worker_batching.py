@@ -131,6 +131,14 @@ def _queue_rows(db):
     return rows
 
 
+def _spy(sink, real):
+    """호출 인자를 기록하고 그대로 넘긴다(제품 동작은 바꾸지 않는다)."""
+    def wrapper(*a, **kw):
+        sink.append((a, kw))
+        return real(*a, **kw)
+    return wrapper
+
+
 def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True,
                 detail_ok=None):
     """진짜 `doc_worker.main()` 을 돌린다. 브라우저/수집기만 가짜.
@@ -140,7 +148,9 @@ def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True,
     """
     import doc_worker as dw
 
-    stats = {"navs": [], "collects": [], "reused": 0}
+    # 종결에 **무엇을 넘겼는지** 기록한다. 결과만 보면 배선 누락이 안 보인다
+    # (claim_token 을 빼도 단일 실행에서는 결과가 같다 - mutation T7, Sprint 254).
+    stats = {"navs": [], "collects": [], "reused": 0, "done": [], "failed": []}
 
     def spy_go(driver, court_code, case_no, item_no=None, require_exact_item=False):
         stats["navs"].append((court_code, case_no, item_no, require_exact_item))
@@ -179,8 +189,8 @@ def _run_worker(db, *, legacy=False, collect_result=None, exact_nav_ok=True,
                             else (lambda driver, case_no: True)),
         "get_doc_button_id": lambda doc_type, item_no: "qa-btn",
         "collect_document": fake_collect,
-        "mark_queue_done": db.mark_queue_done,
-        "mark_queue_failed": db.mark_queue_failed,
+        "mark_queue_done": _spy(stats["done"], db.mark_queue_done),
+        "mark_queue_failed": _spy(stats["failed"], db.mark_queue_failed),
         "mark_queue_skipped_expired": db.mark_queue_skipped_expired,
         "mark_queue_unsupported": db.mark_queue_unsupported,
         "save_auction_images": db.save_auction_images,
@@ -960,6 +970,569 @@ def test_image_row_added_later_to_an_already_done_item():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+# ---------------------------------------------------------------------------
+# 11-12. claim **경쟁에서 졌을 때** (2026-08-24 Sprint 254 신설)
+#
+# 전체 스위트 합산 커버리지에서 `storage/database.py` 의 미실행 41줄을 훑다가 두 곳을
+# 찾았다. 둘 다 **동시 실행 워커가 있을 때만** 지나가는 자리고, 둘 다 미검증이었다.
+#
+#   claim_next_item_rows  형제 행을 경쟁자가 먼저 집어간 경우 (rowcount=0 -> continue)
+#       -> 그 행을 묶음에서 빼야 한다. 안 빼면 두 워커가 같은 문서를 중복 수집한다
+#          (법원 부하 2배 + 같은 다운로드 폴더를 동시에 만진다).
+#
+#   claim_next_queue_item  상한(CLAIM_RACE_MAX_ATTEMPTS)까지 매번 진 경우
+#       -> None 을 돌려주되 **왜인지 경고를 남겨야** 한다.
+#          이게 BUGS #130 이다: 예전에는 경쟁 한 번에 곧바로 None 을 돌려줬고,
+#          호출부(`doc_worker.main`)가 그것을 "대기열 비어있음"으로 읽어 **그날 남은
+#          큐를 통째로 다음 날로 미뤘다.** 로그에도 사실이 아닌 문장이 남았다.
+#          Sprint 191 이 재조회 + 경고로 고쳤는데, 그 경고 경로가 미검증이었다.
+#
+# 경쟁 창은 SELECT 와 조건부 UPDATE 사이 수 마이크로초라 스레드로는 안정 재현이 안 된다.
+# `test_race_conditions.py` 가 결제에 쓰는 방식(`_InterleavingConn`)을 그대로 가져온다 -
+# UPDATE 를 대행하기 **직전에** 다른 커넥션으로 상태를 바꿔 rowcount=0 을 강제한다.
+# 확률이 개입하지 않는다.
+# ---------------------------------------------------------------------------
+class _QueueInterleavingConn(object):
+    """`UPDATE document_queue` 직전에 콜백을 실행하는 커넥션 래퍼.
+
+    `once=True` 면 첫 UPDATE 에만 끼어든다(형제 행 시나리오).
+    `once=False` 면 매번 끼어든다(재시도 상한 시나리오).
+    """
+
+    def __init__(self, conn, on_update, once=True):
+        self._conn = conn
+        self._on_update = on_update
+        self._once = once
+        self.fired = 0
+
+    def execute(self, sql, *a, **kw):
+        if sql.lstrip().upper().startswith("UPDATE DOCUMENT_QUEUE") \
+                and (not self._once or self.fired == 0):
+            self.fired += 1
+            self._on_update()
+        return self._conn.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _patch_nth_connection(db, nth, on_update, once):
+    """`get_connection()` 의 **n번째** 호출만 래퍼로 감싼다.
+
+    n을 지정하는 이유: `claim_next_item_rows()` 는 커넥션을 두 번 연다 - 첫 번째는
+    머리 행을 집는 `claim_next_queue_item()` 것이고, 형제 행 루프는 두 번째다.
+    아무거나 감싸면 재현하려는 것과 다른 자리에 끼어든다.
+    """
+    real_get = db.get_connection
+    state = {"n": 0, "wrapper": None}
+
+    def fake_get(*a, **kw):
+        state["n"] += 1
+        conn = real_get(*a, **kw)
+        if state["n"] == nth:
+            state["wrapper"] = _QueueInterleavingConn(conn, on_update, once=once)
+            return state["wrapper"]
+        return conn
+
+    db.get_connection = fake_get
+    return real_get, state
+
+
+def test_sibling_lost_to_a_competitor_is_dropped_from_the_batch():
+    print("\n--- 11. 형제 행을 경쟁자가 먼저 집어가면 묶음에서 뺀다 (Sprint 254) ---")
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_claim_sibling_")
+    try:
+        db = _fresh_db(tmp)
+        types = list(cfg.DOC_TYPE_LIST)
+        check_true("검사가 공허하지 않다(형제가 생기려면 문서 종류가 3개 이상)",
+                   len(types) >= 3, types)
+        # 물건 1개 x 전 종류 -> 머리 1행 + 형제 (len(types)-1) 행
+        _seed(db, 1, types)
+
+        real_get = db.get_connection      # 경쟁자는 **감싸지 않은** 커넥션을 쓴다
+        stolen = {"row": None}
+
+        def competitor():
+            """형제 하나를 다른 실행이 먼저 집어간 것으로 만든다.
+
+            형제 루프는 이미 SELECT 를 끝냈으므로, 여기서 훔친 행은 뒤쪽 반복에서
+            rowcount=0 으로 걸린다 - 그게 재현하려는 그 분기다.
+
+            ★ **중간** 형제를 훔친다(OFFSET 1). 마지막 형제를 훔치면 `continue` 와
+              `return rows` 가 같은 결과를 내서 검사가 둘을 구별하지 못한다 - 그런데
+              `return` 은 Sprint 191 이 고친 결함(경쟁 1회로 남은 행을 포기)의 재발이다.
+              중간을 훔치면 뒤에 남은 형제가 집혔는지로 그것이 드러난다.
+            """
+            if stolen["row"]:
+                return
+            c2 = real_get()
+            try:
+                row = c2.execute(
+                    "SELECT id, doc_type FROM document_queue WHERE status='pending'"
+                    " ORDER BY id ASC LIMIT 1 OFFSET 1").fetchone()
+                if row:
+                    c2.execute("UPDATE document_queue SET status='in_progress' WHERE id=?",
+                               (row["id"],))
+                    c2.commit()
+                    stolen["row"] = dict(row)
+            finally:
+                c2.close()
+
+        # 2번째 커넥션 = 형제 루프. (1번째는 머리 행을 집는 claim_next_queue_item)
+        real_get, state = _patch_nth_connection(db, 2, competitor, once=True)
+        try:
+            rows = db.claim_next_item_rows()
+        finally:
+            db.get_connection = real_get
+
+        got = sorted(r["doc_type"] for r in rows)
+        print("    경쟁자가 가져간 것: %s / 이 실행이 집은 것: %s"
+              % (stolen["row"] and stolen["row"]["doc_type"], got))
+        check_true("래퍼가 형제 루프의 UPDATE 를 실제로 가로챘다",
+                   state["wrapper"] is not None and state["wrapper"].fired >= 1,
+                   state["wrapper"] and state["wrapper"].fired)
+        check_true("검사가 공허하지 않다(경쟁자가 실제로 한 행을 가져갔다)",
+                   stolen["row"] is not None, stolen)
+        check("★ 경쟁에서 진 형제는 묶음에 들어오지 않는다(중복 수집 방지)",
+              stolen["row"]["doc_type"] in got, False)
+        check("★ 나머지는 그대로 집힌다(형제 하나가 밀려도 묶음이 무너지지 않는다)",
+              len(got), len(types) - 1)
+        # ★ 밀린 형제 **뒤에 있던** 행까지 집혔는가. 여기서 멈추면(`continue` 대신
+        #   `return`/`break`) 경쟁 1회가 남은 행을 포기하는 Sprint 191 결함이 되살아난다.
+        conn = db.get_connection()
+        try:
+            after = [r["doc_type"] for r in conn.execute(
+                "SELECT doc_type FROM document_queue WHERE id>? ORDER BY id",
+                (stolen["row"]["id"],))]
+        finally:
+            conn.close()
+        check_true("검사가 공허하지 않다(밀린 형제 뒤에 행이 남아 있다)",
+                   len(after) >= 1, after)
+        check("★ 밀린 형제 뒤의 행도 집는다(경쟁 1회로 묶음을 포기하지 않는다)",
+              sorted(t for t in after if t in got), sorted(after))
+
+        # 진 형제는 경쟁자의 상태(in_progress)로 남아야 한다 - 되돌려 놓으면 중복이 된다.
+        conn = db.get_connection()
+        try:
+            left = conn.execute(
+                "SELECT status FROM document_queue WHERE id=?",
+                (stolen["row"]["id"],)).fetchone()["status"]
+            unclaimed = conn.execute(
+                "SELECT COUNT(*) c FROM document_queue WHERE status='pending'"
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        check("★ 경쟁자가 집은 행의 상태를 덮어쓰지 않는다", left, "in_progress")
+        check("★ 집지 않은 채 pending 으로 남겨 둔 행이 없다", unclaimed, 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_claim_exhaustion_warns_instead_of_pretending_empty():
+    """상한까지 매번 지면 None 을 돌려주되 **경고를 남긴다** (BUGS #130 회귀 방어).
+
+    이 검사의 핵심은 반환값이 아니라 **로그**다. None 만 보면 호출부는 "큐가 비었다"로
+    읽는다 - 그게 정확히 BUGS #130 이 만든 사고였다(그날 남은 큐를 통째로 미뤘고,
+    로그에는 "대기열 비어있음"이라는 사실이 아닌 문장이 남았다).
+    """
+    print("\n--- 12. claim 재시도 상한: 비었다고 위장하지 않는다 (Sprint 254) ---")
+    import logging as _logging
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_claim_exhaust_")
+    try:
+        db = _fresh_db(tmp)
+        limit = db.CLAIM_RACE_MAX_ATTEMPTS
+        check_true("상한이 유한하다(무한 재시도면 이 검사가 끝나지 않는다)",
+                   isinstance(limit, int) and 1 <= limit <= 100, limit)
+        # 경쟁자가 매번 하나씩 가져가도 남아 있을 만큼 넉넉히 넣는다.
+        _seed(db, limit + 3, list(cfg.DOC_TYPE_LIST)[:1])
+
+        real_get = db.get_connection
+
+        def competitor():
+            """이 실행이 방금 SELECT 한 그 행을 먼저 가져간다 - 매번.
+
+            제품의 SELECT 와 **같은 정렬**을 쓴다. 다른 행을 훔치면 경쟁이 아니라
+            그냥 다른 작업이 되고, rowcount=0 분기에 닿지 않는다.
+            """
+            c2 = real_get()
+            try:
+                row = c2.execute(
+                    "SELECT id FROM document_queue WHERE status='pending'"
+                    " ORDER BY priority ASC, auction_date ASC LIMIT 1").fetchone()
+                if row:
+                    c2.execute("UPDATE document_queue SET status='in_progress' WHERE id=?",
+                               (row["id"],))
+                    c2.commit()
+            finally:
+                c2.close()
+
+        captured = []
+
+        class _Capture(_logging.Handler):
+            def emit(self, record):
+                # ★ 레벨도 같이 담는다. debug 로 낮추면 운영 로그에는 안 나오는데
+                #   메시지만 보는 검사는 그것을 통과시킨다.
+                captured.append((record.levelno, record.getMessage()))
+
+        handler = _Capture()
+        db_logger = _logging.getLogger("storage.database")
+        prev_level = db_logger.level
+        db_logger.setLevel(_logging.DEBUG)
+        db_logger.addHandler(handler)
+        # 1번째 커넥션 = claim_next_queue_item 이 상한까지 재사용하는 그 커넥션.
+        real_get, state = _patch_nth_connection(db, 1, competitor, once=False)
+        try:
+            got = db.claim_next_queue_item()
+        finally:
+            db.get_connection = real_get
+            db_logger.removeHandler(handler)
+            db_logger.setLevel(prev_level)
+
+        fired = state["wrapper"] and state["wrapper"].fired
+        print("    반환값: %r / 가로챈 UPDATE 수: %s (상한 %s)" % (got, fired, limit))
+        check("★ 상한만큼만 시도한다(무한 루프가 아니다)", fired, limit)
+        check("★ 상한까지 지면 None 을 돌려준다", got, None)
+        exhausted = [(lv, m) for lv, m in captured
+                     if "밀렸" in m and "%d회" % limit in m]
+        check_true("★ 상한 소진을 로그에 남긴다 - '비었다'와 구별된다 (BUGS #130)",
+                   len(exhausted) >= 1, "-> 잡힌 로그 %r" % (captured[-3:],))
+        check_true("★ 그것이 WARNING 이상이다(debug 는 운영에서 안 보인다)",
+                   any(lv >= _logging.WARNING for lv, _m in exhausted),
+                   "-> %r" % (exhausted[:2],))
+        check_true("★ 경고가 '큐가 빈 것이 아니다'를 명시한다",
+                   any("빈 것이 아니다" in m for _lv, m in exhausted),
+                   "-> %r" % (exhausted[:2],))
+
+        # 큐에는 아직 행이 남아 있다 - "비었다"가 사실이 아님을 데이터로도 확인한다.
+        conn = db.get_connection()
+        try:
+            left = conn.execute(
+                "SELECT COUNT(*) c FROM document_queue WHERE status='pending'").fetchone()["c"]
+        finally:
+            conn.close()
+        check("★ 실제로는 큐에 대기 행이 남아 있다(None 이 '비었다'는 뜻이 아니다)",
+              left, 3)
+
+        # 그리고 다음 실행은 정상적으로 집어 온다 - 상한에 걸린 것이 상태를 오염시키지 않았다.
+        again = db.claim_next_queue_item()
+        check_true("★ 경쟁이 사라지면 곧바로 다시 집어 온다(영구 손상이 아니다)",
+                   again is not None, again)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_losing_one_race_still_claims_another_row():
+    """★ BUGS #130 의 본문: **한 번 밀렸다고 빈손으로 돌아오지 않는다.**
+
+    검사 12는 상한까지 매번 지는 극단을 본다. 그런데 그 검사는 기대값을
+    `CLAIM_RACE_MAX_ATTEMPTS` 에서 끌어오기 때문에, 그 상수를 1로 낮추는 변경을
+    통과시킨다(mutation R4 로 확인, 2026-08-24). 상한이 1이면 재조회는 사라지고
+    경쟁 1회가 곧바로 None 이 된다 - 정확히 Sprint 191 이 고친 그 결함이다.
+
+    그래서 여기서는 상수를 보지 않는다. **경쟁자가 한 번만 이기는** 상황을 만들고,
+    이 실행이 다른 행을 집어 오는지만 본다. 상수가 2든 5든 참이어야 하는 문장이다.
+    """
+    print("\n--- 13. 한 번 밀려도 다른 행을 집는다 (Sprint 254, BUGS #130) ---")
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_claim_once_")
+    try:
+        db = _fresh_db(tmp)
+        _seed(db, 2, list(cfg.DOC_TYPE_LIST)[:1])   # 서로 다른 물건 2행
+
+        real_get = db.get_connection
+        stolen = {"id": None}
+
+        def competitor():
+            """제품이 방금 고른 그 행을 **한 번만** 가로챈다."""
+            c2 = real_get()
+            try:
+                row = c2.execute(
+                    "SELECT id FROM document_queue WHERE status='pending'"
+                    " ORDER BY priority ASC, auction_date ASC LIMIT 1").fetchone()
+                c2.execute("UPDATE document_queue SET status='in_progress' WHERE id=?",
+                           (row["id"],))
+                c2.commit()
+                stolen["id"] = row["id"]
+            finally:
+                c2.close()
+
+        real_get, state = _patch_nth_connection(db, 1, competitor, once=True)
+        try:
+            got = db.claim_next_queue_item()
+        finally:
+            db.get_connection = real_get
+
+        print("    경쟁자가 가져간 id: %s / 이 실행이 집은 것: %s"
+              % (stolen["id"], got and got["id"]))
+        check_true("검사가 공허하지 않다(경쟁자가 실제로 한 행을 가져갔다)",
+                   stolen["id"] is not None, stolen)
+        check_true("★ 한 번 밀렸다고 빈손으로 돌아오지 않는다(그날 큐를 미루지 않는다)",
+                   got is not None,
+                   "-> None 을 받았다. 호출부는 이것을 '대기열 비어있음'으로 읽는다")
+        check("★ 경쟁자가 가져간 행이 아니라 다른 행을 집는다",
+              got and got["id"] != stolen["id"], True)
+        check("★ 집은 행은 진행 상태다", got and got["status"], "in_progress")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 14-15. **회수당한 뒤 뒤늦게 끝난 실행**(좀비 워커) — 2026-08-24 Sprint 254, BUGS #181
+#
+# 위 11-13 이 "집을 때"의 경쟁을 본다면, 여기는 "끝낼 때"의 경쟁이다.
+#
+#   `reset_stale_queue()` 는 10분 넘게 in_progress 인 행을 회수한다.
+#   `doc_worker` 의 락은 5시간(LOCK_STALE_HOURS)이 지나면 죽은 것으로 보고 넘어간다.
+#   -> 오래 도는 실행 A 가 있고 그 사이 B 가 시작하면, B 는 A 가 붙들고 있던 행을
+#      회수해 자기 것으로 만든다. 그 뒤 A 가 종결을 부른다.
+#
+# 종결 함수는 `WHERE id=?` 만 걸었기 때문에 **그 행이 아직 자기 것인지 몰랐다.**
+# 상태로는 구별할 수 없다 — 회수 후 다시 집힌 행도 똑같이 'in_progress' 다.
+# 그래서 claim 시점의 `last_attempt_at` 을 토큰으로 돌려주고, 종결할 때 다시 건다.
+# 스키마는 바꾸지 않는다(이미 있는 컬럼이다).
+# ---------------------------------------------------------------------------
+class _CapturedLogs(object):
+    """`storage.database` 로거를 잠깐 가로챈다.
+
+    이 fixture 에는 `auction_item` 이 없어 `document_status` 테이블로는 "문서 기록을
+    시도했는가"를 볼 수 없다(대상이 없어 갱신이 생략된다). 그 생략 자체가 로그로
+    남으므로, **로그로 경로를 확인한다** — 확인하려는 것은 값이 아니라 "거기까지
+    갔는가"이기 때문이다.
+    """
+
+    def __init__(self):
+        import logging
+        self.messages = []
+        self._logging = logging
+        outer = self
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                outer.messages.append(record.getMessage())
+
+        self._handler = _H()
+        self._logger = logging.getLogger("storage.database")
+
+    def __enter__(self):
+        self._prev = self._logger.level
+        self._logger.setLevel(self._logging.DEBUG)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *a):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._prev)
+        return False
+
+    def has(self, needle):
+        return any(needle in m for m in self.messages)
+
+
+def _steal_by_stale_recovery(db, queue_id):
+    """A 가 집은 행을 stale 회수로 빼앗아 B 가 다시 집게 만든다. B 의 item 을 돌려준다."""
+    import contextlib
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE document_queue SET last_attempt_at=? WHERE id=?",
+                     ((datetime.now() - timedelta(minutes=30)).isoformat(), queue_id))
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        db.reset_stale_queue()
+    return db.claim_next_queue_item()
+
+
+def test_late_success_does_not_steal_a_reclaimed_row():
+    print("\n--- 14. 회수당한 뒤의 늦은 성공이 남의 행을 종결하지 않는다 (Sprint 254) ---")
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_zombie_done_")
+    try:
+        db = _fresh_db(tmp)
+        _seed(db, 1, list(cfg.DOC_TYPE_LIST)[:1])
+        a = db.claim_next_queue_item()
+        check_true("claim 이 토큰을 돌려준다(없으면 소유권을 확인할 수 없다)",
+                   bool(a.get("claim_token")), a)
+
+        b = _steal_by_stale_recovery(db, a["id"])
+        check_true("설정: 회수 뒤 다른 실행이 같은 행을 집었다",
+                   b is not None and b["id"] == a["id"], b)
+        check_true("설정: 두 claim 의 토큰이 다르다(상태로는 구별되지 않는다)",
+                   a["claim_token"] != b["claim_token"],
+                   (a["claim_token"], b["claim_token"]))
+
+        # A 가 이제야 성공으로 끝난다.
+        with _CapturedLogs() as logs:
+            db.mark_queue_done(a["id"], a["court_code"], a["case_no"], a["item_no"],
+                               a["doc_type"], None, "hash-A", files_saved=[],
+                               claim_token=a["claim_token"])
+
+        conn = db.get_connection()
+        try:
+            row = dict(conn.execute(
+                "SELECT status, last_attempt_at FROM document_queue WHERE id=?",
+                (a["id"],)).fetchone())
+        finally:
+            conn.close()
+
+        check("★ 남의 claim 을 done 으로 덮지 않는다", row["status"], "in_progress")
+        check("★ 남의 claim 토큰을 건드리지 않는다", row["last_attempt_at"], b["claim_token"])
+        check_true("★ 왜 종결하지 않았는지 로그에 남긴다(조용히 넘기지 않는다)",
+                   logs.has("회수돼 다른 실행이 집어갔다"), logs.messages[-3:])
+        # ★ 그래도 **문서 기록 경로는 계속 간다** — 파일은 실제로 받아졌기 때문이다.
+        #   이 fixture 에는 auction_item 이 없어 갱신은 생략되지만, 그 생략 로그가
+        #   "거기까지 갔다"는 증거다. 조기 return 으로 바뀌면 이 로그가 사라진다.
+        check_true("★ 받은 문서를 기록하는 경로는 그대로 탄다",
+                   logs.has("document_status 갱신 대상 없음"), logs.messages)
+
+        # 대조군: 회수가 없었다면 같은 호출이 정상으로 종결한다(검사가 공허하지 않다).
+        c = db.claim_next_queue_item()
+        check_true("설정: 대조군을 위해 다시 집었다", c is None or c["id"] == a["id"], c)
+        if c is None:
+            conn = db.get_connection()
+            try:
+                conn.execute("UPDATE document_queue SET status='pending',"
+                             " last_attempt_at=NULL WHERE id=?", (a["id"],))
+                conn.commit()
+            finally:
+                conn.close()
+            c = db.claim_next_queue_item()
+        db.mark_queue_done(c["id"], c["court_code"], c["case_no"], c["item_no"],
+                           c["doc_type"], None, "hash-C", files_saved=[],
+                           claim_token=c["claim_token"])
+        conn = db.get_connection()
+        try:
+            final = conn.execute("SELECT status FROM document_queue WHERE id=?",
+                                 (a["id"],)).fetchone()["status"]
+        finally:
+            conn.close()
+        check("대조군: 자기 claim 이면 정상 종결한다", final, "done")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_late_failure_does_not_burn_someone_elses_retry_budget():
+    """늦은 실패는 **아무것도 쓰지 않는다** — 성공 쪽과 규칙이 다른 이유가 있다.
+
+    회수 뒤 다시 집힌 행을 실패로 처리하면 세 가지가 한꺼번에 망가진다:
+      - 지금 받고 있는 실행의 claim 이 'pending' 으로 풀려 제3의 실행이 또 집는다
+      - 그 실행의 몫이 아닌 `retry_count` 가 깎인다(예산 3회는 행의 것이다)
+      - 그쪽이 성공할 문서가 잠깐 화면에서 '수집실패' 로 보인다
+    """
+    print("\n--- 15. 회수당한 뒤의 늦은 실패가 남의 예산을 깎지 않는다 (Sprint 254) ---")
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_zombie_fail_")
+    try:
+        db = _fresh_db(tmp)
+        _seed(db, 1, list(cfg.DOC_TYPE_LIST)[:1])
+        a = db.claim_next_queue_item()
+        b = _steal_by_stale_recovery(db, a["id"])
+        check_true("설정: 회수 뒤 다른 실행이 같은 행을 집었다",
+                   b is not None and b["id"] == a["id"], b)
+
+        with _CapturedLogs() as logs:
+            db.mark_queue_failed(a["id"], a["retry_count"], a["claim_token"])
+
+        conn = db.get_connection()
+        try:
+            row = dict(conn.execute(
+                "SELECT status, retry_count, last_attempt_at FROM document_queue"
+                " WHERE id=?", (a["id"],)).fetchone())
+        finally:
+            conn.close()
+
+        check("★ 남이 받고 있는 행을 대기로 풀지 않는다", row["status"], "in_progress")
+        check("★ 남의 재시도 예산을 깎지 않는다", row["retry_count"], 0)
+        check("★ 남의 claim 토큰을 건드리지 않는다", row["last_attempt_at"], b["claim_token"])
+        check_true("★ 왜 건너뛰었는지 로그에 남긴다", logs.has("실패 처리를 건너뛴다"),
+                   logs.messages[-3:])
+        # ★ 성공 쪽과 규칙이 다르다: 여기서는 **아무것도 쓰지 않는다.** 그쪽이 성공할
+        #   문서를 실패로 표시하면 안 되기 때문이다. 문서 기록 경로에 닿지 않아야 한다.
+        check_true("★ 문서 상태에 손대지 않는다(그쪽이 성공할 수 있다)",
+                   not logs.has("document_status"), logs.messages)
+
+        # 대조군: 자기 claim 이면 예전 그대로 실패 처리한다.
+        db.mark_queue_failed(b["id"], b["retry_count"], b["claim_token"])
+        conn = db.get_connection()
+        try:
+            after = dict(conn.execute(
+                "SELECT status, retry_count FROM document_queue WHERE id=?",
+                (a["id"],)).fetchone())
+        finally:
+            conn.close()
+        check("대조군: 자기 claim 이면 재시도 대기로 돌린다",
+              (after["status"], after["retry_count"]), ("pending", 1))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_worker_passes_the_claim_token_to_both_terminations():
+    """★ 워커가 종결에 claim 토큰을 넘긴다 (Sprint 254, BUGS #181 배선 확인).
+
+    제품의 방어가 아무리 옳아도 호출부가 토큰을 안 넘기면 그 방어는 꺼져 있는 것과
+    같다(`claim_token=None` 이면 예전 동작으로 되돌아간다). 그래서 **실제**
+    `doc_worker.main()` 을 돌려 넘어간 값을 본다.
+    """
+    print("\n--- 16. 워커가 종결에 claim 토큰을 넘긴다 (Sprint 254) ---")
+    import config.settings as cfg
+
+    tmp = tempfile.mkdtemp(prefix="qa_token_wiring_")
+    try:
+        db = _fresh_db(tmp)
+        types = list(cfg.DOC_TYPE_LIST)
+        _seed(db, 2, types)
+
+        # 한 종류는 실패시켜 **두 종결 경로**를 다 태운다.
+        fail_type = types[0]
+
+        def collect_result(case_no, doc_type):
+            if doc_type == fail_type:
+                return {"success": False}
+            return None
+
+        stats = _run_worker(db, collect_result=collect_result)
+
+        check_true("검사가 공허하지 않다(성공 종결이 실제로 일어났다)",
+                   len(stats["done"]) >= 1, stats["done"])
+        check_true("검사가 공허하지 않다(실패 종결도 실제로 일어났다)",
+                   len(stats["failed"]) >= 1, stats["failed"])
+
+        def token_of(call, kw_name, pos):
+            args, kwargs = call
+            if kw_name in kwargs:
+                return kwargs[kw_name]
+            return args[pos] if len(args) > pos else None
+
+        done_tokens = [token_of(c, "claim_token", 8) for c in stats["done"]]
+        failed_tokens = [token_of(c, "claim_token", 2) for c in stats["failed"]]
+        print("    성공 종결 %d회 / 실패 종결 %d회" % (len(done_tokens), len(failed_tokens)))
+
+        check("★ 성공 종결에 토큰 없이 부른 호출이 없다",
+              [t for t in done_tokens if not t], [])
+        check("★ 실패 종결에 토큰 없이 부른 호출이 없다",
+              [t for t in failed_tokens if not t], [])
+
+        # 토큰이 **그 행의 claim 값**인가 — 아무 문자열이나 넘기고 있지 않은지 본다.
+        conn = db.get_connection()
+        try:
+            seen = {r["last_attempt_at"] for r in conn.execute(
+                "SELECT last_attempt_at FROM document_queue")}
+        finally:
+            conn.close()
+        # 성공 종결한 행은 last_attempt_at 이 claim 값 그대로 남아 있다(종결이 안 바꾼다).
+        check("★ 성공 종결의 토큰이 실제 claim 값이다",
+              [t for t in done_tokens if t not in seen], [])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     test_batching_reduces_navigations()
     test_image_still_requires_exact_item()
@@ -975,6 +1548,12 @@ def main():
     test_window_end_leaves_margin_before_crawl()
     test_reuse_verifies_the_page_before_trusting_it()
     test_image_row_added_later_to_an_already_done_item()
+    test_sibling_lost_to_a_competitor_is_dropped_from_the_batch()
+    test_claim_exhaustion_warns_instead_of_pretending_empty()
+    test_losing_one_race_still_claims_another_row()
+    test_late_success_does_not_steal_a_reclaimed_row()
+    test_late_failure_does_not_burn_someone_elses_retry_budget()
+    test_worker_passes_the_claim_token_to_both_terminations()
 
     print("\n" + "=" * 55)
     if FAILS:

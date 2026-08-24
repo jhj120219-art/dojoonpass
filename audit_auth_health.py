@@ -4,10 +4,10 @@
 
 왜 만들었나
 ---------------------------------------------------------------------------
-이 세션에서 실제로 밟은 함정: `.env`의 `NEXT_PUBLIC_SUPABASE_URL`에 REST API
-베이스 URL(".../rest/v1/")이 프로젝트 URL 자리에 잘못 들어 있었다. 코드(`api/auth.py`)는
-`SUPABASE_URL`이 "있기는 하니" 조용히 그 값으로 JWKS 주소를 만들었고, 그 주소는 401을
-반환했다 - `_get_jwk()`가 그 실패를 `except Exception`으로 삼키고 경고 로그만 남기므로
+막으려는 함정: `NEXT_PUBLIC_SUPABASE_URL`에 REST API 베이스 URL(".../rest/v1/")이
+프로젝트 URL 자리에 들어가는 경우다. 코드(`api/auth.py`)는
+`SUPABASE_URL`이 "있기는 하니" 조용히 그 값으로 JWKS 주소를 만들고, 그 주소로는 키가
+오지 않는다 - `_get_jwk()`가 그 실패를 `except Exception`으로 삼키고 경고 로그만 남기므로
 서버는 죽지 않는다. 겉보기엔 "정상 기동"이지만 **로그인 사용자 인증(ES256)이 전부
 거부되는 상태**였다. `.env`는 gitignore 대상이라 세션/컴퓨터마다 값이 다르고, 이런
 조용한 실패는 실제로 로그인 API를 두드려 보지 않으면 드러나지 않는다.
@@ -25,6 +25,20 @@
 
     python audit_auth_health.py
     python audit_auth_health.py --selftest   # _project_origin() 정규화 로직 자체를 검증
+
+★ 2026-08-24 정정 — 위 "왜 만들었나"는 원래 "이 세션에서 실제로 밟은 함정: `.env`의
+  NEXT_PUBLIC_SUPABASE_URL 에 .../rest/v1/ 이 들어 있었다"라고 단정했다.
+  **이 저장소의 현재 상태에서는 재현되지 않는다** — 2026-08-24 실측:
+
+      .env         키 3개, 전부 NEXT_PUBLIC_* 아님 (SUPABASE_URL/ANON_KEY 는 빈 값,
+                   SUPABASE_JWT_SECRET 88자)
+      .env.local   NEXT_PUBLIC_SUPABASE_URL 40자, urlsplit().path == ''  (경로 없음)
+      해석 결과    api.auth.SUPABASE_URL 의 path '' -> JWKS 경로가 정상으로 만들어진다
+
+  그래도 이 감사기는 그대로 가치가 있다 — `.env` 는 gitignore 대상이라 컴퓨터마다
+  값이 다르고, 이런 조용한 실패는 실제로 재 보지 않으면 드러나지 않는다.
+  (값은 길이/경로 유무만 확인했고 어디에도 출력하지 않았다. [3]번 검사는 외부 서비스로
+   실제 네트워크 요청을 보내므로, 승인 없이 도는 자동 검증에서는 실행하지 않는다.)
 """
 import os
 import sys

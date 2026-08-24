@@ -84,10 +84,32 @@ def sync_expired_status(conn, user_id: str = None, at: datetime = None,
             logger.warning("자동 만료 전이가 규칙에 막힘: id=%s %s -> %s",
                            row["id"], row["status"], expected)
             continue
-        conn.execute(
-            "UPDATE subscriptions SET status=?, updated_at=? WHERE id=?",
-            (str(expected), now.isoformat(), row["id"]),
+        # 읽었던 상태를 WHERE에 다시 건다 — 이 모듈의 다른 writer(`change_status()`,
+        # `renew()`)가 이미 쓰는 패턴이다. 여기만 조건 없이 쓰고 있었다.
+        #
+        # ★ 2026-08-24 Sprint 254 (BUGS #180). 조건이 없으면 **읽은 뒤 바뀐 상태를
+        #   그대로 덮는다.** 이 함수는 읽기 경로(`GET /api/v1/subscriptions/me`,
+        #   Admin 목록)에서 `BEGIN IMMEDIATE` 없이 불리므로 SELECT와 UPDATE 사이가
+        #   실제로 열려 있다 — 다른 writer 들과 달리 락으로 닫혀 있지 않다.
+        #
+        #   실측(scratch DB, 커넥션 래퍼로 창을 벌려 결정적 재현):
+        #     ACTIVE 를 읽음 -> 그 사이 해지(CANCELLED) -> 여기서 EXPIRED 로 덮어씀
+        #   CANCELLED 는 **최종 상태**(state_machines.py: `CANCELLED: set()`)라
+        #   CANCELLED -> EXPIRED 는 금지된 전이다. 즉 이 UPDATE 는 바로 위에서
+        #   "전이 규칙을 우회하지 않는다"고 적어 둔 그 관문을 **실제로 우회했다** —
+        #   판정에 쓴 상태(ACTIVE)와 덮어쓰는 대상의 상태(CANCELLED)가 다르기 때문이다.
+        #   그리고 로그에는 `ACTIVE -> EXPIRED` 라는 사실이 아닌 문장이 남았다.
+        #   해지된 구독이 EXPIRED 가 되면 재구독으로 되살아난다(EXPIRED -> ACTIVE 는 허용).
+        cursor = conn.execute(
+            "UPDATE subscriptions SET status=?, updated_at=? WHERE id=? AND status=?",
+            (str(expected), now.isoformat(), row["id"], row["status"]),
         )
+        if cursor.rowcount == 0:
+            # 진 쪽은 조용히 빠진다 — 실패가 아니다. 이긴 쪽의 판단이 더 최신이고,
+            # 다음 호출이 그 새 상태를 기준으로 다시 판단한다(이 함수는 idempotent 하다).
+            logger.info("구독 자동 전이 생략: id=%s (읽은 상태 %s 가 그 사이 바뀌었다)",
+                        row["id"], row["status"])
+            continue
         logger.info("구독 자동 전이: id=%s %s -> %s", row["id"], row["status"], expected)
         changed += 1
 

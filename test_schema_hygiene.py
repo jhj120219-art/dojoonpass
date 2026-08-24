@@ -1894,10 +1894,43 @@ def test_migration_runner_skip_and_failure():
 KNOWN_VULNERABLE_NEXT_VERSION = "16.2.9"
 # 2026-08-18 Sprint 207 정정: 예전 값 "16.2.11" 은 **더 이상 안전선이 아니다.**
 # `npm audit` 실측(같은 날)에서 next 취약 범위가 `9.3.4-canary.0 - 16.3.0-preview.10`
-# 으로 넓어졌고, npm 이 제시하는 수정본은 **16.3.1**(isSemVerMajor=false)이다.
+# 으로 넓어졌고, npm 이 제시하는 수정본은 16.3.1(isSemVerMajor=false)이었다.
 # 16.2.11 로 올리면 CVE-2026-64641 하나는 벗어나도 나머지 8건이 그대로 남는다.
 # 낡은 안전선을 그대로 두면 "올렸으니 됐다"는 잘못된 종결로 이어진다.
-KNOWN_SAFE_MIN_NEXT_VERSION = "16.3.1"
+#
+# ★ 2026-08-24 Sprint 251 재실측 (`npm audit --json`): 취약 범위는 그대로
+#   `9.3.4-canary.0 - 16.3.0-preview.10`, 권고 9건도 그대로인데 npm 이 제시하는
+#   수정본이 **16.3.2** 로 올라갔다(isSemVerMajor=false). 안전선을 따라 올린다.
+KNOWN_SAFE_MIN_NEXT_VERSION = "16.3.2"
+
+# ---------------------------------------------------------------------------
+# ★ 2026-08-24 Sprint 251 — 이 저장소에서 **가장 중요한 권고는 DoS 가 아니다**
+#
+# 아래 안내 문구는 오랫동안 CVE-2026-64641(Server Actions 미인증 DoS, CVSS 8.2)
+# 하나만 이름으로 불렀다. 오늘 `npm audit` 전체를 다시 읽으니 같은 묶음에
+# 이 앱의 구조에 훨씬 직접적으로 걸리는 것이 있다:
+#
+#   GHSA-6gpp-xcg3-4w24  Middleware / Proxy bypass in App Router applications
+#                        using Turbopack and single locale   (high, CWE-285 인가 우회)
+#                        해당 범위 >=16.0.0 <16.2.11  -> 설치본 16.2.9 는 **해당된다**
+#
+# 왜 이 앱에 직접 걸리나 (2026-08-24 실측):
+#   - 라우트 단위 인증 게이트가 `src/proxy.ts` **하나뿐**이다
+#     (PROTECTED_PREFIXES = /properties, /favorites, /mypage -> 미로그인 시 307).
+#   - `next dev` 배너가 "Next.js 16.2.9 (Turbopack)", i18n 설정 없음(단일 로케일).
+#     즉 권고가 말하는 전제 조건과 구성이 일치한다.
+#
+# 다만 **데이터가 새는 것은 아니다** — 이것도 재서 확인했다:
+#   - 개인 데이터는 전부 파이썬 API 가 낸다. `src/lib/api.ts` 가 Supabase
+#     access_token 을 `Authorization: Bearer` 로 실어 보내고,
+#   - 그 API 는 토큰 없음/쓰레기 토큰/`alg=none` 위조 토큰 세 경우 모두 **401** 이다
+#     (오늘 6개 보호 라우트 x 3가지 토큰 = 18회 실측, 전부 401).
+#   따라서 게이트가 뚫려도 얻는 것은 **빈 화면 껍데기**이고 사용자 데이터는 아니다.
+#
+# 그래도 등급을 낮추지 않는다 — 인가 경계가 설계대로 작동하지 않는 상태이고,
+# 다음에 누가 화면에서 직접 데이터를 읽는 경로를 하나만 추가해도 그 순간 실피해가 된다.
+# 업그레이드는 `npm install` 이 필요해 **승인 영역**이다(이 세션에서 실행하지 않았다).
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # 2026-08-18 Sprint 207 실측 스냅샷 (`npm audit`, moderate 1 / high 6 / 합계 7).
@@ -1949,10 +1982,16 @@ def test_known_dependency_cves_are_tracked():
                cur >= known, "package.json next=%s, 기준=%s" % (next_ver, KNOWN_VULNERABLE_NEXT_VERSION))
 
     if cur < safe_min:
-        print("   [알려진 취약점] next=%s는 CVE-2026-64641(CVSS 8.2, App Router+Server Action "
-              "미인증 DoS, 우회책 없음)에 해당한다 - %s 이상으로 올리면 해소된다"
-              "(docs/SPRINT125_NEXTJS_CVE_CORRECTION.md, 승인 후 `npm install next@%s`)."
-              % (next_ver, KNOWN_SAFE_MIN_NEXT_VERSION, KNOWN_SAFE_MIN_NEXT_VERSION))
+        print("   [알려진 취약점] next=%s 는 권고 9건에 해당한다. 이 저장소에 가장 직접적인 것:"
+              % next_ver)
+        print("     - GHSA-6gpp-xcg3-4w24  Middleware/Proxy bypass (high, 인가 우회, <16.2.11)")
+        print("       이 앱의 라우트 인증 게이트는 src/proxy.ts 하나뿐이고 Turbopack+단일 로케일이라")
+        print("       권고의 전제와 구성이 일치한다. 다만 개인 데이터는 파이썬 API 가 Bearer 토큰으로")
+        print("       따로 막고 있어(실측: 무효 토큰 전부 401) 게이트가 뚫려도 새는 것은 껍데기다.")
+        print("     - CVE-2026-64641  Server Actions 미인증 DoS (CVSS 8.2, 우회책 없음)")
+        print("   %s 이상으로 올리면 해소된다 (docs/SPRINT125_NEXTJS_CVE_CORRECTION.md,"
+              " 승인 후 `npm install next@%s`)."
+              % (KNOWN_SAFE_MIN_NEXT_VERSION, KNOWN_SAFE_MIN_NEXT_VERSION))
     else:
         print("   [정리됨] next=%s는 이미 %s 이상이다 - 위 KNOWN_VULNERABLE_NEXT_VERSION/"
               "KNOWN_SAFE_MIN_NEXT_VERSION 상수와 SPRINT125 문서의 SKIP 항목을 정리하십시오."
@@ -2998,6 +3037,379 @@ def test_no_hardcoded_foreign_machine_paths():
                "-> %s. os.path.dirname(os.path.abspath(__file__)) 기준으로 바꿔라" % offenders)
 
 
+# ---------------------------------------------------------------------------
+# register_scheduler_tasks.ps1 의 "기존 작업 탐지"가 실제로 탐지하는가 (2026-08-24 Sprint 251)
+#
+# 이 블록이 존재하는 이유는 단 하나다 - 같은 .bat 을 가리키는 **다른 이름의 기존 작업**을
+# 못 보고 -Apply 해서 하루 두 번 도는 중복 작업을 만드는 사고를 막는 것.
+#
+# 2026-08-24 실측으로 그 탐지가 한 종류를 통째로 놓치는 것을 확인했다.
+# 필터가 `$_.Arguments` 만 봤기 때문이다:
+#
+#     등록 모양                                          Arguments만  Execute포함
+#     cmd.exe  /c "...\run_daily.bat"                     탐지          탐지
+#     Execute="...\run_daily.bat", Arguments 비어 있음    **놓침**      탐지
+#
+# 뒤쪽은 `schtasks /create /TR "C:\...\run_daily.bat"` 가 만드는 아주 흔한 모양이다.
+# 놓치면 경고가 **아예 뜨지 않은 채** 중복이 등록된다 - 실패가 정상과 똑같이 생겼다.
+#
+# 그래서 이 테스트는 문구를 grep 하지 않고 **스크립트에 실제로 들어 있는 필터 식을 그대로
+# 떼어내 PowerShell 로 돌린다.** 필터가 다시 Arguments 만 보게 퇴행하면 여기서 깨진다.
+# ---------------------------------------------------------------------------
+def test_scheduler_script_detects_legacy_tasks():
+    print("\n--- register_scheduler_tasks.ps1 의 기존 작업 탐지 (Sprint 251) ---")
+    import io as _io
+    import re as _re
+    import tempfile
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    ps1 = os.path.join(root, "register_scheduler_tasks.ps1")
+    if not os.path.exists(ps1):
+        check_true("등록 스크립트가 있다", False, ps1)
+        return
+    src = _io.open(ps1, encoding="utf-8-sig", errors="replace").read()
+    lines = src.splitlines()
+
+    # (1) 열거로 얻은 작업의 실행 이력을 조회할 때 -TaskPath 를 함께 준다.
+    #     실측(2026-08-24): 루트(\) 밖 폴더의 작업은 이름만으로 조회하면
+    #     "The system cannot find the file specified" 로 실패한다. -ErrorAction
+    #     SilentlyContinue 라 조용히 $null 이 되고, 사람이 볼 근거가 사라진다.
+    info_calls = _re.findall(r"Get-ScheduledTaskInfo[^\r\n]*\$lc\.TaskName[^\r\n]*", src)
+    check_true("검사가 공허하지 않다(열거 결과에 대한 이력 조회를 찾았다)",
+               len(info_calls) >= 1, "-> Get-ScheduledTaskInfo ... $lc.TaskName 이 없다")
+    missing_path = [c for c in info_calls if "-TaskPath" not in c]
+    check("★ -TaskPath 없이 조회하는 곳", missing_path, [])
+
+    # (2) 탐지 필터 식을 스크립트에서 **그대로** 떼어낸다.
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("$LegacyBatPattern"):
+            start = i
+            break
+    check_true("탐지 패턴 상수를 찾았다($LegacyBatPattern)", start is not None,
+               "-> 형식이 바뀌었으면 이 테스트를 함께 고칠 것")
+    if start is None:
+        return
+
+    end = None
+    depth = 0
+    seen_brace = False
+    for i in range(start, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if lines[i].count("{"):
+            seen_brace = True
+        if seen_brace and depth == 0:
+            end = i
+            break
+    check_true("탐지 필터 식의 끝을 찾았다", end is not None, "-> 중괄호 균형이 맞지 않는다")
+    if end is None:
+        return
+
+    snippet = "\n".join(lines[start:end + 1])
+    check_true("★ 필터가 Execute 도 본다(Arguments 만 보면 직접 실행 등록을 놓친다)",
+               "$($_.Execute)" in snippet or "$_.Execute" in snippet,
+               "-> 떼어낸 식:\n%s" % snippet)
+
+    # (3) 떼어낸 식을 실제로 실행해 본다. 정적 문구 검사만으로는
+    #     "본다고 써 놓고 안 보는" 퇴행을 못 잡는다.
+    exe = None
+    for cand in ("powershell.exe", "powershell", "pwsh"):
+        try:
+            p = subprocess.run([cand, "-NoProfile", "-Command", "1"],
+                               capture_output=True, timeout=60)
+            if p.returncode == 0:
+                exe = cand
+                break
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    if exe is None:
+        print("      (PowerShell 이 없어 동작 확인은 건너뛴다 ― 위 정적 검사는 수행됐다)")
+        return
+
+    # ★ 반드시 raw 문자열로 쓴다. 보통 문자열로 적으면 `C:\repo\run_daily.bat` 의
+    #   `\r` 이 **캐리지 리턴**이 되어 목 데이터에서 `run_daily.bat` 이라는 글자가
+    #   사라지고, 필터는 아무것도 못 찾는다 - 그러면 이 테스트는 결함이 없는데도
+    #   실패하거나(운이 나쁘면) 결함이 있는데도 통과한다. 실제로 한 번 그렇게 됐다.
+    prelude = r"""$knownNames = @('DojoonPass-PriorityRefresh','DojoonPass-DocWorker','DojoonPass-DailyCrawl')
+$MockTasks = @(
+  [pscustomobject]@{ TaskName='LEGACY_CMDC'; TaskPath='\'; Actions=@([pscustomobject]@{Execute='cmd.exe'; Arguments='/c "C:\repo\run_daily.bat"'; WorkingDirectory='C:\repo'}) }
+  [pscustomobject]@{ TaskName='LEGACY_DIRECT'; TaskPath='\'; Actions=@([pscustomobject]@{Execute='C:\repo\run_daily.bat'; Arguments=$null; WorkingDirectory='C:\repo'}) }
+  [pscustomobject]@{ TaskName='UNRELATED'; TaskPath='\'; Actions=@([pscustomobject]@{Execute='notepad.exe'; Arguments=''; WorkingDirectory='C:\'}) }
+  [pscustomobject]@{ TaskName='DojoonPass-DailyCrawl'; TaskPath='\'; Actions=@([pscustomobject]@{Execute='cmd.exe'; Arguments='/c "C:\repo\run_daily.bat"'; WorkingDirectory='C:\repo'}) }
+)
+"""
+    # 목 데이터가 (위 함정 때문에) 망가지지 않았는지 먼저 확인한다.
+    check_true("목 데이터가 온전하다(run_daily.bat 3회, 제어문자 없음)",
+               prelude.count("run_daily.bat") == 3 and "\r" not in prelude,
+               "-> raw 문자열이 아니면 \\r 이 캐리지 리턴이 된다")
+
+    body = snippet.replace("Get-ScheduledTask -ErrorAction SilentlyContinue", "$MockTasks")
+    check_true("검사가 공허하지 않다(Get-ScheduledTask 호출을 목으로 바꿨다)",
+               "$MockTasks" in body, "-> 호출 형태가 바뀌었으면 이 테스트를 함께 고칠 것")
+    postlude = "\n'RESULT:' + ((@($legacyCandidates) | ForEach-Object { $_.TaskName }) -join ',')\n"
+
+    tmp = os.path.join(tempfile.gettempdir(), "dojoonpass_legacy_filter_probe.ps1")
+    with open(tmp, "wb") as fh:
+        fh.write(codecs.BOM_UTF8)
+        fh.write((prelude + body + postlude).encode("utf-8"))
+    try:
+        p = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp],
+                           capture_output=True, timeout=120)
+        out = (p.stdout or b"").decode("utf-8", "replace")
+        err = (p.stderr or b"").decode("utf-8", "replace")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    line = next((l for l in out.splitlines() if l.startswith("RESULT:")), None)
+    check_true("떼어낸 필터가 실행됐다", line is not None,
+               "-> stdout=%r stderr=%r" % (out[-400:], err[-400:]))
+    if line is None:
+        return
+    detected = sorted(n for n in line[len("RESULT:"):].split(",") if n)
+    # LEGACY_DIRECT 가 빠지면 = Arguments 만 보는 퇴행.
+    # UNRELATED 가 들어가면 = 패턴이 비어 아무거나 매칭(공허한 통과).
+    # DojoonPass-DailyCrawl 이 들어가면 = 자기가 등록할 이름까지 "기존 작업"으로 센다.
+    check("★ 목 작업에서 탐지된 기존 작업", detected, ["LEGACY_CMDC", "LEGACY_DIRECT"])
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md 가 **없는 파일/폴더를 있다고 서술**하지 않는가 (2026-08-24 Sprint 251 신설)
+#
+# `docs/CLAUDE.md` 는 세션마다 컨텍스트로 들어가는 색인 문서다. 여기 적힌 것이 틀리면
+# 그 오류가 이후 모든 판단에 전파된다 - 바로 위 검사(스케줄러 이름)가 같은 이유로 생겼다.
+#
+# 2026-08-24 실측으로 한 건 더 나왔다:
+#
+#     "Note `src/login/` is a stale duplicate of the real `src/app/login/`."
+#     -> `src/login/` 은 **존재하지 않는다**(src 아래는 app, components, lib, proxy.ts 넷뿐).
+#        `docs/BETA_RELEASE_CHECKLIST.md` 는 2026-08-22 에 이미 "해결 확인"으로 적었는데
+#        색인 문서만 갱신되지 않았다.
+#
+# 이 오류의 값비싼 점: 없는 폴더를 "정리 대상 죽은 코드"로 알고 있으면, 세션은 있지도
+# 않은 것을 찾느라 시간을 쓰거나 **다른 폴더를 그것으로 착각한다.**
+#
+# ## 무엇을 검사하는가 - 좁게 잡는다
+#
+# 백틱 안의 토큰 중 **`/` 가 들어 있어 경로가 분명한 것**만 본다. 맨 파일명
+# (`filter_engine.py` 처럼 하위 폴더에 있는 것)은 위치를 특정하지 않는 참조라 제외한다 -
+# 넓히면 오탐이 실제 결함보다 많아지고, 그러면 아무도 안 본다(이 저장소가 반복해서
+# 배운 것).
+#
+# 그리고 **없어진 것을 없어졌다고 적는 것은 정상**이다. 그래서 그 토큰 **바로 옆**에
+# 제거/개명 표시가 있으면 넘어간다. 실제로 CLAUDE.md 에는 그런 정상 서술이 둘 있다:
+#
+#     `storage/migrate_doc_collect.py` 는 Migration 017로 대체되어 **제거됐다**
+#     `src/proxy.ts` ... **renamed from** `src/middleware.ts` in Sprint 50
+# ---------------------------------------------------------------------------
+# 한 문장 안에서 "절"을 가르는 문자들. 제거/개명 표시는 자기가 설명하는 경로와
+# **같은 절** 안에 있어야 한다 - 옆 절의 표시를 빌려 쓰면 이 검사가 눈이 먼다.
+#
+# ★ EM DASH(U+2014)를 `chr()`로 만든다. 이 저장소는 cp949로 못 내보내는 문자가
+#   출력 리터럴에 섞이는 것을 `test_console_encoding.py`가 막는데, 그 검사는
+#   `test_*.py`의 **모든** 문자열 상수를 본다(문서화 문자열 제외). 여기서 U+2014는
+#   출력할 글자가 아니라 **찾을 대상 데이터**라 그 규칙의 취지 밖이지만, 검사기가
+#   둘을 구별할 수는 없다. 리터럴로 적지 않으면 둘 다 만족한다.
+CLAUSE_SEPARATORS = (chr(0x2014), chr(0x2015), ",", ";", ":", "(", ")", ".")
+
+REMOVAL_MARKERS = (
+    "renamed", "removed", "deleted",
+    "\uc81c\uac70\ub410", "\uc81c\uac70\ud588", "\uc0ad\uc81c\ub410", "\uc0ad\uc81c\ud588",
+    "\ub300\uccb4\ub418\uc5b4", "\uc5c6\uc5b4\uc9c4", "\ub354 \uc774\uc0c1 \uc5c6",
+    "\uc774\ub984\ub9cc \ubcc0\uacbd", "\uc874\uc7ac\ud558\uc9c0 \uc54a",
+)
+
+
+def _claude_md_missing_paths(text, root):
+    """`text` 안에서 **실재하지 않는데 없어졌다는 표시도 없는** 경로 토큰을 돌려준다.
+
+    ## 표시를 토큰에 **묶는** 방법 (여기가 이 검사의 핵심이다)
+
+    처음에는 토큰 앞뒤 120자를 훑어 제거/개명 표시를 찾았다. **그 방식은 눈이 멀었다** -
+    mutation 으로 확인했다: 정상적인 개명 서술("`src/proxy.ts` ... renamed from
+    `src/middleware.ts`")이 있는 **같은 줄에** 가짜 경로를 심었더니, 그 'renamed' 가
+    120자 안에 들어와 가짜 경로까지 함께 면제됐다. 한 줄에 표시가 하나만 있어도 그 줄의
+    모든 경로가 통과하는 셈이라, 이 검사가 있으나 마나가 된다.
+
+    그래서 표시를 찾는 범위를 **그 토큰의 이웃**으로 좁힌다 - 바로 앞 백틱 토큰이 끝나는
+    자리부터 바로 뒤 백틱 토큰이 시작하는 자리까지(줄을 넘지 않는다). 그것만으로도
+    부족해서 절 구분자(`CLAUSE_SEPARATORS`)에서 한 번 더 자른다. 아래
+    "같은 줄의 다른 개명 표시를 빌려 쓰지 않는다" 자기 검증이 이 두 번째 조임을 잠근다.
+    """
+    import os as _os
+    import re as _re
+
+    spans = [(m.group(1), m.start(), m.end()) for m in _re.finditer(r"`([^`\s]+)`", text)]
+    missing = []
+    for i, (tok, start, end) in enumerate(spans):
+        if "/" not in tok or "*" in tok:
+            continue
+        if tok.startswith(("http://", "https://", "/api/")):
+            continue
+        if _os.path.exists(_os.path.join(root, tok.replace("/", _os.sep))):
+            continue
+        lo = spans[i - 1][2] if i > 0 else 0
+        hi = spans[i + 1][1] if i + 1 < len(spans) else len(text)
+        # 줄을 넘지 않는다 - 다른 문단의 표시를 빌려 오면 안 된다.
+        lo = max(lo, text.rfind("\n", 0, start) + 1)
+        nl = text.find("\n", end)
+        hi = min(hi, nl if nl != -1 else len(text))
+        # 앞쪽은 **마지막** 구분자 뒤부터, 뒤쪽은 **첫** 구분자 앞까지만 본다.
+        before, after = text[lo:start], text[end:hi]
+        cut = max([before.rfind(sep) for sep in CLAUSE_SEPARATORS] + [-1])
+        if cut >= 0:
+            before = before[cut + 1:]
+        ends = [after.find(sep) for sep in CLAUSE_SEPARATORS]
+        ends = [e for e in ends if e >= 0]
+        if ends:
+            after = after[:min(ends)]
+        neighborhood = (before + " " + after).lower()
+        if any(mk.lower() in neighborhood for mk in REMOVAL_MARKERS):
+            continue          # 없어졌다고 밝히고 있다 - 정상
+        missing.append(tok)
+    return sorted(set(missing))
+
+
+def test_claude_md_paths_exist():
+    print("\n--- CLAUDE.md 가 없는 경로를 있다고 적지 않는가 (Sprint 251) ---")
+    import io as _io
+    import re as _re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    md = os.path.join(root, "docs", "CLAUDE.md")
+    if not os.path.exists(md):
+        check_true("CLAUDE.md 가 있다", False, md)
+        return
+    src = _io.open(md, encoding="utf-8-sig", errors="replace").read()
+
+    n_paths = sum(1 for m in _re.finditer(r"`([^`\s]+)`", src)
+                  if "/" in m.group(1) and "*" not in m.group(1))
+    check_true("검사가 공허하지 않다(경로형 토큰을 찾았다)",
+               n_paths >= 10, "-> %d개" % n_paths)
+
+    missing = _claude_md_missing_paths(src, root)
+    check("★ 존재하지 않는데 제거/개명 표시도 없는 경로", missing, [])
+    if missing:
+        print("      -> 없는 것을 있다고 적으면 이후 모든 세션이 그것을 믿는다."
+              " 고치거나, 없어졌다고 밝힐 것")
+
+    # 자기 검증 - 실제 문서와 **같은 함수**로 돌린다(로직을 복제하지 않는다).
+    check("자기 검증: 없는 경로를 잡는다",
+          _claude_md_missing_paths("Note `src/qa_does_not_exist/` is a duplicate.", root),
+          ["src/qa_does_not_exist/"])
+    check("자기 검증: '제거됐다'로 밝힌 경로는 오탐하지 않는다",
+          _claude_md_missing_paths("`storage/qa_gone.py` 는 Migration 017로 대체되어 제거됐다.", root),
+          [])
+    check("자기 검증: 실재하는 경로는 잡지 않는다",
+          _claude_md_missing_paths("라우팅은 `src/proxy.ts` 가 담당한다.", root), [])
+    # ★ 이 검사가 한 번 눈이 멀었던 바로 그 모양 - 같은 줄의 정상 개명 서술이
+    #   옆의 가짜 경로까지 면제해 주면 안 된다.
+    check("★ 자기 검증: 같은 줄의 다른 개명 표시를 빌려 쓰지 않는다",
+          _claude_md_missing_paths(
+              "(`src/lib/supabaseServer.ts`, `src/qa_ghost/` gates stuff "
+              "\u2015 renamed from `src/middleware.ts` in Sprint 50)", root),
+          ["src/qa_ghost/"])
+
+
+# ---------------------------------------------------------------------------
+# 추적 대상에 **SQLite 데이터베이스 파일**이 새로 들어오지 않는가 (2026-08-24 Sprint 251)
+#
+# ## 위 6-2 검사와 무엇이 다른가 (이게 핵심이다 - 중복이 아니다)
+#
+# 6-2(`test_no_new_tracked_but_ignored_files`)는 **`.gitignore` 가 무시하겠다고 말해
+# 놓고 실제로는 추적 중인 파일**을 잡는다. 지금 추적 중인 DB 백업 9개(36.9MB)는
+# `.gitignore:73 *.db.backup*` 에 걸리므로 그 검사가 이미 전부 덮고 있다.
+#
+# **덮지 못하는 것이 있다: 어떤 무시 규칙에도 안 걸리는 이름의 데이터베이스.**
+# 실측(2026-08-24)으로 확인했다 -
+#
+#     git check-ignore  auction.db.backup_20260728_103355  -> .gitignore:73 *.db.backup*  (6-2가 잡는다)
+#     git check-ignore  qa_snapshot_2026 / db_dump_for_debug -> **무시 안 됨**            (6-2가 못 잡는다)
+#
+# 확장자 없는 이름, `fixtures/sample`, `snapshot_before_x` 같은 이름으로 SQLite 파일이
+# 커밋되면 6-2는 아무 말도 하지 않는다. 그래서 여기서는 **이름이 아니라 내용**으로 본다:
+# SQLite 매직 바이트(`SQLite format 3\0`, 16바이트). 추적 파일 401개 전수로 0.05초다.
+#
+# ## 왜 잡아야 하나 - 저장소 크기가 아니라 **다음번**이 문제다
+#
+# 지금 9개 안의 사용자 데이터는 전부 합성이다(6-2 주석의 실측: `user_id` 가 전부 `qa-*`).
+# 그래서 **지금은** 유출이 아니다. 그러나 운영 DB 스냅숏을 커밋하는 습관이 남아 있으면,
+# 실사용자가 생긴 뒤 뜬 스냅숏 하나가 같은 방식으로 들어온다 - 그때는
+# `favorites`/`payments`/`recent_items` 에 진짜 `user_id` 가 있고, git 이력에서
+# 지우는 비용은 비교가 안 되게 커진다.
+#
+# allowlist 는 **6-2 의 목록을 그대로 재사용한다.** 같은 9개를 여기 다시 적으면
+# 한쪽만 갱신되는 날이 온다(이 저장소가 BUGS #78 에서 얻은 교훈 그대로).
+# git 에서 빼는 것은 commit 이 필요해 승인 영역이므로, 여기서도 **늘어나는 것만** 막는다.
+# ---------------------------------------------------------------------------
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def test_no_new_tracked_sqlite_databases():
+    print("\n--- 추적 대상에 새 SQLite DB 가 들어오지 않았는가 (Sprint 251) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        ls = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if ls.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+
+    paths = [p.decode("utf-8", "replace") for p in ls.stdout.split(b"\x00") if p]
+    check_true("추적 파일 목록을 얻었다 (%d개)" % len(paths), len(paths) > 50, len(paths))
+
+    found, total_bytes = set(), 0
+    for rel in paths:
+        full = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            with open(full, "rb") as fh:
+                head = fh.read(len(SQLITE_MAGIC))
+            if head == SQLITE_MAGIC:
+                found.add(rel)
+                total_bytes += os.path.getsize(full)
+        except OSError:
+            continue          # 작업 트리에 없는 것은 판정 대상이 아니다
+
+    print("    추적 중인 SQLite 파일 %d개 / %.1f MB" % (len(found), total_bytes / 1048576.0))
+
+    # ★ 목록을 복제하지 않는다 - 6-2 가 이미 들고 있는 것을 그대로 쓴다.
+    check_true("검사가 공허하지 않다(6-2 의 allowlist 를 읽었다)",
+               len(KNOWN_TRACKED_BUT_IGNORED) > 0, KNOWN_TRACKED_BUT_IGNORED)
+    new = sorted(found - KNOWN_TRACKED_BUT_IGNORED)
+    check("★ 새로 추적된 SQLite DB(6-2 목록 밖)", new, [])
+    if new:
+        print("      -> 이름이 무시 규칙에 안 걸려도 데이터베이스는 데이터베이스다."
+              " 실사용자 데이터가 들어간 뒤에는 git 이력에서 지우는 비용이 훨씬 커진다")
+
+    # 자기 검증 - 매직 바이트 판정이 실제로 동작하는가(공허하지 않은가).
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        real = os.path.join(td, "probe.sqlite")
+        # ★ 반드시 닫는다. Windows 는 열린 파일을 지우지 못해
+        #   TemporaryDirectory 정리가 PermissionError 로 죽는다(실측).
+        probe = sqlite3.connect(real)
+        try:
+            probe.execute("CREATE TABLE t(a)")
+            probe.commit()
+        finally:
+            probe.close()
+        with open(real, "rb") as fh:
+            is_db = fh.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC
+        plain = os.path.join(td, "plain.txt")
+        with open(plain, "wb") as fh:
+            fh.write(b"SQLite format 2\x00 not really")
+        with open(plain, "rb") as fh:
+            is_not_db = fh.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC
+    check_true("자기 검증: 진짜 SQLite 파일을 잡는다", is_db)
+    check_true("자기 검증: 비슷한 텍스트는 잡지 않는다", not is_not_db)
+
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -3029,6 +3441,9 @@ def run():
     test_claude_md_scheduler_claims_match_register_script()
     test_root_scripts_do_not_write_db_without_apply()
     test_no_hardcoded_foreign_machine_paths()
+    test_scheduler_script_detects_legacy_tasks()
+    test_claude_md_paths_exist()
+    test_no_new_tracked_sqlite_databases()
 
     print("\n" + "=" * 55)
     if failures:

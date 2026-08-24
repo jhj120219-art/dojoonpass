@@ -306,6 +306,76 @@ def test_image_format_edge_cases():
     check("bmp 음수 높이(하향식 비트맵)도 절대값으로 읽는다",
           read_image_dimensions(_bmp(64, -32)), (64, 32))
 
+    # --- ★ 손으로 만든 fixture 는 **가장 쉬운 경로만** 지나간다 (2026-08-24 Sprint 254) ---
+    #
+    # 위 `make_jpeg()` 는 SOI 다음에 곧바로 SOF0 를 놓는다. 그래서 마커 순회 루프
+    # (`_read_jpeg_dimensions`)의 대부분 — 패딩(FF FF), 독립 마커, 재시작 마커, EOI,
+    # 길이 필드가 이상한 세그먼트 — 가 **한 번도 실행되지 않았다**(합산 커버리지 실측).
+    # 진짜 카메라/브라우저가 만든 JPEG 은 APP0/JFIF, DQT, DHT 를 앞에 달고 오므로
+    # 그 경로를 반드시 지난다.
+    #
+    # 그래서 (1) 실제 인코더가 만든 파일과 대조하고 (2) 경계값은 손으로 만든다.
+    #
+    # ★ 인코더 대조는 **선택**이다. `crawler/image_assets.py` 는 "Pillow 를 쓰지 않는다"를
+    #   설계 원칙으로 못 박고 있고(그 모듈 주석 참고), 그 원칙을 테스트가 뒤집으면 안 된다.
+    #   Pillow 는 `pdfplumber`(고정 의존)를 통해 들어와 있어 보통은 존재하지만,
+    #   없으면 **건너뛴 사실을 출력**한다 — 조용히 통과시키지 않는다.
+    # ★ 실제 인코더 출력과의 대조는 **의존을 남기지 않고** 한 번 재서 결과만 남겼다.
+    #
+    #   Pillow 로 JPEG(baseline/progressive) / PNG / GIF / BMP /
+    #   WEBP(VP8 · VP8L · VP8X) 를 6가지 크기로 만들어 대조했다:
+    #   **48건 중 불일치 0건**(2026-08-24 실측). 운영 DB 의 사진 45장과도
+    #   판독기·DB 저장값이 **45/45 일치**한다.
+    #
+    #   그런데 그 대조를 검사에 남기지는 않는다. `PIL` 은
+    #   `requirements.txt` 에 선언되지 않은 **전이 의존**이고
+    #   (`pdfplumber` 를 통해 우연히 들어있다), `crawler/image_assets.py` 는
+    #   "Pillow 를 쓰지 않는다 - 검사가 그대로 돌아야 한다"를 설계 원칙으로
+    #   적어 둔다. 검사가 제품의 원칙을 뒤집으면 안 된다 -
+    #   `test_schema_hygiene.py` 의 "선언되지 않은 third-party" 가드가 실제로 이것을
+    #   잡았다. 아래 바이트 수준 경계값은 의존 없이 같은 분기를 덤는다.
+
+    # --- JPEG 마커 순회 경계값(손으로 만든다) ---
+    #
+    # 크기를 못 읽는 것 자체는 치명적이지 않다(제품이 (None, None) 을 허용한다).
+    # 하지만 **틀린 값**을 읽으면 상세 화면이 그 값으로 자리를 잡아 레이아웃이 튄다
+    # (`src/app/properties/[id]/page.tsx` 가 width/height 를 그대로 쓴다).
+    # 그래서 "못 읽음"과 "틀리게 읽음"을 갈라서 본다.
+    def _sof(w, h):
+        return b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, h, w, 3) + b"\x00" * 6
+
+    def _jpeg(*chunks):
+        return b"\xff\xd8" + b"".join(chunks) + _sof(321, 123) + b"\xff\xd9"
+
+    # 마커가 아닌 바이트 위에 서 있으면 한 칸씩 전진한다 ―
+    # 손상된 파일에서도 멈추지 않고 SOF 를 찾아간다.
+    check("★ 마커가 아닌 바이트를 건너뛴다",
+          read_image_dimensions(_jpeg(b"\xff\xe0" + struct.pack(">H", 4) + b"\x00" * 2 + b"\x00" * 3)), (321, 123))
+    check("★ 패딩(FF FF)을 건너뛰고 SOF 를 찾는다",
+          read_image_dimensions(_jpeg(b"\xff\xff\xff\xff")), (321, 123))
+    check("★ 독립 마커(FF 01)를 건너뛴다",
+          read_image_dimensions(_jpeg(b"\xff\x01")), (321, 123))
+    check("★ 재시작 마커(FF D0~D7)를 건너뛴다",
+          read_image_dimensions(_jpeg(b"\xff\xd0" + b"\xff\xd7")), (321, 123))
+    check("★ 길이 필드가 있는 세그먼트(APP0)를 건너뛴다",
+          read_image_dimensions(_jpeg(b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9)),
+          (321, 123))
+    check("★ DHT(FFC4)는 SOF 가 아니다 ― 크기로 오독하지 않는다",
+          read_image_dimensions(_jpeg(b"\xff\xc4" + struct.pack(">H", 6) + b"\x00" * 4)),
+          (321, 123))
+    # EOI 를 먼저 만나면 거기서 멈춘다 — 뒤에 SOF 가 있어도 읽지 않는다.
+    check("★ EOI 뒤의 데이터를 크기로 읽지 않는다",
+          read_image_dimensions(b"\xff\xd8" + b"\xff\xd9" + _sof(999, 888)), (None, None))
+    # 길이 필드가 2보다 작으면 더 나아갈 수 없다(무한 루프 방지).
+    check("★ 망가진 길이 필드에서 멈춘다(무한 루프가 되지 않는다)",
+          read_image_dimensions(b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 0)
+                                + b"\x00" * 40), (None, None))
+    check("★ SOF 가 없으면 (None, None)", read_image_dimensions(b"\xff\xd8" + b"\x00" * 40),
+          (None, None))
+    check("잘린 JPEG 도 예외를 던지지 않는다", read_image_dimensions(b"\xff\xd8\xff"), (None, None))
+    check("빈 바이트열", read_image_dimensions(b""), (None, None))
+    check("형식을 모르는 바이트열", read_image_dimensions(b"qa-not-an-image" * 4), (None, None))
+
     # webp 세 형식 — 이 분기는 커버리지 0%였다
     # 청크 크기 4바이트(16:20)를 반드시 채워야 본문이 20부터 시작한다.
     # VP8  : 본문 20 + 프레임태그3 + 싱크코드3 = 26 부터 width/height
@@ -1325,6 +1395,42 @@ def test_case_level_status_reuse():
         # 되돌린다
         import time as _t
         now = _t.time()
+        os.utime(os.path.join(d1, "status.json"), (now, now))
+
+        # --- 거절 조건 나머지 (2026-08-24 Sprint 254) ---
+        #
+        # 여기서 잘못 통과시키면 **남의 문서나 빈 파일**을 이 물건의 것으로 재사용한다.
+        # 찾는 쪽이 틀리면 한 번 더 받으면 그만이지만, 거절이 틀리면 화면이 거짓을 말한다.
+        check("사건 디렉터리가 아예 없으면 None",
+              find_sibling_case_document(court, "2025타경999999", "2", "status"), None)
+
+        # 형제 자리에 **디렉터리가 아닌 것**이 있으면 건너뛴다.
+        with open(os.path.join(env.docs, court, case_no, "not-a-dir"), "w",
+                  encoding="utf-8") as f:
+            f.write("qa")
+        check("형제 자리의 파일을 디렉터리로 착각하지 않는다",
+              os.path.basename(find_sibling_case_document(court, case_no, "2", "status") or ""),
+              "1")
+
+        # 대표 파일이 **없는** 형제(디렉터리만 있다) -> 건너뛴다.
+        empty_sib = os.path.join(env.docs, court, case_no, "0")
+        os.makedirs(empty_sib)
+        found2 = find_sibling_case_document(court, case_no, "2", "status")
+        check("대표 파일이 없는 형제는 재사용하지 않는다",
+              os.path.basename(found2 or ""), "1")
+
+        # 대표 파일이 **0바이트**인 형제 -> 건너뛴다(빈 파일은 문서가 아니다).
+        with open(os.path.join(empty_sib, "status.json"), "w", encoding="utf-8"):
+            pass
+        found3 = find_sibling_case_document(court, case_no, "2", "status")
+        check("0바이트 대표 파일은 재사용하지 않는다",
+              os.path.basename(found3 or ""), "1")
+
+        # 쓸 만한 형제가 하나도 남지 않으면 None 이다(공허하지 않은 대조군).
+        os.utime(os.path.join(d1, "status.json"), (0, 0))
+        check("쓸 만한 형제가 없으면 None",
+              find_sibling_case_document(court, case_no, "2", "status",
+                                         max_age_seconds=60), None)
         os.utime(os.path.join(d1, "status.json"), (now, now))
 
         # --- 실제 복사 (driver를 절대 쓰지 않는다: None을 넘겨 확인한다)
@@ -3622,6 +3728,24 @@ def test_skip_path_records_the_document_it_already_has():
             got_files = existing_doc_files(court, case_no, item_no, doc_type)
             check("%s: 이미 있는 파일 목록" % doc_type,
                   sorted(os.path.basename(p) for p in got_files), sorted(files))
+
+            # ★ 모르는 종류는 **빈 목록이 아니라 예외**다 (2026-08-24 Sprint 254).
+            #
+            #   빈 목록을 돌려주면 호출부는 그것을 "파일이 없다"로 읽는다. 그러면
+            #   오타 난 doc_type 이 조용히 "아직 안 받은 문서"로 처리되고, 큐는
+            #   영원히 같은 자리를 맴돈다. `mark_queue_done()` 이 같은 이유로
+            #   `.get()` 대신 `[doc_type]` 을 고집하는 것과 같은 규칙이다
+            #   (그 함수 주석: "오타 난 doc_type 이 조용히 성공 처리되어...").
+            raised = None
+            try:
+                existing_doc_files(court, case_no, item_no, "qa-unknown-doc-type")
+            except Exception as exc:  # noqa: BLE001 - 예외가 나는 것이 검사 대상이다
+                raised = exc
+            check("★ 모르는 doc_type 은 예외다(빈 목록으로 조용히 넘기지 않는다)",
+                  type(raised).__name__, "ValueError")
+            check_true("★ 예외가 가능한 값을 알려 준다(디버깅 가능해야 한다)",
+                       "qa-unknown-doc-type" in str(raised) and doc_type in str(raised),
+                       str(raised))
 
             qid = env.enqueue(court, case_no, item_no, doc_type)
             r1 = _run_doc_worker_real_collector(env, court, case_no, item_no, qid)

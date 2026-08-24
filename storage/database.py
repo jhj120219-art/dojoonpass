@@ -1600,6 +1600,12 @@ def claim_next_queue_item() -> Optional[Dict]:
                 item = dict(row)
                 item["status"] = claimed_status
                 item["overwrite"] = claimed_status in QUEUE_OVERWRITE_STATUSES
+                # ★ claim 토큰 (2026-08-24 Sprint 254, BUGS #181).
+                #   방금 우리가 써 넣은 `last_attempt_at` 이다. 종결할 때 이 값을 다시
+                #   걸어 **그때 집은 그 claim 이 아직 살아 있는지** 확인한다.
+                #   상태만으로는 구별할 수 없다 - 회수 후 다른 실행이 다시 집어도
+                #   상태는 똑같이 'in_progress' 이기 때문이다. 스키마는 건드리지 않는다.
+                item["claim_token"] = now
                 return item
 
             # ★ 여기 도달 = **경쟁에서 졌다**. 큐가 빈 것이 아니다
@@ -1719,6 +1725,7 @@ def claim_next_item_rows(max_rows: int = QUEUE_BATCH_MAX_ROWS) -> List[Dict]:
             item = dict(row)
             item["status"] = claimed_status
             item["overwrite"] = claimed_status in QUEUE_OVERWRITE_STATUSES
+            item["claim_token"] = now      # 머리 행과 같은 규약 (BUGS #181)
             rows.append(item)
     finally:
         conn.close()
@@ -1766,9 +1773,29 @@ def release_queue_rows(queue_ids: List[int]) -> int:
         conn.close()
 
 
+def _claim_is_still_ours(conn, queue_id: int, claim_token: Optional[str]) -> bool:
+    """이 실행이 집었던 그 claim 이 아직 살아 있는가 (2026-08-24 Sprint 254, BUGS #181).
+
+    `claim_token` 은 claim 시점에 써 넣은 `last_attempt_at` 이다. 그 뒤 누군가
+    `reset_stale_queue()` 로 회수하고 다시 집었다면 그 값이 바뀌어 있다.
+
+    ★ 상태(`in_progress`)로는 구별할 수 없다 - 회수 후 다시 집은 행도 `in_progress` 다.
+      그래서 토큰이 필요하다. 컬럼을 새로 만들지 않고 이미 있는 값을 쓴다.
+
+    `claim_token` 이 None 이면 **예전 동작 그대로** True 다 - 토큰을 넘기지 않는
+    호출부(회귀 테스트 등)의 계약을 바꾸지 않는다.
+    """
+    if claim_token is None:
+        return True
+    row = conn.execute(
+        "SELECT last_attempt_at FROM document_queue WHERE id=?", (queue_id,)).fetchone()
+    return bool(row) and row["last_attempt_at"] == claim_token
+
+
 def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, doc_type: str,
                      previous_hash: str, new_hash: str, status: str = "READY",
-                     files_saved: Optional[List[str]] = None) -> None:
+                     files_saved: Optional[List[str]] = None,
+                     claim_token: Optional[str] = None) -> None:
     """큐 항목을 성공으로 종결한다.
 
     2026-08-17 Sprint 144에 **뒤에 두 개의 선택 인자**가 붙었다. 기존 호출부
@@ -1801,7 +1828,24 @@ def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, 
     conn = get_connection()
     try:
         now = datetime.now().isoformat()
-        conn.execute("UPDATE document_queue SET status='done' WHERE id=?", (queue_id,))
+        # ★ 우리 claim 이 아직 살아 있을 때만 큐 행을 종결한다 (BUGS #181).
+        #
+        #   회수당한 뒤라면 그 행은 지금 **다른 실행이 받고 있는 중**이다. 'done' 으로
+        #   덮으면 그 실행이 헛돌고(같은 문서를 두 번 받는다), 그쪽이 뒤이어 실패로
+        #   종결하면 방금 성공한 문서가 'failed' 로 뒤집힌다.
+        #
+        #   ★ 그래도 `document_status`/`doc_raw` 는 그대로 쓴다 - 파일은 **실제로**
+        #     받아졌기 때문이다. 화면이 그 사실을 반영해야 하고, 나중에 그쪽 실행이
+        #     같은 값을 다시 써도 결과는 같다(멱등).
+        owns = _claim_is_still_ours(conn, queue_id, claim_token)
+        if owns:
+            conn.execute("UPDATE document_queue SET status='done' WHERE id=?", (queue_id,))
+        else:
+            logger.warning(
+                "[%s-%s] %s 수집은 끝났지만 그 사이 큐 행(id=%s)이 회수돼 다른 실행이 "
+                "집어갔다 - 큐 상태는 그쪽에 맡기고 문서 기록만 남긴다"
+                "(동시 실행 중인 워커가 있는지 확인할 것)",
+                case_no, item_no, doc_type, queue_id)
 
         # ★ 알 수 없는 doc_type은 **여전히 예외로 죽어야 한다.**
         #
@@ -1839,9 +1883,23 @@ def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, 
         conn.close()
 
 
-def mark_queue_failed(queue_id: int, retry_count: int) -> None:
+def mark_queue_failed(queue_id: int, retry_count: int,
+                      claim_token: Optional[str] = None) -> None:
     conn = get_connection()
     try:
+        # ★ 우리 claim 이 아직 살아 있을 때만 손댄다 (2026-08-24 Sprint 254, BUGS #181).
+        #
+        #   성공 쪽(`mark_queue_done`)과 달리 여기서는 **아무것도 쓰지 않는다.**
+        #   회수 뒤 다시 집힌 행을 실패로 처리하면
+        #     - 지금 받고 있는 실행의 claim 이 'pending' 으로 풀려 제3의 실행이 또 집고
+        #     - 그 실행의 몫이 아닌 `retry_count` 가 깎이며
+        #     - 그쪽이 성공할 문서가 잠깐 화면에서 '수집실패' 로 보인다.
+        #   이 실행의 실패 사실은 로그와 `document_collect_failures` 에 이미 남는다.
+        if not _claim_is_still_ours(conn, queue_id, claim_token):
+            logger.warning(
+                "실패 처리를 건너뛴다(id=%s) - 그 사이 큐 행이 회수돼 다른 실행이 집어갔다. "
+                "이 실행의 재시도 예산으로 남의 행을 깎지 않는다", queue_id)
+            return
         now = datetime.now().isoformat()
         new_retry = retry_count + 1
         if new_retry >= MAX_DOC_RETRY:

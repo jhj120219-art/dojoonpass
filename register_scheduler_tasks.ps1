@@ -43,9 +43,31 @@
 .PARAMETER SkipCoveredByLegacy
     2026-08-22 신설. 이 스크립트가 모르는 이름의 기존 작업이 **같은 .bat**을 가리키고
     **정상 동작 중**(LastTaskResult 0)이면, 그 .bat에 대응하는 항목을 이번 등록 대상에서
-    **자동으로 뺀다** ― 실측(2026-08-22)으로 `DOJOONPASS_DAILY`가 `run_daily.bat`을 매일
-    03:00에 정상 실행 중임을 확인했다. 이 스위치 없이 `-Apply`하면 `DojoonPass-DailyCrawl`
-    (06:00)이 추가로 등록돼 **같은 배치가 하루 두 번** 돈다.
+    **자동으로 뺀다**. 이 스위치 없이 `-Apply`했을 때 같은 배치를 가리키는 기존 작업이
+    남아 있으면 `DojoonPass-DailyCrawl`(06:00)이 추가로 등록돼 **같은 배치가 하루 두 번**
+    돌 수 있고, 그것을 막기 위한 선택지다.
+
+    ★ 2026-08-24 정정 — 이 문단은 원래 "실측(2026-08-22)으로 `DOJOONPASS_DAILY`가
+      `run_daily.bat`을 매일 03:00에 정상 실행 중임을 확인했다"라고 적혀 있었다.
+      **그 문장은 지금 사실이 아니다.** 2026-08-24 08:45 실측:
+
+          Get-ScheduledTask 전체 249개 중 이 저장소를 가리키는 작업   0개
+          이름에 (?i)dojoon 이 든 작업                                 0개
+          logs/daily_run.log  mtime 2026-08-11 17:05 / 마지막 완료 줄 2026-08-02
+          auction_item crawl_date 최댓값                               2026-08-12
+          기일이 남은 물건                                             0건 (최종 기일 2026-08-19)
+
+      즉 `run_daily.bat`은 2026-08-11 이후 한 번도 돌지 않았다 — 03:00에 매일 성공
+      중이었다면 로그가 갱신됐어야 한다. 2026-08-21 Sprint 247도 네 가지 방법으로
+      "등록 0개"를 확인했다(docs/SPRINT247_SCHEDULER_TRUTH_AND_LARGE_FONT.md §2).
+
+      **왜 이 정정이 중요한가**: 틀린 문장을 믿으면 "DailyCrawl은 이미 커버되니
+      `-SkipCoveredByLegacy`로 나머지만 등록하면 된다"고 판단하게 되는데, 실제로는
+      DailyCrawl 이 등록되지 않아 크롤이 계속 돌지 않고 기본 검색이 계속 0건이 된다.
+      **지금 상태에서는 세 개 다 등록해야 한다.**
+
+      문서에 박힌 숫자는 언제든 stale 해진다. 등록 상태는 항상 직접 재라:
+      `python audit_schedule_health.py` (읽기 전용).
 
     기본값은 꺼짐이다 ― 어떤 기존 작업을 남길지 판단하는 것은 여전히 사람의 몫이라는
     2026-08-17 Sprint 187의 원래 결정을 바꾸지 않는다. 이 스위치는 그 판단을 이미
@@ -64,8 +86,9 @@
 
 .EXAMPLE
     .\register_scheduler_tasks.ps1 -Apply -SkipCoveredByLegacy
-    # 이미 정상 동작 중인 기존 작업(예: DOJOONPASS_DAILY)이 커버하는 배치는 건드리지 않고,
-    # 아직 등록되지 않은 나머지(DocWorker/PriorityRefresh)만 등록한다.
+    # 이미 정상 동작 중인 기존 작업이 커버하는 배치는 건드리지 않고 나머지만 등록한다.
+    # ★ 2026-08-24 현재는 커버 중인 기존 작업이 **하나도 없다**(위 .PARAMETER 정정 참고).
+    #   지금 이 스위치를 붙이면 아무것도 빠지지 않으므로 -Apply 만 준 것과 결과가 같다.
 #>
 [CmdletBinding()]
 param(
@@ -124,6 +147,10 @@ Write-Host ("  머신 PATH 로 해석 가능 : {0}" -f $(if ($machineHasPy) { '�
 #
 # 실측(2026-08-17): 이 저장소를 가리키는 작업이 "DOJOONPASS_DAILY"라는 **다른 이름**으로
 # 이미 등록돼 있었다 (매일 03:00, run_daily.bat, LastTaskResult 0 = 정상 동작 중).
+#   ※ 이것은 **2026-08-17 당시의 기록이고 지금은 사실이 아니다** — 2026-08-21(Sprint 247)과
+#     2026-08-24 실측 모두 "이 저장소를 가리키는 작업 0개"다. 이 블록은 "그런 것이 다시
+#     생겨 있을 수 있다"는 대비이지, 지금 있다는 뜻이 아니다. 상태는 항상 직접 재라:
+#     python audit_schedule_health.py
 # 이 스크립트는 자기가 등록/조회하는 이름(DojoonPass-DailyCrawl 등)만 알아서 그 존재를
 # 모르고, 그대로 -Apply 하면 **같은 run_daily.bat 을 하루 두 번(03:00 기존 + 06:00 신규)
 # 도는 중복 작업**이 생긴다 — mvp_scraper.py 는 idempotent upsert라 데이터가 깨지지는
@@ -131,17 +158,36 @@ Write-Host ("  머신 PATH 로 해석 가능 : {0}" -f $(if ($machineHasPy) { '�
 #
 # 자동으로 지우지 않는다 — 어떤 이름의 기존 작업을 정리할지는 이 스크립트가 판단할
 # 일이 아니라 실행하는 사람의 몫이다. 여기서는 **알아채지 못하고 지나치는 일**만 막는다.
+#
+# ★ 2026-08-24 수정 — 원래 이 필터는 `$_.Arguments` 만 봤다. 그래서 배치 파일을
+#   **Execute 에 직접 넣어 등록한 작업**(`schtasks /create /TR "C:\...\run_daily.bat"`
+#   이 만드는 모양이고, Arguments 는 비어 있다)을 통째로 놓쳤다. 재현:
+#
+#       Arguments 만 보는 필터   : cmd.exe /c "...run_daily.bat"  탐지 O
+#                                  Execute="...run_daily.bat"      탐지 X   <- 놓침
+#       Execute+Arguments 필터   : 둘 다 탐지 O
+#
+#   놓치면 경고가 아예 뜨지 않은 채 -Apply 가 중복 작업을 등록한다 — 이 블록이
+#   존재하는 이유 그 자체가 무력화된다. WorkingDirectory 까지 함께 보는 이유는
+#   `cd /d %~dp0` 없이 작업 디렉터리로만 저장소를 가리키는 등록도 있기 때문이다.
 $knownNames = $Tasks.Name
+$LegacyBatPattern = 'run_daily\.bat|run_doc_worker\.bat|run_priority_refresh\.bat'
 $legacyCandidates = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
     $_.TaskName -notin $knownNames -and
-    ($_.Actions | ForEach-Object { $_.Arguments }) -match 'run_daily\.bat|run_doc_worker\.bat|run_priority_refresh\.bat'
+    ($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -match $LegacyBatPattern
 }
 if ($legacyCandidates) {
     Write-Host ''
     Write-Host '★ 이 스크립트가 등록/관리하지 않는, 같은 배치를 가리키는 기존 작업이 있다:'
+    # ★ 2026-08-24 수정 — -TaskPath 없이 이름만 주면 **루트(\) 밖 폴더에 있는 작업은
+    #   조회되지 않는다**(실측: \GoogleSystem\GoogleUpdater\ 의 작업을 이름만으로 조회 ->
+    #   "The system cannot find the file specified", -TaskPath 를 주면 result=0 반환).
+    #   -ErrorAction SilentlyContinue 라 조용히 $null 이 되고, 그러면 아래 출력이
+    #   "(마지막 실행 , 결과 )" 로 비어 사람이 판단할 근거가 사라진다.
     foreach ($lc in $legacyCandidates) {
-        $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -ErrorAction SilentlyContinue
-        Write-Host ("    - {0}  (마지막 실행 {1}, 결과 {2})" -f $lc.TaskName, $info.LastRunTime, $info.LastTaskResult)
+        $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -TaskPath $lc.TaskPath -ErrorAction SilentlyContinue
+        Write-Host ("    - {0}{1}  (마지막 실행 {2}, 결과 {3})" -f `
+            $lc.TaskPath, $lc.TaskName, $info.LastRunTime, $info.LastTaskResult)
     }
     Write-Host '  -Apply 로 그대로 진행하면 같은 배치가 하루 두 번 이상 돈다.'
     Write-Host '  계속하기 전에 위 작업을 남길지/지울지 직접 판단할 것 (이 스크립트는 지우지 않는다).'
@@ -150,13 +196,18 @@ if ($legacyCandidates) {
         Write-Host ''
         Write-Host '-SkipCoveredByLegacy 지정됨 - 정상 동작 중인 기존 작업이 커버하는 항목은 뺀다:'
         foreach ($lc in $legacyCandidates) {
-            $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -ErrorAction SilentlyContinue
-            if ($info.LastTaskResult -ne 0) {
-                Write-Host ("    - {0} : 마지막 결과가 0이 아니라({1}) 건너뛰지 않는다(정상 동작 확인 안 됨)" -f $lc.TaskName, $info.LastTaskResult)
+            $info = Get-ScheduledTaskInfo -TaskName $lc.TaskName -TaskPath $lc.TaskPath -ErrorAction SilentlyContinue
+            if ($null -eq $info) {
+                Write-Host ("    - {0}{1} : 실행 이력을 조회할 수 없다 -> 건너뛰지 않는다(정상 동작 확인 안 됨)" -f $lc.TaskPath, $lc.TaskName)
                 continue
             }
+            if ($info.LastTaskResult -ne 0) {
+                Write-Host ("    - {0}{1} : 마지막 결과가 0이 아니라({2}) 건너뛰지 않는다(정상 동작 확인 안 됨)" -f $lc.TaskPath, $lc.TaskName, $info.LastTaskResult)
+                continue
+            }
+            # Execute 에 .bat 을 직접 넣은 등록도 커버로 인정해야 한다(위 탐지 필터와 같은 이유).
             $covered = $Tasks | Where-Object {
-                ($lc.Actions | ForEach-Object { $_.Arguments }) -match [regex]::Escape($_.Bat)
+                ($lc.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)" }) -match [regex]::Escape($_.Bat)
             }
             foreach ($c in $covered) {
                 Write-Host ("    - {0} 이 {1} 을(를) 이미 커버함(결과 0) -> {2} 는 이번에 등록하지 않는다" -f $lc.TaskName, $c.Bat, $c.Name)

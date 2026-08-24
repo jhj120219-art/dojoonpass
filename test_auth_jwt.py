@@ -718,11 +718,17 @@ check("복원 후 정상 토큰이 다시 통한다(검사가 뒤를 오염시�
 
 print()
 print("--- SUPABASE_URL 값에 경로가 섞여 있어도 JWKS 주소가 안 깨지는가 (Sprint 267) ---")
-# 실측(2026-08-23): 이 환경의 .env가 NEXT_PUBLIC_SUPABASE_URL에 REST API 베이스 URL
-# (".../rest/v1/")을 프로젝트 URL 자리에 잘못 넣어 두고 있었다. 예전 코드(.rstrip("/")만
-# 적용)는 이 경로를 그대로 남겨 JWKS 주소가 ".../rest/v1/auth/v1/.well-known/jwks.json"이
-# 되고, 그 주소는 401을 반환한다(실제 프로젝트로 직접 확인함) - ES256(주 인증 경로) 검증이
-# 전부 실패했다. `_project_origin()`이 scheme+host만 남기도록 고쳤다 - 그 정규화 자체를 고정한다.
+# 막으려는 고장: 프로젝트 URL 자리에 REST API 베이스 URL(".../rest/v1/")이 들어가면
+# 예전 코드(.rstrip("/")만 적용)는 그 경로를 그대로 남겨 JWKS 주소가
+# ".../rest/v1/auth/v1/.well-known/jwks.json"이 되고, 그 주소로는 키를 못 받는다 -
+# ES256(주 인증 경로) 검증이 전부 실패한다. `_project_origin()`이 scheme+host만
+# 남기도록 고쳤고, 여기서 그 정규화 자체를 고정한다.
+#
+# ★ 2026-08-24 정정 — 원래 이 주석은 "실측(2026-08-23): **이 환경의** .env가 ... 잘못
+#   넣어 두고 있었다"라고 단정했다. 이 저장소의 현재 상태에서는 재현되지 않는다 -
+#   .env 에 NEXT_PUBLIC_SUPABASE_URL 키 자체가 없고, .env.local 의 값은 경로가 없다
+#   (2026-08-24 실측, api/auth.py:_project_origin docstring 에 수치 기록).
+#   아래 네 개의 단언은 환경과 무관한 순수 함수 검사라 그대로 유효하다.
 check("★ REST API 베이스 URL이 섞여도 origin만 남는다",
       auth_mod._project_origin("https://abcxyz.supabase.co/rest/v1/")
       == "https://abcxyz.supabase.co")

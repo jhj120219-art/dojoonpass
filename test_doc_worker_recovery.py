@@ -102,7 +102,10 @@ def test_driver_restart_failure_stops_run_instead_of_burning_retry_budget():
         restart_calls.append(1)
         raise Exception("qa-simulated-chromedriver-launch-failure")
 
-    def fake_mark_queue_failed(queue_id, retry_count):
+    # `claim_token` 은 2026-08-24 Sprint 254(BUGS #181)에 붙었다. 대역도 실물과 같은
+    # 모양이어야 한다 — 고정 인자 2개로 두면 워커가 토큰을 넘기기 시작한 날 대역만
+    # 터져서, 제품 결함이 아닌 것을 결함처럼 보이게 만든다.
+    def fake_mark_queue_failed(queue_id, retry_count, claim_token=None):
         failed_calls.append(queue_id)
 
     originals = _patch_all({
@@ -185,7 +188,10 @@ def test_driver_restart_success_continues_processing():
         restart_calls.append(1)
         return _FakeDriver("restarted")
 
-    def fake_mark_queue_failed(queue_id, retry_count):
+    # `claim_token` 은 2026-08-24 Sprint 254(BUGS #181)에 붙었다. 대역도 실물과 같은
+    # 모양이어야 한다 — 고정 인자 2개로 두면 워커가 토큰을 넘기기 시작한 날 대역만
+    # 터져서, 제품 결함이 아닌 것을 결함처럼 보이게 만든다.
+    def fake_mark_queue_failed(queue_id, retry_count, claim_token=None):
         failed_calls.append(queue_id)
 
     def fake_mark_queue_done(queue_id, *a, **kw):
@@ -285,7 +291,7 @@ def test_case_not_reachable_does_not_restart_the_driver():
         "go_to_case_detail": fake_go,
         "collect_document": fake_collect,
         "restart_download_driver": lambda d: (restarts.append(1), _FakeDriver("r"))[1],
-        "mark_queue_failed": lambda qid, rc: failed.append(qid),
+        "mark_queue_failed": lambda qid, rc, tok=None: failed.append(qid),
         "mark_queue_skipped_expired": lambda *a, **kw: None,
         "mark_queue_unsupported": lambda *a, **kw: None,
         "mark_queue_done": lambda qid, *a, **kw: done.append(qid),
@@ -344,7 +350,7 @@ def test_real_exception_still_restarts_the_driver():
         "go_to_case_detail": fake_go,
         "collect_document": fake_collect,
         "restart_download_driver": lambda d: (restarts.append(1), _FakeDriver("r"))[1],
-        "mark_queue_failed": lambda qid, rc: failed.append(qid),
+        "mark_queue_failed": lambda qid, rc, tok=None: failed.append(qid),
         "mark_queue_skipped_expired": lambda *a, **kw: None,
         "mark_queue_unsupported": lambda *a, **kw: None,
         "mark_queue_done": lambda qid, *a, **kw: done.append(qid),

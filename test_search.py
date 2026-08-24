@@ -190,6 +190,27 @@ def check_no_stale_read_path():
     `test_asset_pipeline.py` 12-O 가 따로 본다(같은 크기의 다른 사진으로 검증).
 
     실측(2026-08-19): `api.ts` fetch 5곳 / `no-store` 5곳, 라우터 캐시 헤더 0곳.
+
+    ## ★ 2026-08-24 Sprint 252 — 세는 대상을 바꿨다 (계약은 그대로다)
+
+    그날 `api.ts` 가 리팩터링되면서 **요청을 내는 자리가 `fetch(` 가 아니게 됐다.**
+    다섯 래퍼가 각자 `fetch()` 를 부르던 것을, 시간 제한을 한 곳에 모으려고
+    `timedRequest()` 하나를 거치도록 바꿨다(그 전에는 타임아웃이 **하나도 없어서**
+    백엔드가 멈추면 화면이 영원히 `불러오는 중...` 이었다).
+
+        예전 모양   fetch(url, { cache: 'no-store', ... })         x 5
+        지금 모양   timedRequest(url, { cache: 'no-store', ... })  x 6  -> 내부에서 fetch 1회
+        (2026-08-24 Sprint 253 에 이름이 timedFetch -> timedRequest 로 바뀌었다 —
+         본문 소비까지 타이머 안에 넣으면서 Response 대신 파싱 결과를 돌려주게 됐다)
+
+    그래서 `fetch(` 개수를 세던 이 검사가 "1개"를 보고 **공허하다고 스스로 판정**했다.
+    검사가 틀린 것이지 계약이 깨진 것이 아니다 — 세는 대상을 **요청을 내는 호출부**
+    (`timedRequest`)로 옮기고, `fetch(` 는 **정확히 1개**(timedRequest 안)여야 한다는
+    조건을 새로 건다. 그래야 "시간 제한을 우회하는 맨 fetch" 가 다시 생기면 잡힌다.
+
+    이 갱신 과정에서 **실제 누락도 하나 나왔다**: 새로 옮겨 온 `headOk()` 의 HEAD 요청에
+    `no-store` 가 없었다(옮겨 오기 전 맨 fetch 에도 없었다). 브라우저가 그 응답을
+    재사용하면 이미 사라진 문서에 대해 뷰어가 열린다. 같은 자리에서 함께 고쳤다.
     """
     import io as _io
     import re as _re
@@ -204,12 +225,22 @@ def check_no_stale_read_path():
 
     api_ts = os.path.join(root, "src", "lib", "api.ts")
     code = strip_comments(_io.open(api_ts, encoding="utf-8-sig").read())
-    fetches = len(_re.findall(r"\bfetch\(", code))
+    # 요청을 내는 자리 = timedRequest **호출부**. 여기에 init(캐시 옵션 포함)이 실린다.
+    # `function timedRequest(` 정의 자체는 호출이 아니므로 뺀다 — 넣으면 호출부보다
+    # 하나 많아져서 no-store 개수와 영원히 어긋난다(실제로 한 번 그렇게 틀렸다).
+    requests_out = len(_re.findall(r"(?<!function )\btimedRequest\b", code))
+    # 맨 fetch 는 timedRequest 정의 안의 1개뿐이어야 한다. 그보다 많으면
+    # 시간 제한과 캐시 계약을 함께 우회하는 경로가 생긴 것이다.
+    bare_fetch = len(_re.findall(r"(?<![\w.])fetch\(", code))
     nostore = code.count("no-store")
-    check("api.ts 의 fetch 를 실제로 찾았다(검사가 공허하지 않다)", fetches >= 4,
-          "-> %d개" % fetches)
-    check("★ 모든 fetch 가 no-store 다(옛 응답을 재사용하지 않는다)",
-          nostore >= fetches, "-> fetch %d / no-store %d" % (fetches, nostore))
+
+    check("api.ts 의 요청 호출부를 실제로 찾았다(검사가 공허하지 않다)",
+          requests_out >= 4, "-> timedRequest %d개" % requests_out)
+    check("★ 시간 제한을 우회하는 맨 fetch 가 없다(정의 1개뿐)",
+          bare_fetch == 1, "-> fetch %d개 (timedRequest 정의 안의 1개여야 한다)" % bare_fetch)
+    check("★ 모든 요청이 no-store 다(옛 응답을 재사용하지 않는다)",
+          nostore >= requests_out,
+          "-> timedRequest %d / no-store %d" % (requests_out, nostore))
 
     # 서버 라우터에 캐시 헤더가 붙지 않았는가 (사진 서빙은 예외 — 별도 파일이다)
     stale_headers = []
@@ -222,7 +253,8 @@ def check_no_stale_read_path():
     check("★ 검색/상세 응답에 캐시 헤더가 없다", sorted(stale_headers) == [],
           "-> %s (넣으려면 매각기일이 옛 값으로 보이는 경우를 먼저 답해야 한다)"
           % sorted(stale_headers))
-    print("    api.ts fetch %d곳 / no-store %d곳" % (fetches, nostore))
+    print("    api.ts 요청 호출부 %d곳 / no-store %d곳 / 맨 fetch %d곳"
+          % (requests_out, nostore, bare_fetch))
 
 def check_every_list_screen_contract():
     r"""**목록 성격의 화면 전부**가 자기 API 와 계약이 맞는가 (Sprint 221).

@@ -47,6 +47,7 @@ TEST_USER_ADMIN_TARGET = "qa-race-admintarget-" + uuid.uuid4().hex[:10]
 TEST_USER_REFUND = "qa-race-refund-" + uuid.uuid4().hex[:10]
 TEST_USER_SUB_STATUS = "qa-race-substatus-" + uuid.uuid4().hex[:10]
 TEST_USER_WEBHOOK_REPROCESS = "qa-race-whreprocess-" + uuid.uuid4().hex[:10]
+TEST_USER_WEBHOOK_CAS = "qa-race-whcas-" + uuid.uuid4().hex[:10]
 failures = []
 
 
@@ -879,6 +880,135 @@ def test_search_preset_cap_guard_is_structural():
     check_true("COUNT와 INSERT가 모두 트랜잭션 안에 있다", begin_i < count_i < insert_i)
 
 
+class _PaymentsInterleavingConn:
+    """`UPDATE payments` 직전에 콜백을 딱 한 번 실행하는 커넥션 래퍼 (2026-08-24 Sprint 253).
+
+    위 `_InterleavingConn` 과 같은 이유로 존재한다 — SELECT 와 조건부 UPDATE 사이의 창은
+    수 마이크로초라 실제 스레드로는 안정 재현이 불가능하다. 그 창을 직접 벌린다.
+    다른 점은 가로채는 문장뿐이다(`UPDATE REGISTRY_REQUESTS` -> `UPDATE PAYMENTS`).
+    """
+
+    def __init__(self, conn, on_update):
+        self._conn = conn
+        self._on_update = on_update
+        self.fired = False
+
+    def execute(self, sql, *a, **kw):
+        if not self.fired and sql.lstrip().upper().startswith("UPDATE PAYMENTS"):
+            self.fired = True
+            self._on_update()
+        return self._conn.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_webhook_apply_cas_is_deterministic():
+    """`_apply_webhook_event()` 의 **조건부 UPDATE 실패 분기**를 결정적으로 실행한다
+    (2026-08-24 Sprint 253 신설).
+
+    ## 왜 필요했나 — 커버리지 0 인 돈 관련 분기였다
+
+    합산 커버리지에서 `api/v1/payments.py` 는 96% 인데, 미실행 14줄이 **전부 오류/롤백
+    분기**였다. 그중 하나가 이것이다:
+
+        cursor = conn.execute("UPDATE payments SET status=? ... WHERE id=? AND status=?", ...)
+        if cursor.rowcount == 0:
+            return skip("다른 요청이 먼저 상태를 바꿨습니다")
+
+    이 줄이 없으면 **늦게 도착한 PG 노티가 이미 환불된 결제를 다시 PAID 로 되돌린다.**
+    바로 위 `test_webhook_reprocess_guard_is_structural()` 은 소스에
+    `WHERE id=? AND status=?` 문자열이 남아 있는지만 본다 — 그 조건이 실제로
+    **rowcount 0 을 만들고, 그때 상태를 보존하며 skip 으로 답하는지**는 확인하지 못한다.
+
+    ## 어떻게 결정적으로 만드나
+
+    `_apply_webhook_event()` 는 `SELECT * FROM payments` 로 현재 상태를 읽고,
+    그 값을 조건에 넣어 UPDATE 한다. 래퍼가 **UPDATE 를 대행하기 바로 전에** 다른
+    커넥션으로 상태를 바꿔 놓으면 조건부 UPDATE 는 rowcount=0 을 볼 수밖에 없다.
+    확률이 개입하지 않는다.
+    """
+    import api.v1.payments as pay_mod
+
+    print("\n--- 16. webhook 상태 반영 CAS 분기 결정적 검증 (Sprint 253) ---")
+
+    # 설정: 결제 1건 + RECEIVED webhook 1건 (PAID -> REFUNDED 를 노리는 이벤트)
+    r = client.post(
+        "/api/v1/payments",
+        json={"payment_type": "SUBSCRIPTION", "plan": "BASIC",
+              "amount": resolve_plan_price("BASIC", BILLING_MONTHLY),
+              "billing_cycle": BILLING_MONTHLY},
+        headers=auth_headers(TEST_USER_WEBHOOK_CAS),
+    )
+    body = r.json()
+    check_true("설정: 결제 생성 성공", body.get("success"))
+    payment_id = body["data"]["payment"]["id"]
+
+    conn = get_connection()
+    try:
+        pg_txid = conn.execute(
+            "SELECT pg_transaction_id FROM payments WHERE id=?", (payment_id,)
+        ).fetchone()[0]
+        # 노티가 노리는 전이가 유효하도록 현재 상태를 PAID 로 둔다.
+        conn.execute("UPDATE payments SET status='PAID' WHERE id=?", (payment_id,))
+        now = datetime.now().isoformat()
+        webhook_id = conn.execute(
+            """
+            INSERT INTO payment_webhooks
+            (provider, event_type, event_id, pg_transaction_id, payment_id,
+             signature_verified, processing_status, raw_payload, received_at)
+            VALUES ('mock','PAYMENT_REFUNDED',?,?,?,1,'RECEIVED','{}',?)
+            """,
+            ("qa-cas-" + uuid.uuid4().hex[:8], pg_txid, payment_id, now),
+        ).lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 끼어드는 쪽: UPDATE 직전에 다른 커넥션으로 상태를 먼저 바꾼다(환불이 먼저 확정된 상황).
+    def interloper():
+        c2 = get_connection()
+        try:
+            c2.execute("UPDATE payments SET status='REFUNDED' WHERE id=?", (payment_id,))
+            c2.commit()
+        finally:
+            c2.close()
+
+    class _Event:
+        event_type = "PAYMENT_REFUNDED"
+        status = "REFUNDED"
+        pg_transaction_id = pg_txid
+        amount = None
+        raw = {}
+
+    real = get_connection()
+    wrapped = _PaymentsInterleavingConn(real, interloper)
+    try:
+        result = pay_mod._apply_webhook_event(wrapped, webhook_id, "mock", _Event())
+        wrapped.commit()
+    finally:
+        real.close()
+
+    check_true("래퍼가 UPDATE payments 를 실제로 가로챘다", wrapped.fired)
+    # 값을 문자열로 베끼지 않는다 — 제품 상수를 그대로 쓴다(WEBHOOK_SKIPPED == "SKIPPED").
+    check("★ CAS 실패 시 skip 으로 답한다", result.get("result"), pay_mod.WEBHOOK_SKIPPED)
+    check("★ skip 사유가 '다른 요청이 먼저' 임을 밝힌다",
+          "먼저" in (result.get("reason") or ""), True)
+
+    # 상태가 끼어든 쪽의 값으로 **보존**되는가 (덮어쓰지 않았는가)
+    conn = get_connection()
+    try:
+        final = conn.execute("SELECT status FROM payments WHERE id=?", (payment_id,)).fetchone()[0]
+        wh = conn.execute(
+            "SELECT processing_status FROM payment_webhooks WHERE id=?", (webhook_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    check("★ 끼어든 쪽의 상태가 보존된다(덮어쓰지 않는다)", final, "REFUNDED")
+    check("webhook 수신 기록이 종결 처리된다(RECEIVED 로 남지 않는다)",
+          wh != "RECEIVED", True)
+
+
 def cleanup():
     print("\n--- cleanup (test user rows only) ---")
     conn = get_connection()
@@ -973,13 +1103,36 @@ def cleanup():
             )
             total += cur.rowcount
 
+        # CAS 시나리오(Sprint 253)가 만든 webhook 도 payments 앞에 치운다 —
+        # payment_webhooks 에는 user_id 컬럼이 없어 payment_id 로만 연결된다.
+        # ★ 이 정리를 빼먹어 운영 DB 에 qa- 행 7개가 남은 적이 있다(2026-08-24).
+        #   `test_api_regression.py` 의 "no stray qa-* rows" 가드가 그것을 잡았다 —
+        #   새 TEST_USER_* 를 만들면 **반드시** 이 목록에도 넣어야 한다.
+        cas_payment_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM payments WHERE user_id=?", (TEST_USER_WEBHOOK_CAS,)
+            ).fetchall()
+        ]
+        if cas_payment_ids:
+            placeholders = ",".join("?" * len(cas_payment_ids))
+            cur = conn.execute(
+                "DELETE FROM payment_webhooks WHERE payment_id IN (%s)" % placeholders,
+                cas_payment_ids,
+            )
+            total += cur.rowcount
+            cur = conn.execute(
+                "DELETE FROM audit_logs WHERE target_type='PAYMENT' AND target_id IN (%s)"
+                % placeholders, [str(i) for i in cas_payment_ids],
+            )
+            total += cur.rowcount
+
         # subscriptions가 payments **앞**이어야 한다 ― `subscriptions.payment_id`가
         # 생기면서 구독이 결제의 자식이 됐다 (2026-08-13 Sprint 96, BUGS #94).
         for table in ("registry_credit_logs", "registry_requests", "registry_usage",
                       "payment_logs", "subscriptions", "payments"):
             for user in (TEST_USER_LIMIT, TEST_USER_PAYMENT, TEST_USER_SUBSCRIPTION,
                          TEST_USER_ADMIN_TARGET, TEST_USER_REFUND, TEST_USER_SUB_STATUS,
-                         TEST_USER_WEBHOOK_REPROCESS):
+                         TEST_USER_WEBHOOK_REPROCESS, TEST_USER_WEBHOOK_CAS):
                 cur = conn.execute("DELETE FROM %s WHERE user_id=?" % table, (user,))
                 total += cur.rowcount
         conn.commit()
@@ -1001,6 +1154,15 @@ def cleanup():
         ).fetchone()[0]
         left += conn.execute(
             "SELECT COUNT(*) FROM payment_webhooks WHERE event_id='qa-race-wh-1'"
+        ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id=?", (TEST_USER_WEBHOOK_CAS,)
+        ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM subscriptions WHERE user_id=?", (TEST_USER_WEBHOOK_CAS,)
+        ).fetchone()[0]
+        left += conn.execute(
+            "SELECT COUNT(*) FROM payment_webhooks WHERE event_id LIKE 'qa-cas-%'"
         ).fetchone()[0]
         if wh_ids:
             placeholders = ",".join("?" * len(wh_ids))
@@ -1140,6 +1302,207 @@ def test_admin_registry_conflict_is_deterministic():
           ("FAILED", "qa-deterministic-control"))
 
 
+class _SubscriptionsInterleavingConn:
+    """`UPDATE SUBSCRIPTIONS` 직전에 콜백을 딱 한 번 실행하는 커넥션 래퍼.
+
+    위 두 래퍼와 같은 이유로 존재한다. 가로채는 문장만 다르다.
+    """
+
+    def __init__(self, conn, on_update):
+        self._conn = conn
+        self._on_update = on_update
+        self.fired = False
+
+    def execute(self, sql, *a, **kw):
+        if not self.fired and sql.lstrip().upper().startswith("UPDATE SUBSCRIPTIONS"):
+            self.fired = True
+            self._on_update()
+        return self._conn.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _scratch_db():
+    """이 검사 전용 DB 를 부트스트랩 3단계로 만든다.
+
+    ★ 운영 DB 를 쓰지 않는다. 이 시나리오는 **두 커넥션이 각자 커밋**해야 성립하므로
+      이 파일의 다른 검사처럼 qa- 행을 남겼다가 지우는 방식으로는 격리가 되지 않는다
+      (커밋된 중간 상태가 잠시라도 운영 DB 에 보인다). 그리고 `sync_expired_status()` 는
+      커넥션을 인자로 받으므로 전역 DB 를 건드리지 않고 그대로 태울 수 있다.
+    """
+    import contextlib
+    import io as _io
+    import tempfile
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    tmp = tempfile.mkdtemp(prefix="qa_race_sync_")
+    path = os.path.join(tmp, "auction.db")
+    prev_env = os.environ.get("AUCTION_DB_PATH")
+    prev_path = dbmod.DB_PATH
+    os.environ["AUCTION_DB_PATH"] = path
+    dbmod.DB_PATH = path
+    with contextlib.redirect_stdout(_io.StringIO()):
+        dbmod.init_db()
+        mig.migrate()
+        runmig.run()
+
+    def restore():
+        import shutil
+        dbmod.DB_PATH = prev_path
+        if prev_env is None:
+            os.environ.pop("AUCTION_DB_PATH", None)
+        else:
+            os.environ["AUCTION_DB_PATH"] = prev_env
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return dbmod, restore
+
+
+def test_sync_expired_status_does_not_clobber_a_concurrent_change():
+    """★ 자동 만료 동기화가 **그 사이 바뀐 상태를 덮어쓰지 않는다** (2026-08-24 Sprint 254).
+
+    ## 무엇이 문제였나 (BUGS #180)
+
+    `sync_expired_status()` 는 이 모듈에서 **유일하게 조건 없이** 쓰고 있었다:
+
+        UPDATE subscriptions SET status=?, updated_at=? WHERE id=?      <- CAS 없음
+
+    다른 writer(`change_status()`, `renew()`)는 전부 `AND status=?` 로 읽었던 값을 다시
+    건다. 그리고 그 둘은 함수 진입 직후 `BEGIN IMMEDIATE` 로 쓰기 락을 먼저 잡는다 —
+    실측해 보면 그 락이 SELECT~UPDATE 창을 실제로 닫는다(끼어든 쪽이 1.075초 대기 후에야
+    쓴다). 그래서 그 둘의 `rowcount == 0` 분기는 현재 도달 불가능한 방어선이다.
+
+    **이 함수만 다르다.** 읽기 경로(`GET /api/v1/subscriptions/me`, Admin 목록)에서
+    락 없이 불리므로 창이 열려 있다. 그래서 여기만 실제로 덮어썼다.
+
+    ## 왜 심각한가 — 금지된 전이가 DB 에 남는다
+
+    바로 위 코드에 "전이 규칙을 우회하지 않는다 — 자동 전이도 같은 관문을 통과해야 한다"
+    고 적혀 있고, 실제로 `assert_subscription_transition()` 을 부른다. 그런데 그 판정은
+    **읽었던(낡은) 상태**로 한다. 해지가 끼어들면:
+
+        판정: ACTIVE -> EXPIRED (허용)      실제로 덮는 대상: CANCELLED
+        결과: CANCELLED -> EXPIRED 가 DB 에 남는다 -- 이 전이는 **금지**다
+              (state_machines.py 에서 CANCELLED 는 최종 상태다)
+
+    그리고 EXPIRED 는 최종이 아니라서(EXPIRED -> ACTIVE 허용) **해지된 구독이 재구독으로
+    되살아난다.** 로그에도 `ACTIVE -> EXPIRED` 라는 사실이 아닌 문장이 남는다.
+
+    ## 어떻게 결정적으로 재현하나
+
+    래퍼가 UPDATE 를 대행하기 직전에, 다른 커넥션이 정식 경로(`change_status()`)로 해지를
+    끝낸다. 확률이 개입하지 않는다.
+    """
+    import api.v1.subscriptions as subs_mod
+    from api.v1.state_machines import can_transition_subscription
+
+    print("\n--- 17. 자동 만료 동기화가 동시 변경을 덮지 않는다 (Sprint 254) ---")
+
+    dbmod, restore = _scratch_db()
+    try:
+        user = "qa-race-sync-" + uuid.uuid4().hex[:10]
+        past = (datetime.now() - timedelta(days=60)).isoformat()
+        conn = dbmod.get_connection()
+        try:
+            sub_id = conn.execute(
+                "INSERT INTO subscriptions (user_id, plan, price, status, started_at,"
+                " expires_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (user, "BASIC", 12900, "ACTIVE", past, past, past, past),
+            ).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 검사가 공허하지 않다: 끼어들기가 없으면 이 행은 실제로 EXPIRED 로 동기화된다.
+        conn = dbmod.get_connection()
+        try:
+            baseline_changed = subs_mod.sync_expired_status(conn, user, commit=True)
+            baseline = conn.execute(
+                "SELECT status FROM subscriptions WHERE id=?", (sub_id,)).fetchone()["status"]
+        finally:
+            conn.close()
+        check("설정: 끼어들기가 없으면 자동 만료가 실제로 일어난다",
+              (baseline_changed, baseline), (1, "EXPIRED"))
+
+        # 다시 ACTIVE 로 돌려놓고 이번엔 창을 벌린다.
+        conn = dbmod.get_connection()
+        try:
+            conn.execute("UPDATE subscriptions SET status='ACTIVE' WHERE id=?", (sub_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        def interloper():
+            """그 사이 사용자가 해지했다 — 정식 경로로."""
+            c2 = dbmod.get_connection()
+            try:
+                subs_mod.change_status(c2, sub_id, subs_mod.SubscriptionStatus.CANCELLED,
+                                       actor="qa-race")
+                c2.commit()
+            finally:
+                c2.close()
+
+        real = dbmod.get_connection()
+        wrapped = _SubscriptionsInterleavingConn(real, interloper)
+        try:
+            changed = subs_mod.sync_expired_status(wrapped, user, commit=True)
+        finally:
+            real.close()
+
+        conn = dbmod.get_connection()
+        try:
+            final = conn.execute(
+                "SELECT status FROM subscriptions WHERE id=?", (sub_id,)).fetchone()["status"]
+        finally:
+            conn.close()
+
+        check("래퍼가 UPDATE subscriptions 를 실제로 가로챘다", wrapped.fired, True)
+        check("★ 그 사이 확정된 해지를 덮어쓰지 않는다", final, "CANCELLED")
+        check("★ 덮지 않았으므로 '바꿨다'고 세지도 않는다", changed, 0)
+        # 허용된 전이였다면 위 검사는 아무것도 증명하지 못한다(그냥 늦은 갱신일 뿐).
+        check_true("★ 이 전이가 애초에 금지였음을 확인한다(검사가 공허하지 않다)",
+                   not can_transition_subscription("CANCELLED", "EXPIRED"))
+
+        # 그리고 다음 호출은 새 상태를 기준으로 판단한다 — 영구히 멈추지 않는다.
+        conn = dbmod.get_connection()
+        try:
+            again = subs_mod.sync_expired_status(conn, user, commit=True)
+            still = conn.execute(
+                "SELECT status FROM subscriptions WHERE id=?", (sub_id,)).fetchone()["status"]
+        finally:
+            conn.close()
+        check("★ 다음 호출도 해지를 건드리지 않는다(멱등)", (again, still), (0, "CANCELLED"))
+    finally:
+        restore()
+
+
+def test_subscription_writers_all_use_cas():
+    """구독 상태를 쓰는 **모든** 문장이 CAS 를 건다 — 새 writer 가 생겨도 걸린다.
+
+    위 검사는 지금 있는 한 경로를 본다. 이 검사는 **다음에 추가될 경로**를 본다.
+    `sync_expired_status()` 가 정확히 그렇게 빠져나갔다 — 나중에 붙은 함수였고,
+    조건 없는 UPDATE 한 줄이 아무 검사에도 걸리지 않았다.
+    """
+    print("\n--- 18. 구독 writer 전수: 조건 없는 UPDATE 가 없다 (Sprint 254) ---")
+    import re
+    import api.v1.subscriptions as subs_mod
+
+    src = open(subs_mod.__file__, encoding="utf-8").read()
+    # ★ 먼저 **인접 문자열 리터럴을 잇는다.** 파이썬은 `"UPDATE ..." " WHERE ..."` 를
+    #   한 문장으로 이어 붙이는데, 조각만 보면 뒤쪽 WHERE 절을 놓쳐 멀쩡한 CAS 를
+    #   "조건 없음"으로 오판한다(이 검사를 쓰다가 실제로 `renew()` 를 오탐했다).
+    joined = re.sub(r'"[ \t]*(?:\r?\n)?[ \t]*"', "", src)
+    # 문자열 리터럴 안의 UPDATE 문만 본다(주석/설명문은 제외).
+    stmts = re.findall(r'"(UPDATE subscriptions SET[^"]*)"', joined)
+    print("    찾은 UPDATE 문: %d개" % len(stmts))
+    check_true("검사가 공허하지 않다(UPDATE 문을 실제로 찾았다)", len(stmts) >= 4)
+    naked = [q for q in stmts if "AND status=?" not in q]
+    check("★ 조건 없이 구독 상태를 덮는 UPDATE 가 없다", naked, [])
+
+
 def run():
     try:
         test_registry_free_limit_race()
@@ -1150,6 +1513,7 @@ def run():
         test_toctou_guard_is_structural()
         test_refund_guard_is_structural()
         test_admin_webhook_reprocess_race()
+        test_webhook_apply_cas_is_deterministic()
         test_webhook_reprocess_guard_is_structural()
         test_admin_subscription_status_race()
         test_subscription_status_guard_is_structural()
@@ -1157,6 +1521,8 @@ def run():
         test_search_preset_cap_race()
         test_search_preset_cap_guard_is_structural()
         test_admin_registry_conflict_is_deterministic()
+        test_sync_expired_status_does_not_clobber_a_concurrent_change()
+        test_subscription_writers_all_use_cas()
     finally:
         cleanup()
 

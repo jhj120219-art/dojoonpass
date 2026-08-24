@@ -47,12 +47,25 @@ load_dotenv(os.path.join(_REPO_ROOT, ".env.local"), override=False)
 def _project_origin(url: str) -> str:
     """Supabase 프로젝트 URL에서 scheme+host만 남긴다 (2026-08-23 Sprint 267).
 
-    실측: 이 환경의 `.env`에 `NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co/rest/v1/`
-    (REST API 베이스 URL을 프로젝트 URL 자리에 잘못 붙여 넣은 값)이 들어 있었다. 예전 코드는
-    `.rstrip("/")`만 하므로 `/rest/v1` 경로가 그대로 남아 JWKS 주소가
-    `.../rest/v1/auth/v1/.well-known/jwks.json`이 되고, 그 주소는 401을 반환한다
-    (`.../auth/v1/.well-known/jwks.json`만 200) - ES256(주 인증 경로) 검증이 전부
-    실패했다. 경로가 붙어 있어도 origin만 남기면 이런 오타에도 견딘다.
+    막으려는 고장: 프로젝트 URL 자리에 REST API 베이스 URL
+    (`https://<ref>.supabase.co/rest/v1/`)을 붙여 넣으면, `.rstrip("/")`만 하던 예전
+    코드는 `/rest/v1` 경로를 그대로 남긴다. 그러면 JWKS 주소가
+    `.../rest/v1/auth/v1/.well-known/jwks.json`이 되고 그 주소는 200을 주지 않는다
+    (`.../auth/v1/.well-known/jwks.json`만 유효) - ES256(주 인증 경로) 검증이 전부
+    실패한다. origin만 남기면 이런 오타에도 견딘다.
+
+    ★ 2026-08-24 정정 — 이 docstring은 원래 "실측: **이 환경의** `.env`에
+      `NEXT_PUBLIC_SUPABASE_URL=.../rest/v1/`이 들어 있었다"라고 단정했다.
+      **이 저장소의 현재 상태에서는 재현되지 않는다.** 2026-08-24 실측:
+
+          .env         SUPABASE_URL(빈값) / SUPABASE_ANON_KEY(빈값) / SUPABASE_JWT_SECRET(88자)
+                       -> NEXT_PUBLIC_SUPABASE_URL 키 자체가 없다
+          .env.local   NEXT_PUBLIC_SUPABASE_URL 40자, urlsplit().path == ''  (경로 없음)
+          해석 결과    SUPABASE_URL 40자, path '' -> JWKS 경로 '/auth/v1/.well-known/jwks.json'
+
+      즉 지금 이 정규화는 **오타를 고치고 있는 것이 아니라 방어만 하고 있다.**
+      정규화 자체는 그대로 둘 가치가 있으므로 코드는 유지한다 — 고친 것은 사실 주장뿐이다.
+      (값은 길이/경로 유무만 확인했고 어디에도 출력하지 않았다.)
     """
     parsed = urllib.parse.urlsplit(url)
     if not parsed.scheme or not parsed.netloc:

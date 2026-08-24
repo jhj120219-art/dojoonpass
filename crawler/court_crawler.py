@@ -52,6 +52,61 @@ def log_error(case_no: str, step: str, error: Exception, retry: int) -> None:
     except Exception:
         pass
 
+class BrowserSessionLost(Exception):
+    """브라우저 세션 자체가 죽었다 - **이 항목의 문제가 아니다.**
+
+    2026-08-24 Sprint 254 신설 (BUGS #182). `crawl_detail()` 은 예외를 전부 잡아
+    MAX_RETRY 만큼 재시도했기 때문에, 브라우저가 죽어도 그것이 "이 사건을 못 읽었다"로
+    처리됐다. 그 결과 `crawl_court()` 이 가지고 있던 드라이버 재시작 복구가
+    **한 번도 실행되지 않았다**(실측: 항목 4 x 재시도 3 = 12회 헛돌고 restart 0회).
+    """
+
+
+# 세션이 죽었을 때 Selenium 이 쓰는 이름/문구. 클래스 이름과 메시지를 **둘 다** 본다 -
+# 드라이버 버전에 따라 같은 사건이 다른 예외로 오기 때문이다.
+#
+# ★ `WebDriverException` 을 통째로 잡으면 안 된다. `NoSuchElementException` /
+#   `TimeoutException` 이 그 자식이라, 평범한 "이 화면에 그 요소가 없다"까지
+#   세션 사망으로 오판해 멀쩡한 브라우저를 매번 재시작하게 된다.
+_SESSION_DEAD_TYPES = (
+    "InvalidSessionIdException", "NoSuchWindowException", "NoSuchDriverException",
+    "SessionNotCreatedException", "MaxRetryError",
+)
+_SESSION_DEAD_MESSAGES = (
+    "invalid session id", "session deleted", "session not created",
+    "chrome not reachable", "disconnected: not connected to devtools",
+    "target window already closed", "no such window", "browser has closed",
+    "unable to connect to renderer", "failed to establish a new connection",
+    "connection refused",
+)
+
+
+def is_session_dead(exc: Exception) -> bool:
+    """이 예외가 '브라우저가 죽었다' 인가. 회귀가 참조하는 공개 표면이다.
+
+    두 갈래를 본다. **둘 다 필요하다** ― 어느 한쪽만으로는 실제 사례를 놓친다:
+
+      이름   `InvalidSessionIdException` 처럼 클래스 자체가 세션 사망인 경우.
+             드라이버 버전/로케일에 따라 메시지는 얼마든지 달라지므로 문구만으로는
+             놓친다.
+      문구   드라이버가 같은 사건을 밋밋한 `WebDriverException` 으로 던지는 경우.
+             `chrome not reachable` / `disconnected: not connected to DevTools` 가
+             실제로 그렇게 온다. 클래스만 보면 놓친다.
+
+    ★ `isinstance` 로 selenium 클래스를 직접 대조하는 판을 한 번 넣었다가 **걷어냈다**
+      (2026-08-24 Sprint 254). 이름 대조와 결과가 갈리는 경우는 "그 클래스의 하위
+      클래스" 뿐인데 selenium 4.47 에는 그런 클래스가 하나도 없다(실측). 즉 어떤
+      입력으로도 다른 결과를 내지 못하는 분기였고, mutation 으로 지워도 아무 검사가
+      죽지 않았다. 검증할 수 없는 코드를 남기지 않는다.
+      selenium 이 그런 하위 클래스를 만드는 날 다시 볼 것 ― 그때는 그것을 재현하는
+      검사부터 쓸 수 있다.
+    """
+    if type(exc).__name__ in _SESSION_DEAD_TYPES:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _SESSION_DEAD_MESSAGES)
+
+
 def crawl_detail(driver, item_info: dict, court: CourtInfo) -> Optional[AuctionItem]:
     case_no = item_info["case_no"]
     dtl_idx = item_info["dtl_idx"]
@@ -92,6 +147,17 @@ def crawl_detail(driver, item_info: dict, court: CourtInfo) -> Optional[AuctionI
             )
 
         except Exception as e:
+            # ★ 브라우저가 죽은 것은 **이 항목의 실패가 아니다** (Sprint 254, BUGS #182).
+            #   여기서 삼키고 재시도하면 (1) 남은 재시도 2회가 확실히 헛돌고
+            #   (2) 바깥의 드라이버 재시작 복구가 영영 발동하지 않으며
+            #   (3) 그 법원이 빈 목록을 돌려줘 `run_courts()` 가 그것을
+            #       "기일 없어 스킵" 으로 기록한다 - **사실이 아닌 요약**이다.
+            #   doc_worker 가 Sprint 137/232 에서 정한 것과 같은 규칙이다.
+            if is_session_dead(e):
+                logger.error("[%s] 브라우저 세션이 죽었다(%s) - 이 항목의 문제가 아니므로 "
+                             "재시도하지 않고 올린다", case_no, type(e).__name__)
+                log_error(case_no, "session", e, attempt)
+                raise BrowserSessionLost(str(e)) from e
             logger.warning("[%s] attempt %d/%d failed: %s",
                 case_no, attempt, MAX_RETRY, str(e))
             log_error(case_no, "detail", e, attempt)
@@ -154,6 +220,10 @@ def crawl_court(court: CourtInfo) -> List[AuctionItem]:
             try:
                 result = crawl_detail(driver, item_info, court)
             except Exception as e:
+                # 여기 도달하는 것은 이제 **세션 사망뿐**이다(그 외는 crawl_detail 이
+                # 재시도하고 None 을 돌려준다). 한 번 재시작해 보고, 그래도 죽어 있으면
+                # 예외를 그대로 올린다 - `run_courts()` 가 이 법원을 `failed` 로 센다.
+                # 삼키면 빈 목록이 되고, 그것은 "기일 없음" 과 구별되지 않는다.
                 logger.error("세션 오류 감지: %s. 드라이버 재시작", str(e))
                 driver = restart_driver(driver)
                 result = crawl_detail(driver, item_info, court)
@@ -167,5 +237,11 @@ def crawl_court(court: CourtInfo) -> List[AuctionItem]:
         return all_items
 
     finally:
-        driver.quit()
+        # ★ `quit()` 이 던지면 **원래 오류가 그것으로 바뀐다** - 죽은 세션을 닫을 때
+        #   실제로 일어나는 일이고, 그러면 `run_courts()` 의 로그가 엉뚱한 원인을
+        #   가리킨다. 종료 실패는 종료 실패로만 남긴다.
+        try:
+            driver.quit()
+        except Exception as quit_exc:  # noqa: BLE001 - 원인을 덮지 않는 것이 목적이다
+            logger.warning("브라우저 종료 실패(%s): %s", court.name, quit_exc)
         logger.info("브라우저 종료: %s", court.name)

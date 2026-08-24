@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""응답 캐시 헤더 계약 (2026-08-20 Sprint 237 신설).
+"""응답 캐시 헤더 계약 (2026-08-20 Sprint 237 신설 / 2026-08-24 Sprint 254 확장).
 
 ## 무엇을 잠그나
 
@@ -130,6 +130,90 @@ def run():
             check("★ 조건부 요청이 여전히 304 를 돌려준다", r4.status_code, 304)
             check_true("304 는 본문이 없다(절약이 실제로 일어난다)",
                        len(r4.content) == 0, len(r4.content))
+
+        # --- 5. 조건부 요청의 **나머지 절반** (2026-08-24 Sprint 254 신설) -------
+        #
+        # 위 4번은 강한 `If-None-Match` 하나만 본다. 합산 커버리지로 재보니
+        # `api/http_cache.py` 의 12줄이 **어떤 테스트도 실행하지 않는 상태**였다:
+        #
+        #     65      약한 ETag(`W/`) 접두사 벗기기
+        #     73-79   `_http_date_to_timestamp()` 전체
+        #     121-125 `If-Modified-Since` 분기 전체
+        #
+        # 실제로 두드려 보니 13가지 경우가 전부 RFC 9110 대로 동작했다 — 즉 지금은
+        # **결함이 아니라 미검증**이다. 그래서 고칠 것은 없고 잠글 것만 있다.
+        # 잠그지 않으면 다음 리팩터링이 조용히 깨뜨린다. 그리고 이 경로가 깨지는
+        # 방향은 두 가지인데 **둘 다 사용자에게 보인다**:
+        #
+        #     304 를 못 주면   문서/사진을 매번 다시 받는다(실측 395KB/235KB 낭비)
+        #     304 를 잘못 주면 바뀐 문서를 **옛것으로 보여준다** — 이쪽이 더 나쁘다
+        #
+        # 브라우저는 압축/프록시를 거치면 `W/` 를 붙여 보내고, ETag 가 없는 캐시는
+        # `If-Modified-Since` 만 보낸다. 둘 다 실제로 오는 요청이다.
+        print("\n--- 5. 조건부 요청: 약한 ETag / If-Modified-Since (Sprint 254) ---")
+        import email.utils
+
+        last_modified = r3.headers.get("last-modified")
+        check_true("★ 파일 응답이 Last-Modified 를 준다(IMS 협상의 전제)",
+                   bool(last_modified), r3.headers.get("last-modified"))
+
+        if etag and last_modified:
+            def cond(headers):
+                return client.get(target, headers=dict(HDR, **headers)).status_code
+
+            # (1) 약한 비교 — RFC 9110 §13.1.2 는 If-None-Match 에 약한 비교를 쓰라고 한다.
+            check("★ 약한 ETag(W/) 도 304 다", cond({"If-None-Match": "W/" + etag}), 304)
+            check("★ 소문자 w/ 도 같다", cond({"If-None-Match": "w/" + etag}), 304)
+            check("★ 목록 중 하나만 맞아도 304 다",
+                  cond({"If-None-Match": '"nope", W/' + etag + ', "other"'}), 304)
+            check("★ `*` 는 표현이 있기만 하면 304 다", cond({"If-None-Match": "*"}), 304)
+            check("★ 맞지 않는 ETag 는 200 이다(공허하지 않은 대조군)",
+                  cond({"If-None-Match": '"definitely-not-it"'}), 200)
+
+            file_ts = email.utils.parsedate_to_datetime(last_modified).timestamp()
+
+            # (2) If-Modified-Since — ETag 를 못 쓰는 캐시가 쓰는 경로.
+            check("★ 파일과 같은 시각이면 304 다",
+                  cond({"If-Modified-Since": last_modified}), 304)
+            check("★ 클라이언트 쪽이 더 최신이면 304 다",
+                  cond({"If-Modified-Since":
+                        email.utils.formatdate(file_ts + 60, usegmt=True)}), 304)
+            check("★ 파일이 더 최신이면 200 이다(바뀐 문서를 옛것으로 보여주지 않는다)",
+                  cond({"If-Modified-Since":
+                        email.utils.formatdate(file_ts - 60, usegmt=True)}), 200)
+
+            # (3) 날짜를 못 읽으면 **조건을 무시하고 200** — 잘못 304 를 주는 것보다 안전하다.
+            check("★ 깨진 날짜는 조건을 무시하고 200 이다",
+                  cond({"If-Modified-Since": "not-a-date"}), 200)
+            check("★ 빈 값도 마찬가지다", cond({"If-Modified-Since": ""}), 200)
+
+            # (4) 우선순위 — RFC 9110 §13.1.3: If-None-Match 가 있으면 IMS 는 **보지 않는다.**
+            #     이 규칙이 없으면 ETag 로 "바뀌었다"고 판정한 요청을 날짜가 뒤집는다.
+            check("★ If-None-Match 가 있으면 If-Modified-Since 는 무시한다",
+                  cond({"If-None-Match": '"nope"', "If-Modified-Since": last_modified}), 200)
+
+            # (5) ★ HEAD 에는 304 를 주지 않는다 (의도된 예외).
+            #
+            #     프런트는 문서 뷰어를 열기 전에 HEAD 로 존재를 확인한다
+            #     (`src/app/properties/[id]/page.tsx` 의 `headOk()`). 그 판정은
+            #     `res.ok` 이고 그것은 200~299 에서만 참이다. HEAD 응답에는 애초에
+            #     본문이 없으니 304 로 아낄 바이트가 **0** 인데, 304 를 주면
+            #     "문서 없음" 으로 잘못 읽힐 위험만 생긴다.
+            #     얻는 것이 없으면 위험도 만들지 않는다 - 그 규칙을 여기서 잠근다.
+            head = client.head(target, headers=dict(HDR, **{"If-None-Match": etag}))
+            check("★ HEAD 에는 304 를 주지 않는다(존재 확인이 '없음'으로 뒤집힌다)",
+                  head.status_code, 200)
+            check_true("★ 그래서 res.ok 가 참이다(프런트의 판정 기준)",
+                       200 <= head.status_code < 300, head.status_code)
+            check_true("HEAD 에도 검증자는 그대로 붙는다",
+                       bool(head.headers.get("etag")), dict(head.headers))
+
+            # (6) 304 응답도 검증자를 다시 실어야 한다 — RFC 9110 §15.4.5.
+            #     안 실으면 캐시가 다음 요청에서 조건을 걸 수 없어 304 절약이 1회로 끝난다.
+            r5 = client.get(target, headers=dict(HDR, **{"If-None-Match": etag}))
+            check("★ 304 가 ETag 를 다시 실어 준다", r5.headers.get("etag"), etag)
+            check("★ 304 가 Last-Modified 를 다시 실어 준다",
+                  r5.headers.get("last-modified"), last_modified)
 
     print("\n" + "=" * 64)
     if failures:

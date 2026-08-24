@@ -74,6 +74,11 @@ def _http_date_to_timestamp(value: str) -> Optional[float]:
         parsed = email.utils.parsedate_to_datetime(value)
     except (TypeError, ValueError):
         return None
+    # ★ 이 줄은 **이 인터프리터에서는 도달하지 않는다** (2026-08-24 Sprint 254 실측).
+    #   Python 3.12.10 의 `parsedate_to_datetime()` 은 못 읽으면 항상 ValueError 를
+    #   던진다(위 except 가 잡는다). None 을 돌려주던 것은 3.9 이하다.
+    #   그래서 커버리지에 영원히 빨간 줄로 남고, 어떤 변이를 넣어도 죽지 않는다 —
+    #   **테스트 구멍이 아니라 버전 방어다.** 커버리지 숫자를 이유로 지우지 말 것.
     if parsed is None:
         return None
     return parsed.timestamp()

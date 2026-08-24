@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
-import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
+import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, headOk, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { resolveNavContext } from './navContext'
@@ -310,9 +310,11 @@ export default function PropertyDetailPage() {
     // 이미 확인한 문서는 다시 묻지 않는다(같은 페이지 세션 안에서만 유효한 캐시).
     if (docCheckResult[docCheckKey]) return
     const key = docCheckKey
-    fetch(`${API_BASE_URL}/api/v1/item/${id}/documents/${viewingDoc}`, { method: 'HEAD' })
-      .then((res) => setDocCheckResult((prev) => ({ ...prev, [key]: res.ok ? 'ok' : 'notfound' })))
-      .catch(() => setDocCheckResult((prev) => ({ ...prev, [key]: 'notfound' })))
+    // 2026-08-24 Sprint 252: 맨 fetch 였다 — 시간 제한이 없어 백엔드가 멈추면 then/catch
+    // 어느 쪽도 불리지 않고 뷰어가 확인 상태에 영원히 남았다. api.ts 의 headOk 로 옮겨
+    // 다른 요청과 같은 한도를 쓴다(실패는 전부 notfound 로 떨어지는 기존 동작 유지).
+    headOk(`/api/v1/item/${id}/documents/${viewingDoc}`)
+      .then((ok) => setDocCheckResult((prev) => ({ ...prev, [key]: ok ? 'ok' : 'notfound' })))
   }, [docCheckKey, viewingDoc, id, docCheckResult])
   useEffect(() => {
     async function fetchData() {

@@ -737,11 +737,63 @@ def test_row_to_subscription_shapes_agree():
         check_true("payments 는 %s 를 내지 않는다(판정은 한 곳에서)" % k, k not in a, sorted(a))
 
 
+def test_every_plan_prices_every_billing_cycle():
+    """모든 `VALID_PLANS` x `VALID_BILLING_CYCLES` 조합에 가격이 있는가 (2026-08-24 Sprint 253).
+
+    ## 왜 이 검사가 생겼나 — 커버리지 구멍에서 시작했다
+
+    `api/v1/payments.py` 는 96% 커버리지인데 미실행 14줄이 전부 오류/롤백 분기였다.
+    그중 350행이 눈에 걸렸다:
+
+        expected_amount = resolve_plan_price(req.plan, billing_cycle)
+        if expected_amount is None:
+            return error_response(ErrorCode.PAY_INVALID_PLAN, "구독 플랜이 올바르지 않습니다")
+
+    바로 위에서 `req.plan not in VALID_PLANS` 를 이미 걸렀는데 **또** 플랜 오류를 낸다.
+    즉 "플랜 목록은 통과했지만 가격이 없는" 상태를 위한 방어다. 실제로 그런 상태가 될 수
+    있는가를 확인했다:
+
+        VALID_PLANS          = tuple(PLAN_CATALOG.keys())          <- 카탈로그에서 파생(단일 소스)
+        VALID_BILLING_CYCLES = (MONTHLY, YEARLY)                   <- **독립 리터럴**
+
+    앞쪽은 파생이라 어긋날 수 없다. 뒤쪽은 아니다 — 새 플랜을 추가하면서 `prices` 에
+    `YEARLY` 를 빼먹으면, 플랜 검사는 통과하고 가격만 None 이 된다. 그때 사용자가 보는
+    문구는 **"구독 플랜이 올바르지 않습니다"** 다. 가격표에 구멍이 난 것인데 사용자에게는
+    플랜을 잘못 고른 것처럼 안내된다 — 이 저장소가 반복해서 잡아 온 "사실과 다른 안내"다.
+
+    2026-08-24 실측: 4개 조합(BASIC/PRO x MONTHLY/YEARLY) 전부 가격이 있다.
+    그래서 지금 350행은 **도달 불가**다. 그 상태를 못 박는다 — 도달 가능해지는 순간
+    이 검사가 먼저 실패해서, 사용자가 잘못된 안내를 받기 전에 드러난다.
+    """
+    print("\n--- 플랜 x 결제주기 가격 완전성 (Sprint 253) ---")
+    from api.v1.payments import (PLAN_CATALOG, VALID_PLANS, VALID_BILLING_CYCLES,
+                                 resolve_plan_price)
+
+    check_true("검사가 공허하지 않다(플랜/주기를 실제로 읽었다)",
+               len(VALID_PLANS) >= 1 and len(VALID_BILLING_CYCLES) >= 1,
+               (VALID_PLANS, VALID_BILLING_CYCLES))
+    check("VALID_PLANS 는 카탈로그에서 파생된다(하드코딩 사본 아님)",
+          sorted(VALID_PLANS), sorted(PLAN_CATALOG.keys()))
+
+    gaps = []
+    for plan in VALID_PLANS:
+        for cycle in VALID_BILLING_CYCLES:
+            price = resolve_plan_price(plan, cycle)
+            if price is None or price <= 0:
+                gaps.append("%s/%s=%r" % (plan, cycle, price))
+    check("★ 가격이 없는 (플랜, 결제주기) 조합", sorted(gaps), [])
+    if gaps:
+        print("      -> 이 조합을 고른 사용자는 '구독 플랜이 올바르지 않습니다'를 본다."
+              " 플랜이 아니라 **가격표**가 빈 것이다(payments.py:350)")
+    print("    조합 %d개 전부 가격 있음" % (len(VALID_PLANS) * len(VALID_BILLING_CYCLES)))
+
+
 def run():
     test_row_to_subscription_shapes_agree()
     test_plan_prices()
     test_registry_limits()
     test_invalid_combinations()
+    test_every_plan_prices_every_billing_cycle()
     test_discount_structure()
     test_monthly_reset_and_plan_limit()
     test_auction_case_composite_key()

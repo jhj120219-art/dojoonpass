@@ -368,6 +368,275 @@ def test_runlock_is_atomic_under_concurrency():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+def test_runlock_reclaim_token_contention():
+    """오래된 락을 **두 실행이 동시에 회수하려 할 때** 한 쪽만 들어간다
+    (2026-08-24 Sprint 254 신설).
+
+    ## 왜 이것까지 봐야 하나
+
+    회수 자체는 위 6번이 본다. 그런데 회수는 "오래된 락 파일을 지우고 새로 만드는"
+    **여러 단계**라, 두 실행이 같이 들어오면 둘 다 성공할 수 있다. 그래서 제품은
+    `<lock>.reclaim` 토큰을 배타적으로 만들어 회수 구간 자체를 하나로 좁힌다.
+
+    그 토큰 경합 경로가 합산 커버리지에서 **한 줄도 실행되지 않고 있었다**
+    (`storage/checkpoint.py` 148-166). 하필 이 구간이 뚫리면 **두 워커가 동시에
+    돈다** — 그것이 BUGS #181(회수당한 행을 옛 실행이 종결한다)의 전제 조건이다.
+    즉 이 검사는 #181 의 **한 층 위**를 지킨다.
+
+    토큰 파일을 직접 만들어 두면 확률 없이 그 경로를 밟을 수 있다.
+    """
+    print("\n--- 8. RunLock: 회수 토큰 경합 (Sprint 254) ---")
+    import os
+    import shutil
+    import time
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "z.lock")
+        token = path + ".reclaim"
+        STALE = 5.0
+        old = time.time() - (STALE + 1) * 3600
+
+        owner = RunLock(path, stale_hours=STALE, label="owner")
+        check("설정: 소유자가 락을 잡는다", owner.acquire(), True)
+        os.utime(path, (old, old))       # 그 소유자는 죽었다고 치자
+
+        # (1) 다른 실행이 **지금 회수 중**이다 — 갓 만든 토큰이 있다.
+        with open(token, "w") as f:
+            f.write("qa-other-reclaimer")
+        check("★ 회수가 진행 중이면 물러난다(둘이 동시에 회수하지 않는다)",
+              RunLock(path, STALE, "late").acquire(), False)
+        check_true("남의 회수 토큰을 지우지 않는다", os.path.exists(token), token)
+
+        # (2) 회수하다 **죽은** 토큰 — 토큰 자체가 오래됐다.
+        os.utime(token, (old, old))
+        check("★ 죽은 회수 토큰은 넘어서 회수한다(영구 교착이 되지 않는다)",
+              RunLock(path, STALE, "recoverer").acquire(), True)
+        check_true("회수가 끝나면 토큰을 치운다(다음 실행을 막지 않는다)",
+                   not os.path.exists(token), "토큰이 남았다: %s" % token)
+        check_true("회수한 쪽이 락을 가진다", os.path.exists(path), path)
+
+        # (3) 죽은 토큰을 **둘이 동시에** 넘어서려 할 때. 하나가 지우고 새로 만드는
+        #     사이에 다른 하나가 먼저 가져가면, 진 쪽은 물러나야 한다.
+        #     여기가 뚫리면 둘 다 회수 구간에 들어가고 = 두 워커가 동시에 돈다.
+        os.utime(path, (old, old))
+        with open(token, "w") as f:
+            f.write("qa-dead-reclaimer")
+        os.utime(token, (old, old))
+
+        loser = RunLock(path, STALE, "loser")
+        real_create = loser._create_exclusive
+        seen = {"reclaim_calls": 0, "stolen": False}
+
+        def create_but_lose_the_token(target):
+            # 순서를 따라간다:
+            #   1회차  이미 있는 죽은 토큰 때문에 실패 -> 제품이 그것을 지운다
+            #   2회차  제품이 새 토큰을 만들려는 **그 순간** 경쟁자가 먼저 만든다
+            if target.endswith(".reclaim"):
+                seen["reclaim_calls"] += 1
+                if seen["reclaim_calls"] == 2:
+                    seen["stolen"] = True
+                    with open(target, "w") as fh:
+                        fh.write("qa-winner")
+            return real_create(target)
+
+        loser._create_exclusive = create_but_lose_the_token
+        got = loser.acquire()
+        check_true("검사가 공허하지 않다(2회차에서 경쟁자가 실제로 토큰을 가져갔다)",
+                   seen["stolen"], seen)
+        check("★ 토큰 경쟁에서 지면 회수하지 않고 물러난다", got, False)
+        check_true("진 쪽이 이긴 쪽의 토큰을 지우지 않는다", os.path.exists(token), token)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_reclaim_rechecks_after_taking_the_token():
+    """토큰을 잡은 뒤 **다시 확인한다** — 그 사이 정상적으로 잡힌 락을 빼앗지 않는다.
+
+    토큰을 얻기까지 시간이 걸리는 동안 원래 락이 정상적으로 갱신·재취득될 수 있다.
+    그때 확인 없이 지우면 **살아 있는 실행의 락을 빼앗는다** — 두 워커가 같은
+    다운로드 폴더를 쓰기 시작하고, 큐 행도 서로 뺏는다(BUGS #181 의 전제).
+    """
+    print("\n--- 9. RunLock: 토큰을 잡은 뒤 다시 확인한다 (Sprint 254) ---")
+    import os
+    import shutil
+    import time
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "w.lock")
+        STALE = 5.0
+        old = time.time() - (STALE + 1) * 3600
+
+        # 오래된 락을 만들어 두고, **회수 판정과 실제 회수 사이에** 락을 새것으로 바꾼다.
+        RunLock(path, STALE, "dead").acquire()
+        os.utime(path, (old, old))
+
+        late = RunLock(path, STALE, "late")
+        real_create = late._create_exclusive
+        flipped = {"done": False}
+
+        def create_and_flip(target):
+            ok = real_create(target)
+            # 회수 토큰을 막 잡은 순간 — 그 사이 원래 락이 정상 갱신됐다고 만든다.
+            if ok and target.endswith(".reclaim") and not flipped["done"]:
+                flipped["done"] = True
+                now = time.time()
+                os.utime(path, (now, now))
+            return ok
+
+        late._create_exclusive = create_and_flip
+        got = late.acquire()
+
+        check_true("검사가 공허하지 않다(끼어들기가 실제로 일어났다)",
+                   flipped["done"], flipped)
+        check("★ 그 사이 정상 갱신된 락을 빼앗지 않는다", got, False)
+        check_true("★ 물러날 때 회수 토큰을 남기지 않는다(다음 회수를 막지 않는다)",
+                   not os.path.exists(path + ".reclaim"), "토큰이 남았다")
+
+        # 대조군: 끼어들기가 없으면 같은 상황에서 회수에 성공한다.
+        os.utime(path, (old, old))
+        check("대조군: 끼어들기가 없으면 회수한다",
+              RunLock(path, STALE, "clean").acquire(), True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_reclaims_when_the_lock_vanishes_mid_reclaim():
+    """토큰을 잡은 뒤 락 파일이 **사라져 있으면** 그냥 잡는다.
+
+    소유자가 정상 종료하며 `release()` 한 경우다. "없어졌으니 잡아도 된다" 가
+    맞는 판단이고, 여기서 물러나면 아무도 안 쓰는 락 때문에 한 번을 통째로 건너뛴다.
+    """
+    print("\n--- 10. RunLock: 회수 도중 락이 사라지면 잡는다 (Sprint 254) ---")
+    import os
+    import shutil
+    import time
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "v.lock")
+        STALE = 5.0
+        old = time.time() - (STALE + 1) * 3600
+        RunLock(path, STALE, "dead").acquire()
+        os.utime(path, (old, old))
+
+        late = RunLock(path, STALE, "late")
+        real_create = late._create_exclusive
+        removed = {"done": False}
+
+        def create_and_remove(target):
+            ok = real_create(target)
+            if ok and target.endswith(".reclaim") and not removed["done"]:
+                removed["done"] = True
+                os.remove(path)      # 소유자가 그 사이 정상 종료했다
+            return ok
+
+        late._create_exclusive = create_and_remove
+        got = late.acquire()
+
+        check_true("검사가 공허하지 않다(락이 실제로 사라졌다)", removed["done"], removed)
+        check("★ 사라진 락 때문에 한 번을 건너뛰지 않는다", got, True)
+        check_true("회수 토큰은 치운다", not os.path.exists(path + ".reclaim"), "토큰 잔존")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_takes_a_lock_that_vanishes_while_being_inspected():
+    """락이 **있다고 본 직후 사라지면** 곧바로 다시 잡는다 (2026-08-24 Sprint 254).
+
+    소유자가 정확히 그 순간 `release()` 한 경우다. 여기서 물러나면 아무도 쓰지 않는
+    락 때문에 그 실행을 통째로 건너뛴다 - 하루치 수집이 사라진다는 뜻이다.
+
+    ★ 이 경로는 원래 `test_doc_worker_recovery.py` 의 **스레드 8개 검사**가
+      "가끔" 밟고 있었다(합산 커버리지가 실행마다 달라지는 것으로 드러났다).
+      가끔 밟는 것은 방어선이 아니다 - 창을 직접 벌려 확률을 없앤다.
+    """
+    print("\n--- 11. RunLock: 확인하는 사이 락이 사라지면 잡는다 (Sprint 254) ---")
+    import os
+    import shutil
+    tmp, RunLock = _lock_env()
+    try:
+        path = os.path.join(tmp, "u.lock")
+        check("설정: 소유자가 락을 잡는다", RunLock(path, 5, "owner").acquire(), True)
+
+        late = RunLock(path, 5, "late")
+        real_create = late._create_exclusive
+        vanished = {"done": False}
+
+        def create_then_vanish(target):
+            ok = real_create(target)
+            # 첫 시도는 실패한다(락이 있다). 그 직후 소유자가 정상 종료한다.
+            if not ok and target == path and not vanished["done"]:
+                vanished["done"] = True
+                os.remove(path)
+            return ok
+
+        late._create_exclusive = create_then_vanish
+        got = late.acquire()
+
+        check_true("검사가 공허하지 않다(확인 직후 실제로 사라졌다)",
+                   vanished["done"], vanished)
+        check("★ 사라진 락 때문에 실행을 건너뛰지 않는다", got, True)
+        check_true("잡았으면 락 파일이 있다", os.path.exists(path), path)
+        check_true("불필요한 회수 토큰을 만들지 않는다",
+                   not os.path.exists(path + ".reclaim"), "토큰이 남았다")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_runlock_backs_off_when_the_filesystem_is_weird():
+    """지울 수 없는 것이 락/토큰 자리에 있으면 **조용히 물러난다** (2026-08-24 Sprint 254).
+
+    OneDrive 동기화 폴더에서 도는 저장소라 잔여물이 남는 일이 실제로 있다(이 파일
+    상단이 그 사고를 이미 기록하고 있다). 그 자리에 디렉터리가 남아 있으면
+    `os.remove()` 가 던진다 - 그때 예외를 위로 올리면 **배치 전체가 죽는다.**
+    락을 못 얻는 것은 실패가 아니라 "이번엔 안 한다" 이므로 False 로 물러나야 한다.
+
+    디렉터리를 파일 자리에 두면 Windows/POSIX 양쪽에서 `os.remove()` 가 OSError 를
+    낸다 - 표준 라이브러리를 갈아 끼우지 않고 그 방어선을 밟을 수 있다.
+    """
+    print("\n--- 12. RunLock: 이상한 파일시스템 상태에서 물러난다 (Sprint 254) ---")
+    import os
+    import shutil
+    import time
+    tmp, RunLock = _lock_env()
+    try:
+        STALE = 5.0
+        old = time.time() - (STALE + 1) * 3600
+
+        # (1) 락 자리에 **디렉터리**가 있다 - 오래됐지만 지울 수 없다.
+        path = os.path.join(tmp, "dir.lock")
+        os.mkdir(path)
+        os.utime(path, (old, old))
+        raised = None
+        got = None
+        try:
+            got = RunLock(path, STALE, "weird").acquire()
+        except Exception as exc:  # noqa: BLE001 - 예외가 나가지 않는 것이 검사 대상이다
+            raised = exc
+        check("★ 락을 지울 수 없어도 예외를 올리지 않는다", raised, None)
+        check("★ 잡지 못했다고 정직하게 답한다", got, False)
+        check_true("치우지 못한 회수 토큰을 남기지 않는다",
+                   not os.path.exists(path + ".reclaim"), "토큰 잔존")
+
+        # (2) 회수 토큰 자리에 **디렉터리**가 있다 - 역시 오래됐지만 지울 수 없다.
+        path2 = os.path.join(tmp, "t.lock")
+        check("설정: 오래된 락을 만든다", RunLock(path2, STALE, "dead").acquire(), True)
+        os.utime(path2, (old, old))
+        token_dir = path2 + ".reclaim"
+        os.mkdir(token_dir)
+        os.utime(token_dir, (old, old))
+        raised = None
+        got = None
+        try:
+            got = RunLock(path2, STALE, "weird2").acquire()
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        check("★ 회수 토큰을 지울 수 없어도 예외를 올리지 않는다", raised, None)
+        check("★ 그때도 잡지 못했다고 답한다", got, False)
+        check_true("★ 남의 것을 지우려다 락까지 날리지 않는다", os.path.exists(path2), path2)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run():
     try:
         test_save_get_clear_roundtrip()
@@ -377,6 +646,11 @@ def run():
         test_runlock_refuses_a_second_holder()
         test_runlock_does_not_steal_a_fresh_lock()
         test_runlock_is_atomic_under_concurrency()
+        test_runlock_reclaim_token_contention()
+        test_runlock_reclaim_rechecks_after_taking_the_token()
+        test_runlock_reclaims_when_the_lock_vanishes_mid_reclaim()
+        test_runlock_takes_a_lock_that_vanishes_while_being_inspected()
+        test_runlock_backs_off_when_the_filesystem_is_weird()
     finally:
         cleanup()
 

@@ -14,10 +14,10 @@ Owner: Project Management
 
 | 항목 | 문서 상태 | **2026-08-21 실측** | 판정 |
 |---|---|---|---|
-| P0-A 데이터 공급 정지 | P0 | 스케줄러 등록 **0개**, `auction_item` 최신 수집일 **2026-08-12**, 기일 남은 물건 **0건** | ~~P0 유지~~ → **2026-08-23 Sprint 267 재실측: "검색 결과 0건"은 해소, 그러나 새 P0급 결함 발견 (아래 참고)** |
-| P0-B 커밋 시 API 부팅 불가 | P0 | `from api_server import app` **성공**, OpenAPI 엔드포인트 **42개** 정상 노출 | **해소** |
-| P0-C migration 020 누락 → 검색/상세 500 | P0 | `auction_image` 테이블 **존재**(45행), `migration_history` 에 `020_create_auction_image.sql` **기록됨** | ~~해소~~ → **2026-08-23 Sprint 267 재실측: 다시 미적용 (500은 아님, 아래 참고)** |
-| P0-2 ADMIN_API_KEY / SUPER_ADMIN_API_KEY | P0 | `.env` 에 **두 키 모두 없음**. admin 라우트 5종 호출 → 전부 **500 `관리자 키 미설정`** | ~~P0 유지~~ → **2026-08-23 Sprint 267 재실측: 둘 다 있다(75/74자), 실제 200/403 재현 - 정상(아래 등급 재분류 논의는 유효)** |
+| P0-A 데이터 공급 정지 | P0 | 스케줄러 등록 **0개**, `auction_item` 최신 수집일 **2026-08-12**, 기일 남은 물건 **0건** | **P0 유지** — 2026-08-24 재실측으로 **다시 확인**: 기일 남은 물건 **0건**, `GET /api/v1/search` **total 0**, 예약 작업 **0개**. Sprint 267의 "해소"는 이 저장소 상태에서 **재현되지 않는다**(아래 Sprint 251 절의 대조표) |
+| P0-B 커밋 시 API 부팅 불가 | P0 | `from api_server import app` **성공**, OpenAPI 엔드포인트 정상 노출(2026-08-24 실측 **38개** — 이전 기록의 42개와 다르나 부팅/노출 자체는 정상) | **해소** |
+| P0-C migration 020 누락 → 검색/상세 500 | P0 | `auction_image` 테이블 **존재**(45행), `migration_history` 에 `020_create_auction_image.sql` **기록됨** | **해소** — 2026-08-24 재실측: `auction_image` **45행**, `migration_history` 에 `020_create_auction_image.sql` (applied 2026-08-17T09:03). Sprint 267의 "다시 미적용"은 이 저장소 상태에서 **재현되지 않는다** |
+| P0-2 ADMIN_API_KEY / SUPER_ADMIN_API_KEY | P0 | `.env` 에 **두 키 모두 없음**. admin 라우트 5종 호출 → 전부 **500 `관리자 키 미설정`** | **P0 유지** — 2026-08-24 재실측: 두 키 모두 **미설정**(`.env` 에는 SUPABASE_* 3개뿐), admin 라우트 5종 호출 → 키 없음/틀린 키 모두 **500 `관리자 키 미설정`**. Sprint 267의 "둘 다 있다"는 **재현되지 않는다** (`.env` 변경은 승인 영역 → SKIP) |
 | P0-3 Supabase Site URL / Redirect URLs | P0 | 이 세션에서 확인 불가(외부 콘솔 = 승인 영역) | **판정 보류** |
 | P0-4 `.env` 에 `SUPABASE_JWT_SECRET` 없음 | P0 | **설정돼 있다**(88자). 런타임 `api.auth` 에서 HS256 시크릿 + JWKS URL 둘 다 해석됨 | ~~해소~~ → **2026-08-23 Sprint 267 재실측: 다시 없다 (아래 참고)** |
 
@@ -206,6 +206,243 @@ mutation 으로 확인했다 — `mark_queue_skipped_expired()` 가 `document_st
 > ~~위 결론은 2026-08-23 Sprint 267에서 낡은 것으로 확인됐다~~ → **최신 결론은 아래
 > Sprint 267 절 참고: "검색 결과 0건"은 사라졌지만 "DocWorker 미등록으로 상세 화면
 > 사진/문서의 89%가 비어 있다"는 같은 뿌리의 다른 증상이 P0로 남아 있다.**
+
+---
+
+## ★ [2026-08-24 Sprint 252] 프런트 요청 타임아웃 신설 + 미검증 진입점 3개 회귀 (승인 불필요분)
+
+Sprint 251 과 같은 날, 승인 없이 가능한 축을 이어서 소진했다. 상세는
+`docs/SPRINT252_TIMEOUTS_AND_UNCOVERED_ENTRYPOINTS.md`.
+
+### 고친 제품 결함
+
+| # | 결함 | 사용자 영향 | 근거 |
+|---|---|---|---|
+| 1 | `src/lib/api.ts` 의 **모든 fetch 에 시간 제한이 없었다** | 백엔드가 멈추면 화면이 `불러오는 중...` 에서 **영원히** 멈춘다. 각 화면의 실패 UI 가 이미 있는데 **도달하지 못했다** | 무응답 서버 실측: 타임아웃 없음 15,000ms 후에도 pending / 3초 타임아웃 3,007ms 종료 |
+| 2 | `properties/[id]` 의 문서 존재 확인이 **api.ts 밖 맨 fetch** | 같은 이유로 문서 뷰어가 확인 상태에 남는다 | 소스 전수 스캔에서 api.ts 밖 유일한 fetch |
+| 3 | 그 요청에 `cache: 'no-store'` 누락 | 브라우저가 HEAD 응답을 재사용하면 **이미 사라진 문서에 뷰어가 열린다** | `test_search.py` 의 기존 신선도 검사가 이동 직후 잡아냈다 |
+| 4 | `mvp_scraper.save_csv_backup()` 이 **cwd 상대경로** | 다른 폴더에서 실행하면 백업 CSV 가 거기 떨어진다("백업이 있다"고 믿는데 저장소엔 없다) | Sprint 245/246 이 고친 cwd 계열의 **마지막 잔존 1건** |
+
+새 한도: JSON `8000ms` / 파일 다운로드 `60000ms`. 8초 근거 — JSON 왕복 p95 ~30ms,
+DB 계층 p95 ≤ 1.5ms(실측). 정상 요청은 8초 근처에도 가지 않고, 크게 잡을수록
+"고장인데 조용한 시간"만 길어진다.
+
+### 아무도 실행하지 않던 진입점에 회귀를 붙였다
+
+전체 스위트를 **모듈 단위 합산 coverage** 로 재서 "어떤 제품 코드가 아무 테스트도 지나지
+않나"를 물었다(기존 `audit_test_reality.py` 는 그 반대를 잰다).
+
+```
+refresh_priority.py   커버리지 0%   ★ 매일 01:50 에 돌 스케줄 진입점
+mvp_scraper.py        38%           ★ BUGS #47(성공으로 위장한 실패)이 태어난 배선
+crawler/base_crawler.py 55%          그중 순수 판단은 wait_for_detail() 하나뿐
+```
+
+신규 테스트 4개(`test_refresh_priority.py` / `test_crawl_orchestration.py` /
+`test_wait_for_detail.py` / `tests/api-timeout.test.mjs`).
+**mutation 24건 전부 검출**(5/5, 3/3, 1/1, 5/5, 6/6, 4/4) — BUGS #47 회귀,
+Sprint 63/121/189 회귀를 각각 주입해 확인했다.
+
+### 측정으로 **기각한** 가설 (변경 없음)
+
+| 가설 | 실측 결과 |
+|---|---|
+| WAL 이 아니라 긴 쓰기가 읽기를 막는다 | **아니다.** BEGIN IMMEDIATE 는 RESERVED 락이라 읽기 0ms 성공. WAL 로 바꿔도 동일 |
+| migrate 단일 트랜잭션이 사용자 쓰기를 막는다 | **아니다.** 전체 122ms(8,888행), 동시 사용자 쓰기 21ms 성공 |
+| 로그가 무한히 커진다 | 연 19MB(scraper) 규모. Windows 다중 프로세스 rotation 위험이 이득보다 크다 -> 근거 남기고 보류 |
+| `sigungu` 동명이인으로 잘못된 결과 | 결함 아님. 결과 카드가 `full_address`("서울특별시 중구…")를 먼저 보여준다 |
+| 사건번호 정규식 4벌이 드리프트 | 입력 도메인이 다른 의도적 분화. 실데이터 269 대 269 로 동일 판정 |
+
+### 프로덕션 빌드 검증
+
+`npm start`(빌드 산출물)에서도 계약 스위트 **179/183 통과**(dev 와 동일), 인증 게이트
+307 + `?redirect=` 보존, 커스텀 404 동작. 페이지 p50 6.6~11.9ms / p95 26~35ms.
+
+### 기준선 이동
+
+```
+python  통과 48 -> 52 | 단언 7,719 -> 7,821 | 파일 53 -> 57
+node    175 -> 183 tests (179 PASS)
+tsc 0 / eslint 0 / next build 성공
+운영 DB 무변경(행수·integrity_check·FK 전후 동일)
+```
+
+---
+
+## ★ [2026-08-24 Sprint 253] 타임아웃이 **헤더까지만** 보호했다 + API 2차 Audit (승인 불필요분)
+
+상세: `docs/SPRINT253_TIMEOUT_COVERS_BODY_AND_API_AUDIT.md`
+
+### 고친 제품 결함
+
+| # | 결함 | 사용자 영향 | 근거 |
+|---|---|---|---|
+| 1 | Sprint 252 의 타임아웃이 **본문 소비를 보호하지 않았다** | 백엔드가 응답을 흘리기 시작한 뒤 멈추면 화면이 **여전히 영원히** `불러오는 중...` | 헤더 200 뒤 본문 정지 서버: 수정 전 14,000ms 후에도 pending / 수정 후 8,009ms 에 408 |
+| 2 | 호출부가 준 `signal` 을 **덮어써 버렸다** | 화면이 "이동하면 이전 요청 취소"를 붙이는 순간 조용히 무시된다. 사용자 취소가 408(서버 장애)로 보고될 수도 있었다 | `{ ...init, signal: controller.signal }` 이 caller signal 을 덮어쓴다 |
+
+`timedFetch(...) -> Response` 를 `timedRequest(..., consume) -> T` 로 바꿔 **헤더 + 상태
+판정 + 본문 파싱**을 한 타이머 안에 넣었다. `fetchAuthedRaw` 는 본문을 전량 받아 새
+`Response` 로 돌려주므로 호출부 계약(`res.ok`/`headers`/`json()`/`blob()`)은 그대로다.
+
+### API 2차 Audit — 실제 HTTP, ★ 0건
+
+```
+IDOR             보호 라우트 10종 x (무인증 / alg=none 위조) = 20회 -> 전부 401
+쓰기 차단         POST·DELETE·PATCH 7종 -> 사용자 401 / admin 500(fail-closed)
+pagination       size 0·101·1000·99999 -> 422 / page 95·100000 -> items 0 (오류 아님)
+페이지 무결성      94페이지 전수: 수집 1,876 / **중복 0**
+오류 누출         탐침 5종 -> Traceback·경로·sqlite3 문자열 0건
+SSRF/리다이렉트    외부 호스트 리다이렉트 0건
+동시 요청         같은 GET 12회 병렬 -> 응답 1종(완전 동일)
+rate limiting    40연속 429 0건 = **미구현** (127.0.0.1 바인딩. 한도 정책은 승인 영역)
+```
+
+### DB Audit — 중복/상태전이 18항목 전부 0
+
+중복 8축(auction_item·auction·document_queue·document_status·doc_raw·auction_image·
+favorites·recent_items) 0건. 모순 10축(READY↔doc_raw, 큐 done↔화면 COLLECTING,
+in_progress 잔존, retry 초과, 기일↔상태, 가격 역전, bid_rate 범위) 전부 0건.
+
+### 프런트 늦은 응답(stale response) 전수 확인 — 결함 없음
+
+가드가 없는 4개 화면은 effect 의존성이 고정(`[router]`/`[]`)이라 마운트 1회만 돈다 —
+늦은 응답이 새 상태를 덮어쓰는 경로가 구조적으로 없다. 가드가 필요한 두 곳
+(`properties/[id]`, `SearchForm`)에는 이미 있다.
+
+### 측정으로 기각/보류
+
+| 가설 | 결과 |
+|---|---|
+| 큐 claim 이 매번 2,753행을 정렬한다 | **아니다.** `ANALYZE` 후 `idx_queue_priority` 로 정렬 없이 0.052ms. 6.5배(22,769행)에서만 TEMP B-TREE 로 3.75ms |
+| 복합 인덱스가 그것을 고친다 | **아니다.** 추가해도 3.76ms(SQLite 가 여전히 `idx_queue_status` 선택) -> 마이그레이션 근거 소멸 |
+| 클라이언트 retry 를 넣어야 한다 | `postJSON`/`deleteJSON` 은 멱등이 아니다(결제·관심물건). 무엇을 재시도할지는 제품 결정 |
+
+### 결제 경로 가드 1건 신설
+
+`payments.py:350`(플랜 검사를 통과했는데 가격이 None)은 지금 **도달 불가**지만,
+`VALID_PLANS` 는 카탈로그 파생인데 `VALID_BILLING_CYCLES` 는 독립 리터럴이라 드리프트가
+가능하다. 새 플랜에 `YEARLY` 가격을 빼먹으면 사용자는 "구독 플랜이 올바르지 않습니다"를
+본다(가격표 구멍인데 플랜 오류로 안내됨). 4개 조합 전부 가격 있음을 검사로 못 박았다.
+
+### 결제 상태 CAS 분기 회귀 신설 (돈 관련 커버리지 0 -> 검증)
+
+`_apply_webhook_event()` 의 `rowcount == 0` 분기(늦게 도착한 PG 노티가 **이미 환불된
+결제를 다시 PAID 로 되돌리는 것**을 막는 자리)가 커버리지 0 이었다. 기존 검사는 소스에
+`WHERE id=? AND status=?` 문자열이 있는지만 봤다.
+
+저장소에 이미 있던 `_InterleavingConn` 방식을 따라 `UPDATE payments` 직전에 다른
+커넥션으로 상태를 바꿔 놓아 **rowcount 0 을 결정적으로** 만들었다.
+skip 응답 / 사유 문구 / **끼어든 쪽 상태 보존** / webhook 종결까지 확인.
+mutation 2/2 검출(CAS 조건 제거, rowcount 검사 제거).
+
+### 기준선 이동
+
+```
+node 183 -> 188 tests (184 PASS) | python 단언 7,825 -> 7,834
+mutation 4축 18건 전부 검출 (타임아웃 8/8, no-store 4/4, 가격표 4/4, 결제 CAS 2/2)
+테스트 자체 결함 2건 수정: 제품 종료에 의존 -> watchdog / 소켓 누수 318초 -> 16.8초
+tsc 0 / eslint 0 / 운영 DB 무변경
+```
+
+---
+
+<!-- P0A-VERDICT: OPEN -->
+<!-- 위 한 줄이 P0-A(기본 검색이 빈 화면)의 **기계 판독용 판정**이다.
+     OPEN = 지금 제품이 깨져 있다 / RESOLVED = 지금 정상이다.
+     test_pipeline_integrity.py 의 `test_checklist_p0a_verdict_matches_reality()` 가
+     이 토큰을 **실제 DB 측정값과 대조**한다 - 둘이 어긋나면 스위트가 빨개진다.
+     아래 산문을 고칠 때 이 토큰을 함께 바꾸지 않으면 테스트가 잡아 준다. -->
+
+## ★★★ [2026-08-24 Sprint 251] 바로 아래 Sprint 267 절은 **이 저장소의 현재 상태에서 재현되지 않는다**
+
+Sprint 267(2026-08-23)은 "P0-A 는 더 이상 사실이 아니다 — 검색 275건, `DOJOONPASS_DAILY`
+가 매일 03:00 정상 실행"이라고 적었다. 2026-08-24 08:45~08:55 에 같은 항목을 전부 다시
+쟀더니 **하나도 일치하지 않는다.** 어느 쪽이 옳은지 단정하지 않고, 잰 것만 적는다.
+
+```
+항목                       Sprint 267 기록(2026-08-23)   2026-08-24 실측
+-------------------------  ----------------------------  --------------------------------
+auction_item 총 행           2,360                        1,876
+기일 미도래 물건             275건                        0건   (최종 기일 2026-08-19)
+GET /api/v1/search           total 275                    total 0        (HTTP 200)
+  ?include_closed=true       total 2,360                  total 1,876    (HTTP 200)
+  ?sido=서울                 total 49                     total 0        (HTTP 200)
+DOJOONPASS_DAILY             Ready / 08-22 03:00 / 결과 0  **존재하지 않음**
+저장소를 가리키는 예약 작업   1개                          **0개** (전체 249개 전수 스캔)
+logs/daily_run.log           [SUCCESS] Finished 08-22 4:48 mtime 2026-08-11 17:05
+                                                          마지막 완료줄 "Finished at 2026-08-02"
+document_queue               pending 4,883 / done 549      pending 2,753 / done 559
+                             SKIPPED_EXPIRED 178/refresh 9 SKIPPED_EXPIRED 186 / refresh 0
+item id=173 (2024타경2981)   기일 2026-09-02               기일 2026-08-05
+auction_image 테이블         "테이블 자체가 없다"(P0-C)     **있다, 45행**
+auction_item crawl_date max  (미기재)                      2026-08-12
+```
+
+측정 방법(전부 읽기 전용):
+
+- DB 경로는 추측하지 않고 제품 코드가 쓰는 것을 그대로 물었다 —
+  `storage.database.DB_PATH` -> `...\dojoonpass\auction.db` (5,246,976 bytes, 단일 파일.
+  저장소 안의 다른 `.db` 는 0바이트 `auction_data.db` 뿐이다).
+- **이 파일의 mtime 은 내가 열기 전 기준 2026-08-21 19:19 이었다.** 그러므로 이 파일이
+  2026-08-22/23 의 크롤 결과를 담고 있을 수 없다. (`auction.db` 는 `.gitignore:64`
+  `*.db` 로 추적 대상이 아니라 git 이력으로는 확인할 수 없다.)
+- 예약 작업은 세 가지 독립적인 방법으로 확인했다 — `Get-ScheduledTask` 전수(249개)의
+  Action 문자열 매칭, 이름 정규식 `(?i)dojoon`, 그리고 별도 도구
+  `python audit_schedule_health.py`. 셋 다 0개.
+- API 는 로컬에서 실제로 띄워 HTTP 로 호출했다(`api_server.py`, 127.0.0.1:8000).
+
+**지금 유효한 판정**
+
+```
+[P0] 크롤 정지 -> 기일 남은 물건 0건 -> 기본 검색이 빈 화면
+     이 저장소의 현재 상태에서 **여전히 재현된다.**
+     test_pipeline_integrity.py 의 "기본 검색에 뜰 물건이 남아 있다" 가 지금 FAIL 이다
+     (2026-08-24 전체 실행: 통과 48 / 실패 1 - 그 1건이 이것이다).
+```
+
+### 조치 **순서**도 이번에 재서 바로잡는다 — DocWorker 부터 등록하면 아무 일도 안 일어난다
+
+바로 아래 Sprint 267 절은 "활성 물건의 89%가 문서/사진이 비어 있다 → DocWorker 등록이
+P0"이라고 적었다. **이 저장소 상태에서는 그 처방이 아무것도 바꾸지 못한다.** 이유를 쟀다:
+
+```
+document_queue pending                 2,753행
+  그중 기일이 이미 지난 행             2,753행  (100%)
+  그중 기일이 남은 행                      0행
+  auction_date 가 비어 있는 행             0행
+큐의 auction_date 최댓값                2026-08-19  (오늘 2026-08-24)
+```
+
+`doc_worker.py` 의 2차 방어선은 `auction_date < today` 인 행을 **브라우저를 열기 전에**
+`mark_queue_skipped_expired()` 로 종결한다. 즉 지금 DocWorker 를 등록해 돌리면
+2,753행을 전부 `SKIPPED_EXPIRED` 로 닫고 **문서는 한 건도 수집하지 않는다.**
+(고아 큐 행 18개도 같은 이유로 지금 낭비 비용이 0이다 — `audit_asset_integrity.py` [7]
+참고. 그 도구는 2026-08-24 이전까지 이 12행을 "워커가 실제로 수집을 시도할 행"으로
+세고 있었고, 같은 세션에 함께 고쳤다.)
+
+**따라서 뿌리는 하나다: 크롤이 멈춰 있다.** 순서는 DailyCrawl 이 먼저고, 새 물건이
+들어와 기일이 남은 큐가 생긴 다음에야 DocWorker/PriorityRefresh 가 할 일이 생긴다.
+(세 개를 한 번에 등록해도 무방하다 — 순서가 뒤바뀌면 안 된다는 뜻이 아니라,
+DocWorker 만 등록하고 "이제 됐다"고 끝내면 안 된다는 뜻이다.)
+
+**조치는 승인 영역이라 이 세션에서 하지 않았다** — 예약 작업 등록도, 실크롤도,
+DB 수정도 하지 않았다. 사람이 할 일은 하나다:
+
+```
+python audit_schedule_health.py           # 먼저 현재 상태를 직접 잰다 (읽기 전용)
+.\register_scheduler_tasks.ps1            # 무엇이 등록될지 본다 (dry-run, 아무것도 안 바꾼다)
+.\register_scheduler_tasks.ps1 -Apply     # 실제 등록
+```
+
+`-SkipCoveredByLegacy` 는 **지금 붙이지 말 것** — 커버 중인 기존 작업이 0개라 효과가
+없고, 그 스위치의 설명문이 "DOJOONPASS_DAILY 가 정상 실행 중"이라고 잘못 적고 있던
+것을 2026-08-24 에 정정했다(같은 세션에서 그 오탐/누락 두 건도 함께 고쳤다 —
+`register_scheduler_tasks.ps1` 의 기존 작업 탐지가 `Execute` 에 .bat 을 직접 넣어
+등록한 작업을 통째로 놓쳤고, `Get-ScheduledTaskInfo` 를 `-TaskPath` 없이 불러
+루트 밖 폴더의 작업 이력을 못 읽었다. `test_schema_hygiene.py` 가 회귀를 잠근다).
+
+**문서에 박힌 숫자는 언제든 stale 해진다.** 이 절의 숫자도 마찬가지다 —
+믿지 말고 `python audit_schedule_health.py` 로 직접 재라.
 
 ---
 
@@ -1191,6 +1428,47 @@ moderate 1 / high 6 / 합계 7
 **스냅샷보다 낮아지면 실패**한다(오프라인 판정). 새 CVE 는 오프라인으로 알 수 없으므로
 `npm audit` 재실측은 여전히 사람이 주기적으로 해야 한다 - 이 표가 그 기준점이다.
 
+#### ★ 2026-08-24 Sprint 251 재실측 — 표는 그대로, **우선순위 근거가 바뀐다**
+
+`npm audit --json` 을 다시 돌렸다. 패키지 7개·등급 분포(moderate 1 / high 6)·설치본이
+**전부 위 표와 같다**(`package-lock.json` 대조로 7/7 일치, 드리프트 0). 바뀐 것은 둘이다.
+
+```
+npm 이 제시하는 next 수정본   16.3.1  ->  16.3.2   (isSemVerMajor 여전히 false)
+```
+
+그리고 **권고 9건 중 이 앱에 가장 직접적인 것을 이 문서가 이름으로 부르지 않고 있었다.**
+지금까지는 CVE-2026-64641(Server Actions 미인증 DoS)만 이름이 있었는데, 같은 묶음에
+이것이 있다:
+
+```
+GHSA-6gpp-xcg3-4w24
+  Middleware / Proxy bypass in App Router applications using Turbopack and single locale
+  high / CWE-285(인가 우회) / 해당 범위 >=16.0.0 <16.2.11  -> 설치본 16.2.9 는 해당됨
+```
+
+이 앱의 **라우트 단위 인증 게이트는 `src/proxy.ts` 하나뿐**이고
+(`PROTECTED_PREFIXES = /properties, /favorites, /mypage`, 미로그인 시 307 —
+오늘 5개 경로에서 실제로 307 + `?redirect=` 보존 확인), `next dev` 배너가
+"Next.js 16.2.9 (Turbopack)", i18n 설정 없음(단일 로케일)이다. **권고가 말하는 전제와
+이 앱의 구성이 일치한다.**
+
+**다만 데이터가 새는 것은 아니다 — 이것도 쟀다.**
+
+```
+개인 데이터 경로   src/lib/api.ts 가 Supabase access_token 을 Authorization: Bearer 로 실어
+                   파이썬 API 를 부른다 (화면이 Supabase 를 직접 읽지 않는다)
+파이썬 API 실측    보호 라우트 6종 x (토큰 없음 / 쓰레기 토큰 / alg=none 위조) = 18회
+                   -> 18회 전부 401.  admin 라우트 5종은 키 미설정으로 전부 500(fail-closed)
+```
+
+즉 게이트가 뚫려도 얻는 것은 **빈 화면 껍데기**이고 사용자 데이터가 아니다.
+그래도 등급을 낮추지 않는다 — 인가 경계가 설계대로 동작하지 않는 상태이고, 앞으로
+화면이 데이터를 직접 읽는 경로가 하나만 생겨도 그 순간 실피해가 된다.
+
+**조치는 그대로 승인 영역이다**(`npm install` 은 빌드/런타임 동작을 바꾼다).
+승인 후 `npm install next@16.3.2` -> `npm audit` 재실측 -> `npm run build` -> 이 표 갱신.
+
 
 ---
 
@@ -1439,3 +1717,51 @@ Sprint257이 새로 만든 탐지 스크립트(`detect_orphaned_queue_court_dryr
 3. python backfill_doc_raw.py --apply            (doc_raw 555행 — 스크래치 검증 완료)
 셋 다 승인 영역이라 이 세션에서 실 DB에는 실행하지 않았다.
 ```
+---
+
+## 2026-08-24 Sprint 254 — 동시성 결함 4건을 찾아 고쳤다 (전부 코드 범위, 승인 불필요)
+
+이번 세션은 **"아무 테스트도 실행하지 않는 제품 코드"** 를 합산 커버리지로 찾아
+들어가는 방식이었다. 그렇게 연 자리에서 결함 4건이 나왔고 전부 고쳤다.
+넷 다 **동시 실행이 있을 때만** 드러나는 부류라, 지금 화면에서 보이지는 않지만
+운영을 시작하는 순간부터 성립한다.
+
+| # | 결함 | 지금 안 보이는 이유 | 출시 후 영향 |
+|---|---|---|---|
+| #180 | 자동 만료 동기화가 그 사이 확정된 구독 상태를 덮어쓴다 | 구독 0건 | **해지가 EXPIRED 로 뒤집히고**, 금지된 전이(CANCELLED→EXPIRED)가 DB 에 남는다. 해지된 구독이 재구독으로 되살아난다 |
+| #181 | 회수당한 큐 행을 옛 실행이 자기 것처럼 종결한다 | 워커가 한 번에 하나만 도는 상태 | 같은 문서를 두 번 받고(법원 부하 2배), 성공한 문서가 'failed' 로 뒤집히며, 남의 재시도 예산이 깎인다 |
+| #182 | 브라우저가 죽어도 재시작 복구가 발동하지 않고, 그 법원이 **"기일 없어 스킵"** 으로 요약된다 | 크롤이 안 돌고 있다(P0-A) | 브라우저가 한 번 죽으면 그 법원이 통째로 유실되는데 **배치는 성공으로 끝난다**(#47 계열) |
+| #183 | 락 자리에 파일이 아닌 것이 있으면 `acquire()` 가 예외를 올려 배치가 죽는다 | 그런 잔여물이 아직 없다 | 락 정리 하나 때문에 그날 수집 전체를 잃는다. OneDrive 동기화 폴더라 실제로 생길 수 있다 |
+
+**#182 는 P0-A 와 직접 이어진다.** 스케줄러를 등록하는 순간(승인 영역) 이 결함이
+살아나는데, 그때 브라우저가 죽으면 **로그와 종료 코드가 "정상"이라고 말한다.**
+등록 전에 고쳐 두는 것이 맞다고 보고 이번에 처리했다.
+
+검증은 전부 실측이다 — 결함마다 결정적 재현(커넥션/파일시스템 래퍼로 창을 직접
+벌린다) → 수정 → 회귀 → mutation. 변이 검출 **7/7, 3/3, 7/7, 6/6**.
+자세한 내용은 `docs/SPRINT254_CLAIM_RACE_BRANCHES.md`, 각 결함은 `docs/BUGS.md`
+#180~#183.
+
+### 이번 세션에 올라간 커버리지 (합산, 실측)
+
+```
+crawler/court_crawler.py    26%  ->  100%     매일 06:00 크롤의 판단 전부가 미검증이었다
+storage/checkpoint.py       85%  ->   96%     락 회수 경합이 한 줄도 안 돌고 있었다
+api/http_cache.py           73%  ->   98%     조건부 요청(약한 ETag / IMS / HEAD)
+storage/database.py         93%  ->   93%     미실행 41줄 -> 37줄 (큐 claim 경쟁 분기 2곳)
+```
+
+(`http_cache.py` 의 남은 1줄과 `checkpoint.py` 의 4줄은 **도달 불가능하거나** 표준
+라이브러리를 갈아 끼워야 밟히는 방어다. 왜 그런지는 코드 옆과 Sprint 254 문서에
+적어 뒀다 - 커버리지 숫자를 맞추려고 테스트를 비틀지 않는다.
+`storage/database.py` 는 백분율이 그대로인 것이 맞다: 닫은 2분기보다 파일이 커졌다.)
+
+`api/auth.py` 는 좁은 부분집합으로 재면 63% 로 보이는데 인증을 태우는 회귀 15개를
+합치면 **100%** 다. 보안 핵심 모듈의 구멍인 줄 알았던 것이 측정 범위의 문제였다 —
+**잰 값과 재는 방법을 같이 적어야 한다**는 사례로 남긴다.
+
+### 출시 차단 항목에는 변화 없다
+
+P0-A(데이터 공급 정지) / P0-2(Admin 키) / P0-3(Supabase 콘솔)은 그대로다.
+셋 다 승인 영역이라 이번 세션에서 손대지 않았다. 회귀의 실패 1건도 같은 원인이다
+(기일이 남은 물건 0건 → 기본 검색 결과 0건).

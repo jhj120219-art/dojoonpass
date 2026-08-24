@@ -33,6 +33,7 @@
     python audit_asset_integrity.py
 """
 import contextlib
+import datetime
 import os
 import sqlite3
 import sys
@@ -412,12 +413,19 @@ def selftest():
     "어긋남 없음"을 계속 찍으면서 아무것도 안 보게 된다. 그리고 그 상태는 **정상과
     겉으로 완전히 같다.** 그래서 결함을 일부러 심어 잡히는지 확인한다.
 
-    ## 왜 회귀 스위트가 아니라 여기 있나
+    ## 왜 검사 내용이 회귀 스위트가 아니라 여기 있나
 
-    이 파일은 아직 **미추적 파일**이고(`git add` 는 승인 영역), 추적된 테스트가
-    미추적 파일을 import 하면 커밋 시 부팅이 깨진다(BUGS #105).
-    `test_schema_hygiene.py` 가 그 규칙을 강제하므로, 의존을 만들지 않고 여기에 둔다.
-    파일이 추적되면 그때 회귀 스위트로 옮기는 것이 맞다.
+    원래 이유는 이랬다: *"이 파일은 아직 **미추적 파일**이고(`git add` 는 승인 영역),
+    추적된 테스트가 미추적 파일을 import 하면 커밋 시 부팅이 깨진다(BUGS #105).
+    파일이 추적되면 그때 회귀 스위트로 옮기는 것이 맞다."*
+
+    ★ 2026-08-24 갱신 — 이 파일은 **이미 추적된다**(`git ls-files` 실측). 그래서 그
+      조건이 스스로 말한 대로 충족됐다. 다만 검사 **내용**은 여기 그대로 둔다 —
+      심는 결함이 이 파일의 경로 규칙·쿼리와 한 몸이라 떼면 곧 갈라진다.
+      대신 `test_audit_selftests.py` 가 이 `--selftest` 를 **회귀 스위트에서 실제로
+      실행**한다(import 가 아니라 서브프로세스 + 종료코드 계약). 그 전까지는 이
+      selftest 를 돌리는 것이 저장소 어디에도 없었다 — 감사기가 눈이 멀어도
+      아무도 모르는 상태였고, 그것은 이 파일이 막으려던 상태 그 자체다.
 
         python audit_asset_integrity.py --selftest
     """
@@ -599,6 +607,24 @@ def selftest():
             srv.shutdown()
         check("[9] 가 열리지 않는 사진 URL 을 잡는다", broken > 0, True)
         check("[9] 는 서버가 없으면 '확인하지 못함'(어긋남 0)", unreachable, 0)
+
+        # 결함 E — [7] 의 "실제로 수집을 시도할 행" 분류 (2026-08-24 Sprint 251)
+        #
+        # 운영 데이터만으로는 이 분류를 검증할 수 없다. 지금 고아 대기 행은 12개인데
+        # **전부 기일 경과**라, 옛 코드(전부를 낭비로 세던 것)와 새 코드(경과분을 빼는 것)를
+        # 구별하려면 "기일이 남은 고아 행"이 있어야 한다. 그래서 여기서 만들어 넣는다.
+        _rows = [
+            {"status": "pending", "auction_date": "2026-07-30", "n": 3},   # 경과 -> 비용 0
+            {"status": "pending", "auction_date": "2099-01-01", "n": 2},   # 남음 -> 실제 비용
+            {"status": "refresh", "auction_date": None,         "n": 1},   # 날짜 없음 -> 방어선 통과
+            {"status": "done",    "auction_date": "2026-07-14", "n": 3},   # 대기가 아니다
+            {"status": "SKIPPED_EXPIRED", "auction_date": "2026-07-09", "n": 3},
+        ]
+        _t, _w, _live, _exp = classify_queue_orphans(_rows, "2026-08-24")
+        check("[7] 고아 전체 수", _t, 12)
+        check("[7] 대기(pending/refresh) 수", _w, 6)
+        check("★ [7] 기일이 남은 것만 '실제로 수집한다'로 센다", _live, 3)
+        check("[7] 기일 경과분은 비용에서 뺀다", _exp, 3)
     finally:
         _db.DB_PATH = saved
         shutil.rmtree(tmp, ignore_errors=True)
@@ -611,6 +637,25 @@ def selftest():
     return 0
 
 
+def classify_queue_orphans(rows, today):
+    """고아 큐 행을 (전체, 대기, 기일남음, 기일경과) 로 나눈다. 순수 함수 — DB 를 안 본다.
+
+    쿼리에서 떼어 낸 이유는 하나다: **자체 검사가 이 분류를 직접 검증할 수 있어야 한다.**
+    운영 DB 에는 지금 "기일 남은 고아 행"이 하나도 없어서(전부 경과), 실제 데이터만으로는
+    분류가 맞는지 확인할 수 없다 — 0을 0으로 세는 것은 공허하다.
+
+    `expired` 판정은 워커의 2차 방어선과 **글자 그대로 같은 조건**이어야 한다
+    (`doc_worker.py`: `if auction_date and auction_date < today`).
+    날짜가 비어 있으면 그 방어선을 통과하므로 만료로 세지 않는다.
+    """
+    total = sum(r["n"] for r in rows)
+    waiting = [r for r in rows if r["status"] in ("pending", "refresh")]
+    waiting_n = sum(r["n"] for r in waiting)
+    live_n = sum(r["n"] for r in waiting
+                 if not (r["auction_date"] and r["auction_date"] < today))
+    return total, waiting_n, live_n, waiting_n - live_n
+
+
 def audit_queue_orphans(conn):
     """큐 -> 물건 방향: **대응하는 `auction_item` 이 없는 큐 행**이 있는가.
 
@@ -621,11 +666,26 @@ def audit_queue_orphans(conn):
 
     왜 문제인가:
 
-        pending 이면   워커가 실제로 브라우저를 몰아 수집한다(물건당 약 22초).
+        pending 이고 **기일이 남아 있으면**
+                       워커가 실제로 브라우저를 몰아 수집한다(물건당 약 22초).
                        그리고 `mark_queue_done()` 은 `document_status`/`doc_raw` 를
                        **쓰지 못한 채**(item_id 가 없다) 큐만 done 으로 닫는다.
                        = 시간과 법원 부하를 쓰고, 파일은 고아로 남고, 기록은 안 남는다.
+        pending 이지만 **기일이 지났으면**
+                       비용이 없다. `doc_worker.py` 의 2차 방어선(`auction_date < today`)
+                       이 브라우저를 열기 전에 `mark_queue_skipped_expired()` 로 종결한다.
+                       고아 행은 `reconcile_queue_auction_date()` 가 대조할 물건 자체가
+                       없어 큐 날짜를 그대로 돌려주므로, 정정으로 되살아나지도 않는다.
         done 이면      이미 그 일이 벌어진 뒤다. 디스크에 고아 문서가 남아 있다([6] 이 잡는다).
+
+    ★ 2026-08-24 수정 — 이 감사기는 원래 pending/refresh 고아 행 **전부**를
+      "워커가 실제로 수집을 시도할 대기 행"으로 셌다. 그 숫자는 기일 방어선을 빼먹은
+      것이라 실제보다 크다. 실측(2026-08-24): 고아 18행 중 pending 12행이지만 **12행
+      전부 기일 경과**(가장 늦은 것이 2026-07-30)라 실제로 수집을 시도할 행은 **0행**이다.
+      같은 저장소의 `test_pipeline_integrity.py` 고아 상한 주석은 이미 "낭비 비용은
+      지금은 0"이라고 적고 있었다 — 두 도구가 서로 다른 말을 하고 있었다.
+      **왜 중요한가**: 이 숫자는 사람이 "고아 정리를 지금 해야 하나"를 판단하는 근거다.
+      부풀려진 비용은 승인 영역의 파괴적 삭제를 서두르게 만든다.
 
     실측(2026-08-18): 고아 6물건 x 3종 = **18행**. 그중 `2024타경2803` 은 같은 사건번호가
     **두 법원에 존재**하는 경우였다 — 고양지원(고아, 문서 12.7MB 수집됨) / 춘천지방법원
@@ -634,29 +694,37 @@ def audit_queue_orphans(conn):
     **사용자에게 보이는 피해는 없다** — 서빙은 `auction_item` 을 근거로 하므로 고아 쪽
     경로는 조회되지 않는다. 정리는 `cleanup_orphans_dryrun.py` 가 담당한다(삭제는 승인 영역).
     """
+    today = datetime.date.today().isoformat()
     rows = conn.execute("""
-        SELECT dq.court_code, dq.case_no, dq.item_no, dq.status, COUNT(*) AS n
+        SELECT dq.court_code, dq.case_no, dq.item_no, dq.status, dq.auction_date,
+               COUNT(*) AS n
         FROM document_queue dq
         LEFT JOIN auction_case ac ON ac.court_code = dq.court_code
                                  AND ac.case_no = dq.case_no
         LEFT JOIN auction_item ai ON ai.case_id = ac.id AND ai.item_no = dq.item_no
         WHERE ai.id IS NULL
-        GROUP BY dq.court_code, dq.case_no, dq.item_no, dq.status
+        GROUP BY dq.court_code, dq.case_no, dq.item_no, dq.status, dq.auction_date
         ORDER BY dq.status, dq.court_code
     """).fetchall()
 
-    total = sum(r["n"] for r in rows)
-    wasteful = sum(r["n"] for r in rows if r["status"] in ("pending", "refresh"))
+    total, waiting_n, live_n, expired_n = classify_queue_orphans(rows, today)
 
     _head("[7] 큐 -> 물건: 대응 auction_item 이 없는 큐 행")
-    print("    고아 큐 행 %d개 (그중 워커가 실제로 수집을 시도할 대기 행 %d개)"
-          % (total, wasteful))
+    print("    고아 큐 행 %d개" % total)
+    print("      대기(pending/refresh) %d개 = 기일 남음 %d개 + 기일 경과 %d개"
+          % (waiting_n, live_n, expired_n))
+    print("      -> 워커가 실제로 브라우저를 여는 것은 **기일 남음 %d개**뿐이다"
+          " (기일 경과분은 doc_worker 2차 방어선이 브라우저 없이 종결한다)" % live_n)
     for r in rows[:SAMPLE]:
-        print("      %s %s-%s  %s x%d" % (r["court_code"], r["case_no"],
-                                          r["item_no"], r["status"], r["n"]))
-    if wasteful:
+        print("      %s %s-%s  %s x%d  (기일 %s)"
+              % (r["court_code"], r["case_no"], r["item_no"], r["status"], r["n"],
+                 r["auction_date"] or "없음"))
+    if live_n:
         print("      -> 이 행들은 수집에 시간·법원 부하를 쓰지만 기록은 남지 않는다."
               " 정리는 cleanup_orphans_dryrun.py (삭제는 승인 영역)")
+    elif total:
+        print("      -> 지금 낭비되는 수집 비용은 **0**이다. 정리는 급하지 않다"
+              " (남은 문제는 디스크 고아 파일뿐 - [6] 참고)")
 
     return total
 

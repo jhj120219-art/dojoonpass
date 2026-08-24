@@ -361,6 +361,13 @@ def test_no_orphan_rows_in_pipeline_tables():
                   AND ai.item_no = dq.item_no
             )
         """)
+        # ※ 2026-08-24 Sprint 251 실측: **18행**이다(상한 21보다 3 적다).
+        #   이 3칸의 여유는 **패딩이 아니라 데이터가 줄어든 결과**다 — 상한 21은
+        #   2026-08-22 에 auction_item 이 더 많던 상태에서 실제로 잰 값이고, 지금 이
+        #   DB(1,876행)에는 그중 3행에 해당하는 사건이 아예 없다. 그래서 조이지 않는다:
+        #   데이터가 원래 크기로 돌아오면 21이 다시 정상값이 되고, 그때 붉어지는 것은
+        #   회귀가 아니라 오탐이다. (같은 세션에 조인 sido 상한 5->4 와 차량 역방향
+        #   상한 5->3 은 성격이 다르다 — 그쪽 여유는 어떤 측정에도 근거가 없었다.)
         check_true("document_queue -> auction_item(court+case+item) 고아가 늘지 않았다"
                    " (court_code 재배정으로 영구 고아가 되는 알려진 결함, 상한 21)",
                    orphan_queue <= 21, "-> 현재 %d행 (상한 21)" % orphan_queue)
@@ -515,7 +522,15 @@ def test_property_type_matches_content():
         print("    내용은 차량인데 종류가 차량이 아닌 행: %d건" % len(rev))
         for b in rev[:5]:
             print("      ", b)
-        check_true("역방향 오분류가 늘지 않았다 (현재 %d건, 상한 5)" % len(rev), len(rev) <= 5, rev[:5])
+        # ★ 2026-08-24 Sprint 251: 상한을 5 -> 3 으로 조인다.
+        #   `docs/BUGS.md` #56 은 이 검사를 만들 당시 실측을 **3건**으로 적어 두었고
+        #   (id=542 / 1806 / 6311), 오늘 다시 재도 **같은 3건**이다. 그런데 상한만
+        #   5로 적혀 있었다 — 어떤 측정에도 근거가 없는 **2칸의 여유**다.
+        #   상한이 실측보다 헐거우면 새 오분류가 그만큼 조용히 통과한다.
+        #   (앞 방향 상한 2는 실측 2와 정확히 맞아 손대지 않았다.)
+        #   크롤이 재개돼 선박 물건이 새로 들어오면 이 값이 늘 수 있다 — 그때는
+        #   **늘어난 행이 새 결함인지 같은 부류인지 확인한 뒤** 상한을 올릴 것.
+        check_true("역방향 오분류가 늘지 않았다 (현재 %d건, 상한 3)" % len(rev), len(rev) <= 3, rev[:5])
     finally:
         conn.close()
 
@@ -796,6 +811,71 @@ def test_data_freshness_runway():
     _report_scheduler_registration()
 
 
+# ---------------------------------------------------------------------------
+# 11-b. 체크리스트의 P0-A 판정이 **실측과 같은 말을 하는가** (2026-08-24 Sprint 251 신설)
+#
+# 왜 필요한가 — 위 11번 검사는 제품 상태를 정확히 잰다. 그런데 사람이 읽는 문서는
+# 그것과 **반대말**을 하고 있어도 아무도 모른다. 실제로 그렇게 됐다:
+#
+#     docs/BETA_RELEASE_CHECKLIST.md (2026-08-23 Sprint 267)
+#         "P0-A 재실측 — 더 이상 사실이 아니다 ... 검색 275건"
+#     같은 저장소 실측 (2026-08-24)
+#         기일 남은 물건 0건 / GET /api/v1/search total 0 / 예약 작업 0개
+#
+# 이 어긋남이 위험한 이유는 "출시를 막는 것이 무엇인가"를 그 문서로 판단하기 때문이다.
+# 문서가 "해소"라고 적혀 있으면 아무도 스케줄러를 등록하지 않고, 제품은 계속 빈 화면이다.
+#
+# ## 무엇을 고정하는가
+#
+# 문장은 검사하지 않는다 — 산문은 계속 바뀌고, 문구 grep 은 금방 공허해진다.
+# 대신 문서에 **기계 판독용 토큰 한 줄**을 두고 그것만 실측과 대조한다:
+#
+#     <!-- P0A-VERDICT: OPEN -->        지금 제품이 깨져 있다(기본 검색 0건)
+#     <!-- P0A-VERDICT: RESOLVED -->    지금 정상이다
+#
+# 양방향으로 잠근다 — 깨졌는데 RESOLVED 여도, 정상인데 OPEN 이어도 실패한다.
+# 그래서 크롤이 되살아나 실제로 해소되는 날에도 문서를 **반드시** 갱신하게 된다.
+
+
+def test_checklist_p0a_verdict_matches_reality():
+    print("\n--- 11-b. 체크리스트 P0-A 판정 vs 실측 (Sprint 251) ---")
+    import re as _re
+
+    path = os.path.join(ROOT, "docs", "BETA_RELEASE_CHECKLIST.md")
+    if not os.path.exists(path):
+        check_true("체크리스트 문서가 있다", False, path)
+        return
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        md = fh.read()
+
+    tokens = _re.findall(r"<!--\s*P0A-VERDICT:\s*(OPEN|RESOLVED)\s*-->", md)
+    check_true("판정 토큰이 정확히 1개 있다 (<!-- P0A-VERDICT: OPEN|RESOLVED -->)",
+               len(tokens) == 1,
+               "-> %d개 발견. 여러 개면 어느 것이 최신인지 알 수 없다" % len(tokens))
+    if len(tokens) != 1:
+        return
+    verdict = tokens[0]
+
+    conn = connect()
+    try:
+        today = datetime.date.today()
+        live = conn.execute(
+            "SELECT COUNT(*) FROM auction_item"
+            " WHERE auction_date >= ? AND TRIM(auction_date) <> ''",
+            (today.isoformat(),)).fetchone()[0]
+    finally:
+        conn.close()
+
+    expected = "OPEN" if live == 0 else "RESOLVED"
+    print("    실측 기일 미도래 물건 : %d건  -> 기대 판정 %s" % (live, expected))
+    print("    문서에 적힌 판정      : %s" % verdict)
+    check_true(
+        "★ 체크리스트의 P0-A 판정이 실측과 일치한다",
+        verdict == expected,
+        "-> 문서는 '%s' 라고 하는데 실측은 기일 남은 물건 %d건(=%s)이다. "
+        "docs/BETA_RELEASE_CHECKLIST.md 의 P0A-VERDICT 토큰과 그 주변 서술을 함께 고칠 것"
+        % (verdict, live, expected))
+
 def _report_scheduler_registration():
     """예약 작업에 이 저장소를 가리키는 항목이 있는지 **보고만** 한다(실패시키지 않는다)."""
     import subprocess
@@ -853,8 +933,29 @@ def _report_scheduler_registration():
 #               저장 '서울' -> 실제 '경기' (건물명 "서울시니어스분당타워"에 들어간
 #               "서울"을 시도로 오매칭 - 도로명이 아니라 건물명이 원인이라는 점만 다르고
 #               "문자열 아무 데나 있는 시도명과 매칭" 이라는 근본 원인은 #103-1과 같다)
+#
+# ★ 2026-08-24 Sprint 251 — 두 가지를 바로잡는다.
+#
+# (1) sido 상한을 5 -> **4** 로 내린다. 위 Sprint 121이 5로 올린 근거였던 id=11903 은
+#     지금 이 DB(auction_item 1,876행)에 없다. 실측 4행이다. 상한이 실측보다 하나
+#     헐거우면 **새 오분류 하나가 조용히 들어와도 통과한다** - 상한의 목적이 사라진다.
+#     현재 4행: id=550 '서울'->'인천' / id=1787 '부산'->'경남'
+#              id=8160 '서울'->'경기' / id=9977 '세종'->'제주'
+#
+# (2) `docs/BUGS.md` #78 의 마무리 문장 *"만료 물건이라 검색(D7 기본 제외)에는 나오지
+#     않는다"* 는 **절반만 맞다.** `src/app/search/SearchForm.tsx:643` 에
+#     **"종결물건 포함" 체크박스**가 있다. 사용자가 그것을 켜면 이 행들이 그대로 나온다.
+#     실측(2026-08-24): `?include_closed=true&sido=서울` 응답에 시흥시(경기) 물건
+#     id=8160 이 들어 있다. 즉 "지금은 사용자에게 안 보인다"가 아니라
+#     **"한 번의 체크박스 클릭 거리에 있다"** 이다. BUGS.md 쪽도 함께 정정했다.
+#
+# ※ 이 검사는 **데이터 드리프트**를 본다. `extract_sido()` 자체가 옛 규칙으로 퇴행하는
+#   것은 여기서 못 잡는다 - 퇴행하면 새로 계산한 값이 저장된 옛 값과 **같아져서**
+#   드리프트가 오히려 줄기 때문이다. 그 축은 `test_normalizer.py` 가 맡는다
+#   (2026-08-24 mutation 확인: '가장 앞선 표기' 규칙을 되돌리면 test_normalizer.py 가
+#    실패하고, 이 검사는 통과한다). 두 검사는 **다른 것을 지킨다.**
 # ---------------------------------------------------------------------------
-NORMALIZE_DRIFT_CEILING = {"sido": 5, "sigungu": 207, "dong": 0, "lot_number": 0}
+NORMALIZE_DRIFT_CEILING = {"sido": 4, "sigungu": 207, "dong": 0, "lot_number": 0}
 
 
 def test_stored_normalization_matches_code():
@@ -1112,6 +1213,16 @@ def test_stored_normalization_matches_code():
     # 값과 "원래 없음"으로 인한 빈 값을 구분할 방법이 지금 없다) 이건 핵심 파이프라인
     # 로직 변경이라 이 세션 범위를 벗어난다(승인 필요). 지금은 §12와 같은 방식으로
     # **알려진 1건**만 허용하고 새로 늘면 잡는다.
+    #
+    # ※ 2026-08-24 Sprint 251 — 지금 이 DB 에서는 **0건**이라 아래 §13-B 가
+    #   "[정리됨] 상한을 0으로 낮출 수 있다"고 찍는다. **그 제안을 그대로 따르지 말 것.**
+    #   0이 된 이유는 고쳐졌기 때문이 아니라, 그 1건(auction.id=357 대전지방법원
+    #   2024타경11191-1, 세종 주소에 sigungu='칠곡군')에 해당하는 사건이 **지금 이 DB에
+    #   아예 없기 때문**이다(auction_item 1,876행). 원인인 `migrate_execute.py` 의
+    #   병합 규칙은 그대로다 — 데이터가 원래 크기로 돌아오면 그 행도 돌아온다.
+    #   0으로 내리면 그때 붉어지는 것은 회귀가 아니라 오탐이다.
+    #   (같은 세션에 조인 상한들은 성격이 다르다 — sido 5->4, 차량 역방향 5->3 은
+    #    어떤 측정에도 근거가 없던 여유였다.)
     SYNC_MISMATCH_CEILING = {"sigungu": 1}
     FIELDS = ["property_type", "sido", "sigungu", "dong", "lot_number", "full_address",
               "appraisal_price", "minimum_bid_price", "auction_date", "status",
@@ -1392,6 +1503,7 @@ def run():
     test_property_type_matches_content()
     test_court_identity_convention()
     test_data_freshness_runway()
+    test_checklist_p0a_verdict_matches_reality()
     test_stored_normalization_matches_code()
     test_stale_region_contamination_detector()
     test_empty_sido_is_explained_by_the_address()

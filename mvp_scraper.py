@@ -61,11 +61,30 @@ def _lock() -> RunLock:
 
 
 def save_csv_backup(rows: list) -> str:
+    """수집 결과 CSV 백업. 경로는 **이 파일 기준**이다.
+
+    ★ 2026-08-24 Sprint 252 수정 — 예전에는 `filename` 이 상대경로("auction_YYYYMMDD.csv")라
+      **현재 작업 디렉터리**에 떨어졌다. Sprint 245/246 이 같은 계열의 cwd 의존을 네 군데
+      고쳤는데(`api/auth.py` 의 load_dotenv, `storage/database.py` 의 DB_PATH,
+      `doc_worker.py` 의 LOCK_PATH, 운영 도구 8개) **이 한 곳만 남아 있었다.**
+      이 모듈 자신도 로그/락은 이미 `_HERE` 기준인데 CSV 만 아니었다.
+
+      `.bat` 은 `cd /d %~dp0` 로 보호되므로 예약 실행에서는 드러나지 않는다. 드러나는 것은
+      수동 실행/서비스 등록처럼 cwd 가 다른 경우이고, 그때 백업이 엉뚱한 폴더에 흩어진다 —
+      "백업이 있다"고 믿는데 저장소에는 없는 상태가 된다.
+
+      `test_schema_hygiene.py` 의 cwd 감사가 이것을 못 잡은 이유도 남긴다: 그 검사는
+      알려진 경로 호출(open/connect/makedirs...)에 **문자열 리터럴**이 들어가는 모양을
+      본다. 여기는 pandas 의 `to_csv` 이고 인자도 조립된 변수라 두 조건 다 비껴간다.
+      그래서 정적 검사 대신 **다른 cwd 에서 실제로 돌려 보는** 회귀를 따로 뒀다
+      (`test_crawl_orchestration.py`).
+    """
     df = pd.DataFrame(rows)
     filename = "auction_" + datetime.today().strftime("%Y%m%d") + ".csv"
-    df.to_csv(filename, index=False, encoding="utf-8-sig")
-    logger.info("CSV 백업 저장: %s (%d건)", filename, len(rows))
-    return filename
+    path = os.path.join(_HERE, filename)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    logger.info("CSV 백업 저장: %s (%d건)", path, len(rows))
+    return path
 
 def print_validation_summary(engine: ValidationEngine, items: List[AuctionItem]) -> None:
     summary = engine.summary(items)

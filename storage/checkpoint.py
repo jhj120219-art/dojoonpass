@@ -198,6 +198,22 @@ class RunLock:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             return False
+        except OSError as exc:
+            # ★ 2026-08-24 Sprint 254 (BUGS #183).
+            #
+            #   락 자리에 **파일이 아닌 것**(디렉터리 등)이 있으면 Windows 는
+            #   `FileExistsError` 가 아니라 `PermissionError` 를 던진다. 그것이 그대로
+            #   `acquire()` 밖으로 나가면 **배치가 예외로 죽는다** - 락 정리 하나 때문에
+            #   그날 수집 전체를 잃는다. 이 저장소는 OneDrive 동기화 폴더 안에 있어
+            #   그런 잔여물이 남는 일이 실제로 있다(이 파일 상단의 flaky 사고 참고).
+            #
+            #   락을 못 얻는 것은 실패가 아니다("이번엔 안 한다"). 그러니 False 로
+            #   물러나되, 정상적인 "남이 잡고 있다"와 **구별되게 로그를 남긴다** -
+            #   조용히 False 를 돌려주면 매일 아무 일도 안 하면서 이유를 알 수 없다.
+            logger.warning("[%s] 락 파일을 만들 수 없다(%s: %s) - 이번 실행은 건너뛴다. "
+                           "그 경로에 파일이 아닌 것이 있는지 확인할 것: %s",
+                           self.label, type(exc).__name__, exc, path)
+            return False
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()) + " " + datetime.now().isoformat())
         return True

@@ -479,12 +479,14 @@ def main() -> int:
                             "[%s-%s] 사진 %d장을 받았다고 했으나 **한 장도 기록되지 못했다** "
                             "- 성공으로 종결하지 않고 재시도한다",
                             case_no, item_no, len(result.get("images") or ()))
-                        mark_queue_failed(item["id"], item["retry_count"])
+                        mark_queue_failed(item["id"], item["retry_count"],
+                                          item.get("claim_token"))
                     else:
                         mark_queue_done(
                             item["id"], court_code, case_no, item_no, doc_type,
                             result["previous_hash"], result["new_hash"],
                             status=done_status, files_saved=result.get("files_saved"),
+                            claim_token=item.get("claim_token"),
                         )
 
                         succeeded += 1
@@ -496,7 +498,7 @@ def main() -> int:
                             logger.info("[%s-%s] %s 처리 성공%s", case_no, item_no, doc_type,
                                         " (재수집)" if overwrite else "")
                 else:
-                    mark_queue_failed(item["id"], item["retry_count"])
+                    mark_queue_failed(item["id"], item["retry_count"], item.get("claim_token"))
                     logger.warning("[%s-%s] %s 처리 실패 (retry=%d)", case_no, item_no, doc_type, item["retry_count"] + 1)
 
             except CaseNotReachable as e:
@@ -507,13 +509,13 @@ def main() -> int:
                 #   "사건 하나를 못 찾았다"가 그런 결과를 부를 이유가 없다.
                 logger.warning("[%s-%s] %s: %s (브라우저 정상 - 재시작 없이 다음 항목으로)",
                                case_no, item_no, doc_type, str(e))
-                mark_queue_failed(item["id"], item["retry_count"])
+                mark_queue_failed(item["id"], item["retry_count"], item.get("claim_token"))
                 time_module.sleep(1)
                 continue
 
             except Exception as e:
                 logger.error("[%s-%s] %s 처리 중 오류: %s", case_no, item_no, doc_type, str(e))
-                mark_queue_failed(item["id"], item["retry_count"])
+                mark_queue_failed(item["id"], item["retry_count"], item.get("claim_token"))
                 # ★ 드라이버를 재시작하면 그 전에 서 있던 페이지는 사라진다.
                 #   기억을 지우지 않으면 다음 종류가 "재사용 가능"으로 읽고
                 #   **빈 페이지에서 수집을 시도**한다 (2026-08-20 Sprint 236).
