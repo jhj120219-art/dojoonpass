@@ -41,6 +41,31 @@ if not defined PY (
     exit /b 1
 )
 
+REM ---------------------------------------------------------------------------
+REM Schema migrations (added 2026-08-26).
+REM
+REM This batch never called storage.migrations.run_migrations before. init_db()
+REM inside mvp_scraper.py only creates the 3 legacy tables; it does not apply the
+REM numbered migrations. So 001-025 got applied only because a human ran the
+REM runner by hand, and a new migration would NOT reach a fresh deployment.
+REM Risk: the first crawl after a new migration writes into the old schema.
+REM
+REM The runner is safe to re-run (migration_history blocks double-apply).
+REM On failure we stop here - not writing crawl data beats writing it into a
+REM wrong schema. See docs/BUGS.md for the full reasoning.
+REM
+REM NOTE: comments in this file are ASCII on purpose. The .bat is UTF-8 but cmd
+REM reads it in the system codepage (cp949 here), and multi-byte text can shift
+REM byte alignment so that following ASCII is swallowed and a fragment runs as a
+REM command. That already happens with the older Korean comments in this file.
+REM ---------------------------------------------------------------------------
+"%PY%" -m storage.migrations.run_migrations >> logs\migrate_execute.log 2>&1
+if errorlevel 1 (
+    echo ===================================== >> logs\daily_run.log
+    echo [FAILED] run_migrations exited with code %errorlevel% at %date% %time% >> logs\daily_run.log
+    exit /b 1
+)
+
 "%PY%" mvp_scraper.py >> logs\daily_run.log 2>&1
 if errorlevel 1 (
     echo ===================================== >> logs\daily_run.log

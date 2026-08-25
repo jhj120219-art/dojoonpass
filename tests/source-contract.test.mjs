@@ -313,9 +313,13 @@ describe('검색 파라미터 계약: 프런트가 보내는 것과 백엔드가
   // 문제는 그 사실이 **주석에만** 있다는 것이다 — 누군가 입력을 살리는 순간 아무 경고 없이
   // 잘못된 결과가 나간다. 미지원 목록을 여기 고정해, 늘어나면 실패하고 구현되면 목록에서
   // 빼도록 강제한다.
+  // 2026-08-26: 면적 4종(min/max_building_area, min/max_land_area)을 **구현했다** —
+  //   migration 025 가 컬럼을, normalizer.extract_areas() 가 추출을,
+  //   api/v1/search.py 가 WHERE 절을 맡는다(실데이터 커버리지 99.3%).
+  //   그래서 목록에서 뺐다. 남은 것은 special_conditions 하나다 —
+  //   이쪽은 auction_item 은 물론 rights_summary 에도 대응 데이터가 없어
+  //   **뽑아낼 원천 자체가 없다**(면적과 다른 점이다).
   const KNOWN_UNSUPPORTED = new Set([
-    'min_building_area', 'max_building_area',
-    'min_land_area', 'max_land_area',
     'special_conditions',
   ])
 

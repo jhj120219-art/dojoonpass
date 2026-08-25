@@ -213,12 +213,42 @@ def test_done_rows_have_file_and_ready_status():
             if not ai:
                 no_item.append(key)
                 continue
-            if not os.path.exists(os.path.join(
+            # ★ 사진은 **다른 규칙으로** 본다 (2026-08-26). 면제가 아니다.
+            #
+            #   이 루프는 done 행 전부를 도는데 `QUEUE_DOC_FILE` 은 **문서 3종만** 담는다
+            #   (위 28행 주석이 그렇게 적고 있다). 그래서 doc_type='image' 는
+            #   `.get(..., "?")` 로 **파일명이 문자 "?"** 가 되어 절대 존재하지 않고,
+            #   `QUEUE_TO_DS.get("image")` 는 None 이라 document_status 조회도 빈다.
+            #   즉 image 가 done 이 되는 순간 두 목록에 무조건 걸린다.
+            #
+            #   지금까지 드러나지 않은 이유는 단순하다 — **image 행이 done 이 된 적이
+            #   없었다.** `DojoonPass-DocWorker` 가 등록돼 있지 않아 사진 수집 자체가
+            #   한 번도 돌지 않았다(auction_image 0행). 2026-08-26 에 워커를 등록하고
+            #   처음 돌리자 image done 17행이 생기며 곧바로 붉어졌다.
+            #   **사진 쪽은 멀쩡했다** — 17행 전부 auction_image 행과 실제 파일을 갖고 있다.
+            #
+            #   사진은 물건당 0~N장이라 "종류당 파일 1개" 표에 넣을 수 없다. 대신 문서에
+            #   요구하는 것과 **같은 강도**로 본다: 행이 있고, 파일이 실재하고, 0바이트가 아니다.
+            if r["doc_type"] == "image":
+                imgs = conn.execute(
+                    "SELECT seq, storage_path FROM auction_image WHERE item_id=?",
+                    (ai["id"],)).fetchall()
+                if not imgs:
+                    no_file.append(key + " (auction_image 행 없음)")
+                for im in imgs:
+                    ipath = os.path.join(ROOT, (im["storage_path"] or "").replace("/", os.sep))
+                    if not im["storage_path"] or not os.path.exists(ipath):
+                        no_file.append(key + " seq=%s" % im["seq"])
+                    elif os.path.getsize(ipath) == 0:
+                        no_file.append(key + " seq=%s (0바이트)" % im["seq"])
+            elif not os.path.exists(os.path.join(
                     doc_dir(ai["court_name"], r["case_no"], r["item_no"]),
                     QUEUE_DOC_FILE.get(r["doc_type"], "?"))):
                 no_file.append(key)
+            # document_status 조회는 **image 를 포함한 전체 표**를 쓴다 — 사진도 화면
+            # 상태를 갖는다(READY 여야 상세가 '수집완료'로 보인다).
             st = conn.execute("SELECT status FROM document_status WHERE item_id=? AND doc_type=?",
-                              (ai["id"], QUEUE_TO_DS.get(r["doc_type"]))).fetchone()
+                              (ai["id"], QUEUE_TO_DS_ALL.get(r["doc_type"]))).fetchone()
             if not st:
                 no_ds.append(key)
             elif st["status"] != "READY":
@@ -249,7 +279,7 @@ def test_files_are_reflected_in_queue():
     conn = connect()
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute("""SELECT ai.court_name, ai.case_no, ai.item_no, ac.court_code
+        rows = conn.execute("""SELECT ai.id, ai.court_name, ai.case_no, ai.item_no, ac.court_code
                                FROM auction_item ai JOIN auction_case ac ON ac.id = ai.case_id""").fetchall()
         found, bad = 0, []
         for r in rows:
@@ -263,10 +293,38 @@ def test_files_are_reflected_in_queue():
                 qr = conn.execute("""SELECT status FROM document_queue
                                      WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?""",
                                   (r["court_code"], r["case_no"], r["item_no"], dt)).fetchone()
-                if qr is None or qr["status"] not in ("done", "refresh"):
+                ok_states = ("done", "refresh")
+                status = qr["status"] if qr else None
+
+                # ★ SKIPPED_EXPIRED 는 **조건부로** 정상이다 (2026-08-26).
+                #
+                #   doc_worker 의 2차 방어선은 기일이 지난 큐 행을 브라우저를 열지 않고
+                #   `SKIPPED_EXPIRED` 로 종결한다. 그런데 그 행이 **예전에 이미 수집돼
+                #   파일을 갖고 있는** 경우가 있다(변경 감지로 다시 pending 이 됐다가
+                #   그 사이 기일이 지난 경우). 그러면 "파일은 있는데 큐는 done 이 아니다"가 된다.
+                #
+                #   2026-08-26 워커 첫 실행에서 13행이 그렇게 됐다. **전부 무해했다** —
+                #   13행 모두 `document_status` 가 READY 라 사용자는 그 문서를 그대로 본다.
+                #   기일이 지난 물건을 다시 수집할 이유도 없으므로 종결 자체가 옳다.
+                #
+                #   그래서 통째로 면제하지 않고 **사용자가 실제로 볼 수 있을 때만** 통과시킨다.
+                #   파일은 있는데 화면 상태가 READY 가 아니면 그건 진짜 결함이다 —
+                #   받아 놓고도 못 보여 주는 상태이므로 여전히 잡아야 한다.
+                if status == "SKIPPED_EXPIRED":
+                    ds = conn.execute(
+                        "SELECT status FROM document_status WHERE item_id=? AND doc_type=?",
+                        (r["id"], QUEUE_TO_DS[dt])).fetchone()
+                    if ds and ds["status"] == "READY":
+                        continue
+                    bad.append("%s %s-%s %s -> SKIPPED_EXPIRED 인데 화면 상태가 %s"
+                               % (r["court_name"], r["case_no"], r["item_no"], dt,
+                                  ds["status"] if ds else "없음"))
+                    continue
+
+                if status not in ok_states:
                     bad.append("%s %s-%s %s -> %s"
                                % (r["court_name"], r["case_no"], r["item_no"], dt,
-                                  qr["status"] if qr else "큐에 없음"))
+                                  status if status else "큐에 없음"))
         check_true("검사 대상 파일이 실제로 존재한다", found > 0, "파일을 하나도 못 찾으면 공허한 검사다")
         check("파일이 있는데 큐가 done/refresh가 아닌 것 없음", bad[:5], [])
     finally:
@@ -1127,7 +1185,25 @@ def _report_scheduler_registration():
 #   (2026-08-24 mutation 확인: '가장 앞선 표기' 규칙을 되돌리면 test_normalizer.py 가
 #    실패하고, 이 검사는 통과한다). 두 검사는 **다른 것을 지킨다.**
 # ---------------------------------------------------------------------------
-NORMALIZE_DRIFT_CEILING = {"sido": 4, "sigungu": 207, "dong": 0, "lot_number": 0}
+# ★★ 2026-08-26 — 네 축 전부 **0** 으로 조인다. 상한이 아니라 이제 **불변식**이다.
+#
+#   그동안 sido 4 / sigungu 207 은 "고칠 수 없는 옛 오분류"를 안고 가는 상한이었다.
+#   이번에 그 전제가 깨졌다 — `backfill_region_normalize.py --apply` 로 실제로 **전부
+#   고쳤다**(auction 170행 + auction_item 174행). 재측정 결과 네 축 모두 **0행**이다.
+#
+#   상한을 실측보다 헐겁게 두면 안 되는 이유는 바로 위 Sprint 251 주석이 이미 적었다 —
+#   *"상한이 실측보다 하나 헐거우면 새 오분류 하나가 조용히 들어와도 통과한다."*
+#   지금 실측이 0 이므로 상한도 0 이어야 그 목적을 지킨다. 207 을 남겨 두면 앞으로
+#   **206건이 새로 오염돼도 초록불**이다.
+#
+#   ※ 이 검사가 붉어지면 할 일은 정해져 있다:
+#         python backfill_region_normalize.py            (dry-run 으로 무엇이 바뀌는지 본다)
+#         python backfill_region_normalize.py --apply
+#     크롤러가 새 드리프트를 만들고 있다는 신호이기도 하므로, 반복되면 유입 경로
+#     (`migrate_execute.py` 의 `or existing[...]` 병합 규칙)를 함께 본다.
+#
+#   자세한 경위는 docs/BUGS.md #214.
+NORMALIZE_DRIFT_CEILING = {"sido": 0, "sigungu": 0, "dong": 0, "lot_number": 0}
 
 
 def test_stored_normalization_matches_code():

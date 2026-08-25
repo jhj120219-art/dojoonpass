@@ -88,6 +88,19 @@ const FAIL_COUNT_OPTIONS = Array.from({ length: 11 }, (_, i) => String(i))
 // Tank Auction의 minbPctBgn/minbPctEnd select(10~100, 10 단위)와 동일 구성.
 const BID_RATE_OPTIONS = Array.from({ length: 10 }, (_, i) => String((i + 1) * 10))
 
+// 면적(㎡) 구간. 2026-08-26 신설 — 백엔드 구현(migration 025)과 함께 열었다.
+//
+// 값은 임의로 고르지 않고 **실데이터 분위수**에서 잡았다
+// (auction_item 2,444행, 면적 보유 2,428행 실측):
+//
+//   건물  p10 21 / p25 30 / p50 49 / p75 84 / p90 151 / p95 294 / p99 1,057
+//   토지  p10 151 / p25 330 / p50 870 / p75 2,766 / p90 8,382 / p95 18,540
+//
+// 그래서 건물은 촘촘하게(10~300) 두고 큰 쪽은 성기게, 토지는 시작을 높게 잡는다.
+// 구간이 데이터와 어긋나면 어느 구간을 골라도 결과가 비거나 전부 나온다.
+const BUILDING_AREA_OPTIONS = ['10', '20', '30', '40', '50', '60', '85', '100', '150', '200', '300', '500', '1000']
+const LAND_AREA_OPTIONS = ['50', '100', '200', '330', '500', '870', '1000', '2000', '3000', '5000', '10000', '20000']
+
 type SearchFormState = {
   sido: string
   sigungu: string
@@ -350,7 +363,9 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
     if (Number(form.appraisalMax) > 0) query.max_appraisal = Number(form.appraisalMax)
     if (Number(form.bidPriceMin) > 0) query.min_bid_price = Number(form.bidPriceMin)
     if (Number(form.bidPriceMax) > 0) query.max_bid_price = Number(form.bidPriceMax)
-    // TODO(API 미지원): auction_item에 대응 컬럼이 없어 백엔드가 이 파라미터를 읽지 않는다
+    // 2026-08-26 구현됨: auction_item.building_area / land_area (migration 025) +
+    // normalizer.extract_areas() 가 주소 원문에서 뽑는다. 실데이터 커버리지 99.3%.
+    // 면적을 못 뽑는 물건(차량/선박 등)은 NULL 이라 면적 조건을 주면 결과에서 빠진다.
     if (form.buildingAreaMin) query.min_building_area = Number(form.buildingAreaMin)
     if (form.buildingAreaMax) query.max_building_area = Number(form.buildingAreaMax)
     if (form.landAreaMin) query.min_land_area = Number(form.landAreaMin)
@@ -661,8 +676,35 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
         />
       </SearchAccordionSection>
 
-      <SearchAccordionSection title="면적 조건" defaultOpen={false} muted>
-        <p className="text-xs text-gray-400 py-1">준비 중입니다</p>
+      {/* 2026-08-26: '준비 중입니다' 를 걷어내고 실제 입력을 연다.
+          백엔드가 이제 이 파라미터를 실제로 읽는다 — migration 025 가 컬럼을,
+          normalizer.extract_areas() 가 주소 원문에서 값을(실데이터 커버리지 99.3%),
+          api/v1/search.py 가 WHERE 절을 맡는다.
+          면적을 뽑을 수 없는 물건(차량/선박/건설기계 16건)은 NULL 이라 면적 조건을
+          주면 결과에서 빠진다 — 조건을 지키지 않은 행을 섞어 주지 않는다. */}
+      <SearchAccordionSection title="면적 조건" defaultOpen={false}>
+        <RangeSelect
+          label="건물면적"
+          minValue={form.buildingAreaMin}
+          maxValue={form.buildingAreaMax}
+          onMinChange={(v) => update('buildingAreaMin', v)}
+          onMaxChange={(v) => update('buildingAreaMax', v)}
+          options={BUILDING_AREA_OPTIONS.map((v) => ({ value: v, label: `${Number(v).toLocaleString()}㎡` }))}
+          placeholder="선택 안함"
+          selectClassName={inputClass}
+          labelClassName={labelClass}
+        />
+        <RangeSelect
+          label="토지면적"
+          minValue={form.landAreaMin}
+          maxValue={form.landAreaMax}
+          onMinChange={(v) => update('landAreaMin', v)}
+          onMaxChange={(v) => update('landAreaMax', v)}
+          options={LAND_AREA_OPTIONS.map((v) => ({ value: v, label: `${Number(v).toLocaleString()}㎡` }))}
+          placeholder="선택 안함"
+          selectClassName={inputClass}
+          labelClassName={labelClass}
+        />
       </SearchAccordionSection>
 
       <SearchAccordionSection title="특수조건" defaultOpen={false} muted>

@@ -25,12 +25,36 @@ api/v1/search.py의 /api/v1/search 엔드포인트 회귀 테스트.
 """
 import sys
 import os
+import secrets
 from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi.testclient import TestClient
-from api_server import app
+# ---------------------------------------------------------------------------
+# 이 프로세스 안에서만 유효한 합성 JWT 비밀값. **운영 값이 아니다.**
+#
+# 왜 필요한가 (2026-08-26): 아래 "로그인 화면이 같은 주소 원문을 받는가"(Sprint 250)
+# 검사는 앱이 실제로 쓰는 시크릿으로 토큰을 서명해 **진짜 인증 경로**를 지난다.
+# 그런데 `.env` 에 `SUPABASE_JWT_SECRET` 이 없으면(=지금 이 머신) 서명할 수가 없어
+# 그 검사가 "공허하다"며 실패했다 — **제품 결함이 아니라 환경 미설정** 때문이다.
+#
+# 그 변수는 HS256(레거시) 전용이고 지금 Supabase 는 ES256 을 발급한다. 즉 운영에
+# 없어도 정상일 수 있는 값이라, 그것 하나에 API 계약 검사가 묶여 있는 것이 잘못이다.
+# 이 검사가 확인하려는 것은 **주소 원문이 인증 경로를 지나며 변형되지 않는가**이지
+# 시크릿이 프로비저닝됐는가가 아니다.
+#
+# 이 저장소는 같은 상황에서 이미 같은 방법을 쓴다 — `test_api_regression.py`,
+# `test_admin_secret_contract.py`, `test_admin_id_bounds.py`,
+# `test_admin_failure_injection.py` 네 곳이 전부 이 관례다. 그것을 그대로 따른다.
+#
+# ★ `api/auth.py` 가 **모듈 최상단에서 한 번만** 읽으므로 import 보다 먼저 넣어야 한다.
+# ★ 이미 설정돼 있으면 덮어쓰지 않는다 — 운영 값이 있는 환경에서는 그 값을 그대로 쓴다.
+# ★ 값은 매 실행 랜덤이고 프로세스 환경에만 있다. `.env` 파일은 건드리지 않는다.
+if not os.getenv("SUPABASE_JWT_SECRET"):
+    os.environ["SUPABASE_JWT_SECRET"] = "qa-search-" + secrets.token_hex(16)
+
+from fastapi.testclient import TestClient          # noqa: E402
+from api_server import app                         # noqa: E402
 
 client = TestClient(app)
 
@@ -544,11 +568,14 @@ def check_declared_filters_actually_filter():
         "max_bid_rate": 0.0,
         "min_fail_count": 9999,
         "max_fail_count": -1,
-        # 미구현(프런트는 보내지만 백엔드가 안 받는다)
+        # 면적 4종은 2026-08-26 에 **구현됐다**(migration 025 + extract_areas).
+        # KNOWN_UNSUPPORTED 에서 빠졌으므로 이제 아래 극단값이 실제로 0건을 만들어야 하고,
+        # 안 그러면 이 검사가 붉어진다 — 즉 구현이 되돌려지면 여기서 잡힌다.
         "min_building_area": 10 ** 9,
         "max_building_area": 1,
         "min_land_area": 10 ** 9,
         "max_land_area": 1,
+        # 미구현(프런트는 보내지만 백엔드가 안 받는다) — 원천 데이터가 없다
         "special_conditions": "존재하지않는조건zzz",
     }
     # `include_closed` 는 **범위를 넓히는** 파라미터라 극단값 개념이 다르다 - 따로 본다.
@@ -1222,8 +1249,18 @@ def run():
     #     unknown 파라미터를 거부하도록 바뀌면 **검색 자체가 죽는다**.
     #   - 백엔드에 그 이름이 생기면(구현되면) 이 검사가 실패한다 ― 프론트 TODO를 정리하고
     #     기대값을 옮기라는 신호다. 조용히 어긋난 상태로 남지 않게 한다.
-    UNSUPPORTED = ("min_building_area", "max_building_area", "min_land_area", "max_land_area",
-                   "special_conditions")
+    # ★ 2026-08-26: 면적 4종을 **구현하면서** 이 목록에서 뺐다.
+    #   위 주석이 예고한 그대로다 — "백엔드에 그 이름이 생기면 이 검사가 실패한다.
+    #   프론트 TODO를 정리하고 기대값을 옮기라는 신호다." 실제로 그 신호가 왔고
+    #   (min/max_building_area, min/max_land_area 4건이 "더 이상 무시되지 않는다"로 붉어졌다)
+    #   여기와 프런트 주석, source-contract 의 KNOWN_UNSUPPORTED 를 함께 정리했다.
+    #
+    #   구현: migration 025(컬럼+인덱스) / normalizer.extract_areas()(주소 원문에서 추출,
+    #   실데이터 커버리지 99.3%) / api/v1/search.py(WHERE 절) / backfill_area.py(기존 행).
+    #
+    #   `special_conditions` 만 남는다 — 면적과 달리 **원천 데이터 자체가 없다**
+    #   (auction_item 에도 rights_summary 에도 대응 필드가 없다).
+    UNSUPPORTED = ("special_conditions",)
 
     # ★ 2026-08-17 Sprint 163: 이 목록이 **최신인지 자체를 검사**한다.
     #

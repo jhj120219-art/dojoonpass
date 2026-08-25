@@ -514,25 +514,52 @@ def _probe_from(cwd):
 print()
 print("--- .env 로딩이 작업 디렉터리에 의존하지 않는가 (Sprint 245) ---")
 
+# ★ 2026-08-26 — 공허함 판정을 **둘 중 하나라도 있으면**으로 바꿨다.
+#
+#   예전에는 `_root_vals[0] > 0`, 즉 **`SUPABASE_JWT_SECRET` 이 설정돼 있어야만** 이
+#   검사가 성립했다. 그런데 그 변수는 **HS256(레거시) 전용이고 선택 사항**이다 —
+#   Supabase 는 지금 ES256 을 발급하고, 그 경로는 `SUPABASE_URL` -> JWKS 로만 검증한다.
+#   `.env` 에 그 변수가 없는 환경(=지금 이 머신)에서는 **재려던 성질과 무관한 이유로**
+#   빨간불이 켜졌다. 실제로 성질 자체는 성립하고 있었다:
+#
+#       cwd=저장소 루트   SECRET=0 URL=40 (src=NEXT_PUBLIC_SUPABASE_URL)
+#       cwd=임시 폴더     SECRET=0 URL=40 (src=NEXT_PUBLIC_SUPABASE_URL)
+#
+#   이 검사가 지켜야 하는 것은 "`.env` 를 **cwd 가 아니라 `__file__` 기준으로** 읽는가"다.
+#   그것은 **해석된 값 아무거나 하나**로 확인할 수 있다. 그래서 게이트를 넓히되
+#   **공허해지지는 않게** 한다 — 둘 다 0이면 여전히 실패한다(그때는 정말 잴 것이 없다).
+#
+#   그리고 **있는 값만** 비교한다. 0자인 항목을 "루트도 0 다른 폴더도 0 이니 통과"로
+#   세면 그거야말로 공허한 통과다(BUGS #204 가 경계한 모양).
 _root_vals, _root_raw = _probe_from(_REPO)
-check("저장소 루트에서 설정을 읽는다(검사가 공허하지 않다)",
-      _root_vals is not None and _root_vals[0] > 0,
-      f"-> {_root_raw}")
+check("저장소 루트에서 설정을 하나라도 읽는다(검사가 공허하지 않다)",
+      _root_vals is not None and (_root_vals[0] > 0 or _root_vals[1] > 0),
+      f"-> {_root_raw}  (SUPABASE_JWT_SECRET 과 SUPABASE_URL 이 **둘 다** 비어 있으면"
+      " cwd 비의존을 확인할 재료가 없다)")
 
-if _root_vals and _root_vals[0] > 0:
+if _root_vals and (_root_vals[0] > 0 or _root_vals[1] > 0):
     _tmp = _tf.mkdtemp(prefix="qa_cwd_")
     try:
         _other_vals, _other_raw = _probe_from(_tmp)
         check("다른 디렉터리에서도 임포트가 성공한다",
               _other_vals is not None, f"-> {_other_raw}")
         if _other_vals:
-            check("★ 다른 디렉터리에서도 JWT 시크릿을 읽는다(cwd 비의존)",
-                  _other_vals[0] == _root_vals[0],
-                  f"-> 루트 {_root_vals[0]}자 vs 다른 폴더 {_other_vals[0]}자. "
-                  "load_dotenv 가 cwd 기준이면 0자가 된다")
-            check("★ 다른 디렉터리에서도 SUPABASE_URL 을 읽는다(JWKS/ES256 경로)",
-                  _other_vals[1] == _root_vals[1],
-                  f"-> 루트 {_root_vals[1]}자 vs 다른 폴더 {_other_vals[1]}자")
+            # 루트에서 값이 있던 항목만 본다 — 애초에 0인 것을 "0==0" 으로 통과시키지 않는다.
+            _compared = 0
+            if _root_vals[0] > 0:
+                _compared += 1
+                check("★ 다른 디렉터리에서도 JWT 시크릿을 읽는다(cwd 비의존)",
+                      _other_vals[0] == _root_vals[0],
+                      f"-> 루트 {_root_vals[0]}자 vs 다른 폴더 {_other_vals[0]}자. "
+                      "load_dotenv 가 cwd 기준이면 0자가 된다")
+            if _root_vals[1] > 0:
+                _compared += 1
+                check("★ 다른 디렉터리에서도 SUPABASE_URL 을 읽는다(JWKS/ES256 경로)",
+                      _other_vals[1] == _root_vals[1],
+                      f"-> 루트 {_root_vals[1]}자 vs 다른 폴더 {_other_vals[1]}자. "
+                      "load_dotenv 가 cwd 기준이면 0자가 된다")
+            check("실제로 대조한 항목이 있다(0==0 통과가 아니다)", _compared > 0,
+                  f"-> 대조 {_compared}건")
     finally:
         _sh.rmtree(_tmp, ignore_errors=True)
 

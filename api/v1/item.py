@@ -12,7 +12,19 @@ from api.v1.thumbnails import image_url as _image_url
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter()
+
+def _area_of(row, key):
+    """`row` 에서 면적 컬럼을 꺼낸다. 컬럼이 없는 DB 도 견딘다.
+
+    migration 025 이전 스키마(옛 백업 등)에서는 `row[key]` 가 IndexError 를 낸다.
+    상세 전체가 500 이 되는 것보다 **그 필드만 null** 이 낫다.
+    `api/v1/search.py` 의 같은 이름 함수와 같은 규칙이다.
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 bearer_scheme = HTTPBearer(auto_error=False)
 
 @router.get("/item/{item_id}")
@@ -129,6 +141,12 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "fail_count": row["fail_count"],
             "validation_status": row["validation_status"],
             "crawl_date": row["crawl_date"],
+            # 면적(㎡). 2026-08-26 신설 — 검색 목록(`api/v1/search.py:row_to_item`)과
+            # **같은 키·같은 의미**로 맞춘다. 목록에서 면적으로 거르고 들어왔는데 상세에
+            # 그 값이 없으면 사용자가 확인할 방법이 없다.
+            # 못 뽑는 물건(차량/선박 등)은 null 이다 — 0 이 아니다.
+            "building_area": _area_of(row, "building_area"),
+            "land_area": _area_of(row, "land_area"),
             "case": dict(case) if case else None,
             # ★ 기존 계약 유지: `doc_type`/`status`는 그대로 있고 **키만 늘었다**.
             #    프런트의 기존 코드(`property.documents.some(d => d.doc_type==='SPEC' ...)`)는

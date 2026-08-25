@@ -87,7 +87,9 @@ def run():
 
     tmp = tempfile.mkdtemp(prefix="crawlorch_")
     scratch = os.path.join(tmp, "auction.db")
-    shutil.copy2(real_db, scratch)
+    # 온라인 백업 스냅샷 - 워커가 쓰는 중이어도 일관된 사본을 만든다
+    # (shutil.copy2 는 찢어질 수 있다. 사유: storage/database.py:snapshot_live_db)
+    db.snapshot_live_db(scratch)
     db.DB_PATH = scratch
 
     try:

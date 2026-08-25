@@ -62,11 +62,14 @@ DROP TABLE auction_item;
 ALTER TABLE auction_item_new RENAME TO auction_item;
 
 -- 4. 인덱스 재생성 (검색 API가 의존하는 인덱스 전부)
-CREATE INDEX IF NOT EXISTS idx_ai_case_no ON auction_item(case_no);
+-- ★ 2026-08-26 (migration 021): 여기 있던 3줄을 뺐다 —
+--   idx_ai_case_no / idx_ai_auction_date / idx_minimum_bid_price.
+--   전부 아래 idx_auction_item_* 와 **열 구성이 완전히 같은 중복**이라 021 이 지운다.
+--   여기 선언을 남겨 두면 '소스가 선언한 인덱스가 새 DB 에 전부 존재한다' 검사가
+--   붉어진다(만들자마자 021 이 지우므로). 최종 상태는 기존 DB·새 DB 모두 동일하다.
+--   idx_ai_sido 는 접두 중복이지만 **성능상 필요해 남긴다**(021 주석 참고).
 CREATE INDEX IF NOT EXISTS idx_ai_sido ON auction_item(sido);
-CREATE INDEX IF NOT EXISTS idx_ai_auction_date ON auction_item(auction_date);
 CREATE INDEX IF NOT EXISTS idx_search_main ON auction_item(sido, sigungu, property_type, auction_date);
-CREATE INDEX IF NOT EXISTS idx_minimum_bid_price ON auction_item(minimum_bid_price);
 CREATE INDEX IF NOT EXISTS idx_fail_count_date ON auction_item(fail_count, auction_date);
 CREATE INDEX IF NOT EXISTS idx_status_date ON auction_item(status, auction_date);
 CREATE INDEX IF NOT EXISTS idx_auction_item_case_no ON auction_item(case_no);

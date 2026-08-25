@@ -723,13 +723,18 @@ KNOWN_TRACKED_BUT_IGNORED = {
 # 직접 생성됐다 - fresh clone은 이 인덱스를 갖지 않는다(순수 중복이라 동작 차이는 없다).
 # 어떻게 생겼는지는 추적 불가(DB 변경 이력 없음). 드롭은 마찬가지로 스키마 변경이라 보류.
 # ---------------------------------------------------------------------------
-KNOWN_DUPLICATE_INDEXES = {
-    ("auction_item", ("auction_date",)),
-    ("auction_item", ("case_no",)),
-    ("auction_item", ("minimum_bid_price",)),
-    ("rights_summary", ("item_id",)),
-    ("audit_logs", ("admin_id",)),
-}
+# ★ 2026-08-26 migration 021: 위 5쌍을 **전부 정리했다.** 목록을 비운다 —
+#   이제 완전 중복은 **하나도 허용되지 않는다**(새로 생기면 곧바로 붉어진다).
+#
+#   Sprint 100이 "지금은 병목이 아니라 이득 없이 위험만 만든다"며 미룬 것을 뒤집은 근거는
+#   **이득을 실제로 쟀기 때문**이다(합성 500,000행): 인덱스 생성 18.4% 단축,
+#   파일 10.5%(34.9MB) 절감, API 쿼리 9종의 **실행계획 전부 SAME**, 지연 변화는 잡음 범위.
+#   열 구성이 완전히 같아 플래너가 남는 쪽을 그냥 대체재로 쓴다.
+#
+#   접두(prefix) 중복은 이 검사의 대상이 아니고, **지워서도 안 된다** — 같은 측정에서
+#   `idx_ai_sido`를 지웠더니 sido 검색이 38ms -> 244ms(+540%)가 됐다(좁은 인덱스가
+#   커버링 스캔에서 읽는 페이지가 적다). 자세한 것은 021 마이그레이션 주석.
+KNOWN_DUPLICATE_INDEXES = set()
 
 
 def test_no_new_duplicate_indexes():
@@ -1603,6 +1608,14 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
      "SELECT * FROM audit_logs WHERE %s ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"),
     ("api/v1/payments.py", "UPDATE payment_logs SET payment_id=? WHERE id IN (%s)"),
     ("storage/database.py", "PRAGMA foreign_keys = %s"),
+    # 2026-08-26 신설. `%s` 자리에 들어가는 것은 `",".join("?" * len(MIGRATED_DOC_TYPES))`,
+    # 즉 **`?` 반복뿐**이고 값은 전부 바인딩된다. `MIGRATED_DOC_TYPES` 는 모듈 상수
+    # 튜플이라 요청/외부 입력이 닿지 않는다.
+    #   왜 상수를 SQL 에 직접 쓰지 않았나 — 그 목록이 §3 INSERT 루프와 **같은 단일 소스**여야
+    #   하기 때문이다. 리터럴로 박으면 종류가 늘 때 한쪽만 바뀌고, 그때 이 검증이 조용히
+    #   틀린 답을 낸다(2026-08-26 에 `orig * 3` 하드코딩으로 정확히 그 일이 있었다).
+    ("migrate_execute.py",
+     "SELECT COUNT(*) FROM document_status WHERE doc_type IN (%s)"),
     # 아래는 전부 CLI 운영 스크립트다(요청으로 도달하지 않는다). 2026-08-14 확인:
     #   `%s` 자리에 들어가는 것은 호출부의 테이블 리터럴이거나 `?` 반복뿐이고,
     #   값은 예외 없이 바인딩된다. `TARGET_COLUMNS` 도 모듈 상수 튜플이다.
@@ -3580,9 +3593,13 @@ def test_entrypoints_do_not_attach_file_logs_on_import():
 # **그래서 지우지 않고 목록으로 고정한다.** 이 목록이 늘어나면 새로 생긴 것이므로
 # 검사가 실패한다 - "조용히 무시되는 필터"가 하나 더 생기는 것을 그때 잡는다.
 # 반대로 백엔드가 이 중 하나를 실제로 구현하면 그때도 실패한다(목록에서 빼라는 신호).
+# 2026-08-26: 면적 4종을 **구현하면서** 뺐다 — migration 025(building_area/land_area 컬럼),
+#   normalizer.extract_areas()(주소 원문에서 추출, 실데이터 커버리지 99.3%),
+#   api/v1/search.py(WHERE 절), backfill_area.py(기존 2,428행). 프런트의 '면적 조건'
+#   섹션도 '준비 중입니다' 에서 실제 입력(RangeSelect)으로 바뀌었다.
+#   `special_conditions` 만 남는다 — auction_item 에도 rights_summary 에도 대응 데이터가
+#   없어 **뽑아낼 원천 자체가 없다**(면적과 결정적으로 다른 점이다).
 KNOWN_UNSUPPORTED_SEARCH_PARAMS = {
-    "min_building_area", "max_building_area",   # auction_item 에 면적 컬럼이 없다
-    "min_land_area", "max_land_area",           # (주소 대괄호에서 프런트가 파싱한다)
     "special_conditions",                       # 백엔드에 대응 개념이 없다
 }
 
@@ -3649,9 +3666,13 @@ def test_search_form_params_reach_the_backend():
     if KNOWN_UNSUPPORTED_SEARCH_PARAMS - missing:
         print("      -> 백엔드가 구현했다. KNOWN_UNSUPPORTED_SEARCH_PARAMS 에서 빼라")
 
-    # 이 다섯이 사용자에게 도달하지 않는 근거도 함께 고정한다 -
+    # 아직 백엔드가 읽지 않는 것이 사용자에게 **도달하지 않는다**는 근거를 고정한다 -
     # "준비 중입니다"가 사라지면 그 순간 진짜 결함이 되기 때문이다.
-    for title in ("면적 조건", "특수조건"):
+    #
+    # ★ 2026-08-26: "면적 조건" 은 이 목록에서 **빠졌다.** 백엔드가 구현됐으므로 그 섹션은
+    #   이제 '준비 중입니다' 가 아니라 실제 입력이어야 한다 — 아래 반대 방향 검사가 그것을
+    #   확인한다(다시 '준비 중' 으로 되돌리면 잡힌다).
+    for title in ("특수조건",):
         idx = form_src.find('title="%s"' % title)
         check_true("'%s' 섹션이 있다" % title, idx != -1)
         if idx == -1:
@@ -3665,6 +3686,21 @@ def test_search_form_params_reach_the_backend():
                    "준비 중입니다" in window,
                    "-> 입력 UI 가 생겼다면 위 파라미터가 실제로 전송된다."
                    " 백엔드 구현 없이는 조용히 무시된다")
+
+    # ★ 구현된 섹션은 **반대로** 고정한다 (2026-08-26).
+    #   '면적 조건' 이 다시 '준비 중입니다' 로 돌아가면, 백엔드는 파라미터를 받는데
+    #   화면에서 넣을 방법이 없는 상태가 된다 — 기능이 조용히 사라진 것이다.
+    _idx = form_src.find('title="면적 조건"')
+    check_true("'면적 조건' 섹션이 있다", _idx != -1)
+    if _idx != -1:
+        _end = form_src.find("</SearchAccordionSection>", _idx)
+        _win = form_src[_idx:_end if _end != -1 else _idx + 400]
+        check_true("★ '면적 조건' 은 이제 실제 입력이다('준비 중입니다' 가 아니다)",
+                   "준비 중입니다" not in _win,
+                   "-> 백엔드는 min/max_building_area 를 받는데 화면에서 넣을 수 없다")
+        check_true("'면적 조건' 이 건물/토지 두 범위를 모두 그린다",
+                   "buildingAreaMin" in _win and "landAreaMin" in _win,
+                   "-> 한쪽만 있으면 나머지 파라미터가 도달하지 못한다")
 
     # 자기 검증: 비교가 실제로 동작하는가(공허하지 않은가).
     check_true("자기 검증: 없는 키를 넣으면 잡힌다",

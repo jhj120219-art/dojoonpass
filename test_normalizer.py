@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalizer.normalizer import (
     normalize_address, extract_sido,
     normalize_price, normalize_date, normalize_case_no,
+    extract_areas, address_without_brackets,
 )
 
 
@@ -454,6 +455,145 @@ def run_bracket_preservation():
     return failures
 
 
+# ---------------------------------------------------------------------------
+# extract_areas() — 주소 원문에서 건물/토지 면적 뽑기 (2026-08-26 신설)
+#
+# 왜 순수 함수 테스트인가: 이 함수의 출력이 곧 `auction_item.building_area` /
+# `land_area` 가 되고, 그 컬럼이 검색 필터의 근거가 된다. 즉 여기가 틀리면
+# **사용자가 면적으로 거른 결과가 조용히 틀린다.** DB 없이 고정할 수 있는 계약이다.
+#
+# 표본은 전부 실데이터에서 온 모양이다(2026-08-26, auction_item 2,444행 실측).
+# ---------------------------------------------------------------------------
+AREA_CASES = [
+    # (주소, 기대 building, 기대 land, 설명)
+    ("서울특별시 관악구 난곡로66가길 19 2층202호 [집합건물 철근콘크리트구조 17.08㎡]",
+     17.08, None, "집합건물 단일 면적"),
+    ("서울특별시 종로구 평창동 445-1 [토지 대 420㎡]",
+     None, 420.0, "토지 단일 면적"),
+    ("경상북도 포항시 북구 죽장면 월평리 690 [토지 임야 15446㎡]",
+     None, 15446.0, "임야"),
+    ("인천광역시 서구 건지로249번길 14 [건물 벽돌조 2층 1층 75.60㎡(소매점) 2층 70.20㎡(주택)]",
+     145.8, None, "다층 건물은 층 면적을 **합**한다(연면적)"),
+    ("경상북도 [토지 전[현황:묵전(죽림)] 105㎡]",
+     None, 105.0, "대괄호가 한 겹 더 있어도 통째로 집는다"),
+    ("경상북도 포항시 북구 죽장면 월평리 690 [토지 전 1048평]",
+     None, round(1048 * 3.3057851, 4), "평은 ㎡로 환산한다"),
+    ("충청북도 [토지 대 1,048㎡]",
+     None, 1048.0, "쉼표가 섞인 표기"),
+    ("사용본거지 : 인천 남동구 [카니발 2016년식 승용차]",
+     None, None, "차량은 면적 개념이 없다 - 0이 아니라 None"),
+    ("소재지 : 인천 남동구 장도로 86-13 논현동 [기타 동력선]",
+     None, None, "선박도 마찬가지"),
+    ("부산광역시 동래구 [집합건물 철근콘크리트조 74.5482㎡ 대지권의 표시 토지의 표시 : "
+     "부산광역시 동래구 안락동 308 대 500㎡ 대지권 비율 : 500분의 21.7849]",
+     74.5482, None,
+     "★ 대지권의 500㎡는 **필지 전체**다. 이 물건의 몫은 비율(21.78/500)이므로 "
+     "그대로 쓰면 23배 부풀려진다 - 토지는 None으로 둔다"),
+    ("", None, None, "빈 문자열"),
+    ("대괄호가 없는 주소 123-4", None, None, "대괄호가 없으면 아무것도 못 뽑는다"),
+    ("서울 [집합건물 구조만 있고 면적이 없다]", None, None, "면적 표기가 없으면 None"),
+]
+
+
+def run_area_extraction():
+    failures = []
+    for address, want_b, want_l, why in AREA_CASES:
+        got = extract_areas(address)
+        ok = got["building_area"] == want_b and got["land_area"] == want_l
+        print("[%s] %s" % ("PASS" if ok else "FAIL", why))
+        if not ok:
+            print("       입력: %s" % address[:90])
+            print("       기대 building=%s land=%s / 실제 building=%s land=%s"
+                  % (want_b, want_l, got["building_area"], got["land_area"]))
+            failures.append("extract_areas: %s" % why)
+
+    # 계약: 키는 항상 둘 다 존재한다(호출부가 KeyError를 걱정하지 않아도 된다).
+    for probe in ("", "아무거나", "[토지 대 1㎡]"):
+        keys = set(extract_areas(probe))
+        if keys != {"building_area", "land_area"}:
+            failures.append("extract_areas 반환 키가 다르다: %s" % sorted(keys))
+            print("[FAIL] 반환 키가 항상 building_area/land_area 여야 한다: %s" % sorted(keys))
+    print("[PASS] 반환 키는 언제나 building_area/land_area 둘 다")
+
+    # 0은 None이 아니다 - 실제로 0㎡가 적히면 0.0을 돌려줘야 한다
+    # (이 구분이 무너지면 "면적 미상"과 "면적 0"이 뒤섞인다).
+    got = extract_areas("서울 [토지 대 0㎡]")
+    if got["land_area"] != 0.0:
+        failures.append("0㎡를 0.0으로 돌려주지 않는다: %r" % got["land_area"])
+        print("[FAIL] 0㎡는 None이 아니라 0.0이어야 한다: %r" % got["land_area"])
+    else:
+        print("[PASS] 0㎡는 0.0이다(면적 미상 None과 구분된다)")
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# 대괄호(물건 표시)는 주소 파싱에서 제외한다 (2026-08-26 신설)
+#
+# `full_address` 는 "주소 + [물건 표시]" 형태다. 대괄호 안에는 구조·면적·등기부 항목이
+# 들어 있고 **주소 성분은 없다.** 그런데 시군구 정규식 `[가-힣]+[구시군]` 이 그 안까지
+# 훑어 **"갑구"**(등기부 갑구/을구)를 행정구역으로 집고 있었다.
+#
+#   실측 (2026-08-26, auction_item):
+#     세종특별자치시 전의면 관정리 578-31 [토지 임야 297㎡ 갑구 2번, 3번 ...]
+#       -> sigungu='갑구' 로 저장됨. 세종시는 시군구가 없어 정답은 빈 문자열이다.
+#     같은 모양 2건이 DB 에 실제로 있었다.
+#
+# 영향: `sigungu LIKE '%갑구%'` 검색에 엉뚱한 물건이 걸리고, 지역 필터가 조용히 틀린다.
+# ---------------------------------------------------------------------------
+BRACKET_EXCLUSION_CASES = [
+    # (주소, 기대 sigungu, 설명)
+    ("세종특별자치시 전의면 관정리 578-31 [토지 임야 297㎡ 갑구 2번, 3번 공유자 주식회사]",
+     "", "★ 대괄호 안의 '갑구'(등기부 항목)를 시군구로 읽지 않는다"),
+    ("세종특별자치시 장군면 평기리 265-4 [토지 임야 1434㎡ 갑구 7번 양숙정 지분]",
+     "", "세종시는 시군구가 없다"),
+    ("경기도 고양시 일산동구 고양대로 953-9 205동 4층401호 (식사동,한울하임) [집합건물 철근콘크리트구조]",
+     "고양시 일산동구", "일반구는 그대로 '시 구' 로 잡는다(기존 동작 무변경)"),
+    ("제주특별자치도 제주시 구좌읍 세화리 산29 [토지 임야 93124㎡ 갑구1번 이정도 지분]",
+     "제주시", "대괄호에 '갑구' 가 있어도 주소 쪽 시군구가 이긴다"),
+    ("서울특별시 관악구 난곡로66가길 19 2층202호 [집합건물 철근콘크리트구조 17.08㎡]",
+     "관악구", "일반적인 구"),
+]
+
+
+def run_bracket_exclusion():
+    failures = []
+    for address, want, why in BRACKET_EXCLUSION_CASES:
+        got = normalize_address(address)
+        if got["sigungu"] != want:
+            failures.append("bracket: %s" % why)
+            print("[FAIL] %s" % why)
+            print("       입력: %s" % address[:90])
+            print("       기대 sigungu=%r / 실제 %r" % (want, got["sigungu"]))
+        else:
+            print("[PASS] %s" % why)
+
+        # ★ 원문은 절대 바뀌지 않는다. 대괄호를 떼는 것은 **파싱 입력**에서만이다.
+        if got["full_address"] != address:
+            failures.append("bracket: full_address 변형 (%s)" % why)
+            print("[FAIL] full_address 가 바뀌었다: %r" % got["full_address"][:80])
+
+    # 헬퍼 자체 계약
+    check_pairs = [
+        ("서울 강남구 1 [집합건물 10㎡]", "["),
+        ("경북 [토지 전[현황:묵전(죽림)] 105㎡]", "["),
+    ]
+    for src, forbidden in check_pairs:
+        out = address_without_brackets(src)
+        if forbidden in out:
+            failures.append("address_without_brackets 가 대괄호를 남겼다: %r" % out)
+            print("[FAIL] 대괄호가 남았다: %r" % out)
+    print("[PASS] address_without_brackets 가 중첩 대괄호까지 제거한다")
+
+    if address_without_brackets("") != "":
+        failures.append("address_without_brackets 빈 입력")
+        print("[FAIL] 빈 입력 처리")
+    else:
+        print("[PASS] 빈 입력은 빈 문자열")
+
+    return failures
+
+
 def run():
     failures = []
 
@@ -500,6 +640,8 @@ def run():
     failures += run_sido_position()
     failures += run_batch_isolation()
     failures += run_bracket_preservation()
+    failures += run_area_extraction()
+    failures += run_bracket_exclusion()
 
     print()
     if failures:

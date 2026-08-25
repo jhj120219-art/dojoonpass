@@ -125,6 +125,54 @@ CREATE TABLE IF NOT EXISTS document_version_log (
 """
 
 
+def snapshot_live_db(dest_path: str) -> str:
+    """운영 DB 를 `dest_path` 에 **일관된 스냅샷**으로 복제하고 그 경로를 돌려준다.
+
+    ## 왜 `shutil.copy2()` 로는 안 되는가 (2026-08-26 실측으로 드러났다)
+
+    SQLite 파일을 OS 파일 복사로 뜨면 **다른 프로세스가 쓰는 중일 때 찢어진 사본**이
+    나올 수 있다. 페이지 일부만 반영된 상태, 저널이 안 맞는 상태가 그대로 복사된다.
+
+    지금까지는 이 저장소에서 그럴 일이 거의 없었다 — DocWorker 가 스케줄러에 등록돼
+    있지 않아 **운영 중 DB 에 쓰는 프로세스가 사실상 없었기** 때문이다.
+    2026-08-26 에 `DojoonPass-DocWorker`(02:00~04:00) 를 등록하면서 그 전제가 깨졌다.
+
+    실제로 그날 워커를 돌리면서 스위트를 같이 돌렸더니 **두 검사가 붉어졌다**:
+
+        test_crawl_orchestration.py   (shutil.copy2 로 실 DB 사본을 뜬다)
+        test_worker_batching.py
+
+    둘 다 **단독으로는 통과한다.** 제품 결함이 아니라 사본이 깨진 것이다.
+    앞으로는 매일 밤 02:00~04:00 에 같은 조건이 만들어진다 — 그 시간대에 스위트를
+    돌리면 이유 없이 붉어진다. 그러면 사람이 검사를 믿지 않게 된다.
+
+    ## 무엇이 다른가
+
+    SQLite 의 **온라인 백업 API**(`Connection.backup()`)를 쓴다. 쓰기 중인 DB 에서도
+    **트랜잭션 일관성이 보장된 스냅샷**을 만든다(엔진이 페이지 단위로 잠금을 관리한다).
+
+    원본은 **읽기 전용(`mode=ro`)** 으로 연다 — 스냅샷을 뜨다가 실수로 운영 DB 를
+    건드리는 일이 구조적으로 불가능하게 한다.
+
+    ## 쓰는 곳
+
+    실 DB 사본이 필요한 **모든 검사/감사 도구**가 이 함수를 쓴다. 규칙을 여기 한 곳에만
+    둔다 — 같은 복사 코드가 11곳에 흩어져 있었고, 그중 하나만 고치면 나머지가 조용히
+    옛 방식으로 남는다(이 저장소가 "규칙이 두 벌"에서 반복해 겪은 사고, BUGS #204).
+    """
+    src_uri = "file:%s?mode=ro" % str(DB_PATH).replace("\\", "/")
+    src = sqlite3.connect(src_uri, uri=True)
+    try:
+        dest = sqlite3.connect(dest_path)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        src.close()
+    return dest_path
+
+
 def get_connection(enforce_foreign_keys: bool = True) -> sqlite3.Connection:
     """DB 커넥션. 기본적으로 **외래키 제약을 런타임에 강제**한다(2026-08-07 CTO 승인 1번).
 

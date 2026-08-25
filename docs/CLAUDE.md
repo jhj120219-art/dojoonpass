@@ -98,6 +98,8 @@ Separately: `doc_worker.py` (~02:00, via `run_doc_worker.bat`) drains `document_
 작업 스케줄러 249개를 전수로 훑어 이 저장소를 가리키는 작업이 **0개**임을 확인했다.
 `register_scheduler_tasks.ps1` 이 정의하는 세 작업(`DojoonPass-PriorityRefresh` 01:50 /
 `DojoonPass-DocWorker` 02:00 / `DojoonPass-DailyCrawl` 06:00)이 **전부 미등록**이다.
+**[2026-08-26 갱신] 이 문단은 더 이상 사실이 아니다** — PriorityRefresh/DocWorker 를
+등록했다(DailyCrawl 은 기존 `DOJOONPASS_DAILY` 가 커버). 아래 "지금 사실인 상태" 절 참고.
 그 결과가 지금의 Release Blocker다:
 
 ```
@@ -169,11 +171,33 @@ READY 중 doc_raw 없음      "다수"                    0건 (READY 556건 전
 ```
 
 **오측의 출처를 찾았다.** `auction.db.backup_before_020_20260817_090319` 과
-`.claude/worktrees/sprint95-false-success-audit/auction.db` 가 **정확히 그 주장대로**다 —
-migration 019까지 / `auction_image` 없음 / `doc_raw` 0행 / items 1,876 / queue 3,498 /
-document_status 5,628. 즉 그 세션은 운영 DB가 아니라 **pre-020 백업(또는 worktree 사본)을
-잰 것으로 보인다.** 다만 "2,376행 / 291건 / 최종 09-02"는 이 PC의 DB 파일 18개 어느 것과도
-일치하지 않아 **출처 확인 불가**로 남긴다.
+`.claude/worktrees/sprint95-false-success-audit/auction.db` 는 이후 둘 다 삭제됐다 —
+당시 둘 다 **정확히 그 주장대로**였다: migration 019까지 / `auction_image` 없음 /
+`doc_raw` 0행 / items 1,876 / queue 3,498 / document_status 5,628. 즉 그 세션은 운영 DB가
+아니라 **pre-020 백업(또는 worktree 사본)을 잰 것으로 보인다.** 다만
+"2,376행 / 291건 / 최종 09-02"는 이 PC의 DB 파일 18개 어느 것과도 일치하지 않아
+**출처 확인 불가**로 남긴다.
+
+### ★★★★ [2026-08-25 정정] 위 결론은 틀렸다 — 그 세션이 본 것은 **이 DB 가 맞았다**
+
+바로 위 절은 "그 세션은 백업을 쟀다 / 감사기를 그냥 돌리면 이 오측은 일어나지 않는다"로
+끝난다. 2026-08-25 에 `storage.database.DB_PATH`(= 저장소 루트 `auction.db`)를 **경유해서**
+다시 쟀더니 그 "오측"이라던 값이 전부 사실이었다:
+
+```
+항목                     위 절이 "운영 DB" 라고 적은 값    2026-08-25 실측 (DB_PATH 경유)
+-----------------------  -----------------------------  ------------------------------
+migration_history 최신     020 (08-17 적용)               **019** — 020 이 없었다
+auction_image             있다, 45행                     **테이블 자체가 없었다**
+doc_raw                   556행                          **0행**
+READY 중 doc_raw 없음      0건                            **555건**
+```
+
+즉 경로를 경유하느냐 여부의 문제가 아니었다. **020 은 이 DB 에 실제로 적용된 적이 없고,
+`doc_raw` 도 실제로 비어 있었다.** 위 절이 "백업을 잰 탓"으로 돌린 것이 오히려 오진이다.
+
+이 세션에서 둘 다 실제로 닫았다 — 020 적용(`CREATE TABLE IF NOT EXISTS` 뿐, 데이터 무변경)
++ `backfill_doc_raw.py --apply` 로 555행 백필. 자세한 것은 `docs/BUGS.md` #211.
 
 **교훈 — DB를 잴 때는 반드시 `storage.database.DB_PATH`(= 저장소 루트의 `auction.db`)를
 경유한다.** 루트에는 이름이 비슷한 백업이 16개 더 있어 손으로 열면 구별되지 않는다.
@@ -182,8 +206,27 @@ document_status 5,628. 즉 그 세션은 운영 DB가 아니라 **pre-020 백업
 
 **지금 사실인 상태(2026-08-25 실측):**
 
-- 예약 작업 **0개**. `run_daily.bat`/`run_doc_worker.bat`/`run_priority_refresh.bat`
-  어느 것도 등록돼 있지 않다. 등록은 승인 영역이라 에이전트가 하지 않는다.
+- ~~예약 작업 **0개**. 어느 것도 등록돼 있지 않다.~~
+  **-> 2026-08-26 갱신: 이제 3개가 전부 등록돼 있다.**
+
+```
+\DOJOONPASS_DAILY            03:00  run_daily.bat        (이전부터 등록돼 있었다)
+                                    마지막 2026-08-26 03:00:01 / 결과 0
+DojoonPass-PriorityRefresh   01:50  run_priority_refresh.bat   <- 2026-08-26 등록
+DojoonPass-DocWorker         02:00  run_doc_worker.bat         <- 2026-08-26 등록
+```
+
+  `DojoonPass-DailyCrawl`(06:00)은 **일부러 등록하지 않았다** — `DOJOONPASS_DAILY` 가
+  이미 같은 `run_daily.bat` 을 03:00 에 돌리고 있어, 추가하면 같은 배치가 하루 두 번 돈다.
+  `register_scheduler_tasks.ps1 -SkipCoveredByLegacy` 가 그 판정을 자동으로 한다.
+
+  **★ 등록 전에 선행 조건을 실측했다** — selenium 4.47.0 / 크롬 드라이버 기동 OK
+  (Chrome 151) / doc_worker import OK. 그리고 등록만 하고 끝내지 않고 **실제로 돌려**
+  파이프라인 전체를 확인했다(13분, 문서 58건 + 사진 85장 수집). 자세한 것은 BUGS #215.
+
+  **한계**: 이 작업들은 **로그온 상태에서만** 실행된다(비밀번호 없이 등록하는 방식).
+  완전 로그아웃 운영이 필요하면 `-RunWhetherLoggedOn` 으로 재등록해야 하고
+  그때는 자격 증명 입력이 필요하다.
   (2026-08-25 `register_scheduler_tasks.ps1` dry-run 통과 — 선행 조건 전부 OK,
    등록 대상 3개 전부 신규. 등록은 하지 않았다.)
 - ★ **등록만으로는 안 됐다** — 2026-08-25 까지 이 PC 에서 수집 파이프라인이
@@ -196,17 +239,45 @@ document_status 5,628. 즉 그 세션은 운영 DB가 아니라 **pre-020 백업
   Selenium Manager 폴백을 붙여 고쳤다 — 지금은 세 진입점 전부 1초 안에 기동한다.
   회귀: `test_schema_hygiene.py` 의
   `test_pipeline_resolves_chrome_driver_through_one_place()`. 자세한 것은 BUGS #196.
-- 마지막 크롤 **2026-08-12**(그날 9행, 그 전은 08-01). 기일 남은 물건 **0건** —
-  기본 검색이 빈 화면이다. `docs/BETA_RELEASE_CHECKLIST.md` 의 `P0A-VERDICT` 토큰은
-  이 실측과 같은 말(**OPEN**)이어야 하고, `test_pipeline_integrity.py` 가 그것을 강제한다.
+- ~~마지막 크롤 **2026-08-12**. 기일 남은 물건 **0건** — 기본 검색이 빈 화면이다.~~
+  **-> 2026-08-25 23:00 재실측으로 갱신됐다.** 이 머신에서 크롤이 그날 실제로 돌았다:
+  `MAX(crawl_date)` **2026-08-25**(262건), 기일 미도래 물건 **270건**,
+  `GET /api/v1/search` **total 270 / 20.4ms / HTTP 200**. 즉 **빈 화면이 아니다.**
+  그래서 `docs/BETA_RELEASE_CHECKLIST.md` 의 `P0A-VERDICT` 토큰은 지금 **RESOLVED** 다.
+  `test_pipeline_integrity.py` 가 토큰과 실측을 **양방향으로** 대조하므로, 이 값은
+  문서가 아니라 **그때그때의 DB** 를 따라간다 — 여기 적힌 숫자를 다음 세션이
+  그대로 믿지 말고 **다시 재라.** (이 토큰은 이 머신의 드리프트 가드이지 운영 제품의
+  판정이 아니다 — BUGS #200.)
+- **그 다음 벽은 문서 공급이다** (2026-08-25 실측). 기본 검색에 보이는 270건 중
+  **249건(92.2%)이 문서 전부 `COLLECTING`** 이고 사진이 있는 물건은 **0건**이다.
+  검색·상세는 열리는데 열 것이 없다. 실제로 브라우저를 열어야 하는 물건은 270개뿐이라
+  (큐 5,314행 중 4,275행은 기일 경과분이라 브라우저 없이 종결된다) **워커를 약 1.8일
+  돌리면 따라잡는다.** 자세한 실측은 `docs/SPRINT255_REAL_DB_SCALE_AND_DOC_RAW.md`.
 - `document_queue.last_attempt_at` 최댓값이 **2026-07-12** 에서 멈춰 있다(`enqueued_at`
   최댓값은 2026-08-12). DocWorker 가 큐를 만진 적이 없다는 뜻이고, pending 2,753건 중
   **2,750건(99.9%)은 기일이 이미 지나** 지금 수집해도 의미가 없다.
   `audit_schedule_health.py` 의 `queue_stall_signal()` 이 이 정체를 직접 판정한다.
-- 자산 파이프라인 자체는 **정합**하다 — `audit_asset_integrity.py` 기준 어긋남 0건
-  (`auction_image` 45행/파일 누락 0, `doc_raw` 556행/파일 누락 0, READY 556건 중 doc_raw
-  없는 것 0건). 다만 셋 다 **2026-08-17 Sprint 144 산물이고 그 뒤 증가가 없다** —
-  깨진 것이 아니라 **공급이 멈춘 것**이다. 고아 큐 행 18건은 별도(아래 감사기 참고).
+- ~~자산 파이프라인 자체는 **정합**하다 — 어긋남 0건 (`auction_image` 45행,
+  `doc_raw` 556행, READY 556건 중 doc_raw 없는 것 0건).~~
+  **-> 이 서술은 사실이 아니었다 (2026-08-25 실측, BUGS #211).** 실제로는
+  `auction_image` **테이블 자체가 없었고**(migration 020 미적용), `doc_raw` 는 **0행**,
+  READY 555건 중 doc_raw 없는 것이 **555건**이었다. 즉 화면은 문서를 열 수 있는데
+  **쪽수/크기/버전이 전부 null** 이라 뷰어가 페이지 이동 UI 를 그릴 수 없었다.
+  `audit_asset_integrity.py` 어긋남 **581건**.
+  이 세션에서 020 을 적용하고(`CREATE TABLE IF NOT EXISTS` 뿐, 데이터 무변경)
+  `backfill_doc_raw.py --apply` 로 555행을 채웠다 — **어긋남 581 -> 26건**,
+  그리고 감사기 [9] 가 처음으로 실제 검증됐다(**API 가 광고한 문서 URL 555개 / 열리지
+  않음 0개**). 남은 26 = 재수집 대기 17 + downloads 고아 7 + 고아 디렉터리 1 + 1.
+  고아 큐 행 18건은 별도(아래 감사기 참고).
+- **감사기의 자기 검증이 공허했다** — `audit_asset_integrity.py --selftest` 가 결함을
+  `SELECT ... FROM auction_image LIMIT 1` 로 심어서, **사진이 이미 수집돼 있어야만**
+  검증이 성립했다(사진 수집은 데스크탑1 = 승인 영역이라 이 머신에서는 영원히 0행).
+  `auction_item` 에서 씨앗을 가져오도록 고치고 "심을 물건이 있다" 단언을 세웠다.
+
+**~~`run_daily.bat` 에 대한 관찰은 그대로 유효하다~~ -> 2026-08-26 에 고쳤다.**
+이제 이 배치가 **맨 앞에서 `python -m storage.migrations.run_migrations` 를 부른다**
+(실패하면 거기서 멈춘다 — 틀린 스키마에 크롤 데이터를 쓰는 것보다 안 쓰는 것이 낫다).
+러너는 재실행에 안전하다. 아래 원문은 경위를 위해 남긴다.
 
 **`run_daily.bat` 에 대한 관찰은 그대로 유효하다 — 이건 DB가 아니라 코드를 읽어 확인했다.**
 `mvp_scraper.py`(→ `init_db()`, 레거시 3테이블만)와 `migrate_execute.py` 만 부르고
@@ -221,7 +292,7 @@ migration 적용과 스케줄러 등록은 둘 다 승인 영역이라 이 세�
 ```bash
 python -c "from storage.database import init_db; init_db()"   # creates the legacy auction, document_queue, document_version_log tables
 python storage/migrate_v4_1.py                 # creates auction_case, auction_item, document_status, doc_raw, parsed_document, tenant_rights, rights_summary, rights_analysis_history
-python -m storage.migrations.run_migrations     # applies numbered SQL files 001~020 (favorites, recent_items, search_presets, subscriptions, registry_usage, payments, registry_requests, indexes, payment_logs, registry_credits, audit/credit logs + soft-delete columns, document_collect_failures, document_queue UNIQUE+item_no, subscriptions.payment_id, auction_image); tracked in `migration_history`, safe to re-run. Running it as a script (`python storage/migrations/run_migrations.py`) also works as of 2026-08-11 — before that only the `-m` form did.
+python -m storage.migrations.run_migrations     # applies numbered SQL files 001~025 (favorites, recent_items, search_presets, subscriptions, registry_usage, payments, registry_requests, indexes, payment_logs, registry_credits, audit/credit logs + soft-delete columns, document_collect_failures, document_queue UNIQUE+item_no, subscriptions.payment_id, auction_image, drop-duplicate-indexes, backfill-missing-indexes, align-drifted-constraints, auction_case-court_code-NOT-NULL, auction_item 면적 컬럼); tracked in `migration_history`, safe to re-run. Running it as a script (`python storage/migrations/run_migrations.py`) also works as of 2026-08-11 — before that only the `-m` form did.
 ```
 2026-08-15 Sprint 122 정정: the `init_db()` step above is **required**, not optional. An earlier
 version of this doc listed only the last two commands and said "부트스트랩은 위 두 명령만으로

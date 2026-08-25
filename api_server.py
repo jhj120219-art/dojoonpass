@@ -23,6 +23,12 @@ for _noisy in ("httpx", "httpcore", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+# 이 모듈 자신의 로거. 위 basicConfig 가 root 를 설정한 뒤여야 한다.
+# (속도 제한 미들웨어가 거절을 남길 때 쓴다 — 없으면 그 자리에서 NameError 가 나고,
+#  하필 **상한을 넘긴 순간에만** 터져서 평소 검사로는 드러나지 않는다.)
+logger = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 from api.v1.search import router as search_router
 from api.v1.item import router as item_router
@@ -36,6 +42,10 @@ from api.v1.images import router as images_router
 from api.v1.payments import router as payments_router
 from api.v1.admin import router as admin_router, warn_if_admin_keys_missing
 from api.auth import warn_if_auth_config_missing
+from api.rate_limit import (
+    limiter as _rate_limiter, limit_per_minute, enabled as _rate_limit_enabled,
+    client_key as _rate_limit_key,
+)
 from api.v1.subscriptions import router as subscriptions_router
 
 # 설정 누락을 **부팅 시점에** 알린다 (2026-08-21 Sprint 246).
@@ -80,6 +90,44 @@ app.add_middleware(
 # 이 API에서 직접 담는다). 프런트(3000)와 백엔드(8000)는 포트가 달라 **다른 origin**이므로
 # `SAMEORIGIN`조차 이 뷰어를 깨뜨린다 - 넣으면 안 되는 자리에 그대로 복붙하지 않도록
 # 여기 남긴다(Sprint 126/127이 프런트에서 고른 것과 백엔드는 요구사항이 다르다).
+# 요청 속도 제한 (2026-08-26 신설, P1-5).
+#
+# ★ 보안 헤더 미들웨어보다 **먼저 선언한다.** Starlette 은 나중에 추가된 미들웨어가
+#   바깥쪽에 오므로, 아래 add_security_headers 보다 위에 두면 이 검사가 **안쪽**이 된다.
+#   즉 429 응답에도 보안 헤더가 붙는다. 반대로 두면 거절된 요청만 헤더가 빠져
+#   "어떤 응답은 nosniff 가 없다"는 미묘한 불일치가 생긴다.
+#
+# 왜 여기(애플리케이션)에서 하나: 지금 이 API 앞에 리버스 프록시가 없다. 배포에 프록시가
+# 붙으면 그쪽이 더 나은 자리이고, 그때 이 미들웨어는 이중 안전망으로 남겨 두면 된다.
+#
+# 한계와 기본값의 근거는 `api/rate_limit.py` 상단 주석 참고 — 요약하면
+# **프로세스 안에서만 세고**(워커를 늘리면 실효 상한이 곱해진다), 기본 1200회/분은
+# 사람이 브라우저로 낼 수 있는 속도보다 한참 위라 정상 사용을 막지 않는다.
+@app.middleware("http")
+async def rate_limit(request, call_next):
+    # 정적/헬스 경로까지 셀 이유가 없다. 비용이 드는 것은 API 다.
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    if not _rate_limit_enabled():
+        return await call_next(request)
+
+    allowed, retry_after = _rate_limiter.check(
+        _rate_limit_key(request), limit_per_minute())
+    if not allowed:
+        # 429 + Retry-After. 클라이언트가 언제 다시 오면 되는지 알 수 있어야
+        # 즉시 재시도 루프를 돌지 않는다(그러면 방어가 오히려 부하를 만든다).
+        retry_seconds = max(1, int(retry_after + 0.999))
+        logger.warning("속도 제한 초과 - %s %s (client=%s, 분당 상한 %d)",
+                       request.method, request.url.path,
+                       _rate_limit_key(request), limit_per_minute())
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요."},
+            headers={"Retry-After": str(retry_seconds)},
+        )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def add_security_headers(request, call_next):
     response = await call_next(request)

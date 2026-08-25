@@ -107,7 +107,9 @@ def _setup():
     import storage.database as dbmod
     _tmpdir = tempfile.mkdtemp(prefix="qa_fi_")
     tmpdb = os.path.join(_tmpdir, "scratch.db")
-    shutil.copy2(dbmod.DB_PATH, tmpdb)
+    # 온라인 백업 스냅샷 - 워커가 쓰는 중이어도 일관된 사본을 만든다
+    # (shutil.copy2 는 찢어질 수 있다. 사유: storage/database.py:snapshot_live_db)
+    dbmod.snapshot_live_db(tmpdb)
     dbmod.DB_PATH = tmpdb
 
 

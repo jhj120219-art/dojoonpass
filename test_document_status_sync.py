@@ -820,10 +820,14 @@ def test_ready_means_the_viewer_can_serve_it():
     c.row_factory = sqlite3.Row
     try:
         rows = c.execute(
-            "SELECT ds.doc_type, ai.court_name, ai.case_no, ai.item_no"
+            "SELECT ds.item_id, ds.doc_type, ai.court_name, ai.case_no, ai.item_no"
             " FROM document_status ds JOIN auction_item ai ON ds.item_id = ai.id"
             " WHERE ds.status = 'READY'"
         ).fetchall()
+        # 사진은 문서와 **저장 위치도 서빙 경로도 다르다**(아래 IMAGE 분기에서 쓴다).
+        image_rows = {}
+        for r in c.execute("SELECT item_id, seq, storage_path FROM auction_image"):
+            image_rows.setdefault(r["item_id"], []).append((r["seq"], r["storage_path"]))
     finally:
         c.close()
 
@@ -835,6 +839,39 @@ def test_ready_means_the_viewer_can_serve_it():
     by_type = {}
     for r in rows:
         by_type[r["doc_type"]] = by_type.get(r["doc_type"], 0) + 1
+        # ★ IMAGE 는 문서가 아니다 — **면제가 아니라 다른 규칙으로 검사한다** (2026-08-26).
+        #
+        #   `document_status` 에는 doc_worker 가 만드는 `IMAGE` 행도 들어온다. 사진은
+        #   `auction_image` + `documents/<법원>/<사건>/<물건>/images/` 에 저장되고
+        #   `/api/v1/item/{id}/images/{seq}` 로 서빙된다 — `DOC_TYPE_FILES` 에 없는 것이
+        #   정상이다. 그런데 이 검사는 문서 경로만 알아서 "알 수 없는 doc_type" 으로 잡았다.
+        #
+        #   2026-08-26 에 `DojoonPass-DocWorker` 를 처음 돌려 사진이 실제로 수집되자
+        #   IMAGE READY 17행이 한꺼번에 붉어졌다. **사진 쪽은 멀쩡했다** — 검사가 그
+        #   자산 종류를 몰랐을 뿐이다(그전까지 auction_image 가 0행이라 드러날 일이 없었다).
+        #
+        #   그냥 건너뛰면 사진은 아무도 안 지키게 된다. 그래서 **같은 강도로** 본다:
+        #   READY 라면 (a) auction_image 행이 있어야 하고 (b) 그 파일이 실재하며
+        #   (c) 0바이트가 아니어야 한다. 문서에 요구하는 것과 정확히 같은 세 가지다.
+        if r["doc_type"] == "IMAGE":
+            imgs = image_rows.get(r["item_id"]) or []
+            if not imgs:
+                unservable.append("IMAGE READY 인데 auction_image 행이 없다: item=%s"
+                                  % r["item_id"])
+                continue
+            for seq, rel in imgs:
+                if not rel:
+                    unservable.append("IMAGE storage_path 가 비었다: item=%s seq=%s"
+                                      % (r["item_id"], seq))
+                    continue
+                ipath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     rel.replace("/", os.sep))
+                if not os.path.exists(ipath):
+                    unservable.append("IMAGE 파일 없음: %s" % rel)
+                elif os.path.getsize(ipath) == 0:
+                    unservable.append("IMAGE 0바이트: %s" % rel)
+            continue
+
         if r["doc_type"] not in DOC_TYPE_FILES:
             unservable.append("알 수 없는 doc_type: %s" % r["doc_type"])
             continue

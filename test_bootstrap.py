@@ -215,8 +215,24 @@ def test_bootstrap_matches_live_schema():
         shutil.rmtree(tmp, ignore_errors=True)
 
     # 운영에만 있는 테이블 = 부트스트랩이 못 만드는 것. 이게 있으면 새 배포가 깨진다.
-    # (`sqlite_sequence`는 AUTOINCREMENT가 쓰이면 자동 생성되므로 비교에서 뺀다.)
-    only_live = sorted(live_tables - made - {"sqlite_sequence"})
+    #
+    # `sqlite_` 접두사는 SQLite가 **예약한 내부 이름**이라 스키마가 만들 수 있는 것이
+    # 아니다. 이 비교의 목적은 "부트스트랩이 빠뜨린 **우리 테이블**"을 찾는 것이므로
+    # 엔진이 알아서 만드는 것은 전부 뺀다.
+    #
+    #   sqlite_sequence   AUTOINCREMENT가 쓰이면 자동 생성 (원래부터 빼고 있었다)
+    #   sqlite_stat1      ★ ANALYZE가 만드는 **통계** 테이블이다 (2026-08-25 추가).
+    #                     운영 DB에서 한 번이라도 ANALYZE를 돌리면 생기는데, 부트스트랩은
+    #                     통계를 만들 이유가 없으므로 영원히 못 만든다 — 즉 이 검사가
+    #                     **고칠 수 없는 이유로 영구히 붉어진다.** 실제로 그렇게 됐다
+    #                     (2026-08-25: 운영 DB에 sqlite_stat1 39행). 그 상태를 방치하면
+    #                     이 검사가 잡아야 할 **진짜 스키마 누락**이 그 옆에 묻힌다.
+    #   sqlite_autoindex_*  UNIQUE 제약이 만드는 자동 인덱스(type='table'로는 안 잡히지만
+    #                     같은 예약 접두사이므로 규칙을 하나로 둔다)
+    #
+    # 접두사 하나로 규칙을 세우면 앞으로 sqlite_stat4 등이 생겨도 따라온다.
+    only_live = sorted(t for t in (live_tables - made)
+                       if not t.startswith("sqlite_"))
     check("운영에만 있고 부트스트랩으로는 못 만드는 테이블 없음", only_live, [])
 
     only_new = sorted(made - live_tables - {"sqlite_sequence"})
@@ -257,32 +273,32 @@ def test_bootstrap_matches_live_schema():
 # ---------------------------------------------------------------------------
 
 # (table, (col_name, col_type, notnull, default)) - fresh clone에만 있고 운영에는 없는 컬럼 정의
-KNOWN_FRESH_ONLY_COLUMNS = {
-    ("auction_case", ("court_code", "TEXT", 0, None)),
-    ("payment_webhooks", ("raw_payload", "TEXT", 1, None)),
-    ("payment_webhooks", ("processing_status", "TEXT", 1, "'RECEIVED'")),
-    ("registry_credit_logs", ("delta", "INTEGER", 1, "0")),
-    ("registry_credits", ("amount", "INTEGER", 1, "0")),
-}
+# ★ 2026-08-26 migration 023 이 payment_webhooks / registry_credits /
+#   registry_credit_logs 의 제약 4건을 **소스(더 엄격한 쪽)에 맞췄다.** 세 테이블 다 0행이라
+#   재작성이 무손실이었다(합성 행으로 id 보존·NULL 승격까지 사본에서 검증).
+#
+#   `auction_case.court_code` 만 남는다 — 여기는 **live 쪽이 옳아서** 일부러 두는 것이다.
+#   이 열은 `UNIQUE(court_code, case_no)` 의 앞자리인데 SQLite 는 NULL 을 서로 다른 값으로
+#   보므로, 소스처럼 nullable 이면 court_code 가 NULL 인 중복 사건이 제약을 그냥 통과한다.
+#   즉 fresh 에 맞추면 **방어가 사라진다.** 방향을 반대로(소스를 NOT NULL 로) 잡아야 하고,
+#   그건 1,796행짜리 테이블 재작성이라 별도 마이그레이션으로 다룬다.
+# ★ 2026-08-26 migration 024 가 마지막 하나(auction_case.court_code)까지 닫았다.
+#   여기는 **소스를 라이브에 맞춘** 유일한 항목이다 — UNIQUE(court_code, case_no) 의
+#   앞자리라 nullable 이면 SQLite 가 NULL 을 서로 다른 값으로 봐서 중복 사건이 제약을
+#   그냥 통과한다(= 방어가 사라진다). 이제 fresh 와 live 의 스키마가 **완전히 같다.**
+KNOWN_FRESH_ONLY_COLUMNS = set()
 # 운영에만 있고 fresh clone에는 없는 컬럼 정의(같은 컬럼의 다른 제약 - 위 항목과 쌍을 이룬다)
-KNOWN_LIVE_ONLY_COLUMNS = {
-    ("auction_case", ("court_code", "TEXT", 1, None)),
-    ("payment_webhooks", ("raw_payload", "TEXT", 0, None)),
-    ("payment_webhooks", ("processing_status", "TEXT", 1, None)),
-    ("registry_credit_logs", ("delta", "INTEGER", 1, None)),
-    ("registry_credits", ("amount", "INTEGER", 1, None)),
-}
+KNOWN_LIVE_ONLY_COLUMNS = set()
 # (table, index_name) - fresh clone에만 있고 운영에는 없는 인덱스(파일 편집 후 운영에 재적용 안 됨)
-KNOWN_FRESH_ONLY_INDEXES = {
-    ("payment_logs", "idx_payment_logs_created_at"),
-    ("payment_logs", "idx_payment_logs_event_type"),
-    ("payment_webhooks", "idx_payment_webhooks_received_at"),
-    ("payment_webhooks", "idx_payment_webhooks_status"),
-    ("registry_credits", "idx_registry_credits_created_at"),
-}
+# ★ 2026-08-26 migration 022 가 이 5개를 **라이브에 채웠다.** 목록을 비운다 —
+#   이제 "소스는 선언하는데 라이브에만 없는 인덱스"는 하나도 허용되지 않는다.
+#   (컬럼 제약 드리프트 4건은 테이블 재작성이 필요해 아직 남아 있다 — 아래 두 목록 참고.)
+KNOWN_FRESH_ONLY_INDEXES = set()
 # 운영에만 있고 fresh clone에는 없는 인덱스
 KNOWN_LIVE_ONLY_INDEXES = {
-    ("audit_logs", "idx_audit_logs_admin_id"),  # 출처 불명(test_schema_hygiene.py 참고)
+    # ("audit_logs", "idx_audit_logs_admin_id") 는 2026-08-26 migration 021 이 **지웠다.**
+    #   저장소 어디에서도 만들지 않는(전수 grep 0건) 순수 중복이라 fresh clone 에는 원래
+    #   없었고, 이제 라이브에서도 없어져 **격차 자체가 사라졌다.** 목록에서 뺀다.
     ("registry_credit_logs", "idx_registry_credit_logs_user_id"),
 }
 

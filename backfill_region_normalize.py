@@ -75,7 +75,7 @@ import sqlite3
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 
-from normalizer.normalizer import normalize_address
+from normalizer.normalizer import normalize_address, address_without_brackets
 
 # ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
 #   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
@@ -99,7 +99,27 @@ def plan_table(conn: sqlite3.Connection, table: str) -> dict:
             if stored == new:
                 continue
             if not new:
-                # 새 값이 비었다 ― 채워진 값을 지우지 않는다.
+                # 새 값이 비었다 ― 원칙적으로 **채워진 값을 지우지 않는다.**
+                # 정규화기가 못 읽은 것뿐일 수 있고, 그때 지우면 정보를 잃는다.
+                #
+                # ★ 단 하나의 예외 (2026-08-26): 저장된 값이 **주소 원문에 아예 없으면**
+                #   그것은 "정규화기가 못 읽은 값"이 아니라 **다른 물건에서 흘러든 값**이다.
+                #   실측 예 — id=357 `sigungu='칠곡군'` 인데 주소는
+                #   "세종특별자치시 나성로 96 ..." 이다(세종시는 시군구가 없어 정규화 결과가
+                #   빈 문자열이 맞다). 이 행은 `sigungu=칠곡군` 검색에 **경북이 아닌 물건**으로
+                #   섞여 나온다 — 남겨 두는 쪽이 정보 보존이 아니라 **오염 유지**다.
+                #
+                #   판정은 추측이 아니라 원문 대조다: 저장값이 주소 문자열에 없으면 지운다.
+                #   (`detect_stale_region_contamination_dryrun.py` 가 쓰는 것과 같은 근거)
+                #   ★ 대괄호(= 물건 표시) 를 **뺀 주소 부분**과 대조한다 (2026-08-26).
+                #     대괄호 안에는 주소 성분이 없다. 예컨대 `sigungu='갑구'` 는
+                #     "[토지 임야 297㎡ 갑구 2번 ...]" 의 등기부 용어를 시군구로 잘못 읽은
+                #     것인데, 원문 전체와 대조하면 '갑구' 가 **있다**고 나와 그냥 남는다.
+                #     주소 부분만 보면 없다는 것이 바로 드러난다.
+                addr = address_without_brackets(row["full_address"] or "")
+                if stored and stored not in addr:
+                    changes.append((row["id"], col, stored, "", addr))
+                    continue
                 skipped_empty += 1
                 continue
             changes.append((row["id"], col, stored, new,

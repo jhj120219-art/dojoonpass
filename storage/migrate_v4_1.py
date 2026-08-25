@@ -174,19 +174,27 @@ def migrate():
         logger.info("rights_analysis_history 생성 완료")
 
         # 인덱스
+        #
+        # ★ 2026-08-26 (migration 021): 여기서 만들던 것 중 **마이그레이션 008이 같은 열로
+        #   똑같이 만드는 4개**를 걷어냈다 — idx_ai_case_no / idx_ai_auction_date /
+        #   idx_minimum_bid_price / idx_rs_item_id. 두 계통이 서로를 모르고 각자 만들어
+        #   같은 컬럼에 인덱스가 둘씩 있었고, 읽기 이득은 0인 채 쓰기 비용과 파일 크기만
+        #   늘었다(500,000행 실측: 인덱스 생성 18.4% / 파일 10.5% = 34.9MB 손해).
+        #   021이 기존 DB에서 그 5쌍을 지우는데, 이 목록을 그대로 두면 **이 스크립트를
+        #   다시 돌리는 순간 되살아난다** — 그래서 여기서도 함께 뺀다.
+        #
+        #   `idx_ai_sido`는 **남긴다.** 접두 중복(⊂ idx_search_main)이라 지우고 싶어지지만,
+        #   같은 측정에서 지웠더니 sido 검색이 38ms -> 244ms(+540%)가 됐다. 좁은 인덱스는
+        #   엔트리가 작아 범위/커버링 스캔에서 읽는 페이지가 훨씬 적다. 021의 주석 참고.
         indexes = [
             # 기본 조회
-            "CREATE INDEX IF NOT EXISTS idx_ai_case_no ON auction_item(case_no)",
             "CREATE INDEX IF NOT EXISTS idx_ai_sido ON auction_item(sido)",
-            "CREATE INDEX IF NOT EXISTS idx_ai_auction_date ON auction_item(auction_date)",
             # 검색 API 복합 인덱스
             "CREATE INDEX IF NOT EXISTS idx_search_main ON auction_item(sido, sigungu, property_type, auction_date)",
-            "CREATE INDEX IF NOT EXISTS idx_minimum_bid_price ON auction_item(minimum_bid_price)",
             "CREATE INDEX IF NOT EXISTS idx_fail_count_date ON auction_item(fail_count, auction_date)",
             "CREATE INDEX IF NOT EXISTS idx_status_date ON auction_item(status, auction_date)",
             # 관계 인덱스
             "CREATE INDEX IF NOT EXISTS idx_tr_item_id ON tenant_rights(item_id)",
-            "CREATE INDEX IF NOT EXISTS idx_rs_item_id ON rights_summary(item_id)",
             "CREATE INDEX IF NOT EXISTS idx_rs_risk ON rights_summary(risk_level)",
             "CREATE INDEX IF NOT EXISTS idx_ds_item_id ON document_status(item_id)",
         ]

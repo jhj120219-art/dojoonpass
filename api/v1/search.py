@@ -70,6 +70,19 @@ def _address_detail_condition(address_detail: str):
     # UNKNOWN(건물명/도로명 등) — 기존 방식 그대로 유지
     return "full_address LIKE ?", [f"%{address_detail}%"]
 
+def _area_of(row, key):
+    """`row` 에서 면적 컬럼을 꺼낸다. 컬럼이 없는 DB 도 견딘다.
+
+    migration 025 이전 스키마를 가진 DB(옛 백업 등)를 열었을 때 `row[key]` 는
+    `IndexError` 를 낸다. 검색 전체가 500 이 되는 것보다 **그 필드만 null** 이 낫다 —
+    면적은 부가 정보이고, 없다고 목록을 못 보여 줄 이유가 없다.
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
 def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
     """검색 결과 1건.
 
@@ -98,6 +111,11 @@ def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
         "fail_count": row["fail_count"],
         "validation_status": row["validation_status"],
         "crawl_date": row["crawl_date"],
+        # 면적(㎡). 2026-08-26 신설 — 키를 **추가만** 한다(위 불변 규칙 그대로).
+        # 주소 원문에서 뽑을 수 없는 물건(차량/선박 등)은 null 이다. 0 이 아니다 —
+        # "면적 0㎡"와 "면적을 모른다"는 다르다.
+        "building_area": _area_of(row, "building_area"),
+        "land_area": _area_of(row, "land_area"),
         "is_favorited": row["id"] in favorited_ids,
         # 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없으면 null이다.
         # 경로 규칙은 `api/v1/thumbnails.py` 한 곳에만 있다 — 화면마다 따로 적으면
@@ -201,6 +219,12 @@ def search(
     max_bid_rate: Optional[float] = Query(None),
     min_fail_count: Optional[int] = Query(None),
     max_fail_count: Optional[int] = Query(None),
+    # 면적(㎡). 2026-08-26 신설 — 프런트는 예전부터 이 이름으로 **보내고 있었는데**
+    # 여기서 받지 않아 조용히 무시됐다(migration 025 / normalizer.extract_areas 참고).
+    min_building_area: Optional[float] = Query(None),
+    max_building_area: Optional[float] = Query(None),
+    min_land_area: Optional[float] = Query(None),
+    max_land_area: Optional[float] = Query(None),
     sort_by: Optional[str] = Query(None),
     sort_order: Optional[str] = Query("desc"),
     page: int = Query(1, ge=1),
@@ -383,6 +407,24 @@ def search(
         if max_fail_count is not None:
             conditions.append("fail_count <= ?")
             params.append(max_fail_count)
+        # 면적 범위 (2026-08-26 신설).
+        #
+        # ★ NULL 은 자연히 걸러진다 — SQLite 에서 `NULL >= 3` 은 참이 아니라 **NULL**(거짓 취급)이다.
+        #   즉 면적을 모르는 물건(차량/선박 등 16행)은 면적 조건을 주는 순간 결과에서 빠진다.
+        #   그것이 옳다: "건물 30㎡ 이상"을 찾는 사람에게 면적 미상 물건을 섞어 주면
+        #   조건이 지켜지지 않은 결과를 조건대로라고 보여 주는 셈이다.
+        if min_building_area is not None:
+            conditions.append("building_area >= ?")
+            params.append(min_building_area)
+        if max_building_area is not None:
+            conditions.append("building_area <= ?")
+            params.append(max_building_area)
+        if min_land_area is not None:
+            conditions.append("land_area >= ?")
+            params.append(min_land_area)
+        if max_land_area is not None:
+            conditions.append("land_area <= ?")
+            params.append(max_land_area)
 
         where = " AND ".join(conditions)
         total = conn.execute(

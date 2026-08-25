@@ -477,7 +477,9 @@ def selftest():
 
     tmp = tempfile.mkdtemp(prefix="audit_selftest_")
     scratch = os.path.join(tmp, "auction.db")
-    shutil.copy2(db_path(), scratch)
+    # 온라인 백업 스냅샷 - 워커가 쓰는 중이어도 일관된 사본을 만든다
+    # (shutil.copy2 는 찢어질 수 있다. 사유: storage/database.py:snapshot_live_db)
+    _db.snapshot_live_db(scratch)
     saved = _db.DB_PATH
     _db.DB_PATH = scratch
     try:
@@ -492,17 +494,33 @@ def selftest():
         check("사본 기준선은 어긋남 0", base, 0)
 
         # 결함 A — DB 는 있는데 파일이 없다
+        #
+        # ★ 심는 행의 item_id 를 **`auction_item` 에서** 가져온다 (2026-08-25).
+        #   예전에는 `SELECT ... FROM auction_image LIMIT 1` 이었다. 즉 **사진이 이미
+        #   수집돼 있어야만** 결함을 심을 수 있었다. 사진이 0행이면 INSERT 가 0행을 쓰고,
+        #   `audit_images()` 는 당연히 0 을 돌려주며, 이 검사는 "감사기가 눈이 멀었다"가
+        #   아니라 **아무것도 심지 못했다**는 이유로 붉어진다 — 실제로 그렇게 됐다
+        #   (2026-08-25: `auction_image` 0행, migration 020 미적용 상태에서는 아예
+        #   `no such table` 로 죽었다).
+        #
+        #   이 파일의 존재 이유가 "감사기가 눈이 멀어도 아무도 모르는 상태"를 막는 것인데,
+        #   그 자기 검증이 **운영 데이터의 우연한 내용에 의존**하고 있었다. 사진 수집은
+        #   승인 영역(데스크탑1)이라 이 머신에서는 영원히 채워지지 않는다.
+        #   `auction_item` 은 이 감사기가 도는 어떤 DB 에도 반드시 있다(없으면 아래
+        #   check 가 그것을 먼저 말한다).
         c = sqlite3.connect(scratch)
         try:
-            c.execute("""INSERT INTO auction_image
-                (item_id, seq, kind, storage_path, file_hash, file_size,
-                 crawl_date, created_at)
-                SELECT item_id, 9999, 'QA', 'documents/qa/none/1/images/9999.jpg',
-                       'h', 1, '2026-01-01', '2026-01-01'
-                FROM auction_image LIMIT 1""")
-            c.commit()
+            seed = c.execute("SELECT id FROM auction_item LIMIT 1").fetchone()
+            if seed:
+                c.execute("""INSERT INTO auction_image
+                    (item_id, seq, kind, storage_path, file_hash, file_size,
+                     crawl_date, created_at)
+                    VALUES (?, 9999, 'QA', 'documents/qa/none/1/images/9999.jpg',
+                            'h', 1, '2026-01-01', '2026-01-01')""", (seed[0],))
+                c.commit()
         finally:
             c.close()
+        check("결함 A 를 심을 물건이 있다(검사가 공허하지 않다)", bool(seed), True)
         conn = _connect()
         try:
             with _scratch_output():

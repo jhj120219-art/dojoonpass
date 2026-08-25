@@ -65,14 +65,38 @@ ACTIVE_QUEUE = set(QUEUE_ACTIVE_STATUSES)
 # 주는 것이다. "어차피 기일 지난 것"과 "스키마 결함으로 잃은 것"은 정반대의 결정을
 # 부른다. 그래서 추측하지 않고 세 갈래로 나누되, 모르는 것은 모른다고 남긴다.
 # ---------------------------------------------------------------------------
-def no_queue_reason(court, case_no, item_no, auction_date, crawl_date, case_items):
-    """큐 행이 없는 이유를 증거로 고른다. 순수 함수 — selftest 가 DB 없이 검증한다."""
+def no_queue_reason(court, case_no, item_no, auction_date, crawl_date, case_items,
+                    queue_epoch=""):
+    """큐 행이 없는 이유를 증거로 고른다. 순수 함수 — selftest 가 DB 없이 검증한다.
+
+    `queue_epoch` 는 `MIN(document_queue.enqueued_at)` 의 **날짜 부분**이다(호출부가
+    DB 에서 그때그때 읽어 넘긴다 — 여기에 날짜를 박아 두지 않는다). 아래 b3 분리에 쓴다.
+    """
     if auction_date and crawl_date and auction_date < crawl_date:
         return "(b1) 큐 행 없음 ― 수집 시점에 이미 기일 경과"
     others = case_items.get((court, case_no)) or set()
     if others and item_no not in others:
         return "(b2) 큐 행 없음 ― 같은 사건의 다른 물건만 큐에 있다 (018 이전 UNIQUE 충돌)"
     if not others:
+        # ★ 2026-08-25: 예전에는 이 갈래 전체가 "(b3) 이유 미상" 이었다. 실측으로
+        #   **대부분의 이유가 밝혀졌다** — 큐 자체가 나중에 생겼다.
+        #
+        #       document_queue MIN(enqueued_at)  2026-07-08T12:24:57
+        #       crawl_date 2026-07-06  물건 71개 중 큐 있는 것  7
+        #                  2026-07-07       91          12
+        #                  2026-07-08       76           6
+        #                  2026-07-09       44          44   <- 이후 100%
+        #
+        #   즉 큐가 처음 채워지기 **전에** 수집된 물건은 애초에 넣을 큐가 없었고,
+        #   `enqueue_documents()` 는 기일이 지난 것을 다시 넣지 않으므로(그 함수의
+        #   1차 방어선) 영원히 채워지지 않는다. 이것은 **일회성 유물**이지 지금도
+        #   벌어지는 결함이 아니다 — 그 구분이 중요하다. "이유 미상"으로 두면 매번
+        #   다시 조사하게 되고, 반대로 통짜로 "유물"이라 하면 새로 생기는 누락을 놓친다.
+        #
+        #   그래서 **날짜 증거가 있을 때만** 유물로 부르고, 나머지는 여전히 모른다고 한다.
+        if queue_epoch and crawl_date and crawl_date < queue_epoch:
+            return ("(b3-old) 큐 행 없음 ― 큐가 처음 채워지기 전(%s)에 수집된 물건"
+                    % queue_epoch)
         return "(b3) 큐 행 없음 ― 같은 사건 전체가 큐에 없다 (이유 미상)"
     return "(b4) 큐 행 없음 ― 같은 item_no 가 큐에 있는데 doc_type 만 없다"
 
@@ -101,6 +125,12 @@ def main() -> int:
             case_items.setdefault((r["court_code"], r["case_no"]), set()).add(
                 str(r["item_no"] or "1"))
 
+        # 큐가 **처음 채워진 날**. 이 날 이전에 수집된 물건은 넣을 큐가 없었다.
+        # 하드코딩하지 않고 매번 DB 에서 읽는다 — 다른 머신의 DB 는 다른 값이다.
+        _epoch = conn.execute(
+            "SELECT MIN(enqueued_at) FROM document_queue").fetchone()[0]
+        queue_epoch = (_epoch or "")[:10]
+
         rows = conn.execute("SELECT item_id, doc_type, status FROM document_status").fetchall()
     finally:
         conn.close()
@@ -119,7 +149,7 @@ def main() -> int:
             bucket = no_queue_reason(ik[0], ik[1], ik[2],
                                      item_date.get(r["item_id"], ""),
                                      item_crawl.get(r["item_id"], ""),
-                                     case_items)
+                                     case_items, queue_epoch)
         elif any(s in ACTIVE_QUEUE for s in st):
             bucket = "(정상) 큐에서 대기 중 ― 언젠가 수집된다"
         else:
@@ -193,6 +223,19 @@ def selftest() -> int:
           tag(no_queue_reason("수원지방법원", "2024타경1", "3", "", "", CI)), "(b2)")
     check("같은 사건이 큐에 아예 없으면 b3(이유 미상)",
           tag(no_queue_reason("수원지방법원", "2024타경9", "1", "", "", CI)), "(b3)")
+    # ★ b3 분리 (2026-08-25) — 날짜 증거가 있을 때만 "유물"이라고 부른다.
+    check("큐 도입 전에 수집됐으면 b3-old",
+          tag(no_queue_reason("수원지방법원", "2024타경9", "1", "2026-07-07",
+                              "2026-07-06", CI, "2026-07-08")), "(b3-old)")
+    check("★ 큐 도입 후인데 없으면 여전히 b3(모르는 것은 모른다)",
+          tag(no_queue_reason("수원지방법원", "2024타경9", "1", "2026-08-01",
+                              "2026-07-20", CI, "2026-07-08")), "(b3)")
+    check("★ queue_epoch 를 모르면 유물로 몰지 않는다",
+          tag(no_queue_reason("수원지방법원", "2024타경9", "1", "2026-07-07",
+                              "2026-07-06", CI, "")), "(b3)")
+    check("crawl_date 를 모르면 유물로 몰지 않는다",
+          tag(no_queue_reason("수원지방법원", "2024타경9", "1", "2026-07-07",
+                              "", CI, "2026-07-08")), "(b3)")
     check("자기 item_no 가 큐에 있으면 b4(doc_type 만 빠짐)",
           tag(no_queue_reason("수원지방법원", "2024타경1", "1", "", "", CI)), "(b4)")
 

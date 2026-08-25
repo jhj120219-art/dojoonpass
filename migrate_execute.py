@@ -1,6 +1,9 @@
 ﻿import sys, os, re
 sys.path.insert(0, os.getcwd())
 from storage.database import get_connection, requeue_changed_documents
+# 면적은 주소 원문에서 뽑는다. 추출 규칙의 **정본은 normalizer 한 곳**이다
+# (백필 스크립트도 같은 함수를 쓴다 — 규칙이 두 벌이 되면 갈라진다, BUGS #204).
+from normalizer.normalizer import extract_areas
 from datetime import datetime
 import logging
 
@@ -11,7 +14,24 @@ logging.basicConfig(
         logging.StreamHandler(),
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+# migrate_execute 가 만드는 document_status 행의 종류.
+#
+# **이 목록이 단일 소스다.** 아래 §3 루프가 넣는 것도, 결과 검증이 세는 것도 여기서 온다.
+# 두 곳에 따로 적으면 한쪽만 바뀌는 날이 오고, 그때 검증이 조용히 틀린 답을 낸다
+# (2026-08-26 에 정확히 그 일이 있었다 — 검증만 `orig * 3` 으로 박혀 있어서,
+#  doc_worker 가 만드는 IMAGE 행이 처음 생기자 매일 밤 거짓 실패를 내게 돼 있었다).
+#
+# ★ IMAGE 는 여기 없다. 사진은 doc_worker 가 수집하며 물건마다 있지도 않다
+#   (사진이 없는 물건은 IMAGE 행이 아예 생기지 않는다). "auction 1행당 정확히 3행"이라는
+#   이 파일의 불변식에 IMAGE 를 섞으면 그 불변식 자체가 성립하지 않는다.
+MIGRATED_DOC_TYPE_COLUMNS = (
+    ("SPEC", "has_spec_pdf"),
+    ("STATUS", "has_status_doc"),
+    ("APPRAISAL", "has_appraisal_pdf"),
+)
+MIGRATED_DOC_TYPES = tuple(dt for dt, _ in MIGRATED_DOC_TYPE_COLUMNS)
 
 
 # 마지막 execute() 가 관측한 필드별 변경 건수. 테스트와 운영 점검이 읽는다
@@ -193,13 +213,18 @@ def execute():
                         "fields": changed_fields,
                     })
 
+                # 면적은 `full_address` 에서 파생된다 — 주소가 갱신되면 함께 다시 뽑는다
+                # (2026-08-26). 못 뽑으면 None 이 들어가 컬럼이 NULL 로 남는다.
+                _areas = extract_areas(full_address or "")
+
                 conn.execute("""
                     UPDATE auction_item SET
                         court_name=?, property_type=?, sido=?, sigungu=?, dong=?,
                         lot_number=?, full_address=?, appraisal_price=?,
                         minimum_bid_price=?, auction_date=?, status=?,
                         fail_count=?, bid_rate=?, validation_status=?,
-                        crawl_date=?, updated_at=?
+                        crawl_date=?, updated_at=?,
+                        building_area=?, land_area=?
                     WHERE case_id=? AND item_no=?
                 """, (
                     court_name, property_type, sido, sigungu, dong,
@@ -207,19 +232,22 @@ def execute():
                     minimum_bid_price, auction_date, status,
                     fail_count, bid_rate, validation_status,
                     crawl_date, now,
+                    _areas["building_area"], _areas["land_area"],
                     case_id, row["item_no"],
                 ))
                 item_updated += 1
                 item_id_by_key[(case_id, row["item_no"])] = existing["id"]
             else:
+                _areas = extract_areas(row["full_address"] or "")
                 cur = conn.execute("""
                     INSERT INTO auction_item
                     (case_id, case_no, item_no, court_name, property_type,
                      sido, sigungu, dong, lot_number, full_address,
                      appraisal_price, minimum_bid_price, auction_date,
                      status, fail_count, bid_rate, validation_status,
-                     crawl_date, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     crawl_date, created_at, updated_at,
+                     building_area, land_area)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     case_id,
                     row["case_no"], row["item_no"], row["court_name"],
@@ -233,6 +261,7 @@ def execute():
                     row["crawl_date"],
                     row["created_at"] or now,
                     now,
+                    _areas["building_area"], _areas["land_area"],
                 ))
                 item_inserted += 1
                 item_id_by_key[(case_id, row["item_no"])] = cur.lastrowid
@@ -276,11 +305,7 @@ def execute():
             if item_id is None:
                 continue
 
-            for doc_type, col in [
-                ("SPEC", "has_spec_pdf"),
-                ("STATUS", "has_status_doc"),
-                ("APPRAISAL", "has_appraisal_pdf"),
-            ]:
+            for doc_type, col in MIGRATED_DOC_TYPE_COLUMNS:
                 status = "READY" if row[col] == 1 else "COLLECTING"
                 conn.execute("""
                     INSERT OR IGNORE INTO document_status
@@ -299,13 +324,37 @@ def execute():
         print("=== 마이그레이션 결과 검증 ===")
         ac = conn.execute("SELECT COUNT(*) FROM auction_case").fetchone()[0]
         ai = conn.execute("SELECT COUNT(*) FROM auction_item").fetchone()[0]
-        ds = conn.execute("SELECT COUNT(*) FROM document_status").fetchone()[0]
+        # ★ **문서 3종만** 센다 (2026-08-26).
+        #
+        #   이 검증의 불변식은 *"`auction` 1행마다 document_status 3행(SPEC/STATUS/
+        #   APPRAISAL)이 생긴다"* 이고, 그 3행을 만드는 것이 바로 아래 §3 루프다.
+        #
+        #   그런데 `document_status` 에는 **doc_worker 가 만드는 `IMAGE` 행도 들어온다.**
+        #   사진 수집은 migrate_execute 가 하는 일이 아니고 물건마다 있지도 않다
+        #   (사진이 없는 물건은 IMAGE 행이 아예 안 생긴다). 그것까지 세면
+        #   `ds == orig * 3` 이 **구조적으로 성립할 수 없다.**
+        #
+        #   2026-08-26 에 실제로 그렇게 됐다 — `DojoonPass-DocWorker` 를 등록하고 처음
+        #   돌리자 IMAGE 17행이 생겼고, 이 검증이 `7697 != 7680` 로 붉어졌다.
+        #   차이는 정확히 그 17이다. 데이터는 멀쩡한데 검증만 틀린 것이다.
+        #
+        #   그리고 이 판정은 **exit 1 로 이어진다**(바로 아래 problems 처리).
+        #   즉 고치지 않으면 오늘 밤 03:00 부터 `run_daily.bat` 이 매일 `[FAILED]` 를
+        #   남긴다 — 이 파일이 그토록 경계해 온 "거짓 실패"가 반대 방향으로 재발한다.
+        #   거짓 실패가 쌓이면 진짜 실패가 그 속에 묻힌다.
+        #
+        #   doc_type 목록을 여기 박아 두는 대신 §3 이 넣는 값과 같은 상수를 쓴다.
+        ds = conn.execute(
+            "SELECT COUNT(*) FROM document_status WHERE doc_type IN (%s)"
+            % ",".join("?" * len(MIGRATED_DOC_TYPES)),
+            MIGRATED_DOC_TYPES,
+        ).fetchone()[0]
         orig = conn.execute("SELECT COUNT(*) FROM auction").fetchone()[0]
 
         print(f"  auction 원본        : {orig}건")
         print(f"  auction_case        : {ac}건")
         print(f"  auction_item        : {ai}건")
-        print(f"  document_status     : {ds}건")
+        print(f"  document_status     : {ds}건 (문서 3종만. IMAGE 제외)")
 
         # 이모지(✅/❌)를 쓰지 않는다 — run_daily.bat이 stdout을 로그 파일로 리다이렉트하면
         # 이 환경의 파이썬이 cp949로 인코딩하는데 이모지가 cp949에 없어 UnicodeEncodeError로

@@ -85,7 +85,10 @@ def test_registry_orphan_visibility():
 
     tmp_dir = tempfile.mkdtemp(prefix="qa_false_success_")
     test_db = os.path.join(tmp_dir, "auction_copy.db")
-    shutil.copy(os.path.join(REPO_ROOT, "auction.db"), test_db)
+    # 온라인 백업 스냅샷 - 워커가 쓰는 중이어도 일관된 사본을 만든다
+    # (shutil.copy2 는 찢어질 수 있다. 사유: storage/database.py:snapshot_live_db)
+    import storage.database as _dbmod
+    _dbmod.snapshot_live_db(test_db)
 
     import storage.database as dbmod
     saved_db_path = dbmod.DB_PATH

@@ -51,7 +51,12 @@ _qa_tmp = _qa_tempfile.mkdtemp(prefix="dojoonpass-qa-")
 _qa_atexit.register(_qa_shutil.rmtree, _qa_tmp, True)
 _qa_scratch = os.path.join(_qa_tmp, "auction.db")
 if os.path.exists(_qa_dbmod.DB_PATH):
-    _qa_shutil.copy2(_qa_dbmod.DB_PATH, _qa_scratch)
+    # ★ 파일 복사가 아니라 **온라인 백업 스냅샷**이다 (2026-08-26).
+    #   DocWorker(02:00~04:00)가 등록된 뒤로는 운영 DB 에 쓰는 프로세스가 실제로 있다.
+    #   그 시간대에 shutil.copy2 로 사본을 뜨면 **찢어진 DB** 가 나와 검사가 제품과
+    #   무관한 이유로 붉어진다(실측 재현: 워커와 스위트를 겹쳐 돌리자 2건 실패,
+    #   단독으로는 둘 다 통과). 규칙은 storage/database.py 한 곳에 있다.
+    _qa_dbmod.snapshot_live_db(_qa_scratch)
 _qa_dbmod.DB_PATH = _qa_scratch
 
 # Admin 인증 테스트를 위해 프로세스 환경에만 키를 주입한다(.env 무수정).
