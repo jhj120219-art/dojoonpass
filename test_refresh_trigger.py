@@ -1539,6 +1539,140 @@ def test_image_trigger_reaches_the_collector_end_to_end():
               [x for x in seen if x[0] == "spec"][:1], [("spec", True, "qa-btn")])
 
 
+
+def test_refresh_cycle_respects_the_version_policy():
+    """재수집이 실제로 돌 때 **문서 버전이 어떻게 되는가** (2026-08-25, docs/BUGS.md #203).
+
+    ## 왜 이 검사가 없었나
+
+    이 파일은 재수집 **기계**(예약·claim·retry·상한·배선)를 24개 검사로 덮는다.
+    그런데 `doc_version` 을 **한 번도 보지 않는다**(2026-08-25 실측: 이 파일에
+    `doc_version` 0회). 반대쪽(`record_doc_raw_row` 의 버전 규칙)은 BUGS #197/#199 가
+    덮는다. **두 축의 이음매만 비어 있었다.**
+
+    그 이음매가 일상 운영 경로다 — 매일 크롤이 값을 바꾸면 `refresh` 가 예약되고,
+    워커가 그 문서를 **다시 받는다.** 그때:
+
+        법원이 실제로는 안 바꿨다(같은 파일)  -> 버전이 오르면 안 된다
+                                              (`api/v1/item.py` 가 MAX(doc_version) 을
+                                               사용자에게 노출한다 - BUGS #115)
+        법원이 진짜로 바꿨다                  -> 새 버전이 생기고 **옛 버전은 남아야** 한다
+
+    후자가 중요하다. 이 저장소의 정책은 "덮어쓰기"가 아니라 "버전 쌓기"이고,
+    옛 행을 지우면 무엇이 언제 바뀌었는지 되짚을 수 없다.
+
+    ## 무엇을 고정하는가
+
+        refresh -> 같은 내용 재수집   doc_raw 행 수 그대로 / MAX(doc_version) 그대로
+        refresh -> 바뀐 내용 재수집   행 +1 / MAX +1 / **옛 버전 행이 그대로 존재**
+                                     document_version_log 에 1행
+    """
+    print("\n--- 25. 재수집 사이클의 버전 정책 (BUGS #203) ---")
+    import crawler.doc_paths as dp
+    from storage.database import (claim_next_queue_item, mark_queue_done)
+
+    with ScratchDB() as db:
+        saved_root = dp.DOCUMENT_ROOT
+        docs_root = os.path.join(db.tmp, "documents")
+        os.makedirs(docs_root, exist_ok=True)
+        dp.DOCUMENT_ROOT = docs_root
+        try:
+            COURT, CASE, ITEM = "B000210", "2024타경1", "1"
+            db.seed_item(COURT, CASE, ITEM)
+
+            def counts():
+                c = db.conn()
+                try:
+                    n = c.execute("SELECT COUNT(*) FROM doc_raw").fetchone()[0]
+                    mx = c.execute("SELECT COALESCE(MAX(doc_version),0) FROM doc_raw").fetchone()[0]
+                    log = c.execute("SELECT COUNT(*) FROM document_version_log").fetchone()[0]
+                    return n, mx, log
+                finally:
+                    c.close()
+
+            def collect(body, prev_hash, new_hash, expect_overwrite):
+                """예약된 spec 을 claim 해서 실제로 받아 온 것처럼 종결한다.
+
+                `expect_overwrite` 를 인자로 받는 이유: 첫 수집은 `pending`(overwrite=False)이고
+                재수집은 `refresh`(overwrite=True)다. 둘을 같은 값으로 단언하면 검사가
+                **둘 중 하나를 반드시 틀리게** 만든다 - 그 구분이 이 파일의 핵심 어휘다.
+                """
+                it = claim_next_queue_item()
+                check_true("claim 이 그 행을 집었다", it is not None and it["doc_type"] == "spec",
+                           it)
+                if it is None:
+                    return None
+                check("claim 의 overwrite 가 큐 상태와 맞는다(%s)"
+                      % ("refresh" if expect_overwrite else "pending"),
+                      it["overwrite"], expect_overwrite)
+                d = dp.get_doc_dir(COURT, CASE, ITEM)
+                os.makedirs(d, exist_ok=True)
+                p = os.path.join(d, "spec.pdf")
+                with open(p, "wb") as fh:
+                    fh.write(body)
+                mark_queue_done(it["id"], COURT, CASE, ITEM, "spec", prev_hash, new_hash,
+                                files_saved=[p], claim_token=it.get("claim_token"))
+                return p
+
+            # --- 첫 수집 -------------------------------------------------
+            db.queue_row(COURT, CASE, ITEM, "spec", "pending")
+            first = b"%PDF-1.4 ORIGINAL" + b"a" * 120
+            collect(first, "", "h1", expect_overwrite=False)   # 첫 수집은 pending
+            n0, mx0, log0 = counts()
+            check("첫 수집 후 doc_raw 1행", n0, 1)
+            check("첫 수집 후 버전 1", mx0, 1)
+            check("첫 수집은 변경 이력을 남기지 않는다(이전 값이 없다)", log0, 0)
+
+            # --- 재수집 1: 법원이 실제로는 안 바꿨다 ----------------------
+            c = db.conn()
+            try:
+                c.execute("UPDATE document_queue SET status='refresh', last_attempt_at=NULL"
+                          " WHERE doc_type='spec'")
+                c.commit()
+            finally:
+                c.close()
+            collect(first, "h1", "h1", expect_overwrite=True)   # 같은 파일, 같은 지문
+            n1, mx1, log1 = counts()
+            check("★ 같은 내용 재수집은 행을 늘리지 않는다", n1, 1)
+            check("★ 같은 내용 재수집은 버전을 올리지 않는다", mx1, 1)
+            check("같은 내용이면 변경 이력도 남지 않는다", log1, 0)
+
+            # --- 재수집 2: 법원이 진짜로 바꿨다 ---------------------------
+            c = db.conn()
+            try:
+                c.execute("UPDATE document_queue SET status='refresh', last_attempt_at=NULL"
+                          " WHERE doc_type='spec'")
+                c.commit()
+            finally:
+                c.close()
+            collect(b"%PDF-1.4 REVISED" + b"b" * 400, "h1", "h2", expect_overwrite=True)
+            n2, mx2, log2 = counts()
+            check("★ 바뀐 내용은 새 행을 만든다", n2, 2)
+            check("★ 버전이 2로 오른다", mx2, 2)
+            check("★ 변경 이력이 1행 남는다", log2, 1)
+
+            # ★ 옛 버전을 **지우지 않는다** — 이 저장소의 정책은 덮어쓰기가 아니라 쌓기다.
+            c = db.conn()
+            try:
+                rows = [(r["doc_version"], r["file_size"]) for r in c.execute(
+                    "SELECT doc_version, file_size FROM doc_raw ORDER BY doc_version")]
+            finally:
+                c.close()
+            check("★ 옛 버전 행이 그대로 남아 있다", [v for v, _s in rows], [1, 2])
+            check_true("두 버전의 크기가 실제로 다르다(검사가 공허하지 않다)",
+                       rows[0][1] != rows[1][1], rows)
+
+            # 화면은 재수집 내내 READY 를 유지해야 한다(사용자가 보던 것을 뺏지 않는다)
+            c = db.conn()
+            try:
+                st = c.execute("SELECT status FROM document_status WHERE doc_type='SPEC'"
+                               ).fetchone()
+            finally:
+                c.close()
+            check("재수집이 끝난 뒤에도 화면은 READY", st["status"] if st else None, "READY")
+        finally:
+            dp.DOCUMENT_ROOT = saved_root
+
 def main():
     print("=" * 55)
     print(" 변경 기반 재수집 회귀 (Sprint 189)")
@@ -1567,6 +1701,7 @@ def main():
     test_image_trigger_reaches_the_collector_end_to_end()
     test_refresh_intent_survives_retry_exhaustion()
     test_full_image_chain_reaches_the_api()
+    test_refresh_cycle_respects_the_version_policy()
 
     print("\n" + "=" * 55)
     if failures:

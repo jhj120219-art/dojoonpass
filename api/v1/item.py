@@ -217,29 +217,72 @@ def _document_entry(item_id: int, row, doc_raw_by_type, item_row=None) -> dict:
     `page_count`가 None인 것과 0인 것은 다르다 — None은 "아직 모른다"(수집 전이거나
     PDF가 아니거나 파싱 실패), 0은 있을 수 없는 값이다. 그래서 0으로 뭉개지 않는다.
     프런트는 None이면 페이지 이동 UI를 아예 그리지 않는다.
+
+    ## ★ READY 인데 서빙 파일이 없으면 COLLECTING 으로 낮춘다 (2026-08-25, BUGS #198)
+
+    사진 쪽에는 이 2차 방어선이 **이미 있었다**(`_images_status`: READY 인데 볼 사진이
+    0장이면 COLLECTING). 문서 쪽에만 없었다. 그래서 `document_status` 가 READY 이기만
+    하면 파일이 실제로 없어도 그대로 "열람 가능"이라고 답했다. 실측(2026-08-25,
+    사본 DB + TestClient, 합성 물건 하나로 재현):
+
+        SPEC   status=READY  available=True  file_size=None
+               viewer_url=/api/v1/item/16721/documents/SPEC
+        그 URL 을 실제로 요청 -> **HTTP 404**
+
+    사진 쪽 주석이 적어 둔 이유가 그대로 적용된다 — *"오류도 빈 화면도 아니라 사용자가
+    원인을 알 수 없다."* 프런트도 같은 문제를 한 번 겪었다(`properties/[id]/page.tsx`:
+    *"수집중인 문서도 파란 밑줄 링크였고, 누르면 '문서를 찾을 수 없다'"*).
+
+    **판단 근거는 이미 이 함수가 갖고 있었다.** `served_size` 가 그것이다 — 서빙 경로에서
+    직접 잰 크기이고, 파일이 없거나 0바이트면 None 이다. 그 값을 `file_size` 로만 쓰고
+    판정에는 쓰지 않고 있었다("함수를 불렀다"와 "성공했다"는 다르다 — Sprint 214 가
+    doc_worker 에서 고친 것과 같은 모양이다).
+
+    적용 범위를 좁게 잡는다 —
+
+      - `IMAGE` 는 대상이 아니다. 서빙 파일이 하나로 정해지지 않고(0~N장),
+        판정은 `_images_status()` 가 이미 한다.
+      - `item_row` 가 없으면 잴 수 없으므로 낮추지 않는다("모른다"를 "고장났다"로
+        읽지 않는다 — BUGS #188 이 세운 구분).
+      - READY 가 아닌 상태는 건드리지 않는다. NO_IMAGE/FAILED/COLLECTING 은
+        이미 "볼 것이 없다"와 모순되지 않는다.
     """
     doc_type = row["doc_type"]
     status = row["status"]
     raw = doc_raw_by_type.get(doc_type)
+
+    # 서빙 대상이 아닌 종류(IMAGE)는 이 방어의 대상이 아니다. 목록은 서빙 계층의
+    # 것을 그대로 쓴다 — 같은 어휘를 두 벌로 만들지 않는다(`_served_file_size` 와 같은 이유).
+    try:
+        from api.v1.documents import DOC_TYPE_FILES
+        servable = (doc_type or "").upper() in DOC_TYPE_FILES
+    except Exception:       # noqa: BLE001 - 판정을 못 하면 낮추지 않는다(안전한 쪽)
+        servable = False
+
     # ★ `file_size` 는 **`download_url` 이 주는 파일**의 크기여야 한다.
     #   READY 가 아니면 URL 자체를 주지 않으므로 크기도 재지 않는다(잴 대상이 없다).
     #   서빙 파일을 못 재면 doc_raw 값으로 떨어지지 않는다 — 그것이 바로 다른 파일을
     #   설명하던 예전 동작이다. 모르면 None 이라고 말한다.
-    served_size = (_served_file_size(item_row, doc_type)
-                   if (status == "READY" and item_row is not None) else None)
+    measured = status == "READY" and item_row is not None and servable
+    served_size = _served_file_size(item_row, doc_type) if measured else None
+
+    # 잰 결과 실체가 없으면(파일 없음/0바이트) READY 를 유지하지 않는다.
+    effective_status = "COLLECTING" if (measured and served_size is None) else status
+    ready = effective_status == "READY"
+
     return {
         "doc_type": doc_type,
-        "status": status,
+        "status": effective_status,
         # 화면이 "열람 가능"으로 다룰 수 있는가. 상태 문자열 비교를 프런트마다 따로
         # 하지 않도록 서버가 한 번만 판단한다.
-        "available": status == "READY",
+        "available": ready,
         "page_count": raw["page_count"] if raw else None,
         "file_size": served_size,
         "doc_version": raw["doc_version"] if raw else None,
         # READY가 아니면 URL을 주지 않는다. 열 수 없는 주소를 건네고 프런트가 404를
         # 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다.
-        "viewer_url": _document_url(item_id, doc_type) if status == "READY" else None,
-        "download_url": _document_url(item_id, doc_type) if status == "READY" else None,
+        "viewer_url": _document_url(item_id, doc_type) if ready else None,
+        "download_url": _document_url(item_id, doc_type) if ready else None,
     }
 
 

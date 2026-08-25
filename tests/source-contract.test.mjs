@@ -852,3 +852,93 @@ describe('사진 상태를 화면이 구분해서 말한다 (Sprint 243) — 소
     )
   })
 })
+
+describe('상세 화면의 늦은 응답 방어 (BUGS #210) — 소스 계약', () => {
+  // 왜 소스로 보는가 —
+  //
+  //   `/properties/[id]` 는 이전/다음 이동이 **같은 라우트의 파라미터 전환**이라
+  //   컴포넌트가 재마운트되지 않는다. 그래서 A 를 요청한 뒤 곧바로 B 로 넘어가면
+  //   **A 의 응답이 나중에 도착해 B 화면을 덮을 수 있다.** 화면에는 "다른 물건의
+  //   상세"가 그대로 보인다 — 오류도 로딩도 아니라서 사용자는 그게 틀린 줄 모른다.
+  //
+  //   소스는 그 방어를 이미 갖고 있다: 요청 시작 시 `const requestId = id` 를 잡고
+  //   **모든 await 뒤에** `idRef.current !== requestId` 로 끊는다. 그런데 2026-08-25
+  //   실측 기준 **그 방어를 참조하는 테스트가 하나도 없었다**
+  //   (`grep -rn idRef tests/ test_*.py` -> 0건). 한 줄만 지워도 아무도 모른다.
+  //
+  //   경합 자체는 node --test 에서 재현하기 어렵다(React 렌더러도 DOM 도 없다).
+  //   그래서 `src/proxy.ts` 계약을 소스로 고정한 것과 같은 방식으로 **구조**를 본다.
+  const FILE = 'src/app/properties/[id]/page.tsx'
+  const GUARD = /idRef\.current\s*(!==|===)\s*requestId/
+
+  // ★ 판정 로직은 **한 벌**이다. 본 검사와 자기 검증이 각자 구현하면 갈라진다
+  //   (2026-08-25에 실제로 갈라져 자기 검증만 엉뚱하게 붉어졌다 — BUGS #204 와 같은 계열).
+  function unguardedWrites(source) {
+    const lines = source.split(/\r?\n/)
+    const starts = []
+    lines.forEach((l, i) => {
+      if (/const\s+requestId\s*=\s*id\b/.test(l)) starts.push(i)
+    })
+    const hits = []
+    for (const start of starts) {
+      let sawAwait = false
+      let guarded = true
+      let depth = 0
+      // `requestId` 를 선언한 **그 함수 안에서만** 본다. 중괄호 깊이가 음수가 되면
+      // 함수가 끝난 것이다 — 고정 줄 수로 훑으면 뒤따르는 별개 핸들러까지 끌어와
+      // 오탐이 난다(requireToken / performRegistryRequest 는 requestId 를 잡지 않는다).
+      for (let i = start + 1; i < lines.length; i += 1) {
+        const line = lines[i]
+        for (const ch of line) {
+          if (ch === '{') depth += 1
+          else if (ch === '}') depth -= 1
+        }
+        if (depth < 0) break
+        if (line.trim().startsWith('//')) continue
+        if (/\bawait\b/.test(line)) { sawAwait = true; guarded = false }
+        if (GUARD.test(line)) guarded = true
+        if (sawAwait && !guarded && /\bset[A-Z]\w*\(/.test(line)) {
+          hits.push(`${i + 1}: ${line.trim().slice(0, 80)}`)
+          guarded = true          // 같은 구간을 여러 번 세지 않는다
+        }
+      }
+    }
+    return { starts, hits }
+  }
+
+  test('id 가 바뀌면 idRef 가 따라간다 (가드의 기준점)', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(FILE, 'utf8')
+    // 주석은 걷어낸다 - 주석 처리한 줄이 살아 있는 코드로 읽히면 가드를 꺼도 통과한다
+    // (2026-08-25 mutation 이 실제로 그렇게 뚫었다). `proxy.ts` 검사와 같은 처리다.
+    const code = src.split(/\r?\n/).filter((l) => !l.trim().startsWith('//')).join('\n')
+    assert.ok(/const\s+idRef\s*=\s*useRef\(\s*id\s*\)/.test(code),
+      'idRef = useRef(id) 가 없습니다 — 늦은 응답을 구별할 기준점이 사라졌습니다')
+    assert.ok(/idRef\.current\s*=\s*id/.test(code),
+      'idRef.current = id 갱신이 없습니다 — 기준점이 첫 물건에 고정돼 가드가 항상 통과합니다')
+  })
+
+  test('await 로 받은 결과를 화면에 쓰기 전에 반드시 가드를 지난다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(FILE, 'utf8')
+    const { starts, hits } = unguardedWrites(src)
+    assert.ok(starts.length > 0,
+      'requestId 를 잡는 곳이 없습니다 — 이 검사가 공허합니다(관용구가 바뀌었으면 함께 고치십시오)')
+    assert.deepEqual(hits, [],
+      'await 뒤 가드 없이 화면 상태를 바꾸는 자리가 있습니다.\n' +
+      '이전/다음으로 빠르게 넘기면 **이전 물건의 응답이 지금 화면을 덮습니다** — ' +
+      '오류도 로딩도 아니라 사용자는 틀린 줄 모릅니다.\n' +
+      '해당 줄 앞에 `if (idRef.current !== requestId) return` 을 넣으십시오 (BUGS #210).\n' +
+      hits.join('\n'))
+  })
+
+  test('검사가 공허하지 않다 — 가드를 지우면 잡힌다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(FILE, 'utf8')
+    // 실제 파일은 건드리지 않는다. 가드 줄만 지운 사본에 **같은 판정 함수**를 돌린다.
+    const mutated = src.split(/\r?\n/).filter((l) => !GUARD.test(l)).join('\n')
+    const { hits } = unguardedWrites(mutated)
+    assert.ok(hits.length > 0,
+      '가드를 전부 지웠는데도 탐지되지 않습니다 — 이 검사는 아무것도 지키지 못합니다')
+  })
+})

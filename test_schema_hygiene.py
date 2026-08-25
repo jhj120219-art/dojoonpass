@@ -16,6 +16,7 @@ test_api_regression.py를 정적 감사하며 발견한, 실행 전에는 드러
 """
 import sys
 import codecs
+import ast
 import os
 import sqlite3
 import subprocess
@@ -3410,6 +3411,477 @@ def test_no_new_tracked_sqlite_databases():
     check_true("자기 검증: 비슷한 텍스트는 잡지 않는다", not is_not_db)
 
 
+
+def test_entrypoints_do_not_attach_file_logs_on_import():
+    """진입점을 import 하는 것만으로 운영 로그 파일이 열리면 안 된다 (BUGS #192).
+
+    ## 왜 이 검사가 있는가
+
+    `collect_documents.py` / `mvp_scraper.py` 는 모듈 최상위에서
+    `logging.basicConfig(handlers=[logging.FileHandler(...)])` 를 불렀다. basicConfig 는
+    **루트 로거**를 건드리므로, 그 모듈을 import 한 순간 그 프로세스의 **모든**
+    로그(crawler/* 포함)가 운영 로그 파일로 흘러간다. 이 모듈을 import 하는 것은
+    제품 코드가 아니라 **테스트뿐**이라(2026-08-25 전수 확인), 결과적으로 회귀
+    스위트가 돌 때마다 합성 로그가 운영 로그에 쌓였다. 실측(2026-08-25):
+
+        logs/doc_collect.log    4,136줄 중 1,651줄(40%)이 QA 산출물('QA법원')
+        logs/scraper.log       36,420줄 중 08-24~25 자 2,346줄이 QA 산출물('QA1'/'QA2')
+
+    마지막 실제 크롤은 2026-08-12 다. 즉 로그만 읽으면 "오늘 돌았고 전 법원이
+    실패했다"로 보인다 - 이 저장소가 9일간 크롤 중단을 몰랐던 그 거짓 증거와
+    같은 계열이다(BUGS #186 이 DB 축에서 고친 것의 파일 판).
+
+    ## 무엇을 검사하는가
+
+    문자열이 아니라 **행위**를 본다 - 자식 프로세스에서 진짜로 import 해 루트
+    로거에 FileHandler 가 붙는지 물어본다. 자식 프로세스로 돌리는 이유는 둘이다:
+    (1) 이 검사 자신이 로그를 오염하지 않기 위해, (2) 이미 import 된 모듈이나
+    먼저 설정된 루트 핸들러 때문에 basicConfig 가 no-op 이 되는 것을 피하기 위해.
+    """
+    import ast
+    import json
+    import tempfile
+
+    print("\n--- 진입점 import 가 운영 로그를 여는가 (BUGS #192) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    # .bat / 수동으로 직접 실행되는 루트 진입점 전부.
+    ENTRYPOINTS = ("mvp_scraper", "collect_documents", "doc_worker", "refresh_priority")
+
+    PROBE = (
+        "import sys, os, json, logging\n"
+        "sys.path.insert(0, %r)\n"
+        "import %s\n"
+        "print('__FH__' + json.dumps("
+        "[os.path.basename(h.baseFilename) for h in logging.getLogger().handlers"
+        " if isinstance(h, logging.FileHandler)]))\n"
+    )
+
+    def file_handlers_after_import(modname, sys_path):
+        out = subprocess.run([sys.executable, "-c", PROBE % (sys_path, modname)],
+                             cwd=root, capture_output=True, timeout=180)
+        text = (out.stdout or b"").decode("utf-8", "replace")
+        for line in text.splitlines():
+            if line.startswith("__FH__"):
+                return json.loads(line[len("__FH__"):])
+        raise AssertionError("probe 가 답하지 않았다 (%s): %s / %s"
+                             % (modname, text[-400:],
+                                (out.stderr or b"").decode("utf-8", "replace")[-400:]))
+
+    for mod in ENTRYPOINTS:
+        handlers = file_handlers_after_import(mod, root)
+        check("%s 를 import 한 뒤 루트의 FileHandler" % mod, handlers, [])
+
+    # --- 자기 검증 1: 검사가 공허하지 않다 -------------------------------
+    # 진짜로 붙이는 모듈을 놓고 같은 probe 를 돌려 **잡히는지** 확인한다.
+    # 이것이 없으면 probe 가 항상 빈 목록을 돌려도 전부 초록이 된다.
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "logs"), exist_ok=True)
+        bad = os.path.join(td, "qa_bad_entrypoint.py")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import logging, os\n"
+                "_HERE = os.path.dirname(os.path.abspath(__file__))\n"
+                "logging.basicConfig(level=logging.INFO, handlers=["
+                "logging.FileHandler(os.path.join(_HERE, 'logs', 'qa_probe.log'),"
+                " encoding='utf-8'), logging.StreamHandler()])\n"
+            )
+        caught = file_handlers_after_import("qa_bad_entrypoint", td)
+    check_true("자기 검증: import 시점에 붙이는 모듈은 잡힌다",
+               caught == ["qa_probe.log"], caught)
+
+    # --- 자기 검증 2: 운영 경로는 그대로 남아 있다 -----------------------
+    # 붙이지 "않는" 것만 확인하면 **아예 파일 로그를 지워버린** 회귀를 놓친다.
+    # `.bat` 이 `python <파일>` 로 부를 때는 반드시 붙어야 한다.
+    for name in ("mvp_scraper.py", "collect_documents.py"):
+        src = open(os.path.join(root, name), encoding="utf-8-sig").read()
+        tree = ast.parse(src)
+        has_fn = any(isinstance(n, ast.FunctionDef) and n.name == "attach_file_log"
+                     for n in tree.body)
+        check_true("%s 에 attach_file_log() 가 있다" % name, has_fn)
+        main_calls = []
+        for node in tree.body:
+            if not isinstance(node, ast.If):
+                continue
+            if "__main__" not in ast.dump(node.test):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    main_calls.append(sub.func.id)
+        check_true("%s 의 __main__ 이 attach_file_log() 를 부른다" % name,
+                   "attach_file_log" in main_calls, main_calls)
+
+    # --- 두 벌로 둔 구현이 **갈라지지 않는가** (2026-08-25, BUGS #204) ---
+    #
+    #   BUGS #192 는 `attach_file_log()` 를 두 진입점에 **일부러 인라인**했다 —
+    #   새 모듈을 만들면 미추적 파일을 추적 파일이 import 하게 되어 커밋된 트리가
+    #   부팅하지 못한다(BUGS #105). 그 판단은 그대로 유효하다.
+    #
+    #   대신 인라인이 만든 위험을 여기서 막는다: **한쪽만 고쳐지는 날**이다.
+    #   BUGS #197 이 정확히 그렇게 갈라진 규칙이었다(doc_raw 작성자 둘).
+    #   구조를 정규화해 비교하므로 로그 파일명·상수가 달라도 통과하고,
+    #   **로직이 달라지면** 실패한다.
+    import hashlib as _hashlib
+
+    class _Norm(ast.NodeTransformer):
+        """이름/상수를 지워 구조만 남긴다 - 파일명이 다른 것은 차이가 아니다."""
+
+        def visit_Name(self, n):
+            return ast.copy_location(ast.Name(id="_", ctx=n.ctx), n)
+
+        def visit_Attribute(self, n):
+            self.generic_visit(n)
+            return ast.copy_location(ast.Attribute(value=n.value, attr="_", ctx=n.ctx), n)
+
+        def visit_Constant(self, n):
+            return ast.copy_location(ast.Constant(value="_"), n)
+
+        def visit_arg(self, n):
+            return ast.copy_location(ast.arg(arg="_", annotation=None), n)
+
+    def shape_of(path, fname):
+        tree = ast.parse(open(path, encoding="utf-8-sig").read())
+        fn = next((n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == fname), None)
+        if fn is None:
+            return None
+        body = [n for n in fn.body
+                if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+        clone = ast.parse(ast.unparse(ast.Module(body=body, type_ignores=[])))
+        return _hashlib.md5(ast.dump(_Norm().visit(clone)).encode()).hexdigest()
+
+    shapes = {name: shape_of(os.path.join(root, name), "attach_file_log")
+              for name in ("mvp_scraper.py", "collect_documents.py")}
+    check_true("두 진입점에서 attach_file_log() 를 찾았다",
+               all(v is not None for v in shapes.values()), shapes)
+    check("★ 인라인한 두 구현의 **구조가 같다**(한쪽만 고쳐지지 않았는가)",
+          len(set(shapes.values())), 1)
+    if len(set(shapes.values())) != 1:
+        print("      -> 한쪽만 바꿨다면 다른 쪽도 같이 바꾸라. 일부러 다르게 만든 것이라면")
+        print("         이 검사를 갱신하고 **왜 달라야 하는지**를 함께 적으라 (BUGS #204)")
+
+    # 자기 검증: 이 비교가 실제로 차이를 잡는가(공허하지 않은가)
+    other = shape_of(os.path.join(root, "mvp_scraper.py"), "main")
+    check_true("자기 검증: 다른 함수는 다른 구조로 나온다",
+               other is not None and other not in set(shapes.values()), other)
+
+
+
+# 프런트가 보내는데 백엔드가 읽지 않는 검색 파라미터 (2026-08-25 실측, docs/BUGS.md #195).
+#
+# 아래 다섯은 `SearchForm.buildSearchQuery()` 가 URL 에 싣지만 `api/v1/search.py` 의
+# 시그니처에 **없다.** FastAPI 는 모르는 쿼리 파라미터를 조용히 버리므로 오류도 나지
+# 않는다 - 사용자 입장에서는 "필터를 걸었는데 안 걸린 결과"가 그냥 나온다.
+#
+# 지금은 사용자에게 도달하지 않는다. 그 값을 넣는 UI 가 "준비 중입니다"뿐이라
+# (`SearchForm.tsx` 의 "면적 조건"/"특수조건" 아코디언) 손으로 URL 을 치지 않는 한
+# 폼이 이 값을 만들지 않는다. 소스에도 `TODO(API 미지원)` 이 붙어 있다.
+#
+# **그래서 지우지 않고 목록으로 고정한다.** 이 목록이 늘어나면 새로 생긴 것이므로
+# 검사가 실패한다 - "조용히 무시되는 필터"가 하나 더 생기는 것을 그때 잡는다.
+# 반대로 백엔드가 이 중 하나를 실제로 구현하면 그때도 실패한다(목록에서 빼라는 신호).
+KNOWN_UNSUPPORTED_SEARCH_PARAMS = {
+    "min_building_area", "max_building_area",   # auction_item 에 면적 컬럼이 없다
+    "min_land_area", "max_land_area",           # (주소 대괄호에서 프런트가 파싱한다)
+    "special_conditions",                       # 백엔드에 대응 개념이 없다
+}
+
+
+def test_search_form_params_reach_the_backend():
+    """프런트가 싣는 검색 파라미터가 실제로 API 시그니처에 있는가 (BUGS #195).
+
+    ## 왜 이 검사가 필요한가
+
+    이 저장소는 "조용히 틀리는 것"을 가장 경계한다. 모르는 쿼리 파라미터는
+    FastAPI 가 **오류 없이 버린다.** 그래서 프런트가 `min_building_area=30` 을 보내도
+    서버는 그냥 전체 결과를 돌려주고, 화면에는 필터가 걸린 것처럼 보인다.
+    로그도 안 남고 상태 코드도 200 이다 - 검사 말고는 잡을 방법이 없다.
+
+    ## 어떻게 비교하는가
+
+    양쪽 다 **소스에서 직접** 읽는다. 서버를 띄우지 않으므로 회귀 스위트에서 돈다.
+
+        백엔드   api/v1/search.py 의 `def search(...)` 시그니처 (AST)
+        프런트   SearchForm.tsx 의 `FILTER_PARAM_KEYS` 배열
+
+    `sort_by`/`sort_order`/`page`/`size` 는 검색조건이 아니라 표시 설정이라
+    `FILTER_PARAM_KEYS` 에 없다(그 파일 주석이 그렇게 정의한다). 백엔드에는 있으므로
+    한쪽에만 있어도 결함이 아니다 - 방향을 **프런트 -> 백엔드**로만 본다.
+    """
+    import ast
+    import re
+
+    print("\n--- 프런트 검색 파라미터가 백엔드에 닿는가 (BUGS #195) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    api_src = open(os.path.join(root, "api", "v1", "search.py"), encoding="utf-8-sig").read()
+    tree = ast.parse(api_src)
+    backend = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "search":
+            for a in node.args.args + node.args.kwonlyargs:
+                backend.add(a.arg)
+            break
+    check_true("백엔드 search() 시그니처를 읽었다 (%d개)" % len(backend),
+               len(backend) >= 15, sorted(backend))
+
+    form_path = os.path.join(root, "src", "app", "search", "SearchForm.tsx")
+    form_src = open(form_path, encoding="utf-8-sig").read()
+    m = re.search(r"FILTER_PARAM_KEYS\s*=\s*\[(.*?)\]\s*as const", form_src, re.S)
+    check_true("프런트 FILTER_PARAM_KEYS 를 찾았다", m is not None)
+    if not m:
+        return
+    frontend = set(re.findall(r"'([a-z_]+)'", m.group(1)))
+    check_true("프런트 필터 키를 읽었다 (%d개)" % len(frontend),
+               len(frontend) >= 15, sorted(frontend))
+
+    missing = frontend - backend
+    print("    프런트 %d개 / 백엔드 %d개 / 백엔드에 없는 것 %d개"
+          % (len(frontend), len(backend), len(missing)))
+
+    # ★ 알려진 것보다 **늘어나면** 실패한다. 줄어드는 것(= 백엔드가 구현했다)도 실패한다 -
+    #   그때는 위 목록에서 빼야 검사가 계속 의미를 갖는다.
+    check("★ 백엔드가 읽지 않는 프런트 검색 파라미터",
+          sorted(missing), sorted(KNOWN_UNSUPPORTED_SEARCH_PARAMS))
+    if missing - KNOWN_UNSUPPORTED_SEARCH_PARAMS:
+        print("      -> 새로 생겼다. 서버는 모르는 파라미터를 **오류 없이 버린다** -"
+              " 사용자에게는 '필터가 안 걸린 결과'가 그냥 나온다")
+    if KNOWN_UNSUPPORTED_SEARCH_PARAMS - missing:
+        print("      -> 백엔드가 구현했다. KNOWN_UNSUPPORTED_SEARCH_PARAMS 에서 빼라")
+
+    # 이 다섯이 사용자에게 도달하지 않는 근거도 함께 고정한다 -
+    # "준비 중입니다"가 사라지면 그 순간 진짜 결함이 되기 때문이다.
+    for title in ("면적 조건", "특수조건"):
+        idx = form_src.find('title="%s"' % title)
+        check_true("'%s' 섹션이 있다" % title, idx != -1)
+        if idx == -1:
+            continue
+        # ★ 창을 **그 섹션의 닫는 태그까지**로 자른다. 고정 길이(400자)로 잘랐더니
+        #   창이 다음 섹션까지 삼켜서, 한쪽에서 "준비 중입니다" 를 지워도
+        #   옆 섹션의 것이 잡혀 **검사가 통과했다**(2026-08-25 mutation 에서 발견).
+        end = form_src.find("</SearchAccordionSection>", idx)
+        window = form_src[idx:end if end != -1 else idx + 400]
+        check_true("'%s' 은 아직 입력 UI 가 아니라 '준비 중입니다' 다" % title,
+                   "준비 중입니다" in window,
+                   "-> 입력 UI 가 생겼다면 위 파라미터가 실제로 전송된다."
+                   " 백엔드 구현 없이는 조용히 무시된다")
+
+    # 자기 검증: 비교가 실제로 동작하는가(공허하지 않은가).
+    check_true("자기 검증: 없는 키를 넣으면 잡힌다",
+               ("qa_bogus_param" in ({"qa_bogus_param"} | frontend) - backend))
+    check_true("자기 검증: 백엔드에 있는 키는 안 잡힌다",
+               "sido" in backend and "sido" not in missing)
+
+
+
+# 크롬 드라이버를 **직접** 만들어도 되는 곳. 이 둘만이 폴백을 들고 있는 자리다.
+# 나머지 추적 파일은 전부 `crawler.base_crawler.resolve_chrome_driver()` 를 거쳐야
+# 한다 - 직접 `ChromeDriverManager().install()` 을 부르면 Selenium Manager 폴백이
+# 사라지고, 이 PC 에서는 그 순간 기동에 실패한다(BUGS #196).
+CHROME_DRIVER_FALLBACK_OWNERS = {
+    "crawler/base_crawler.py",  # 수집 파이프라인 전체가 여기를 쓴다
+    "audit_viewport.py",        # 프런트 감사 도구의 같은 구조(BUGS #193)
+}
+
+
+def test_pipeline_resolves_chrome_driver_through_one_place():
+    """수집 파이프라인이 크롬 드라이버를 얻는 경로가 하나인가 (BUGS #196).
+
+    ## 왜 이 검사가 있는가 - 실제로 파이프라인 전체가 멈춰 있었다
+
+    2026-08-25 실측: `crawler.base_crawler.build_driver()` 와
+    `crawler.doc_crawler.build_download_driver()` 가 **둘 다** 1초 남짓 만에 실패했다.
+
+        ConnectionError: Could not reach host. Are you offline?
+
+    그런데 오프라인이 아니었다 - 같은 순간 같은 호스트에 stdlib urllib 로 HTTP 200 이
+    0.05초에 왔다. `webdriver_manager` 가 쓰는 `requests` 경로의 CA 검증만 깨져 있었고
+    (`SSLCertVerificationError: unable to get local issuer certificate`),
+    그 예외가 "오프라인이냐"로 바뀌어 나왔다.
+
+    영향이 크다 - `docs/BETA_RELEASE_CHECKLIST.md` 가 P0-A 의 **1순위 조치**로 적어 둔
+    "스케줄러 등록"을 해도, 그날 밤 크롤과 DocWorker 는 브라우저를 못 띄우고 죽는다.
+    그리고 로그에 남는 문장이 "오프라인이냐"라서 조사하는 사람은 멀쩡한 네트워크를 뒤진다.
+
+    ## 무엇을 검사하는가
+
+    1. 파이프라인 파일들이 `ChromeDriverManager` 를 **직접** 부르지 않는다
+       (유일한 예외는 `crawler/base_crawler.py` 의 폴백 함수 안이다).
+    2. `resolve_chrome_driver()` 가 순서/폴백/실패보고를 실제로 한다 - 가짜 factory 를
+       주입해 **브라우저 없이** 확인한다.
+    """
+    import ast
+
+    print("\n--- 수집 파이프라인의 크롬 드라이버 해석 경로 (BUGS #196) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    # ★ 목록을 손으로 들지 않는다 - 새 스크립트가 추가되면 목록이 낡는다.
+    #   `git ls-files` 로 **추적된 파이썬 전부**를 훑는다.
+    try:
+        ls = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if ls.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+    tracked = (ls.stdout or b"").decode("utf-8", "replace").split()
+    check_true("검사가 공허하지 않다(추적 파이썬 파일이 있다) - %d개" % len(tracked),
+               len(tracked) >= 40, len(tracked))
+
+    offenders = []
+    for rel in tracked:
+        if rel in CHROME_DRIVER_FALLBACK_OWNERS:
+            continue
+        full = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            tree = ast.parse(open(full, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue          # 작업 트리에 없거나 파싱 불가 - 판정 대상이 아니다
+        for node in ast.walk(tree):
+            # 호출만 본다 - 주석/문자열에 이름이 나오는 것은 결함이 아니다.
+            if not isinstance(node, ast.Call):
+                continue
+            fname = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if fname == "ChromeDriverManager":
+                offenders.append("%s:%d" % (rel, node.lineno))
+
+    check("★ 드라이버를 직접 만드는 파일(폴백 보유자 제외)", sorted(offenders), [])
+    if offenders:
+        print("      -> `from crawler.base_crawler import resolve_chrome_driver` 를 쓰라."
+              " 직접 부르면 Selenium Manager 폴백이 사라져 이 PC 에서 기동에 실패한다")
+    for owner in sorted(CHROME_DRIVER_FALLBACK_OWNERS):
+        check_true("폴백 보유자 %s 가 추적된다" % owner, owner in tracked)
+
+    # base_crawler 는 폴백을 **실제로 갖고 있어야** 한다 (없애면 위 검사는 여전히 초록이다)
+    bc = open(os.path.join(root, "crawler", "base_crawler.py"), encoding="utf-8-sig").read()
+    bc_tree = ast.parse(bc)
+    names = {n.name for n in bc_tree.body if isinstance(n, ast.FunctionDef)}
+    check_true("base_crawler 에 resolve_chrome_driver() 가 있다",
+               "resolve_chrome_driver" in names, sorted(names))
+    check_true("폴백이 둘 이상이다(Selenium Manager + webdriver_manager)",
+               bc.count("(\"Selenium Manager\"") == 1 and bc.count("(\"webdriver_manager\"") == 1,
+               "-> CHROME_DRIVER_FACTORIES 가 한 가지로 줄면 이 PC 에서 다시 못 띄운다")
+
+    # --- 행위 검사: 가짜 factory 주입 (브라우저를 띄우지 않는다) -------------
+    sys.path.insert(0, root)
+    from crawler.base_crawler import resolve_chrome_driver, DriverUnavailable
+
+    calls = []
+
+    def ok_factory(tag):
+        def make(opts):
+            calls.append(tag)
+            return "driver-%s" % tag
+        return make
+
+    def bad_factory(tag, message):
+        def make(opts):
+            calls.append(tag)
+            raise RuntimeError(message)
+        return make
+
+    def try_resolve(factories):
+        """예외를 값으로 바꾼다 - 회귀가 트레이스백으로 나오면 어느 단언이 깨졌는지 모른다."""
+        try:
+            return resolve_chrome_driver(None, factories=factories), None
+        except Exception as exc:
+            return None, "%s: %s" % (type(exc).__name__, exc)
+
+    del calls[:]
+    drv, why = try_resolve([("A", ok_factory("A")), ("B", ok_factory("B"))])
+    check("첫 방법이 되면 두 번째는 부르지 않는다", calls, ["A"])
+    check("첫 방법이 돌려준 것을 쓴다", drv, "driver-A")
+
+    del calls[:]
+    drv, why = try_resolve([("A", bad_factory("A", "SSL 실패")), ("B", ok_factory("B"))])
+    check("첫 방법이 실패하면 폴백으로 넘어간다", calls, ["A", "B"])
+    check("폴백이 돌려준 것을 쓴다", drv, "driver-B")
+
+    del calls[:]
+    drv, why = try_resolve([("A", bad_factory("A", "SSL 실패")),
+                            ("B", bad_factory("B", "경로 없음"))])
+    check_true("전부 실패하면 DriverUnavailable 이다",
+               drv is None and why is not None and why.startswith("DriverUnavailable:"), why)
+    check_true("실패 사유에 두 방법이 모두 들어 있다",
+               why is not None and "A ->" in why and "B ->" in why, why)
+    check_true("실패 사유에 원래 메시지가 남는다",
+               why is not None and "SSL 실패" in why and "경로 없음" in why, why)
+
+    # 자기 검증: 이 행위 검사가 공허하지 않다.
+    check_true("자기 검증: 성공/폴백/전멸이 실제로 다르게 나온다",
+               len({try_resolve([("A", ok_factory("A"))])[0],
+                    try_resolve([("A", bad_factory("A", "x")), ("B", ok_factory("B"))])[0],
+                    try_resolve([("A", bad_factory("A", "x"))])[0]}) == 3)
+
+
+
+def test_no_python_syntax_warnings():
+    """추적된 파이썬이 컴파일 단계에서 **경고를 내지 않는가** (2026-08-25, BUGS #204).
+
+    ## 왜 이것이 소음 이상인가
+
+    `invalid escape sequence '\\d'` 는 대개 둘 중 하나다.
+
+        (a) 문서/주석에 Windows 경로를 raw 아닌 문자열로 적었다  -> 무해하지만 소음
+        (b) **정규식을 raw 문자열로 안 썼다**                    -> 패턴이 조용히 달라진다
+
+    (b) 는 이 저장소가 반복해서 잡아 온 "조용히 틀린 것"이다. 지금은 (a) 한 건이었고
+    고쳤지만(`test_asset_record_failures.py` 의 모듈 docstring 에 `storage\\database.py`
+    가 들어 있었다), **구분해서 막을 방법이 없으므로 둘 다 막는다.**
+
+    소음 자체도 값이다 — 이 저장소는 판정 신호를 흐리는 것을 계속 걷어내 왔다
+    (`run_python_tests.py` 의 NO-VERDICT 분류가 같은 취지다). 매 실행마다 나오는 경고는
+    **진짜 경고가 났을 때 눈에 안 띄게** 만든다.
+    """
+    print("\n--- 추적 파이썬의 컴파일 경고 (BUGS #204) ---")
+    import io as _io
+    import warnings as _warnings
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        ls = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if ls.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+    files = (ls.stdout or b"").decode("utf-8", "replace").split()
+    check_true("검사가 공허하지 않다(추적 .py 를 찾았다) - %d개" % len(files),
+               len(files) >= 40, len(files))
+
+    offenders = []
+    for rel in files:
+        full = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            src = _io.open(full, encoding="utf-8-sig").read()
+        except OSError:
+            continue          # 작업 트리에 없는 것은 판정 대상이 아니다
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            try:
+                compile(src, rel, "exec")
+            except SyntaxError:
+                continue      # 문법 오류는 다른 검사의 몫이다
+            for w in caught:
+                if issubclass(w.category, SyntaxWarning):
+                    offenders.append("%s:%s %s" % (rel, w.lineno, str(w.message)[:60]))
+
+    check("★ 컴파일 경고를 내는 추적 파일", sorted(offenders), [])
+    if offenders:
+        print("      -> 정규식이면 raw 문자열(r\"...\")로, 문서에 든 경로면 docstring 을")
+        print("         raw 로 만들라. 텍스트를 고치지 말고 리터럴만 바꾸는 편이 안전하다")
+
+    # 자기 검증 - 이 검사가 실제로 경고를 잡는가(공허하지 않은가)
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        compile('x = "\\d"\n', "<probe>", "exec")
+        probe = [w for w in caught if issubclass(w.category, SyntaxWarning)]
+    check_true("자기 검증: 일부러 만든 잘못된 이스케이프를 잡는다", len(probe) == 1, probe)
+
 def run():
     test_get_connection_fk_parameter()
     test_soft_delete_columns()
@@ -3444,6 +3916,12 @@ def run():
     test_scheduler_script_detects_legacy_tasks()
     test_claude_md_paths_exist()
     test_no_new_tracked_sqlite_databases()
+    test_entrypoints_do_not_attach_file_logs_on_import()
+    test_search_form_params_reach_the_backend()
+    test_pipeline_resolves_chrome_driver_through_one_place()
+    test_no_python_syntax_warnings()
+    test_declared_indexes_survive_bootstrap()
+    test_secret_comparisons_are_constant_time()
 
     print("\n" + "=" * 55)
     if failures:
@@ -3452,6 +3930,284 @@ def run():
     print("ALL TESTS PASSED")
     return 0
 
+
+
+# ---------------------------------------------------------------------------
+# 소스가 만드는 인덱스가 **새 DB 에서 실제로 살아남는가** (2026-08-25 신설, BUGS #208)
+#
+# 왜 필요한가 — `013_auction_item_case_id_unique.sql` 은 `auction_item` 을 **재작성**한다
+# (CREATE TABLE + INSERT INTO + DROP TABLE + ALTER TABLE RENAME). 그 과정에서 기존
+# 인덱스는 전부 사라지고, 013 이 **하드코딩한 16개만** 다시 만들어진다.
+#
+# 그래서 013 보다 앞 번호 마이그레이션에 인덱스를 추가하면 **조용히 없어진다.**
+# 실측(2026-08-25):
+#
+#     008_create_search_indexes.sql 에 CREATE INDEX 한 줄 추가
+#     -> 부트스트랩 후 그 인덱스는 **존재하지 않는다** (013 이 지우고 안 만든다)
+#     -> 오류도 경고도 없다
+#
+# 하필 그 파일 이름이 `create_search_indexes.sql` 이라, 검색이 느려서 인덱스를 넣으려는
+# 사람이 가장 먼저 여는 곳이다.
+#
+# 그리고 이건 **로컬과 배포가 갈리는** 모양이다 - 013 이 이미 돌아간 운영 DB 는 마이그레이션이
+# 다시 실행되지 않으므로 새로 추가한 인덱스가 그대로 남는다. 새로 클론한 개발 머신에는 없다.
+# "여기선 되는데"가 되는 전형적인 자리다.
+#
+# 이 검사는 **소스에 선언된 모든 인덱스가 부트스트랩 결과에 실제로 있는지**를 본다.
+# 013 에만 있는 문제가 아니라, 앞으로 어떤 마이그레이션이 어떤 테이블을 재작성해도 잡힌다.
+# ---------------------------------------------------------------------------
+def test_declared_indexes_survive_bootstrap():
+    """소스가 CREATE INDEX 한 이름이 부트스트랩한 DB 에 전부 존재하는가 (BUGS #208)."""
+    print("\n--- 선언한 인덱스가 새 DB 에서 살아남는다 (BUGS #208) ---")
+    import contextlib
+    import glob as _glob
+    import io as _io
+    import re as _re
+    import sqlite3 as _sqlite3
+    import tempfile
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    sources = ([os.path.join(root, "storage", "migrate_v4_1.py")]
+               + sorted(_glob.glob(os.path.join(root, "storage", "migrations", "*.sql"))))
+    declared = {}          # 인덱스 이름 -> 선언한 파일(마지막에 선언한 곳)
+    for path in sources:
+        try:
+            src = _io.open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        for m in _re.finditer(
+                r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                r"[\"\[`]?(\w+)[\"\]`]?\s+ON\s+[\"\[`]?(\w+)", src, _re.I):
+            declared[m.group(1)] = (os.path.basename(path), m.group(2))
+
+    check_true("검사가 공허하지 않다(소스에서 인덱스 선언을 찾았다) - %d개" % len(declared),
+               len(declared) >= 40, len(declared))
+
+    import storage.database as db
+    prev = db.DB_PATH
+    tmp = tempfile.mkdtemp(prefix="qa-idxsurvive-")
+    try:
+        db.DB_PATH = os.path.join(tmp, "auction.db")
+        import storage.migrate_v4_1 as mig
+        import storage.migrations.run_migrations as runmig
+        # 부트스트랩 로그가 판정 줄을 덮지 않게 삼킨다(실패는 예외로 드러난다)
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.init_db(); mig.migrate(); runmig.run()
+        conn = _sqlite3.connect(db.DB_PATH)
+        try:
+            live = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")}
+        finally:
+            conn.close()
+    finally:
+        db.DB_PATH = prev
+
+    check_true("검사가 공허하지 않다(부트스트랩 DB 에 인덱스가 있다) - %d개" % len(live),
+               len(live) >= 40, len(live))
+
+    missing = sorted((n, declared[n][0], declared[n][1]) for n in declared if n not in live)
+    if missing:
+        for n, f, t in missing:
+            print("      [사라짐] %-40s %s 가 %s 에 만들지만 새 DB 에 없다" % (n, f, t))
+    check_true("★ 소스가 선언한 인덱스가 새 DB 에 전부 존재한다", not missing,
+               "-> %s. 뒤 번호 마이그레이션이 그 테이블을 **재작성**하면서 인덱스를 "
+               "다시 만들지 않았을 가능성이 크다(013 이 auction_item 에 대해 그렇게 한다). "
+               "재작성하는 마이그레이션의 CREATE INDEX 목록에도 함께 넣으라 (BUGS #208)"
+               % [n for n, _f, _t in missing])
+
+    # 자기 검증 - 이 검사가 실제로 "사라짐"을 잡는가(공허하지 않은가).
+    #   소스 파일을 건드리지 않고, 선언 목록에 없는 이름을 하나 끼워 넣어 판정만 흉내 낸다.
+    fake = dict(declared)
+    fake["idx_qa_probe_never_created"] = ("probe", "auction_item")
+    probe_missing = [n for n in fake if n not in live]
+    # 진짜 결손이 있을 때 이 자기 검증까지 함께 붉어지면 원인 줄이 두 배가 된다.
+    # "탐지기가 동작하는가"만 본다 - 실제 결손 여부는 위 검사가 판정한다.
+    check_true("자기 검증: 없는 인덱스를 잡는다",
+               "idx_qa_probe_never_created" in probe_missing, probe_missing)
+
+
+# ---------------------------------------------------------------------------
+# 시크릿 비교가 **상수 시간**인가 (2026-08-25 신설, BUGS #209)
+#
+# 왜 구조로 보는가 — 이건 **행위로 잡을 수 없다.** `==` 로 바꿔도 응답은 완전히 같다.
+# 다른 점은 "얼마나 걸리느냐"뿐이고, 그 차이는 단위 테스트에서 안정적으로 측정되지 않는다.
+#
+# 실측(2026-08-25 mutation): `hmac.compare_digest` 를 `==` 로 바꿔도
+#
+#     api/v1/payment_providers.py  verify_webhook_signature   실패 0건
+#     api/v1/admin.py              resolve_admin_role         실패 0건
+#         (test_admin_secret_contract / test_api_regression / test_schema_hygiene 전부)
+#
+# 즉 **네 자리 전부 무방비**였다. 같은 파일의 주석이 왜 상수 시간이어야 하는지
+# 이미 적어 두고 있는데(`api/v1/admin.py`: *"단순 `!=`는 앞에서부터 다르면 즉시 반환되어
+# 비교 시간이 일치하는 접두 길이에 비례하는 타이밍 사이드채널이 된다"*), 그 판단을
+# 지키는 것이 없었다. BUGS #207 과 같은 모양이다 — 제품은 옳은데 가드가 없다.
+#
+# 두 겹으로 본다.
+#   (1) 아는 자리들이 여전히 compare_digest 를 쓰는가
+#   (2) **새로** 시크릿을 읽고 비교하는 함수가 생겼는데 목록에 없지는 않은가
+# ---------------------------------------------------------------------------
+
+# 값이 새면 곧바로 권한/결제 위조가 되는 환경변수들.
+SECRET_ENV_NAMES = frozenset({
+    "ADMIN_API_KEY", "SUPER_ADMIN_API_KEY",
+    "PAYMENT_WEBHOOK_SECRET", "SUPABASE_JWT_SECRET",
+})
+
+# 그 값을 실제로 **비교**하는 함수 (2026-08-25 실측 기준).
+# 늘어나면 아래 (2) 가 지목한다 - 그때 이 목록에 넣고 compare_digest 를 쓰라.
+SECRET_COMPARING_FUNCTIONS = {
+    ("api/v1/admin.py", "resolve_admin_role"),
+    # 클래스 안의 메서드는 **클래스까지** 적는다 - 같은 이름의 기반 클래스 스텁
+    # (`PaymentProvider.verify_webhook_signature`, 항상 False)이 먼저 잡혀
+    # 엉뚱한 것을 검사하던 것을 2026-08-25 에 고쳤다.
+    ("api/v1/payment_providers.py", "MockProvider.verify_webhook_signature"),
+}
+
+
+def _secret_env_reads(fn):
+    """함수 안에서 os.getenv(<시크릿 이름>) 을 읽는가."""
+    names = set()
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "getenv" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in SECRET_ENV_NAMES):
+            names.add(node.args[0].value)
+    return names
+
+
+def _uses_compare_digest(fn):
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr == "compare_digest":
+                return True
+            if isinstance(f, ast.Name) and f.id == "compare_digest":
+                return True
+    return False
+
+
+def _naive_equality_on(fn, targets):
+    """`==`/`!=` 로 대상 이름을 직접 비교하는 자리를 찾는다(리터럴 비교는 뺀다)."""
+    bad = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(o, (ast.Eq, ast.NotEq)) for o in node.ops):
+            continue
+        sides = [node.left] + list(node.comparators)
+        # 한쪽이라도 리터럴이면 시크릿 대조가 아니다(예: name == "mock", x == "")
+        if any(isinstance(s, ast.Constant) for s in sides):
+            continue
+        ids = {s.id for s in sides if isinstance(s, ast.Name)}
+        if ids & targets:
+            bad.append((getattr(node, "lineno", "?"), sorted(ids & targets)))
+    return bad
+
+
+def _secret_derived_locals(fn):
+    """시크릿에서 유래한 지역 이름 - os.getenv(...) 결과와 hexdigest() 결과."""
+    out = set()
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            v = node.value
+            if (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr in ("getenv", "hexdigest")):
+                out.add(node.targets[0].id)
+    return out
+
+
+def test_secret_comparisons_are_constant_time():
+    """시크릿 비교가 `hmac.compare_digest` 로 이뤄지는가 (BUGS #209)."""
+    print("\n--- 시크릿 비교가 상수 시간이다 (BUGS #209) ---")
+    import glob as _glob
+    import io as _io
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    product = ([p for p in _glob.glob(os.path.join(root, "api", "**", "*.py"), recursive=True)]
+               + [p for p in _glob.glob(os.path.join(root, "storage", "**", "*.py"),
+                                        recursive=True)])
+    trees = {}
+    for path in product:
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        try:
+            trees[rel] = ast.parse(_io.open(path, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue
+    check_true("검사가 공허하지 않다(제품 소스를 파싱했다) - %d개" % len(trees),
+               len(trees) >= 10, len(trees))
+
+    def find_fn(rel, name):
+        """`함수` 또는 `클래스.메서드` 를 찾는다."""
+        tree = trees.get(rel)
+        if tree is None:
+            return None
+        if "." in name:
+            cls_name, meth = name.split(".", 1)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                    for sub in node.body:
+                        if isinstance(sub, ast.FunctionDef) and sub.name == meth:
+                            return sub
+            return None
+        for node in tree.body:            # 최상위 함수만 - 메서드는 위에서 처리한다
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    # (1) 아는 자리가 여전히 상수 시간인가
+    for rel, name in sorted(SECRET_COMPARING_FUNCTIONS):
+        fn = find_fn(rel, name)
+        check_true("검사가 공허하지 않다(%s 의 %s() 를 찾았다)" % (rel, name), fn is not None,
+                   "-> 이름이 바뀌었으면 SECRET_COMPARING_FUNCTIONS 도 고쳐라")
+        if fn is None:
+            continue
+        check_true("★ %s: %s() 가 hmac.compare_digest 를 쓴다" % (rel, name),
+                   _uses_compare_digest(fn),
+                   "-> `==` 로 시크릿을 비교하면 앞에서부터 다를 때 즉시 반환돼 "
+                   "**일치하는 접두 길이에 비례하는 타이밍 차이**가 생긴다. "
+                   "응답은 똑같으므로 행위 검사로는 잡히지 않는다 (BUGS #209)")
+        # 시크릿에서 온 지역 이름을 `==` 로 직접 대조하지는 않는가
+        secret_locals = _secret_derived_locals(fn)
+        naive = _naive_equality_on(fn, secret_locals)
+        check_true("%s: %s() 가 시크릿을 `==` 로 대조하지 않는다" % (rel, name),
+                   not naive, "-> %s" % naive)
+
+    # (2) 새로 생긴 비교 자리가 목록 밖에 있지는 않은가
+    #
+    #     "시크릿을 읽는다"만으로는 부족하다 - `_require_role()` 처럼 **설정 여부만**
+    #     보는 함수도 걸려 오탐이 된다(2026-08-25 실측). 실제로 **대조하는** 함수만 센다:
+    #     compare_digest 를 쓰거나, 시크릿에서 온 이름을 `==` 로 맞대는 함수.
+    unlisted = []
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not _secret_env_reads(node):
+                continue
+            secret_locals = _secret_derived_locals(node)
+            compares_secret = bool(_naive_equality_on(node, secret_locals))
+            if not (compares_secret or _uses_compare_digest(node)):
+                continue                  # 존재 확인만 하는 함수 - 대상이 아니다
+            listed = any(node.name == n.split(".")[-1]
+                         for r, n in SECRET_COMPARING_FUNCTIONS if r == rel)
+            if not listed:
+                unlisted.append("%s:%s" % (rel, node.name))
+    check_true("★ 시크릿을 비교하는데 목록에 없는 함수가 없다", not unlisted,
+               "-> %s. 시크릿 대조라면 hmac.compare_digest 를 쓰고 "
+               "SECRET_COMPARING_FUNCTIONS 에 넣으라. 대조가 아니라면 왜 아닌지를 "
+               "여기 주석으로 남기라 (BUGS #209)" % sorted(set(unlisted)))
+    # 자기 검증 - 이 분석이 실제로 `==` 대조를 잡는가(공허하지 않은가)
+    probe = ast.parse(
+        "def f():\n"
+        "    k = os.getenv('ADMIN_API_KEY', '')\n"
+        "    return given == k\n")
+    pfn = probe.body[0]
+    check_true("자기 검증: 합성 `==` 대조를 잡는다",
+               not _uses_compare_digest(pfn) and _naive_equality_on(pfn, {"k"}),
+               "-> 탐지기가 동작하지 않는다")
 
 if __name__ == "__main__":
     sys.exit(run())

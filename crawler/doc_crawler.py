@@ -72,14 +72,16 @@ def build_download_driver():
     (wait_for_download가 DOWNLOAD_DIR만 지켜보므로 항상 타임아웃 발생)
     반드시 이 함수로 만든 driver만 doc_worker에서 사용한다.
     """
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
+    # ★ 드라이버 해석은 `crawler.base_crawler` 한 곳에 있다 (2026-08-25, BUGS #196).
+    #   예전에는 여기서 `ChromeDriverManager().install()` 을 직접 불렀고, 그 경로가
+    #   이 PC 에서 실제로 깨져 **DocWorker 가 브라우저를 못 띄웠다**
+    #   ("Could not reach host. Are you offline?" - 그런데 오프라인이 아니었다).
+    #   Selenium Manager 를 먼저 쓰고 실패하면 예전 경로로 떨어진다.
+    from crawler.base_crawler import resolve_chrome_driver
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     opts = get_download_driver_options()
-    svc = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=svc, options=opts)
+    driver = resolve_chrome_driver(opts)
     # 이 시점에 Chrome 프로세스는 **이미 떠 있다.** 뒤이은 설정이 실패하면(브라우저가
     # 기동 직후 죽음, 연결 거부 등) 예전에는 그대로 예외가 나가면서 프로세스가 고아로
     # 남았다 — 호출자는 `driver` 참조를 받지 못했으므로 quit()을 부를 수도 없다.

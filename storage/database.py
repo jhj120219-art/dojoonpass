@@ -394,9 +394,20 @@ def calc_priority(auction_date: str) -> int:
 def enqueue_documents(rows: List[Dict]) -> Dict:
     """
     06:00 사건 수집 직후 호출.
-    이미 has_*_pdf=1인 문서는 큐에 넣지 않는다.
-    UNIQUE(court_code, case_no, item_no, doc_type) 이므로 이미 대기 중인 항목은
-    INSERT OR IGNORE로 조용히 무시된다 (중복 enqueue 방지).
+
+    ## 이미 받아 둔 문서를 다시 큐에 넣지 않는 방법 (2026-08-25 서술 정정)
+
+    예전 이 자리에는 *"이미 has_*_pdf=1인 문서는 큐에 넣지 않는다"* 라고 적혀 있었다.
+    **이 함수는 `has_*_pdf` 를 읽지 않는다**(2026-08-25 전수 확인). 실제 기제는 다르다 —
+    `UNIQUE(court_code, case_no, item_no, doc_type)` + `INSERT OR IGNORE` 라서,
+    이미 있는 행은 **상태가 무엇이든 그대로 남는다.** 한 번 `done` 이 된 행은 계속
+    `done` 이므로 재수집되지 않는다(실측: 같은 배치를 다시 넣어도 added=0, done 유지).
+
+    두 서술의 결과는 비슷해 보이지만 조사할 때 갈린다 — 옛 서술을 믿으면 "큐에
+    `done` 행이 남아 있는 것"을 결함으로 오해하게 된다. 그것은 정상이고, 오히려
+    **재수집 예약(`refresh`)이 그 행을 되살리는 방식**으로 동작한다(Sprint 189).
+
+    UNIQUE 덕에 이미 대기 중인 항목도 조용히 무시된다 (중복 enqueue 방지).
 
     1차 방어선(예방): auction_date가 이미 지난 사건은 큐에 넣지 않는다.
     Step 13/14 검증 결과, 매각기일이 지난 사건은 법원경매정보 사이트의
@@ -844,7 +855,8 @@ def reconcile_queue_auction_date(queue_id: int, case_no: str, item_no: str,
 
 
 def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, item_no: str,
-                                doc_type: str, auction_date: str) -> None:
+                                doc_type: str, auction_date: str,
+                                claim_token: Optional[str] = None) -> None:
     """
     Worker가 브라우저 작업을 시작하기 전, auction_date < today를 발견했을 때 호출.
     - 브라우저 작업 없이 즉시 종료 (해당 함수 자체가 그 무작업 종료 지점)
@@ -865,6 +877,27 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
     `test_document_status_sync.py` §6이 들고 있고, 그 검사가 현재 동작을 고정한다
     (배선하는 순간 실패하도록).
 
+    ## ★ 우리 claim 이 아직 살아 있을 때만 종결한다 (2026-08-25, docs/BUGS.md #202)
+
+    `mark_queue_done` / `mark_queue_failed` 는 BUGS #181 에서 이 검사를 받았는데
+    **이 함수와 `mark_queue_unsupported` 만 빠져 있었다.** 그 비대칭을 합성 물건으로
+    재현했다(2026-08-25):
+
+        A 가 집는다 -> 멈춘다 -> reset_stale_queue 가 회수 -> B 가 집어 실제로 수집
+        -> 좀비 A 가 뒤늦게 이 함수를 부른다
+           => 큐 = SKIPPED_EXPIRED  (B 가 작업 중인데 종결됐다)
+           => 게다가 여기서 last_attempt_at 을 덮으므로 **B 의 claim 토큰이 무효가 된다**
+        -> B 가 수집을 끝내고 mark_queue_done(claim_token=B) 을 부른다
+           => 토큰이 안 맞아 큐는 그대로, 문서만 기록된다
+           => 최종: document_status=READY / doc_raw 1행 / **큐=SKIPPED_EXPIRED**
+
+    즉 실제로 받아 놓은 문서가 큐에서는 "대상 아님"으로 남는다. 이것은 이 저장소가
+    스스로 확인해 온 불변식("화면이 READY 인데 큐가 done 계열이 아닌 행 0건")을 깨는
+    상태다. 좀비의 **낡은 판단**(그때의 auction_date)이 살아 있는 실행을 덮는 것이라
+    방향도 틀렸다.
+
+    `claim_token` 이 None 이면 예전 동작 그대로다(토큰을 넘기지 않는 호출부 호환).
+
     ★ 2026-08-14 추가 측정 — 이 상태로 남는 문서는 §6이 센 183건보다 훨씬 많다.
       원인이 **둘**이기 때문이다.
 
@@ -877,6 +910,12 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
     """
     conn = get_connection()
     try:
+        if not _claim_is_still_ours(conn, queue_id, claim_token):
+            logger.warning(
+                "[%s-%s] %s 기일 경과로 종결하려 했으나 그 사이 큐 행(id=%s)이 회수돼 "
+                "다른 실행이 집어갔다 - 종결하지 않는다(그쪽 판단에 맡긴다)",
+                case_no, item_no, doc_type, queue_id)
+            return
         now = datetime.now().isoformat()
         conn.execute("""
             UPDATE document_queue
@@ -894,7 +933,7 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
 
 
 def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no: str,
-                            doc_type: str) -> None:
+                            doc_type: str, claim_token: Optional[str] = None) -> None:
     """수집 버튼 id가 아예 없는(= 지금 구조로는 성공할 수 없는) 항목의 종결 처리.
 
     2026-08-14 신설. `doc_worker.py`는 큐에서 집은 항목마다
@@ -939,6 +978,15 @@ def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no
     """
     conn = get_connection()
     try:
+        # ★ `mark_queue_skipped_expired()` 와 같은 이유로 claim 을 확인한다
+        #   (2026-08-25, docs/BUGS.md #202). 이 함수도 last_attempt_at 을 덮으므로,
+        #   남의 claim 을 무효로 만들면서 종결까지 해 버린다.
+        if not _claim_is_still_ours(conn, queue_id, claim_token):
+            logger.warning(
+                "[%s-%s] %s 미지원으로 종결하려 했으나 그 사이 큐 행(id=%s)이 회수돼 "
+                "다른 실행이 집어갔다 - 종결하지 않는다(그쪽 판단에 맡긴다)",
+                case_no, item_no, doc_type, queue_id)
+            return
         now = datetime.now().isoformat()
         conn.execute("""
             UPDATE document_queue
@@ -1230,6 +1278,154 @@ def to_relative_storage_path(path: str) -> str:
     return rel.replace("\\", "/")
 
 
+# doc_raw 버전 경합 재계산 상한 (2026-08-25, docs/BUGS.md #199).
+# `claim_next_queue_item()` 의 CLAIM_RACE_MAX_ATTEMPTS 와 같은 취지 -
+# 경쟁자가 계속 이겨도 한 호출이 영원히 머물지 않게 한다.
+DOC_RAW_VERSION_RACE_ATTEMPTS = 4
+
+
+def record_doc_raw_row(conn, item_id: int, ds_type: str,
+                       files_saved: Optional[List[str]], now: str,
+                       primary_ext: Optional[str] = None) -> str:
+    """`doc_raw` 한 행을 기록하는 **유일한 규칙**. 커밋하지 않는다.
+
+    돌려주는 값 —
+
+        ""            새 행을 넣었다
+        "unchanged"   내용이 직전 버전과 같아 넣지 않았다. **성공이다**
+        그 밖의 문자열  기록하지 못했다(사유). **실패로 다뤄야 한다**
+
+    ## 왜 이 함수가 따로 생겼나 (2026-08-25, docs/BUGS.md #197)
+
+    `doc_raw` 에 쓰는 곳이 **둘**이었고 규칙이 갈라져 있었다.
+
+        storage.database._record_doc_raw()     doc_worker 경로 (스케줄러가 도는 쪽)
+        collect_documents.save_doc_raw()       손으로 돌리는 진입점
+
+    사본 DB 에 두 함수를 나란히 눌러 재 보니(2026-08-25):
+
+        같은 파일로 두 번 저장   _record_doc_raw  -> 행 1개 (내용 지문 비교로 건너뜀)
+                                 save_doc_raw     -> **행 2개** (MAX(doc_version)+1 무조건)
+        storage_path 표기        _record_doc_raw  -> documents/남양주지원/.../spec.pdf
+                                 save_doc_raw     -> **절대경로 그대로** (배포 위치가 바뀌면 못 쓴다)
+
+    앞의 것은 BUGS #115/#187 이 한쪽에서만 고친 결함 그대로다 — `api/v1/item.py` 가
+    `MAX(doc_version)` 을 사용자 응답에 실으므로, 손으로 두 번 돌리면 내용이 한 글자도
+    안 바뀌었는데 화면의 문서 버전이 오른다.
+
+    뒤의 것은 이 저장소가 명시한 규약 위반이다(`storage/database.py` 머리 주석,
+    `to_relative_storage_path()` docstring). 지금 이 PC 에서는 `os.path.join()` 이
+    절대경로를 그대로 돌려주는 덕에 우연히 열리지만, 배포 위치가 바뀌면 그 행들만
+    통째로 못 쓰게 된다. 실측: 운영 `doc_raw` 556행은 **전부 상대경로**다(아직 안전).
+
+    규칙을 두 벌 두는 대신 **한 벌만 두고 둘 다 그것을 부른다.** 이 저장소가
+    `claim_next_item_rows()` 에서 이미 택한 판단과 같다 — *"그 어휘가 두 곳에 생기면
+    한쪽만 고쳐지는 날이 온다."*
+    """
+    import os as _os
+
+    if not files_saved:
+        return "저장했다는 파일 목록이 비어 있다"
+
+    primary = None
+    if primary_ext:
+        primary = next((p for p in files_saved
+                        if p and p.lower().endswith("." + primary_ext)), None)
+    if primary is None:
+        primary = next((p for p in files_saved if p), None)
+    if primary is None:
+        return "저장했다는 파일 목록이 비어 있다"
+
+    try:
+        size = _os.path.getsize(primary)
+    except OSError:
+        return "저장했다는 파일이 실제로 없다 (%s)" % primary
+    if size <= 0:
+        return "0바이트 파일 (%s)" % primary
+
+    new_hash = _sha256_file(primary)
+    # ★ 버전 계산과 INSERT 사이가 경쟁 구간이다 (2026-08-25, docs/BUGS.md #199).
+    #
+    #   `latest` 를 읽고 `version = latest + 1` 을 계산한 다음 INSERT 하기까지 사이에
+    #   다른 실행이 같은 (item, doc_type) 을 넣으면 **UNIQUE(item_id, doc_type,
+    #   doc_version) 에 걸려 IntegrityError 가 올라간다.** 합성 물건에 스레드 4개로
+    #   재현했다(2026-08-25): 성공 1 / IntegrityError 3.
+    #
+    #   `mark_queue_done()` 은 claim 을 빼앗긴 실행에 대해 *"나중에 그쪽 실행이 같은
+    #   값을 다시 써도 결과는 같다(멱등)"* 이라고 적어 두었는데, 실제로는 멱등이 아니라
+    #   **예외**였다. 도달 경로는 BUGS #181 이 서술한 좀비 워커다 — stale 회수로 행을
+    #   빼앗긴 실행이 뒤늦게 종결하는 동안 새 실행이 같은 문서를 처리하는 경우.
+    #   그때 예외가 호출부까지 올라가면 **실제로 받아 놓은 문서가 실패로 기록되고**
+    #   다시 수집된다(손상은 아니지만 거짓 실패 + 헛수집이다).
+    #
+    #   그래서 경쟁에서 밀리면 **다시 읽고 다시 센다.** 다시 읽었을 때 상대가 이미
+    #   같은 내용을 넣어 두었으면 그것이 곧 "unchanged" 다 — 둘이 같은 문서를 받은
+    #   것이므로 그 답이 정확하다. 상한을 두는 이유는 `claim_next_queue_item()` 과
+    #   같다: 경쟁자가 계속 이겨도 이 호출이 영원히 여기 머물면 안 된다.
+    # ★ 아래 루프는 경쟁에서 밀리면 다시 돈다. 파일을 다시 여는 계산은
+    #   **루프 밖에서 한 번만** 한다 - `_pdf_page_count()` 는 259쪽짜리
+    #   감정평가서를 pdfplumber 로 여는 비용이라(실측: appraisal 최대 259쪽)
+    #   재시도마다 반복하면 경합이 곧 지연이 된다. 값은 재시도해도 같다.
+    rel_path = to_relative_storage_path(primary)
+    page_count = _pdf_page_count(primary)
+    crawl_day = datetime.now().strftime("%Y-%m-%d")
+
+    for attempt in range(DOC_RAW_VERSION_RACE_ATTEMPTS):
+        latest = conn.execute(
+            "SELECT doc_version, file_hash FROM doc_raw WHERE item_id=? AND doc_type=?"
+            " ORDER BY doc_version DESC LIMIT 1",
+            (item_id, ds_type)
+        ).fetchone()
+
+        # 내용이 바뀌지 않았으면 새 행을 쌓지 않는다 (2026-08-17 Sprint 187).
+        #
+        # 재수집을 켜면(overwrite=True) `mark_queue_done()`이 매번 성공으로 호출되고, 그때마다
+        # 여기가 무조건 새 doc_raw 행을 만들며 doc_version을 1씩 올렸다 — 내용이 한 글자도
+        # 안 바뀌어도 그랬다. `document_version_log`는 `previous_hash != new_hash`로 이미
+        # 이 구분을 하는데(storage/database.py:mark_queue_done), 같은 함수가 여는 같은
+        # 트랜잭션 안에서 `doc_raw`만 무조건 증가시켰다 — 이미지의 BUGS #113과 같은 계열:
+        # "계약은 같은데 한쪽만 변경 감지를 실제로 하지 않는다."
+        #
+        # `api/v1/item.py`가 MAX(doc_version)을 그대로 `doc_version`으로 응답에 실어 사용자에게
+        # 노출하므로, 이 결함은 잠재 상태로 있다가 문서 재수집이 켜지는 순간 "매일 밤 버전이
+        # 오르는" 형태로 사용자에게 드러난다.
+        #
+        # 비교는 이 함수가 방금 계산한 `new_hash`(저장할 파일의 sha256) 대 직전 doc_raw 행의
+        # `file_hash`로 한다 — 호출부가 넘기는 previous/new 해시에 기대지 않는다. 그 값들은
+        # 크롤러 계층이 doc_type마다 각자 계산해 넘기는 것이라 여기 대표 파일과 반드시 같은
+        # 파일을 가리킨다는 보장이 없다(예: status는 html+json 두 파일을 저장하고 대표는 json).
+        if latest is not None and latest["file_hash"] and latest["file_hash"] == new_hash:
+            return "unchanged"
+
+        version = (latest["doc_version"] + 1) if latest is not None else 1
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO doc_raw
+                    (item_id, doc_type, storage_path, file_hash, file_size,
+                     doc_version, page_count, crawl_date, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (item_id, ds_type, rel_path, new_hash,
+                 size, version, page_count, crawl_day, now),
+            )
+        except sqlite3.IntegrityError:
+            # 경쟁에서 밀렸다. SQLite 는 제약 위반 시 **그 문장만** 되돌리므로
+            # 바깥 트랜잭션은 살아 있다 — 다시 읽고 다시 센다.
+            logger.debug("doc_raw 버전 경합 (item_id=%s, doc_type=%s, version=%s) - 재계산 %d/%d",
+                         item_id, ds_type, version, attempt + 1, DOC_RAW_VERSION_RACE_ATTEMPTS)
+            continue
+        return ""
+
+    # 상한까지 밀렸다. **조용히 성공했다고 말하지 않는다** — 호출부가 판단하도록 사유를 준다.
+    logger.warning(
+        "doc_raw 버전 경합이 %d회 계속됐다 (item_id=%s, doc_type=%s) - 기록하지 못했다"
+        "(동시 실행 중인 워커가 있는지 확인할 것)",
+        DOC_RAW_VERSION_RACE_ATTEMPTS, item_id, ds_type)
+    return ("doc_raw 버전 경합이 %d회 계속돼 기록하지 못했다"
+            % DOC_RAW_VERSION_RACE_ATTEMPTS)
+
 def _record_doc_raw(conn, court_code: str, case_no: str, item_no: str, doc_type: str,
                     files_saved: Optional[List[str]], now: str) -> None:
     """수집에 성공한 문서의 실체 정보를 `doc_raw`에 남긴다.
@@ -1276,68 +1472,16 @@ def _record_doc_raw(conn, court_code: str, case_no: str, item_no: str, doc_type:
     except Exception:
         primary_ext = None
 
-    primary = None
-    if primary_ext:
-        primary = next((p for p in files_saved
-                        if p.lower().endswith("." + primary_ext)), None)
-    if primary is None:
-        primary = files_saved[0]
-
-    try:
-        size = _os.path.getsize(primary)
-    except OSError:
-        logger.warning("doc_raw 기록 생략: 저장했다는 파일이 실제로 없다 (%s)", primary)
-        return
-    if size <= 0:
-        logger.warning("doc_raw 기록 생략: 0바이트 파일 (%s)", primary)
-        return
-
-    new_hash = _sha256_file(primary)
-
-    latest = conn.execute(
-        "SELECT doc_version, file_hash FROM doc_raw WHERE item_id=? AND doc_type=?"
-        " ORDER BY doc_version DESC LIMIT 1",
-        (item_id, ds_type)
-    ).fetchone()
-
-    # 내용이 바뀌지 않았으면 새 행을 쌓지 않는다 (2026-08-17 Sprint 187).
-    #
-    # 재수집을 켜면(overwrite=True) `mark_queue_done()`이 매번 성공으로 호출되고, 그때마다
-    # 여기가 무조건 새 doc_raw 행을 만들며 doc_version을 1씩 올렸다 — 내용이 한 글자도
-    # 안 바뀌어도 그랬다. `document_version_log`는 `previous_hash != new_hash`로 이미
-    # 이 구분을 하는데(storage/database.py:mark_queue_done), 같은 함수가 여는 같은
-    # 트랜잭션 안에서 `doc_raw`만 무조건 증가시켰다 — 이미지의 BUGS #113과 같은 계열:
-    # "계약은 같은데 한쪽만 변경 감지를 실제로 하지 않는다."
-    #
-    # `api/v1/item.py`가 MAX(doc_version)을 그대로 `doc_version`으로 응답에 실어 사용자에게
-    # 노출하므로, 이 결함은 잠재 상태로 있다가 문서 재수집이 켜지는 순간 "매일 밤 버전이
-    # 오르는" 형태로 사용자에게 드러난다 — 아직 아무도 `overwrite=True`를 넘기지 않아
-    # 지금은 첫 수집(행 없음 -> 항상 삽입)만 일어나므로 도달하지 않았다.
-    #
-    # 비교는 이 함수가 방금 계산한 `new_hash`(저장할 파일의 sha256) 대 직전 doc_raw 행의
-    # `file_hash`로 한다 — `mark_queue_done()`이 받는 `previous_hash`/`new_hash` 인자에
-    # 기대지 않는다. 그 인자들은 크롤러 계층(`crawler/doc_crawler.py`)이 doc_type마다
-    # 각자 계산해 넘기는 값이라 여기 대표 파일과 반드시 같은 파일을 가리킨다는 보장이
-    # 없다(예: status는 html+json 두 파일을 저장하고 대표는 json이다). doc_raw 자기
-    # 행의 file_hash와 비교하면 그 가정이 필요 없다.
-    if latest is not None and latest["file_hash"] and latest["file_hash"] == new_hash:
-        logger.info("doc_raw 기록 생략: 내용 변경 없음 (item_id=%s, doc_type=%s, version=%s 유지)",
-                    item_id, ds_type, latest["doc_version"])
-        return
-
-    version = (latest["doc_version"] + 1) if latest is not None else 1
-
-    conn.execute(
-        """
-        INSERT INTO doc_raw
-            (item_id, doc_type, storage_path, file_hash, file_size,
-             doc_version, page_count, crawl_date, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
-        """,
-        (item_id, ds_type, to_relative_storage_path(primary), new_hash,
-         size, version, _pdf_page_count(primary),
-         datetime.now().strftime("%Y-%m-%d"), now),
-    )
+    # ★ 기록 규칙은 `record_doc_raw_row()` 한 곳에만 있다 (2026-08-25, BUGS #197).
+    #   예전에는 같은 규칙이 `collect_documents.save_doc_raw()` 에도 따로 있었고
+    #   실제로 갈라져 있었다(그쪽은 내용 지문 비교가 없어 매번 버전을 올렸고,
+    #   경로도 절대경로로 넣었다). 어휘를 두 벌 두지 않는다.
+    reason = record_doc_raw_row(conn, item_id, ds_type, files_saved, now, primary_ext)
+    if reason == "unchanged":
+        logger.info("doc_raw 기록 생략: 내용 변경 없음 (item_id=%s, doc_type=%s)",
+                    item_id, ds_type)
+    elif reason:
+        logger.warning("doc_raw 기록 생략: %s", reason)
 
 
 def save_auction_images(court_code: str, case_no: str, item_no: str,

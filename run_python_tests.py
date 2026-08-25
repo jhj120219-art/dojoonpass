@@ -61,6 +61,7 @@
 이 파일은 **프로덕션 코드를 건드리지 않는다.** 순수 실행기다.
 """
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -80,6 +81,86 @@ VERDICT_PATTERNS = (
 
 # 파일 하나당 상한. 통합 테스트(TestClient 부팅, 임시 DB 복사)가 있어 넉넉히 준다.
 PER_FILE_TIMEOUT = 900
+
+
+# ---------------------------------------------------------------------------
+# 운영 DB 감시 (2026-08-25 신설)
+#
+# 왜 — 이 실행기를 한 번 돌린 전후로 운영 `auction.db` 의 md5 가 바뀌고 있었다.
+# 파일별로 격리해 재니 5개가 `get_connection()` 으로 **운영 DB 에 직접** 합성 행을
+# 심고 있었다(test_api_regression / test_beta_journey / test_doc_storage_atomicity /
+# test_race_conditions / test_subscription_policy). 끝에 지우므로 행수는 원복돼서
+# **아무도 몰랐다** — `sqlite_sequence` 만 영구히 전진했고, 중간에 죽으면 합성 행이
+# 그대로 남았다. 다섯 파일은 `qa_scratch_db.activate()` 로 고쳤지만, 고친 것보다
+# **다시 생기지 않게 하는 것**이 중요하다. 새 테스트 파일은 계속 추가된다.
+#
+# 그래서 허용목록(누가 무엇을 import 했는가)이 아니라 **행동**을 본다 — 파일 하나를
+# 돌릴 때마다 운영 DB 파일의 지문을 재고, 달라지면 그 파일을 지목하고 게이트를
+# 붉게 만든다. 허용목록은 새 파일을 놓치지만 이건 놓치지 않는다.
+#
+# 비용: 5MB 파일 md5 가 파일당 ~10ms (전체 ~0.6s). 무시할 수 있다.
+# ---------------------------------------------------------------------------
+def live_db_path():
+    """감시 대상 = 제품이 실제로 여는 경로. 이름으로 고르지 않는다 —
+    저장소 루트에는 `auction.db.backup_*` 가 16개 더 있다."""
+    try:
+        sys.path.insert(0, ROOT)
+        import storage.database as dbmod
+        return dbmod.DB_PATH
+    except Exception:
+        return os.path.join(ROOT, "auction.db")
+
+
+# ---------------------------------------------------------------------------
+# 감시 대상을 운영 로그까지 넓힌다 (2026-08-25, docs/BUGS.md #192)
+#
+# 왜 — 위 감시가 DB 축을 닫자마자 **같은 사고가 파일 축에 그대로 남아 있는 것**을
+# 찾았다. `collect_documents.py` / `mvp_scraper.py` 가 import 시점에 루트 로거에
+# FileHandler 를 붙여서, 그 모듈을 import 하는 테스트가 돌 때마다 합성 로그가
+# 운영 로그에 섞였다. 실측(2026-08-25):
+#
+#     logs/doc_collect.log   4,136줄 중 1,651줄(40%)이 QA 산출물
+#     logs/scraper.log      36,420줄 중 08-24~25 자 2,346줄이 QA 산출물
+#
+# 마지막 실제 크롤은 2026-08-12 다. 즉 이 로그만 읽으면 "오늘 돌았고 전 법원이
+# 실패했다"로 보인다 — 이 저장소가 9일간 크롤 중단을 몰랐던 그 거짓 증거와
+# 같은 계열이다. 이름만 다를 뿐 DB 사고와 같은 결함이므로 감시도 같은 방식으로 한다.
+#
+# 목록을 `logs/` 전체로 두지 않는 이유: 그 폴더에는 세션 산출물(s2xx_*.log)이
+# 섮여 있어 감시가 소음만 낸다. **이 저장소가 증거로 쓰는 파일**만 골랐다 —
+# 네 개 다 `audit_schedule_health.py` / `check_pipeline2.py` / `check_morning.py` 가
+# "마지막으로 언제 돌았는가"를 판단하는 데 직접 읽는다.
+# ---------------------------------------------------------------------------
+WATCHED_LOGS = (
+    "logs/daily_run.log",       # audit_schedule_health.py: run_daily.bat 흔적
+    "logs/doc_run.log",         # audit_schedule_health.py: run_doc_worker.bat 흔적
+    "logs/scraper.log",         # mvp_scraper.py 운영 로그
+    "logs/doc_collect.log",     # collect_documents.py 운영 로그
+    "logs/migrate_execute.log", # run_daily.bat 2단계 흔적
+)
+
+
+def watched_paths():
+    """(표시이름, 절대경로) 목록. 운영 DB + 운영 로그."""
+    paths = [("auction.db", live_db_path())]
+    paths += [(rel, os.path.join(ROOT, *rel.split("/"))) for rel in WATCHED_LOGS]
+    return paths
+
+
+def fingerprint_all(paths):
+    return {label: db_fingerprint(path) for label, path in paths}
+
+
+def db_fingerprint(path):
+    """없으면 None. '없다'와 '비었다'를 구별하기 위해 크기도 함께 넣는다."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return "%d:%s" % (os.path.getsize(path), h.hexdigest())
+    except OSError:
+        return None
 
 
 def discover(pattern=None):
@@ -170,14 +251,27 @@ def main():
     t0 = time.time()
 
     exitcodes = {}
+    watched = watched_paths()
+    live_db = watched[0][1]
+    # {파일명: [바뀐 대상 표시이름, ...]} — DB 만 보던 것을 운영 산출물 전체로 넓혔다 (#192)
+    touched = {}
     for i, name in enumerate(files, 1):
+        before = fingerprint_all(watched)
         status, asserts, out, rc, secs = run_one(name)
+        after = fingerprint_all(watched)
+        changed = [label for label, _ in watched if before[label] != after[label]]
+        if changed:
+            touched[name] = changed
         buckets[status].append(name)
         outputs[name] = out
         exitcodes[name] = rc
         total_asserts += asserts
         emit("[%2d/%2d] %-11s %-38s 단언%-5d %5.1fs" %
              (i, len(files), status, name, asserts, secs))
+        for label in changed:
+            emit("        ** 운영 산출물을 변경했다 ** %s" % label)
+            emit("        전: %s" % before[label])
+            emit("        후: %s" % after[label])
 
         # ---------------------------------------------------------------
         # 실패는 **그 자리에서** 증거를 남긴다 (2026-08-18 Sprint 203).
@@ -215,6 +309,27 @@ def main():
             for n in buckets[key]:
                 emit("   - %s" % n)
 
+    if touched:
+        emit("")
+        emit("운영 산출물을 변경한 파일 (%d) - 통과 여부와 무관하게 게이트를 붉게 만든다:" % len(touched))
+        for n in sorted(touched):
+            emit("   - %-38s -> %s" % (n, ", ".join(touched[n])))
+        emit("")
+        emit("   [로그를 바꿔 놓은 경우] 그 파일이 import 한 모듈이 루트 로거에 FileHandler 를")
+        emit("   붙였다는 뜻이다. 운영 파일 로그는 `if __name__ == \"__main__\":` 안에서만")
+        emit("   붙인다 - 예제: mvp_scraper.attach_file_log() / collect_documents.attach_file_log()")
+        emit("   경위와 이유: docs/BUGS.md #192")
+        emit("")
+        emit("   [DB 를 바꿨 경우] 대상: %s" % live_db)
+        emit("   고치는 법: 그 파일의 `sys.path.insert(...)` 바로 다음, `storage.database` /")
+        emit("   `api_server` 를 import 하기 **전**에 임시 사본으로 돌린다:")
+        emit("       import storage.database as _qa_dbmod")
+        emit("       _qa_tmp = tempfile.mkdtemp(prefix=\"dojoonpass-qa-\")")
+        emit("       shutil.copy2(_qa_dbmod.DB_PATH, os.path.join(_qa_tmp, \"auction.db\"))")
+        emit("       _qa_dbmod.DB_PATH = os.path.join(_qa_tmp, \"auction.db\")")
+        emit("   예제: test_subscription_policy.py / test_admin_failure_injection.py")
+        emit("   경위와 이유: docs/BUGS.md #186")
+
     if args.verbose:
         for n in buckets["FAILED"] + buckets["TIMEOUT"]:
             emit("\n" + "-" * 72)
@@ -222,7 +337,7 @@ def main():
             emit("-" * 72)
             emit(outputs[n][-4000:])
 
-    return 1 if (buckets["FAILED"] or buckets["TIMEOUT"]) else 0
+    return 1 if (buckets["FAILED"] or buckets["TIMEOUT"] or touched) else 0
 
 
 if __name__ == "__main__":

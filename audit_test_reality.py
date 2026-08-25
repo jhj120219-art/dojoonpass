@@ -70,25 +70,51 @@ def is_product(path: str) -> bool:
     return any(p.startswith(d + "/") for d in PRODUCT_DIRS)
 
 
+def _why_no_json(cov, out):
+    """`coverage json` 이 JSON 을 안 내놓았을 때 그 이유를 한 줄로 만든다.
+
+    두 프로세스의 종료코드와 stderr 꺼리를 붙인다. 순수 함수라
+    selftest 가 프로세스 없이도 검증할 수 있다.
+    """
+    def tail(proc):
+        blob = (getattr(proc, "stderr", b"") or b"") + (getattr(proc, "stdout", b"") or b"")
+        text = blob.decode("utf-8", "replace").strip().replace(chr(10), " | ")
+        return text[-160:]
+    bits = ["coverage json 가 JSON 을 내놓지 않았다"]
+    if getattr(cov, "returncode", 0):
+        bits.append("coverage run exit=%s %s" % (cov.returncode, tail(cov)))
+    if getattr(out, "returncode", 0):
+        bits.append("coverage json exit=%s %s" % (out.returncode, tail(out)))
+    if len(bits) == 1:
+        bits.append("두 프로세스 다 exit 0 이다 - 동시 실행으로 수집 파일이 섮였을 수 있다")
+    return " / ".join(bits)
+
+
 def run_one(test_file: str):
     data_file = os.path.join(REPO, ".cov_%s" % test_file.replace(".", "_"))
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["COVERAGE_FILE"] = data_file
+    # ★ 실패하면 **왜** 실패했는지 반드시 남긴다 (2026-08-25).
+    #   예전에는 JSON 이 안 나오면 그냥 `None` 을 돌려줘서 호출부가
+    #   "측정 실패 " 만 찍고 이유를 한 글자도 보여 주지 않았다. 2026-08-25 에
+    #   연속 8개가 그렇게 띄었고(원인은 다른 작업과 동시 실행이었다),
+    #   그 출력만으로는 "감사가 고장났다"와 "검사가 깨졌다"를 구별할 수 없었다 —
+    #   이 저장소가 반복해서 당한 바로 그 모양이다(증거 없는 실패).
     try:
-        subprocess.run([sys.executable, "-m", "coverage", "run", "--source", ".",
-                        test_file],
-                       cwd=REPO, env=env, capture_output=True, timeout=600)
+        cov = subprocess.run([sys.executable, "-m", "coverage", "run", "--source", ".",
+                              test_file],
+                             cwd=REPO, env=env, capture_output=True, timeout=600)
         out = subprocess.run([sys.executable, "-m", "coverage", "json", "-o", "-", "--quiet"],
                              cwd=REPO, env=env, capture_output=True, timeout=300)
         raw = out.stdout.decode("utf-8", "replace")
         i = raw.find("{")
         if i < 0:
-            return None
+            return {"error": _why_no_json(cov, out)}
         data = json.loads(raw[i:])
     except Exception as e:
-        return {"error": str(e)[:60]}
+        return {"error": "%s: %s" % (type(e).__name__, str(e)[:80])}
     finally:
         for suffix in ("", ".lock"):
             try: os.remove(data_file + suffix)
@@ -196,5 +222,80 @@ def main():
               " 검사의 결함이 아니다." % subproc)
 
 
+
+
+# ---------------------------------------------------------------------------
+# selftest (2026-08-25 신설)
+#
+# 이 도구는 다른 검사들이 "공허하지 않은가"를 재는 도구다. 그런데 자기 자신은
+# 아무도 재지 않았다 — `test_audit_selftests.py` 의 표에도 없었다. 감사기가 조용히
+# 눈이 머는 것이 바로 이 저장소가 반복해서 당한 일이라, 최소한 **실패를 설명하는
+# 경로**만큼은 고정해 둔다(그 경로가 실제로 비어 있었다 - 아래 참고).
+#
+# 아무것도 실행하지 않는다 — 순수 함수 `_why_no_json()` / `is_product()` 만 본다.
+# (본 실행은 테스트 55개를 coverage 로 전부 돌려서 수 분이 걸리므로 회귀에 못 넣는다.)
+# ---------------------------------------------------------------------------
+def selftest():
+    fails = []
+
+    def check(name, cond, detail=""):
+        print("  [%s] %s%s" % ("PASS" if cond else "FAIL", name,
+                               "" if cond else " -- %s" % detail))
+        if not cond:
+            fails.append(name)
+
+    class _P:
+        def __init__(self, rc, err=b"", out=b""):
+            self.returncode, self.stderr, self.stdout = rc, err, out
+
+    print("--- selftest: 측정 실패의 이유가 실제로 남는가 ---")
+    #
+    # 왜 이것부터인가 — 2026-08-25 에 이 도구가 연속 8개에 대해 "측정 실패 " 만 찍고
+    # 이유를 한 글자도 남기지 않았다. 그 출력만으로는 "감사기가 고장났다"와 "검사가
+    # 깨졌다"를 구별할 수 없다. 증거 없는 실패는 이 저장소가 반복해서 당한 함정이다.
+    #
+    m = _why_no_json(_P(1, b"No source for code: 'x.py'"), _P(0))
+    check("coverage run 실패를 이유에 담는다",
+          "coverage run exit=1" in m and "No source" in m, m)
+
+    m = _why_no_json(_P(0), _P(2, b"No data to report."))
+    check("coverage json 실패를 이유에 담는다",
+          "coverage json exit=2" in m and "No data" in m, m)
+
+    m = _why_no_json(_P(0), _P(0))
+    check("둘 다 exit 0 이면 그 사실 자체를 말한다(빈 문자열로 끝나지 않는다)",
+          "동시 실행" in m, m)
+
+    m = _why_no_json(_P(1, b"x" * 500), _P(0))
+    check("긴 stderr 를 잘라 한 줄로 만든다", len(m) < 400 and chr(10) not in m, len(m))
+
+    m = _why_no_json(_P(1, b"a\nb\nc"), _P(0))
+    check("여러 줄 stderr 를 한 줄로 접는다", "|" in m and chr(10) not in m, m)
+
+    m = _why_no_json(None, None)
+    check("프로세스 객체가 없어도 죽지 않는다", isinstance(m, str) and m, m)
+
+    check("★ 이유가 절대 빈 문자열이 아니다",
+          all(_why_no_json(a, b) for a, b in
+              [(_P(0), _P(0)), (_P(1), _P(0)), (_P(0), _P(1)), (None, None)]), "")
+
+    print("--- selftest: 제품/검사 파일 구분 ---")
+    check("테스트 파일은 제품이 아니다",
+          not is_product(os.path.join(REPO, "test_search.py")), "")
+    check("감사기 자신도 제품이 아니다",
+          not is_product(os.path.join(REPO, "audit_test_reality.py")), "")
+    check("api 라우터는 제품이다",
+          is_product(os.path.join(REPO, "api", "v1", "search.py")), "")
+
+    print()
+    if fails:
+        print("selftest 실패 %d건: %s" % (len(fails), fails))
+        return 1
+    print("selftest 전체 통과")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     main()

@@ -8424,3 +8424,3015 @@ Sprint 239 이래 이 상태를 우아하게 처리해 500 은 안 나지만, "�
 **[남긴 것]** 이 결함의 근본 수정(마이그레이션 자동화 + DocWorker 등록)은 전부 승인
 영역이다. 다음 세션은 이 문서의 [권장 조치] 3단계를 그대로 따르면 된다 — 원인 재조사가
 필요하지 않다.
+
+--------
+
+#185
+
+**#184 를 철회한다 — 그 항목의 실측값은 운영 `auction.db` 가 아니라 pre-020 백업 파일을
+잰 것으로 보인다** (그리고 그 오측이 회귀 스위트를 red 로 만들었다)
+
+발견 (2026-08-25, `78f4ef5` 직후 상태를 독립 재실측)
+
+**[경위]** `78f4ef5` 는 `docs/BUGS.md` #184 / `docs/CLAUDE.md` / `docs/BETA_RELEASE_CHECKLIST.md`
+세 곳에 "2026-08-24 야간 재실측"을 기록하고, 그 근거로 `P0A-VERDICT` 토큰을 OPEN -> RESOLVED
+로 뒤집었다. 다음 세션이 그 값을 다시 재니 **여덟 항목이 전부 어긋났다.**
+
+**[실측]** 2026-08-25 08:20~08:30, 전부 읽기 전용(`file:...?mode=ro`), 경로는
+`storage.database.DB_PATH` 경유(손으로 파일명을 고르지 않았다):
+
+```
+항목                        #184 주장                 2026-08-25 실측
+--------------------------  ------------------------  ---------------------------------
+migration_history 최신       019 (020 미적용)          020_create_auction_image
+                                                      (2026-08-17T09:03:19 적용)
+auction_image               "테이블 자체가 없다"       있다, 45행 (파일 누락 0건)
+doc_raw                     0행                       556행 (파일 누락 0건)
+document_status READY       555건, 뒷받침 0건         556건, doc_raw 없는 것 0건
+auction_item crawl_date max 2026-08-24 "오늘도 돌았다" 2026-08-12 (그날 9행, 그 전 08-01)
+기일 미도래 물건             291건 (최종 09-02)        0건 (최종 2026-08-19)
+auction_item 총 행           2,376                     1,876
+예약 작업                    1개 \DOJOONPASS_DAILY     0개 (전체 478개 전수 스캔)
+```
+
+`auction.db` 는 그 사이 교체되지 않았다 — `migration_history` 의 020 타임스탬프가
+**2026-08-17** 로 #184 작성 시점보다 앞서고, `quick_check ok` / `foreign_key_check` 위반
+0건이다.
+
+**[원인 — 어느 파일을 쟀는가]** 저장소 루트에는 이름이 비슷한 DB 백업이 **16개** 있다.
+그중 `auction.db.backup_before_020_20260817_090319` 와, 2026-08-13 이후 방치된 worktree 의
+`.claude/worktrees/sprint95-false-success-audit/auction.db` 가 **#184 의 서술과 정확히
+같은 상태**다:
+
+```
+                     migmax  items  queue  docstatus  doc_raw  auction_image
+운영 auction.db        20    1,876  3,498    5,628      556       45행
+backup_before_020      19    1,876  3,498    5,628        0     테이블 없음   <- #184 가 서술한 값
+worktree 사본          19    1,876  3,498    5,628        0     테이블 없음   <- 같음
+```
+
+행수가 운영본과 전부 일치해서 **"최신 DB 를 보고 있다"고 착각하기 쉽다.** 다른 것은
+migration 번호와 자산 테이블뿐이다. 다만 "2,376행 / 291건 / 최종 09-02" 는 이 PC 의 DB
+파일 18개 어느 것과도 일치하지 않아 **출처는 확인 불가**로 남긴다.
+
+**[영향 — 문서 오류가 테스트를 깨뜨렸다]** 이 저장소는 "문서가 실측과 다른 말을 하면
+스위트가 빨개진다"를 이미 장치로 갖고 있고, 그 장치가 정확히 작동했다. `78f4ef5` 직후
+`python run_python_tests.py` = **통과 52 / 실패 2**:
+
+* `test_bootstrap.py` `test_claude_md_bootstrap_claims_are_true()`
+  -> `CLAUDE.md 가 말하는 마이그레이션 끝 번호: 19 (expected 20)`.
+  #184 가 `docs/CLAUDE.md` 에 넣은 "001~019" 표현 때문. 같은 문서 다른 줄은 여전히
+  "001~020" 이라 **문서가 자기모순**이었다.
+* `test_pipeline_integrity.py` `test_checklist_p0a_verdict_matches_reality()`
+  -> 토큰은 RESOLVED 인데 실측은 기일 남은 물건 0건(=OPEN).
+
+**[수정]** 세 문서를 실측에 맞춰 정정하고 토큰을 OPEN 으로 되돌렸다. 원래 서술을 지우지
+않고 **철회 문단을 앞에 두는** 이 저장소의 관례를 따랐다 — 무엇이 왜 틀렸는지가 남아야
+같은 오측이 반복되지 않는다. `audit_asset_integrity.py:160` 의 주석도 같은 이유로 정정했다
+(방어 코드 자체는 유효하므로 그대로 둔다 — 새 개발자의 빈 DB 나 pre-020 백업을 대상으로
+돌 수 있다).
+
+**[회귀]** 두 실패 중 문서 원인 2건은 해소됐다. 남은 1건
+(`기본 검색에 뜰 물건이 남아 있다`)은 **문서가 아니라 실제 데이터 상태**다 —
+마지막 크롤이 2026-08-12 이고 기일 미도래 물건이 0건이라, 크롤(승인 영역)이 돌기 전에는
+정직하게 red 로 남는 것이 맞다. 이 검사를 통과시키려고 상한이나 판정을 손대지 않았다.
+
+**[교훈]** DB 를 잴 때는 반드시 `storage.database.DB_PATH` 를 경유한다. 감사기
+(`audit_asset_integrity.py` / `audit_schedule_health.py`)는 둘 다 그 경유를 이미 하므로
+**감사기를 그냥 돌렸으면 이 오측은 일어나지 않았다.** 손으로 `sqlite3.connect("...")` 에
+파일명을 적는 순간 16개 백업 중 하나를 고를 위험이 생긴다.
+
+--------
+
+#186
+
+**회귀 스위트가 운영 `auction.db` 에 직접 썼다** — 행수가 원복돼서 아무도 몰랐다
+
+발견 (2026-08-25, `run_python_tests.py` 전후로 운영 DB 의 md5 가 바뀌는 것을 보고)
+
+**[경위]** 기준선을 잡으려고 전체 스위트를 한 번 돌렸는데, 그 전후로 `auction.db` 의
+md5 가 바뀌어 있었다. 파일별로 격리해(파일 하나 돌리고 md5 대조) 범인을 특정했다 —
+**5개다**:
+
+```
+test_api_regression.py / test_beta_journey.py / test_doc_storage_atomicity.py
+test_race_conditions.py / test_subscription_policy.py
+```
+
+다섯 다 `from storage.database import get_connection` 으로 **운영 DB 에 그대로 붙어**
+합성 행(`qa-*` 사용자, 가짜 결제/구독/등기 신청)을 심고 단언한 뒤 지운다.
+
+**[왜 오랫동안 몰랐나]** 끝에 지우므로 **행수가 정확히 원복된다.** 25개 테이블 전수
+`COUNT(*)` 비교에서 차이가 0이었다. `iterdump()` 를 통째로 비교해서야 무엇이 바뀌는지
+보였다:
+
+```
+sqlite_sequence 전진 (1회 실행):
+  search_presets       177,089 -> 177,299   (+210)
+  payment_logs          88,805 ->  88,917   (+112)
+  registry_requests     41,994 ->  42,047   (+53)
+  audit_logs            38,701 ->  38,750   (+49)
+  subscriptions         34,429 ->  34,472   (+43)
+  registry_credit_logs  34,648 ->  34,690   (+42)
+  payments              30,996 ->  31,035   (+39)
+  recent_items          30,192 ->  30,226   (+34)
+  registry_usage        19,043 ->  19,064   (+21)
+  payment_webhooks      13,384 ->  13,403   (+19)
+  auction_item          16,711 ->  16,720   (+9)
+  favorites              7,238 ->   7,247   (+9)
+  auction_case           8,613 ->   8,616   (+3)
+  document_collect_failures 903 ->    904   (+1)
+  document_queue        18,380 ->  18,381   (+1)
+```
+
+**[영향]** 숫자만 보면 작아 보이지만 위험은 그것이 아니다.
+
+1. **중간에 죽으면 지우는 코드에 도달하지 못한다** — 합성 행이 운영 테이블에 그대로
+   남는다. 하필 이 다섯은 스레드 경합과 실패 주입을 **일부러 일으키는** 파일들이라
+   중간에 죽을 여지가 가장 큰 축에 속한다. 실제로 `test_doc_storage_atomicity.py` 는
+   과거에 0.1초 만에 25단언에서 죽은 적이 있다(`run_python_tests.py` 의 Sprint 203 주석).
+2. 테스트를 돌리는 동안 운영 API/워커가 같은 파일을 쓰고 있으면 경합한다.
+3. 감사가 "운영 DB 무변경"을 근거로 삼는 순간 그 근거가 거짓이 된다 — 이 저장소의
+   여러 Sprint 문서가 "운영 DB 무변경"을 기준선에 적어 왔다.
+
+**[수정]** 이 저장소에 이미 올바른 선례가 있었다 — `test_admin_failure_injection.py` 는
+"`auction.db` 사본을 임시 디렉터리에 두고 `storage.database.DB_PATH` 를 돌린다".
+다섯 파일에 같은 블록을 `sys.path.insert(...)` 바로 다음(= `storage.database` /
+`api_server` import 전)에 넣었다. `get_connection()` 은 `sqlite3.connect(DB_PATH)` 로
+**호출 시점에** 모듈 전역을 읽으므로, 재지정 한 줄로 API 라우터까지 함께 돌아간다
+(제품 코드 중 `DB_PATH` 를 직접 import 하는 곳은 없다 — 2026-08-25 전수 확인).
+
+**[재발 방지 — 허용목록이 아니라 행동을 본다]** 고친 것보다 중요한 것은 다시 생기지
+않게 하는 것이다 — 새 테스트 파일은 계속 추가된다. `run_python_tests.py` 가
+**파일 하나를 돌릴 때마다 운영 DB 파일의 지문(크기+md5)을 재고**, 달라지면 그 자리에서
+그 파일을 지목하고 **통과 여부와 무관하게 종료코드 1** 을 돌려준다. 허용목록(누가
+무엇을 import 했는가)은 새 파일을 놓치지만 이건 놓치지 않는다. 감시 대상 경로도
+이름으로 고르지 않고 `storage.database.DB_PATH` 를 경유한다(루트에 `auction.db.backup_*`
+가 16개 더 있다 — BUGS #185 가 바로 그 혼동으로 생긴 사고다). 비용은 파일당 ~10ms
+(전체 ~0.6s).
+
+**[검증]**
+
+```
+수정 전  전체 스위트 1회      -> auction.db md5 변경됨
+수정 후  다섯 파일 개별 실행  -> 전부 exit 0, 운영 DB **바이트 동일**
+         전체 스위트 1회      -> 운영 DB **바이트 동일** (2991c5be...)
+         감시기 mutation 검증 -> 감시 대상을 임시 파일로 갈아끼우고 그것을 쓰는 probe
+                                파일을 심었더니 종료코드 1 + 이름 지목 + 그 자리 증거.
+                                대조군(아무것도 안 건드리는 probe)은 종료코드 0.
+                                이 검증 자체도 운영 DB 를 건드리지 않았다.
+```
+
+**[기준선]** 통과 52 -> **53**, 실패 2 -> **1**. 남은 1건은 문서가 아니라 실제 데이터
+상태다(기일 미도래 물건 0건 — 크롤은 승인 영역). 단언 8,113건.
+
+**[2차 결함 — 이 수정이 불러온 것]** 처음에는 공유 모듈 `qa_scratch_db.py` 를 새로 만들어
+다섯 파일이 import 하게 했다. 그랬더니 **이 저장소의 기존 가드 둘이 곧바로 잡았다** —
+실제로 작동하는 가드라는 증거라 그대로 적어 둔다.
+
+* `test_schema_hygiene.py` 의 `test_tracked_sources_do_not_import_untracked()`
+  -> 추적 파일 5개가 **미추적** `qa_scratch_db.py` 를 import 한다(BUGS #105 계열:
+  `git commit -a` 하면 커밋된 트리가 ModuleNotFoundError 로 부팅도 못 한다).
+  `git add` 는 승인 영역이라 **새 파일을 만드는 설계 자체를 철회**하고
+  `test_admin_failure_injection.py` 처럼 파일마다 인라인했다.
+* `test_console_encoding.py` -> 새 감시기 출력문에 넣은 엠대시(U+2014) 2개가 cp949
+  콘솔에서 못 나간다. 하이픈으로 바꿈.
+
+--------
+
+#187
+
+**`78f4ef5` 가 셸 사고 산출물 파일을 하나 커밋했다** — 파일명에 `"` 가 들어 있어
+Windows 도구마다 다르게 보인다
+
+발견 (2026-08-25, `78f4ef5` 의 추가 파일 전수 확인)
+
+**[무엇인가]** 저장소 루트에 이런 파일이 추적되고 있다.
+
+```
+git 표기      "e hardening\357\200\242"     (git 이 비ASCII 를 8진 이스케이프로 찍는다)
+실제 이름     e hardening"                  (마지막 글자가 큰따옴표)
+Git-Bash ls   e hardening"
+크기          6,139 B / 82줄
+추가된 커밋   78f4ef5 (2026-08-25 06:51)
+```
+
+`\357\200\242` 는 UTF-8 로 **U+F022** 다. Windows 파일명에 `"` 를 쓸 수 없어서
+Cygwin/Git-Bash 가 `"` 를 사유영역 문자 U+F022 로 바꿔 저장한 것이다. 즉 파일명은
+**실제로 `e hardening"`** 이고, git 이 보는 바이트는 그 인코딩이다.
+
+**[내용]** ANSI 색상 이스케이프가 그대로 박힌 **`git diff --check` 의 출력**이다.
+`docs/CLAUDE.md:111~151` 에 대한 "trailing whitespace" 경고가 41쌍 나열돼 있고,
+강조(`ESC[41m`)된 "공백"은 실제로는 **CR(`\r`)** 이다 — `docs/CLAUDE.md` 가 index 에
+CRLF 로 들어 있어서 새로 추가된 줄마다 `git diff --check` 가 경고한 것이다.
+
+```
+$ head -c 60 "e hardening\"" | od -c
+0000000   d   o   c   s   /   C   L   A   U   D   E   .   m   d   :   1
+0000020   1   1   :       t   r   a   i   l   i   n   g       w   h   i
+0000040   t   e   s   p   a   c   e   .  \n 033   [   3   2   m   +  ...
+```
+
+**[생성 목적]** 프로젝트가 필요로 해서 만든 파일이 **아니다.** 리다이렉션 따옴표가
+깨진 셸 명령이 `git diff --check` 의 출력을 파일로 흘려보낸 것으로 보인다. 근거:
+
+* 저장소 어디에서도 참조되지 않는다(`*.py` / `*.md` / `*.ts` / `*.tsx` / `*.bat` /
+  `*.ps1` / `*.json` 전수 grep 0건).
+* 내용이 도구 출력 그대로다 — 사람이 쓴 문장이 한 줄도 없다.
+* 파일명이 커밋 메시지 "audit: continue release **hardening**" 의 꼬리와 일치한다.
+* `.gitignore` 어느 규칙에도 걸리지 않아 `git add -A` 에 그대로 딸려 들어갔다.
+
+**[해결하지 않음 — 승인 영역]** **삭제하지 않았다.** `docs/CLAUDE.md` 의 프로젝트 원칙
+("승인 없는 파일 삭제 금지")에 걸리고, 이미 **추적 중인** 파일이라 작업트리에서 지우는
+것만으로는 저장소에서 빠지지도 않는다(`git rm` + 커밋이 필요하고 그것도 승인 영역).
+승인 후 정리할 사람을 위해 명령만 남긴다 — 파일명에 `"` 가 있어 그냥 치면 셸이 삼킨다:
+
+```bash
+git rm "e hardening\""        # Git-Bash. 큰따옴표를 이스케이프해야 한다
+```
+
+**[같은 계열의 진짜 문제 — `.gitattributes` 부재]** 이 파일이 기록한 "trailing
+whitespace" 는 오탐이 아니라 **줄끝 규칙이 저장소에 없다**는 신호다. 실측(2026-08-25):
+
+```
+core.autocrlf = true          (시스템 gitconfig, 저장소 설정 아님)
+.gitattributes                없음
+git ls-files --eol            index 가 파일마다 다르다:
+    docs/CLAUDE.md   i/crlf w/crlf     <- index 에 CRLF
+    api_server.py    i/crlf w/crlf     <- index 에 CRLF
+    docs/BUGS.md     i/lf   w/crlf     <- index 에 LF
+    README.md        i/lf   w/crlf     <- index 에 LF
+```
+
+index 가 CRLF 인 파일은 `core.autocrlf=true` 와 조합되면 **다음에 `git add` 하는 순간
+전체 줄이 LF 로 정규화돼 whitespace-only diff** 가 된다. 지금 `git status` 가 깨끗한
+것은 git 이 크기/mtime 캐시로 내용 비교를 건너뛰기 때문이지 정합해서가 아니다.
+`.gitattributes` 추가는 **대량 재정규화 커밋**을 유발하므로 승인 영역으로 남긴다.
+(그래서 이번 세션의 문서 수정은 전부 **원본 줄끝을 보존**해서 썼다 — 확인:
+`docs/CLAUDE.md` / `docs/BUGS.md` / `docs/BETA_RELEASE_CHECKLIST.md` 전부 lone LF 0개.)
+
+--------
+
+#188
+
+**`audit_auth_health.py` 가 네트워크 타임아웃 한 번을 "로그인 인증이 사실상 막혀 있다"로
+찍었다** — "모른다"를 "고장났다"로 읽었다 (같은 계열로 `audit_test_reality.py` 는
+측정 실패의 이유를 한 글자도 남기지 않았다)
+
+발견 (2026-08-25, 감사 도구를 순서대로 돌리다가 재현)
+
+**[경위]** `python audit_auth_health.py` 가 이렇게 찍었다.
+
+```
+[2] ES256 주 경로 (JWKS)
+    -> None (TimeoutError: The read operation timed out)
+ 종합: ★ ES256(주 경로) 실패 - 로그인 사용자 인증이 사실상 막혀 있다
+```
+
+문장만 보면 P0 다. 그런데 **몇 초 뒤 같은 주소로 직접 GET 을 보내니**:
+
+```
+attempt 1 -> HTTP 200  240 bytes  0.17s
+   keys: ['487c69e7-e70b-4217-84b3-8fe11bdbab1d/ES256']
+```
+
+설정은 멀쩡했다. 네트워크 자체도 멀쩡했다(같은 시각 `github.com` HTTPS GET 200,
+TLS 핸드셰이크 0.04초). 한 번의 딸꾹질이었다.
+
+**[원인]** `_check_jwks_reachable()` 이 **타임아웃 5초로 한 번만** 보내고,
+판정을 `status == 200` 두 갈래로만 했다.
+
+```python
+except Exception as exc:
+    return None, "%s: %s" % (type(exc).__name__, exc)
+...
+ok = status == 200
+...
+elif secret_len:
+    print(" 종합: ★ ES256(주 경로) 실패 - 로그인 사용자 인증이 사실상 막혀 있다")
+return 0 if ok else 1
+```
+
+즉 **"주소가 틀렸다"와 "이번에 못 닿았다"가 같은 값으로 뭉개졌다.** 두 상태는 조치가
+정반대다 — 앞은 사람이 `.env` 를 고쳐야 하고, 뒤는 고칠 것이 아무것도 없다.
+하필 이 감사기의 docstring 은 첫 줄부터 "추측하지 않는다"라고 적고 있었다.
+
+**[영향]** 이 도구는 `docs/BETA_RELEASE_CHECKLIST.md` 가 "운영 점검 도구"로 안내하고
+종료코드까지 계약으로 적어 둔 것이다(`0=ES256 정상 / 1=주 경로 실패`). 자동화에 물리면
+네트워크 딸꾹질마다 "인증 장애" 경보가 간다. 더 나쁜 것은 사람이 읽었을 때다 —
+"로그인 인증이 사실상 막혀 있다"를 보고 `.env` 를 뒤지기 시작하면 멀쩡한 설정을
+고치게 된다. **거짓 P0 는 진짜 P0 를 가린다.**
+
+**[수정]** 판정을 세 갈래로 나눴다.
+
+```
+0  OK       200 + 공개키 1개 이상
+1  FAILED   주소가 틀렸다는 확정 증거 (HTTP 오류 / 200인데 키 0개 / URL 비어 있음)
+2  UNKNOWN  5/8/12초 3회 재시도해도 못 닿았다 - 고칠 것이 없다. 다시 재라
+```
+
+* 네트워크 계열 예외(타임아웃/DNS/TLS/연결거부)만 재시도한다.
+* **HTTP 오류는 재시도하지 않는다** — 몇 번을 보내도 주소는 그대로다.
+* `UNKNOWN` 일 때는 "실패"라고 적지 않는다. "확인하지 못했다 (네트워크가 이번에
+  안 됐다) / 설정이 틀렸다는 뜻이 아니다"로 찍고 다시 재는 법을 안내한다.
+* `SUPABASE_URL` 이 비어 있는 것은 네트워크와 무관하므로 그대로 `FAILED` 다.
+
+**[회귀 + mutation]** `--selftest` 에 12건을 추가했다. `fetch` 를 주입해서 검사하므로
+**회귀 스위트가 외부 서비스를 두드리지 않는다**(그 원칙은 `test_audit_selftests.py`
+docstring 이 이미 세워 둔 것이다). 실제로 겪은 모양 — "앞 두 번 타임아웃, 세 번째 성공" —
+을 그대로 심어 재시도가 있는지 확인한다.
+
+mutation 5/5 검출:
+
+```
+M1 타임아웃을 FAILED 로 되돌린다 (원래 버그 그대로)   -> 잡았다
+M2 재시도를 없앤다 (기본 1회)                        -> 잡았다
+M3 HTTP 오류도 재시도하게 만든다                      -> 잡았다
+M4 200/키0개를 OK 로 통과시킨다                       -> 잡았다
+M5 빈 SUPABASE_URL 을 UNKNOWN 으로 오분류            -> 잡았다
+```
+
+M2 는 **처음에 놓쳤다.** 검사들이 전부 `timeouts=` 를 주입해서 돌기 때문에 상수를
+1회로 줄여도 전부 초록이었다. 그래서 기본 상수 자체를 보는 검사 2건을 더 넣었다
+(`len(JWKS_ATTEMPT_TIMEOUTS) >= 2`, 타임아웃이 회차마다 늘어나는가). mutation 을
+돌리지 않았으면 이 구멍은 남았을 것이다.
+
+**[같은 계열 — `audit_test_reality.py` 의 증거 없는 실패]** 같은 세션에 이 도구를
+돌렸더니 55개 중 **연속 8개**가 이렇게 찍혔다.
+
+```
+  [34/55] test_image_queue_transition.py         측정 실패
+  [35/55] test_intent_analyzer.py                측정 실패
+  ...
+```
+
+이유가 **빈 문자열**이다. `run_one()` 이 `coverage json` 출력에서 `{` 를 못 찾으면
+그냥 `return None` 이었고, 호출부는 `(r or {}).get("error", "")` 로 빈 문자열을 찍었다.
+이 출력만으로는 "감사기가 고장났다"와 "검사가 깨졌다"를 구별할 수 없다 — 증거 없는
+실패는 이 저장소가 반복해서 당한 함정 그 자체다(`run_python_tests.py` Sprint 203 주석,
+로그에 안 남아 9일간 크롤 중단을 몰랐던 일).
+
+이번 건의 **실제 원인은 동시 실행이었다**(같은 시각 전체 스위트와 파일 편집이 돌고
+있었다 — 한 파일만 따로 돌리면 정상 측정된다). 즉 제품 결함이 아니었지만, **그것을
+확인하는 데 별도 조사가 필요했다는 것 자체가 결함**이다.
+
+`_why_no_json(cov, out)` 을 만들어 두 서브프로세스의 종료코드와 stderr 꼬리를 이유로
+남긴다. 순수 함수라 프로세스 없이 검증할 수 있다. 그리고 이 도구에 **`--selftest` 가
+아예 없었으므로** 새로 만들고 `test_audit_selftests.py` 의 `TOOLS` 표에 등록했다
+(그 표의 "목록이 비어 있지 않다" 하한도 3 -> 4 로 올렸다 — 목록이 줄면 잡히게).
+
+**[남은 것]** `audit_contrast.py` / `audit_viewport.py` 는 아직 `--selftest` 가 없다.
+둘 다 프런트 렌더링 측정 도구라 selftest 를 만들려면 가짜 DOM/색상 입력이 필요하다 —
+이번 세션 범위 밖으로 남긴다.
+
+--------
+
+#189
+
+**`measure_endless_collecting.py` 가 "끝나지 않는 수집중" 2,145건의 이유를 통짜로
+"기일 경과"라고 찍었다 — 실측하면 그중 기일 경과는 0건이다.** 진짜 원인은 migration
+018 이 자기 헤더에 이미 적어 둔 UNIQUE 충돌이고, 018 이 약속한 자연 복구는 일어나지 않았다
+
+발견 (2026-08-25, DB 관계 감사 중 `auction_item` 716건에 큐 행이 없는 것을 보고)
+
+**[경위]** 읽기 전용으로 체인을 재다가 이것이 나왔다.
+
+```
+auction_item 1,876건 중 document_queue 행이 하나도 없는 것 : 716건 (38%)
+그 716건의 document_status                              : COLLECTING 2,145 / FAILED 3
+```
+
+`measure_endless_collecting.py` 를 돌리니 같은 2,145건이 이렇게 찍혔다.
+
+```
+(b) 큐 행이 없다 ― 기일 경과로 애초에 넣지 않음      2145
+```
+
+그런데 그 라벨은 **측정이 아니라 코드에 박힌 가정**이었다.
+
+```python
+st = queue.get(...)
+if st is None:
+    bucket = "(b) 큐 행이 없다 ― 기일 경과로 애초에 넣지 않음"   # 왜인지 확인하지 않는다
+```
+
+**[실측 — 가정이 틀렸다]** 716건 전부를 수집 시점 기준으로 다시 쟀다.
+
+```
+auction_date <  crawl_date (수집 시점에 이미 기일 지남) :   0건
+auction_date >= crawl_date (수집 시점에 기일이 남아 있었다): 716건   <- 전부
+대조군(큐 행이 있는 물건 1,160건): 기일 경과 1 / 기일 남음 1,159
+```
+
+즉 **기일 때문에 빠진 것이 하나도 없다.** `enqueue_documents()` 의 사전 제외 조건
+(`auction_date < today` -> `skipped_expired`)에 걸린 것이 아니다.
+
+**[진짜 원인 — 이미 저장소에 적혀 있었다]** `storage/migrations/018_document_queue_item_no_unique.sql`
+헤더가 그대로다(BUGS #48, Sprint 55):
+
+```
+-- 018 이전:  UNIQUE(court_code, case_no, doc_type)     <- item_no 가 없다
+-- 그 결과 한 사건에 물건이 여러 개일 때
+--   **두 번째 물건부터는 INSERT OR IGNORE 에 걸려 조용히 버려졌다.**
+-- 실측 (2026-08-11, 적용 전):
+--     자기 item_no 로 큐에 없는 물건     716 / 1,870  (38%)
+```
+
+**716 이라는 숫자가 오늘 값과 정확히 같다.** 그리고 item_no 분포가 그 서명을 그대로
+보여 준다.
+
+```
+                item_no='1' 비율
+auction_item        1,247 / 1,876  (66%)
+document_queue      3,171 / 3,498  (91%)   <- 큐만 '1' 로 쏠려 있다
+716건 중 410건은 **같은 사건의 다른 item_no 로는 큐 행이 있다**
+```
+
+**[018 이 약속한 복구는 일어나지 않았다]** 018 헤더는 이렇게 끝난다.
+
+```
+-- 빠져 있던 물건들은 다음 enqueue_documents() 실행 때 자연히 채워진다.
+```
+
+**채워지지 않았다.** 018 적용은 2026-08-11, 오늘은 2026-08-25, 그 사이 크롤이 돈 날은
+**2026-08-12 하루뿐**이고 그날 들어간 큐 행은 18개다. `enqueue_documents()` 는 **그날
+새로 긁은 rows 로만** 호출되는데, 716건은 그때 이미 기일이 지나 법원 목록에 없다.
+게다가 `auction_date < today` 사전 제외에도 걸린다. 즉 **이 잔여는 크롤이 되살아나도
+스스로 사라지지 않는다** — 018 의 "자연히 채워진다"는 이 716건에 대해서는 성립하지 않는다.
+(앞으로 새로 들어오는 물건은 018 이후 제약이라 정상 적재된다 — 진행형 결함은 아니다.)
+
+**[영향]** `document_status = COLLECTING` 2,145건이 **영구히** 그 상태로 남는다. 어떤
+큐 행도 없으므로 `mark_queue_skipped_expired()` 같은 종결 경로를 아예 지나지 않는다.
+지금은 716건 전부 기일이 지나 기본 검색에 안 보이지만, `include_closed=true` / 찜 /
+최근 본 물건 / 문서 통계에는 "수집중"으로 섞인다.
+
+라벨이 왜 중요한가 — 이 스크립트의 존재 이유가 "표시 정책을 정하는 데 필요한 숫자"를
+주는 것이다. **"어차피 기일 지난 것"과 "스키마 결함으로 잃은 것"은 정반대의 결정을
+부른다.** 전자는 그냥 숨기면 되고, 후자는 재적재를 검토해야 한다.
+
+**[수정]** 하드코딩 라벨을 증거 기반 분류 `no_queue_reason()` 으로 바꿨다(순수 함수).
+
+```
+(b1) 수집 시점에 이미 기일 경과            증거: auction_date < crawl_date
+(b2) 같은 사건의 다른 물건만 큐에 있다      증거: 같은 (법원,사건)에 다른 item_no 존재
+                                          = 018 이전 UNIQUE 충돌의 서명
+(b3) 같은 사건 전체가 큐에 없다 (이유 미상)  추측하지 않고 미상으로 남긴다
+(b4) 자기 item_no 는 큐에 있는데 doc_type 만 없다
+```
+
+수정 후 실측:
+
+```
+before  (b) 기일 경과로 애초에 넣지 않음                     2145
+after   (b2) 018 이전 UNIQUE 충돌                          1230   (물건 410개)
+        (b3) 같은 사건 전체가 큐에 없다 (이유 미상)             915   (물건 305개)
+        (b1) 수집 시점에 기일 경과                              0   <- 옛 라벨이 주장하던 전부
+```
+
+**[회귀 + mutation]** 이 스크립트에는 `--selftest` 가 없었다. 8건을 만들어 붙이고
+`test_audit_selftests.py` 의 `TOOLS` 표에 등록했다(하한 4 -> 5). DB 도 네트워크도 쓰지
+않는다. mutation 4/4 검출:
+
+```
+M1 기일 비교를 뒤집는다 (b1 과다 판정)        -> 잡았다
+M2 날짜가 없어도 b1 로 몬다 ("모름" -> "지남") -> 잡았다
+M3 018 충돌(b2)을 b3 로 뭉갠다               -> 잡았다
+M4 b4 를 b3 로 뭉갠다                        -> 잡았다
+```
+
+**[해결하지 않음 — 승인 영역]** 잔여 자체를 없애려면 둘 중 하나가 필요하고 **둘 다
+운영 DB 변경**이다.
+
+1. 716건을 큐에 재적재 — 다만 전부 기일이 지나 법원 사이트에서 조회되지 않으므로
+   (`enqueue_documents()` docstring 의 Step 13/14 실측) **수집은 실패한다.** 실익 없음.
+2. `document_status` 를 "대상 아님"으로 종결 — `document_status` enum 에 그 값이 없다.
+   새 상태를 만드는 것은 상태머신 + 화면 문구를 함께 정하는 **제품 결정**이고
+   `test_document_status_sync.py` §6 이 현재 동작(COLLECTING 유지)을 고정하고 있다.
+   Sprint 73 이 검토하고 보류한 그 결정 그대로다.
+
+이 세션은 **숫자와 이유를 정확하게 만드는 것까지** 하고 멈춘다 — 그것이 이 스크립트가
+원래 하기로 한 일이다.
+
+**[같은 계열의 인접 결함 — 감사기의 사각]** `audit_asset_integrity.py` 의
+`audit_queue_vs_status()` 는 `document_queue` 에서 **INNER JOIN** 으로 시작한다.
+
+```sql
+FROM document_queue dq
+JOIN ... JOIN document_status ds ON ...
+```
+
+그래서 **큐 행이 아예 없는** document_status 2,145건은 이 검사에 보이지 않는다 —
+감사기는 "[5] 어긋남 없음" 을 찍는다. 틀린 말은 아니지만(그 검사가 보는 범위 안에서는
+사실이다) "큐와 화면이 정합하다"로 읽히기 쉽다. 이 갈래는
+`measure_endless_collecting.py` 가 담당하는 것으로 역할이 나뉘어 있으므로 감사기를
+고치지는 않고, 여기 적어 둔다 — 다음 세션이 "[5] 어긋남 없음"만 보고
+큐/상태가 전부 정합하다고 결론 내리지 않도록.
+
+--------
+
+#190
+
+**Sprint 253 이 "복합 인덱스는 필요 없다"고 기각한 근거가 `ANALYZE` 를 돌린 상태의
+측정인데, 운영 DB 에는 `ANALYZE` 가 한 번도 돈 적이 없다** — 그래서 운영은 기각 근거가
+말하는 것보다 7.6배 느린 계획으로 돈다
+
+발견 (2026-08-25, 쿼리 계획 감사)
+
+**[경위]** `docs/BETA_RELEASE_CHECKLIST.md` 의 "측정으로 기각/보류" 표에 이 줄이 있다.
+
+```
+| 큐 claim 이 매번 2,753행을 정렬한다 | **아니다.** `ANALYZE` 후 `idx_queue_priority` 로
+  정렬 없이 0.052ms. 6.5배(22,769행)에서만 TEMP B-TREE 로 3.75ms |
+| 복합 인덱스가 그것을 고친다 | **아니다.** 추가해도 3.76ms -> 마이그레이션 근거 소멸 |
+```
+
+운영 DB 에 같은 쿼리(`claim_next_queue_item()` 이 실제로 쓰는 것 — `status IN
+('pending','refresh')` + `last_attempt_at` 조건 포함)를 걸어 계획을 떠 봤다.
+
+**[실측 2026-08-25]** (읽기 전용, 스크래치 사본에서만 `ANALYZE` 실행)
+
+```
+운영 auction.db 에 sqlite_stat1 이 있는가 :  없다
+
+[운영 DB 현재 상태 = ANALYZE 없음]
+    SEARCH document_queue USING INDEX idx_queue_status (status=?)
+    USE TEMP B-TREE FOR ORDER BY
+    100회 평균 0.313 ms
+
+[같은 DB 사본 + ANALYZE]
+    SCAN document_queue USING INDEX idx_queue_priority     <- 정렬 없음
+    100회 평균 0.041 ms
+```
+
+0.041ms 는 체크리스트가 적은 0.052ms 와 사실상 같다. **즉 그 측정 자체는 옳다.
+전제가 운영에 없을 뿐이다.** 지금 운영은 매 claim 마다 2,753행짜리 TEMP B-TREE 를
+만든다 — 기각 근거가 "없다"고 말한 바로 그 동작이다.
+
+**[왜 아무도 몰랐나]** `ANALYZE` 를 부르는 곳이 저장소 어디에도 없다(2026-08-25 전수
+확인 — `storage/`, `crawler/`, `api/`, `config/`, 루트 `*.py`, `*.bat`, `*.ps1`,
+마이그레이션 `*.sql` 전부). 부트스트랩 3단계에도 없다. 즉 이 저장소에서 통계가 있는
+DB 는 **누군가 손으로 `ANALYZE` 를 친 세션의 사본뿐**이고, Sprint 253 이 바로 그런
+사본에서 쟀다. 측정자는 그것을 숨기지 않았다 — "`ANALYZE` 후"라고 명시했다. 다만
+**운영에 그 전제가 없다는 사실을 확인하지 않았다.**
+
+같은 계열이 하나 더 있다 — `favorites` 도 `idx_favorites_user_id` 로 좁힌 뒤
+`ORDER BY created_at DESC` 에서 TEMP B-TREE 를 만든다. 지금은 0행이라 0.0ms 지만
+사용자가 늘면 같은 모양이 된다.
+
+**[영향]** 지금 당장은 작다 — 0.313ms vs 0.041ms 다. 위험한 것은 방향이다.
+
+* 체크리스트가 이 항목을 **"기각"으로 닫아 두었다.** 다음 세션이 큐 지연을 조사할 때
+  이 표를 보고 "이미 재 봤고 문제 없다"로 넘어간다.
+* 큐는 **계속 커진다.** DocWorker 가 등록되지 않아 pending 이 빠지지 않는 상태이고
+  (BUGS #184 계열, 2026-07-12 이후 처리 0), 체크리스트 자신이 6.5배(22,769행)에서
+  TEMP B-TREE 가 3.75ms 라고 적어 두었다. 그 지점은 통계가 없으면 더 일찍 온다.
+
+**[해결하지 않음 — 승인 영역]** 고치는 방법은 셋 다 이 세션의 SKIP 목록에 걸린다.
+
+1. 운영 DB 에 `ANALYZE` 1회 — 무손실이고 `sqlite_stat1` 만 추가하지만 **운영 DB 변경**이다.
+2. 부트스트랩/마이그레이션 러너에 `ANALYZE` 추가 — 다음 실행 때 운영 DB 를 바꾸게 된다.
+3. 복합 인덱스 추가 — **마이그레이션 신설**이고, 애초에 이 기각 근거가 부정한 대상이다
+   (통계가 있으면 실제로 불필요하다 — 위 실측이 그것을 재확인한다).
+
+세 중 **1번이 가장 작고 되돌리기 쉽다**(`ANALYZE` 는 언제든 다시 돌리면 되고,
+`DROP TABLE sqlite_stat1` 로 원복된다). 다음 세션이 승인받아 처리할 것.
+
+**[문서]** 체크리스트의 해당 표에 이 전제를 함께 적었다 — 표만 읽고 "문제 없음"으로
+닫히지 않게 하는 것이 이 항목의 요점이다.
+
+--------
+
+#191
+
+**JWKS 가 응답하지 않으면 요청마다 바깥 호출이 하나씩 나가고, 그 호출이 `_jwks_lock` 을
+잡은 채 일어나 API 전체가 직렬화된다** — 외부 한 곳의 지연이 서비스 정지로 번진다
+
+발견 (2026-08-25, SSRF/외부호출 감사 중 `api/auth.py:112` 의 단발 `timeout=5` 를 보고)
+
+**[경위]** 같은 세션에 `audit_auth_health.py` 가 JWKS 타임아웃 한 번을 "인증이 막혀 있다"로
+오판한 것을 고쳤다(BUGS #188). 그 김에 **제품 쪽 JWKS 조회**도 같은 모양인지 봤다.
+제품 쪽은 방어가 훨씬 낫다 — 10분 TTL 캐시가 있고, 실패해도 기존 캐시로 계속 검증하고
+(`if keys:` 로 빈 응답이 캐시를 날리지 않는다), 실패 전에 시각을 갱신해 재시도 폭주를 막는다.
+
+**그런데 캐시가 비어 있는 동안에는 그 방어가 통째로 꺼진다.**
+
+```python
+if (now - _jwks_fetched_at) >= _JWKS_MIN_REFETCH_SECONDS or not _jwks_keys:
+    #                                                     ^^^^^^^^^^^^^^^^
+    try:
+        _fetch_jwks_locked()        # timeout=5, 재시도 없음 — `with _jwks_lock:` 안이다
+```
+
+`or not _jwks_keys` 는 **캐시가 빌 때 하한을 무효화한다.** 하필 그 상수의 주석이
+"알 수 없는 kid 가 쏟아져도 외부 호출이 폭주하지 않게 하는 하한"이다 — 예외 조항이
+정확히 그 취지가 필요한 순간에 취지를 껐다.
+
+**[재현]** `urlopen` 을 응답하지 않는 가짜로 갈아끼우고(네트워크 안 탄다) 스레드 8개로
+콜드 스타트 상태의 `_get_jwk()` 를 동시에 호출했다. 타임아웃은 재현용으로 1초로 축소했다.
+
+```
+수정 전   바깥 JWKS 호출 8회 / 전체 8.00초 / 마지막 요청 8.00초
+수정 후   바깥 JWKS 호출 1회 / 전체 1.00초 / 마지막 요청 1.00초
+```
+
+호출이 요청 수만큼 나가고, `_jwks_lock` 때문에 **완전히 직렬화된다.**
+실제 코드의 `timeout=5` 로 환산하면 **동시 8요청에 마지막 요청이 40초**다.
+
+**[영향 — 우선순위 2(서비스 장애) + 3(인증)]** 캐시가 비는 상황은 드물지 않다.
+
+* 서버 재기동 직후(배포·크래시 복구) = 항상 콜드 스타트다.
+* JWKS 장애가 10분 TTL 보다 길면 캐시가 무의미해지고 여기로 떨어진다.
+
+그 순간 **JWKS 가 5초 느려지는 것이 인증 API 전체의 응답시간을 요청 수 × 5초로 만든다.**
+게다가 결과는 어차피 401 이다(`_jwks_keys.get(kid)` 가 None) — **5초씩 매달린 끝에 같은
+401 을 준다.** 얻는 것 없이 서버만 묶인다. 이 세션에 실제로 JWKS 타임아웃이 한 번
+관측됐으므로(BUGS #188) 가상의 상황이 아니다.
+
+**[수정 — 1줄]** 하한을 예외 없이 적용하고, "한 번도 조회한 적 없음"만 따로 본다.
+
+```python
+never_fetched = _jwks_fetched_at == 0.0
+if never_fetched or (now - _jwks_fetched_at) >= _JWKS_MIN_REFETCH_SECONDS:
+```
+
+`_fetch_jwks_locked()` 가 **시도 전에** `_jwks_fetched_at` 을 갱신하므로 시간 조건만으로
+실패 후 재시도까지 올바르게 눌린다. 남는 예외는 "아직 한 번도 안 해 봤다"뿐이다.
+
+**0.0 을 시간 비교로 대신하지 않은 이유**: `time.monotonic()` 의 기준점은 플랫폼마다
+다르고 부팅 직후에는 작을 수 있다. 시간 비교만 두면 그런 환경에서 **첫 조회를 통째로
+건너뛰어** 인증이 30초간 죽는다 — 고치려던 것보다 나쁜 회귀다. 그래서 명시적 플래그로 둔다.
+
+**바뀌는 것과 안 바뀌는 것**
+
+```
+캐시 적중(평시)          바깥 호출 0회, 즉시 반환      — 전혀 안 바뀜
+캐시 있음 + 모르는 kid    30초 하한                    — 전혀 안 바뀜
+콜드 스타트 + 정상 네트워크  첫 조회 그대로 수행           — 전혀 안 바뀜
+JWKS 장애 중             401 이 **빠르게** 난다        — 결과 동일, 서버가 살아 있다
+```
+
+**[남는 것 — 이번에 손대지 않았다]** 눌린 뒤에도 그 1회 조회는 여전히 `_jwks_lock` 을
+잡은 채 최대 5초 걸린다. 즉 30초에 한 번은 동시 요청이 최대 5초 함께 밀린다.
+완전히 없애려면 네트워크 호출을 락 **밖으로** 빼고 이중 검사(double-checked) 구조로
+바꿔야 하는데, 그것은 인증 경로의 동시성 구조 변경이라 이번 1줄 수정과 위험도가
+다르다. **요청당 5초 -> 30초당 5초**로 줄인 것이 이번 범위다. 더 줄이려면 별도 Sprint 로.
+
+**[회귀 + mutation]** `test_auth_jwks_robustness.py` 에 8번/8-b 를 신설했다.
+네트워크를 타지 않는다(`urlopen` 교체). 행위 검사(스레드 8개)와 구조 검사
+(`or not _jwks_keys` 가 되돌아오면 실패)를 함께 둔다 — 타이밍 검사 하나에만 기대면
+느린 CI 에서 흔들린다.
+
+mutation 4/4 검출:
+
+```
+M1 `or not _jwks_keys` 를 되돌린다 (원래 버그)          -> 잡았다
+M2 하한을 0 으로 만든다 (사실상 무제한 재조회)            -> 잡았다
+M3 콜드 스타트 예외를 없앤다 (부팅 직후 첫 조회 누락)      -> 잡았다
+M4 실패 전 시각 갱신을 없앤다 (재시도 폭주 복귀)          -> 잡았다
+```
+
+인증 경로 회귀 5종 재실행 전부 exit 0:
+`test_auth_jwt.py` / `test_auth_jwks_robustness.py` / `test_api_regression.py` /
+`test_item_detail_auth.py` / `test_beta_journey.py`.
+
+**[같이 확인한 것 — 결함 아님]**
+
+* **SSRF 없음**: 이 저장소에서 요청 입력으로 바깥 URL 을 만드는 곳이 없다.
+  `api/auth.py` 의 유일한 외부 호출도 URL 이 `SUPABASE_URL` 환경변수에서만 온다.
+* **SQL injection 없음**: `api/v1/admin.py` 의 `"... WHERE " + where` 형태 4곳은
+  `where` 가 전부 **고정 리터럴 조각**이고 값은 전부 `?` 다. `_validate_filter()` 가
+  enum 까지 화이트리스트로 막는다. `storage/database.py` 의 `"UPDATE auction SET " + col`
+  도 `col` 이 `LEGACY_HAS_COLUMN` 딕셔너리 조회 결과이며, 그 앞에서 `doc_type` 이
+  `QUEUE_TO_DOC_STATUS_TYPE` 에 없으면 `KeyError` 로 죽는다.
+* **IDOR 없음**: id 를 받는 라우트 19개를 전수 확인했다. admin 8개는 전부
+  `require_admin` 또는 `require_super_admin`(과금에 영향 주는 3개는 SUPER),
+  사용자 자원 6개는 전부 `AND user_id = ?` 로 좁힌다. 공개 5개는 공개 경매 데이터다.
+* **rate limit 은 여전히 없다** — `api_server.py` 가 `127.0.0.1` 바인딩이라 지금은
+  노출면이 없지만, 외부에 열면 그 순간 필요해진다. 배포 형태가 정해질 때 함께 정할 일이라
+  이번에는 기록만 한다.
+
+--------
+
+#192
+
+**회귀 스위트가 운영 로그 파일에 합성 로그를 써 왔다** — `logs/doc_collect.log` 의 40%,
+`logs/scraper.log` 의 최근 이틀치가 전부 QA 산출물이다. 마지막 실제 크롤은 2026-08-12 인데
+로그만 읽으면 "오늘 크롤이 돌았고 전 법원이 실패했다"로 보인다
+
+발견 (2026-08-25, BUGS #186 이 닫은 DB 축의 **파일 축**을 같은 방법으로 재다가)
+
+**[경위]** `audit_test_reality.py` 를 돌린 직후 `ls -la logs/` 를 보니
+`logs/doc_collect.log` 의 mtime 이 **방금**이었다. 크롤은 13일째 멈춰 있는데 문서 수집
+로그가 갱신될 이유가 없다. 파일을 열어 보니 가짜 법원 이름이 들어 있었다.
+
+```
+2026-08-25 09:52:00 [INFO] [2026타경12-1] spec 저장 완료:
+    C:\...\Temp\qa_specnotab_docs_4fkskgz7\QA법원\2026타경12\1\spec.pdf
+2026-08-25 09:51:34 [ERROR] ===== [QA2] 오류: QA 주입 실패 =====
+2026-08-25 09:51:34 [ERROR] ===== 사건 수집 실패: 전 법원(2곳) 수집 실패 =====
+```
+
+**[실측 — 얼마나 섞였나]** (2026-08-25)
+
+```
+logs/doc_collect.log    총 4,136줄 중 'QA법원' 이 들어간 줄  1,651줄 (40%)
+                        가장 오래된 QA 줄 2026-08-18, 가장 최근 2026-08-25
+logs/scraper.log        총 36,420줄. 2026-08-24 자 1,851줄 / 2026-08-25 자 495줄
+                        (마지막 줄까지 전부 'QA1'/'QA2' 합성 크롤이다)
+auction_item MAX(crawl_date)   2026-08-12      <- 실제 크롤은 여기서 멈췄다
+```
+
+**[원인 — 한 줄이다]** 두 진입점이 **모듈 최상위**에서 파일 핸들러를 붙였다.
+
+```python
+# collect_documents.py / mvp_scraper.py — 수정 전
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(os.path.join(_HERE, "logs", "doc_collect.log"), ...),
+        logging.StreamHandler(),
+    ]
+)
+```
+
+`basicConfig` 는 **루트 로거**를 설정한다. 그래서 이 모듈을 import 하는 순간, 그
+프로세스 안의 **모든** 로그(`crawler/doc_crawler.py` 가 찍는 "spec 저장 완료"까지)가
+운영 로그 파일로 흘러간다. 그리고 이 두 모듈을 import 하는 것은 **제품 코드가 아니라
+테스트뿐**이다(2026-08-25 전수 확인: 제품 모듈의 import 0건, `.bat` 3개는 전부
+`python <파일>` 로 **실행**한다).
+
+**[왜 오랫동안 몰랐나]** 로그는 append 라 아무것도 깨지지 않는다. 테스트는 통과하고,
+행수는 늘기만 하며, 아무도 파일을 열어 보지 않는다. BUGS #186 이 DB 축에서 만난 것과
+같은 모양이다 — **정상으로 보이는 것이 문제였다.**
+
+**[영향 — 왜 사소하지 않은가]** 이 저장소는 2026-08-03~08-11 **9일간 크롤이 멈춘 것을
+몰랐던** 이력이 있고, 그때의 교훈이 "로그에 남지 않으면 아무도 모른다"였다. 지금은
+반대 방향의 같은 함정이다 — **로그에 거짓이 남아 있다.**
+
+* `logs/scraper.log` 를 열면 마지막 줄이 오늘 날짜이고 `[ERROR] 전 법원(2곳) 수집 실패`
+  다. 이것만 보고 "크롤은 도는데 법원 접속이 막혔다"로 진단하면 **엉뚱한 곳을 판다.**
+  실제 원인은 예약 작업이 0개라 크롤이 **아예 실행되지 않는 것**이다.
+* `check_pipeline2.py` 는 `logs/scraper.log` / `logs/doc_collect.log` 를 직접 읽고,
+  `test_max_items_contract.py` 는 `logs/scraper.log` 를 실측 근거로 인용한다.
+* 여러 Sprint 문서가 "운영 무변경"을 기준선에 적어 왔다. DB 는 #186 이 참으로 만들었지만
+  **파일은 여전히 거짓이었다.**
+
+**[수정]** 파일 로그를 **import 시점 → `__main__` 시점**으로 옮겼다. 두 파일에
+`attach_file_log()` 를 두고 `if __name__ == "__main__":` 첫 줄에서 부른다.
+
+```python
+def attach_file_log():
+    """운영 파일 로그를 루트 로거에 붙인다. `__main__` 에서만 부른다."""
+    root = logging.getLogger()
+    target = os.path.abspath(SCRAPER_LOG_PATH)
+    for h in root.handlers:                       # 두 번 불러도 겹치지 않는다
+        if isinstance(h, logging.FileHandler) and os.path.abspath(h.baseFilename) == target:
+            return h
+    ...
+```
+
+**운영 경로는 전혀 바뀌지 않는다** — `run_daily.bat` 는 `"%PY%" mvp_scraper.py` 로 부르므로
+`__main__` 분기를 그대로 지난다. 그리고 이 수정으로 **네 진입점의 import 시점 동작이
+같아진다** — `doc_worker.py` / `refresh_priority.py` 는 애초에 StreamHandler 하나뿐이었다.
+즉 고친 것이 아니라 **빠져 있던 둘을 나머지 둘에 맞춘 것**이다.
+
+**[재발 방지 — #186 과 같은 방식, 같은 이유]** 허용목록이 아니라 **행동**을 본다.
+`run_python_tests.py` 의 감시 대상을 운영 DB 하나에서 **운영 산출물 다섯**으로 넓혔다.
+
+```
+auction.db  /  logs/daily_run.log  /  logs/doc_run.log
+logs/scraper.log  /  logs/doc_collect.log  /  logs/migrate_execute.log
+```
+
+파일 하나를 돌릴 때마다 여섯 개의 지문을 재고, 달라지면 **그 파일이 무엇을 바꿨는지까지
+지목**하고 통과 여부와 무관하게 종료코드 1 을 준다. 목록을 `logs/` 전체로 두지 않은
+이유는 그 폴더에 세션 산출물(`s2xx_*.log`)이 섞여 있어 감시가 소음만 내기 때문이다 —
+**이 저장소가 증거로 쓰는 파일**만 골랐다.
+
+**[회귀 + mutation]** `test_schema_hygiene.py` 에
+`test_entrypoints_do_not_attach_file_logs_on_import()` 를 신설했다(9단언).
+문자열이 아니라 **행위**를 본다 — 자식 프로세스에서 진짜로 import 해 루트 로거의
+FileHandler 목록을 물어본다. 자식 프로세스로 돌리는 이유는 (1) 이 검사 자신이 로그를
+오염하지 않기 위해, (2) 이미 import 된 모듈 때문에 `basicConfig` 가 no-op 이 되어
+**검사가 저절로 초록이 되는 것**을 피하기 위해서다.
+
+붙이지 "않는" 것만 보면 **아예 파일 로그를 지워버린** 회귀를 놓치므로, `__main__` 이
+`attach_file_log()` 를 실제로 부르는지도 AST 로 함께 본다.
+
+mutation 3/3 검출:
+
+```
+M1 import 시점 FileHandler 를 되돌린다 (원래 버그 그대로)  -> 잡았다
+M2 __main__ 의 attach_file_log() 호출을 지운다              -> 잡았다
+M3 attach_file_log() 자체를 없앤다                          -> 잡았다
+대조군 (수정본 그대로)                                      -> exit 0
+```
+
+감시기 쪽도 따로 재현했다 — M1 을 주입한 채 `run_python_tests.py -k crawl_orchestration`
+을 돌리니 **통과 1 / 실패 0 인데 종료코드 1** 이고 `logs/scraper.log` 를 지목했다.
+수정본으로 되돌리니 종료코드 0.
+
+**[검증]**
+
+```
+수정 전  test_court_crawl_recovery / test_crawl_orchestration -> logs/scraper.log 변경
+         test_doc_storage_atomicity                          -> logs/doc_collect.log 변경
+수정 후  같은 네 파일 개별 실행                              -> 전부 무변경
+         전체 스위트 1회                                     -> 운영 산출물 5개 **바이트 동일**
+                                                                auction.db 2991c5be...
+__main__ 경로 보존  임시 경로로 attach_file_log() 를 불러 실제로 기록되는 것 확인
+                    (크롤러는 돌리지 않았다). 두 번 불러도 핸들러 1개.
+```
+
+**[기준선]** 통과 53 / 실패 1 / 건너뜀 3 / 판정없음 1, 단언 **8,138**건
+(수정 전 8,129 -> 신규 검사 9단언). 남은 실패 1건은 이 수정과 무관한 P0-A(기일 미도래
+물건 0건 — 크롤은 승인 영역)다.
+
+**[같이 확인한 것]**
+
+* `test_filter.py`(판정없음 1)와 `test_db.py`/`test_docs.py`/`test_docs2.py`(건너뜀 3)는
+  **전부 의도된 것**이고 파일 자신의 docstring 이 이유를 적고 있다. 정직한 분류다.
+* `logs/scraper.log` 에 남은 `CSV 백업 저장: ...\auction_20260825.csv` — 테스트가 저장소
+  **루트에 CSV 를 쓴다.** 끝에 지우므로 지금 파일은 없지만, 중간에 죽으면 남는다(#186 의
+  "지우는 코드에 도달하지 못한다"와 같은 논리). `*.csv` 가 `.gitignore` 에 있어 커밋되지는
+  않는다. 감시 대상에 넣으려면 파일명이 날짜마다 달라 지문 방식이 맞지 않아 이번에는
+  기록만 한다.
+* `patch_migrate2.py` — 저장소 루트의 **미추적** 일회용 패치 스크립트다(`migrate_execute.py`
+  에 로그 핸들러를 넣으려던 것으로 보이나 실제로 적용돼 있지 않다). 아무 데서도 참조되지
+  않는다. BUGS #187 의 `e hardening"` 과 같은 계열의 잔여물이지만 **미추적이라 저장소를
+  더럽히지는 않는다.** 삭제는 승인 영역이라 남긴다.
+
+--------
+
+#193
+
+**프런트 감사 도구 둘이 "재지 못했다"를 말할 줄 몰랐다** — `audit_contrast.py` 는
+드라이버 실패를 40줄짜리 트레이스백으로 토했고, 텍스트 노드를 **0개 보고도**
+"기준 미달 0 / 종료코드 0"(=정상)을 돌려줄 수 있었다. 그리고 결함 43곳을 다 찾아
+놓고 **보고하다가 죽었다**
+
+발견 (2026-08-25, BUGS #188 이 "남은 것"으로 적어 둔 항목을 실제로 돌려 보다가)
+
+**[경위]** #188 은 `audit_auth_health.py` 의 "모른다를 고장났다로 읽는" 결함을 고치면서
+이렇게 남겼다: *"`audit_contrast.py` / `audit_viewport.py` 는 아직 `--selftest` 가 없다.
+이번 세션 범위 밖으로 남긴다."* 그 둘을 실제로 돌려 보니, selftest 가 없다는 것보다
+**본체가 먼저 문제였다.**
+
+```
+$ python audit_contrast.py
+...
+requests.exceptions.ConnectionError: Could not reach host. Are you offline?
+(트레이스백 40줄. 판정문 0줄.)
+```
+
+**[결함 1 — "오프라인이 아니다"]** 메시지를 믿지 않고 같은 주소를 직접 쟀다.
+
+```
+stdlib urllib  -> HTTP 200, 0.05초, 200 bytes      <- 네트워크는 멀쩡하다
+requests       -> SSLCertVerificationError
+                  "unable to get local issuer certificate"   (3회 전부, 0.18초)
+```
+
+즉 `requests` 의 CA 번들이 이 PC 의 TLS 경로를 검증하지 못하는 것이고,
+`webdriver_manager` 가 그것을 삼켜 **"Are you offline?"** 으로 바꿔 던졌다.
+같은 순간 Selenium 4.47 내장 해석기(Selenium Manager)는 **9.6초 만에 크롬
+151.0.7922.170 을 띄웠다.** 캐시(`~/.wdm/.../151.0.7922.138`)가 브라우저
+(`...170`)와 어긋나 있어 webdriver_manager 는 매번 바깥을 봐야 했던 것이다.
+
+`build_driver()` 는 `webdriver_manager` **하나뿐**이었다. 즉 이 도구들은
+**바깥 네트워크가 되어야만 도는 구조**였고, 그 사실이 어디에도 적혀 있지 않았다.
+
+**[수정 1]** 해석 순서를 둘로 두고, 전부 실패하면 `DriverUnavailable` 로 올린다.
+
+```
+1. Selenium Manager   (내장, 캐시가 맞으면 바깥을 안 본다)   <- 먼저
+2. webdriver_manager  (예전 경로)                            <- 폴백
+둘 다 실패 -> DriverUnavailable("A -> ...; B -> ...")        <- 두 사유를 **함께**
+```
+
+호출부는 그것을 잡아 **시도한 방법과 각각의 사유를 줄마다 찍고 종료코드 2**(측정 불가)를
+준다. 사유를 하나만 남기면 "네트워크가 안 된다"와 "크롬이 없다"를 구별할 수 없다.
+
+**[결함 2 — 아무것도 못 재고 "정상"이라고 말한다]** `audit_contrast.py` 의 끝은 이랬다.
+
+```python
+print("  합계: 텍스트 노드 %d개 / 기준 미달 %d개" % (total_seen, len(all_bad)))
+if not all_bad:
+    return 0
+```
+
+`all_bad` 가 비는 경우는 **둘**인데 코드는 하나로 봤다.
+
+```
+(a) 진짜로 기준 미달이 없다              -> 0 이 맞다
+(b) 화면이 안 그려져 **잰 글자가 없다**   -> 0 은 거짓이다
+```
+
+(b) 는 서버가 죽었거나 라우트가 바뀌었거나 렌더가 20초 안에 안 끝났을 때 나온다.
+그러면 이 도구는 `합계: 텍스트 노드 0개 / 기준 미달 0개` 를 찍고 **종료코드 0** 을
+돌려준다 — 아무것도 재지 않고 "정상"이라고 말하는 것이다. 형제 도구
+`audit_viewport.py` 는 같은 함정을 `nodes < 15 -> UNUSABLE` 로 이미 막고 있었다.
+**이 도구만 빠져 있었다.**
+
+서버 확인도 빠져 있었다(`audit_viewport.py` 는 첫 줄에서 한다).
+
+**[수정 2]** 순수 함수 `contrast_verdict(per_screen, all_bad)` 로 종료코드를 셋으로 가른다.
+
+```
+0  기준 미달 없음      전 화면을 실제로 쟀고 미달이 없다
+1  결함 있음
+2  재지 못했다         텍스트 노드가 0개인 화면이 하나라도 있다 / 잰 화면이 없다
+```
+
+**하한을 "0개"로만 둔 이유**: 화면별 텍스트 노드 수의 정상 범위를 아직 재지 않았다
+(dev 서버가 떠 있어야 잰다). 재지 않은 값을 상수로 박으면 그것이 다음 오판의 근거가
+된다. 지금은 부정할 수 없는 것만 판정한다 — **그려진 화면에 텍스트 노드가 0개일 수는
+없다.** 실측 기준선이 생기면 그때 올린다.
+
+**[결함 3 — 다 찾아 놓고 보고하다 죽었다]** 위 둘을 고친 뒤 dev 서버를 띄우고 처음으로
+끝까지 돌렸더니, 기준 미달 **43곳을 전부 찾아 놓고** 목록을 찍다가 죽었다.
+
+```
+UnicodeEncodeError: 'cp949' codec can't encode character '—' in position 33
+```
+
+화면에서 긁어 온 문구에 엠대시가 있었다. 즉 **측정은 성공했는데 보고가 실패**했고,
+종료코드는 1(결함 있음)이 아니라 트레이스백이 됐다. 이 저장소의
+`test_console_encoding.py` 는 **소스에 박힌 문자열**을 검사하는데, 여기서 터진 것은
+소스가 아니라 **측정 대상 데이터**다 — 화면 문구에는 어떤 글자든 올 수 있으므로
+검사로 막을 수 없고 찍는 쪽에서 처리해야 한다.
+
+**[수정 3]** `console_safe(text, enc=None)` 로 찍는 문자열만 좁혀서 처리한다.
+`sys.stdout` 을 통째로 재설정하지 않는다 — 이 도구는 다른 도구가 import 하기도 해서
+(`audit_contrast` -> `audit_viewport`) 전역 스트림을 바꾸면 호출부까지 바뀐다.
+
+**[실제 측정 — 이제 끝까지 돈다]** dev 서버(운영 DB 가 아니라 **임시 사본**을
+`storage.database.DB_PATH` 로 지정해 띄운 API)에 대고 2026-08-25 실측:
+
+```
+audit_viewport.py    정상 18 / 결함 0 / 로그인필요 18 / 측정불가 0     exit 0
+                     (320/360/390/430/900/1400px x 전 화면)
+audit_contrast.py    텍스트 노드 77개 / WCAG AA 기준 미달 43곳         exit 1
+                     /       35개 중 20  /search 35개 중 19  /login 7개 중 4
+```
+
+**[명암비 43곳 — 8조합, 전부 한 단계 진한 색이면 통과한다]** 대체 색이 실제로
+통과하는지도 브라우저에 칠해서 쟀다(Tailwind v4 계산값은 oklch 라 손으로 예측할 수 없다).
+
+```
+조합                                     지금      한 단계 진하게          곳수
+text-gray-400 on white   (12/14px)      2.60:1   gray-500  4.84:1  OK     19
+text-gray-400 on gray-50 (14px)         2.49:1   gray-500  4.63:1  OK      3
+text-blue-500 on white   (12px)         3.76:1   blue-600  5.25:1  OK      8
+white on bg-blue-500     (12/14/16px)   3.76:1   bg-blue-600 5.25:1 OK    11
+text-gray-500 on gray-100(14px)         4.39:1   gray-600  6.87:1  OK      2
+```
+
+`white on bg-blue-500` 11곳에는 **`/login` 의 로그인 버튼과 `/search` 의 검색 버튼**
+— 이 제품의 주 CTA — 이 들어 있다.
+
+**주의**: `bg-blue-700` 은 rgb(0,0,0) 으로 읽혔다. 그 클래스가 이 빌드에 **생성되지
+않아**(어디서도 쓰지 않는다) 배경이 투명이었던 것이지 검정이 아니다. 그래서 그 값은
+쓰지 않았다 — 도구가 아니라 측정 조건이 만든 값이다.
+
+**[색은 바꾸지 않았다 — 이 저장소가 이미 정한 것]** Sprint 247 이 같은 자리에서
+*"색상은 제품/디자인 판단이라 제안만 남겼다"* 고 적었고 그 판단은 지금도 유효하다.
+특히 `text-gray-400` 중 일부(아코디언 ▼, "면적 조건"/"특수조건" 제목)는
+`SearchAccordionSection` 의 `muted` 가 **일부러** 흐리게 만든 것이다 —
+"백엔드 미연동 섹션임을 제목 색상만으로 표시한다"가 그 컴포넌트 주석에 적혀 있다.
+그것을 일괄로 진하게 만들면 **의도한 신호를 지우는 것**이 된다. 그래서 이 세션은
+**대체 색이 실제로 AA 를 넘는다는 것까지 재 두고** 결정은 남긴다. 위 표의 다섯 줄이
+그대로 지시서다.
+
+**[회귀 + mutation]** 두 도구에 `--selftest` 를 신설하고(#188 의 "남은 것" 해소)
+`test_audit_selftests.py` 의 `TOOLS` 에 등록했다(하한 5 -> 7). 브라우저도 서버도
+네트워크도 쓰지 않는다 — 판정 로직과 드라이버 해석 순서만 본다(가짜 factory 주입).
+
+```
+audit_viewport.py  --selftest   20단언   verdict() 4종 + build_driver 순서/실패
+audit_contrast.py  --selftest   13단언   contrast_verdict 3종 + console_safe + 드라이버
+```
+
+mutation 5/5 검출:
+
+```
+M1 빈 화면을 정상으로 되돌린다 (audit_contrast 원래 버그)  -> 잡았다 (FAIL 5줄)
+M2 console_safe 를 무력화한다                             -> 잡았다 (FAIL 2줄)
+M3 DriverUnavailable 대신 생예외를 던진다                  -> 잡았다 (FAIL 3줄)
+M4 nodes<15 검사를 없앤다 (audit_viewport 빈 화면 통과)     -> 잡았다 (FAIL 2줄)
+M5 폴백을 없앤다 (첫 방법만 시도)                          -> 잡았다 (FAIL 4줄)
+대조군                                                     -> 둘 다 exit 0
+```
+
+M5 는 **처음에 트레이스백으로 죽었다** — 종료코드는 1 이라 게이트는 붉어졌지만
+`[FAIL]` 줄이 0 이라 무엇이 깨졌는지 알 수 없었다. 그것 자체가 이 저장소가 반복해서
+당한 "증거 없는 실패"라, selftest 안에서 예외를 **값으로** 바꾸도록 고쳤다
+(`try_build()`). 지금은 어느 단언이 왜 깨졌는지 네 줄로 나온다.
+
+**[검증]**
+
+```
+python audit_viewport.py --selftest      exit 0   (20단언)
+python audit_contrast.py --selftest      exit 0   (13단언, cp949/utf-8 양쪽에서)
+python test_audit_selftests.py           exit 0   (감사 도구 7개 전부)
+서버 없이 python audit_contrast.py       exit 2   트레이스백 대신 두 줄 안내
+서버 띄우고 audit_viewport.py            exit 0   정상 18 / 결함 0 / 측정불가 0
+서버 띄우고 audit_contrast.py            exit 1   43곳 목록이 **끝까지** 출력됨
+npm run test:frontend                    191건 / 187 pass / 1 fail / 3 skip
+                                         남은 실패 1건 = P0-A (기일 미도래 물건 0건)
+운영 auction.db + 운영 로그 5개           **바이트 무변경** (dev/API 서버를 띄운 동안에도)
+```
+
+**[같이 확인한 것 — 결함 아님]**
+
+* `audit_viewport.py` 는 원래도 `build_driver` 실패를 잡아 종료코드 2 를 주고 있었다.
+  트레이스백이 난 것은 `audit_contrast.py` 쪽뿐이다. 다만 사유를 **한 줄**로만 찍어
+  어느 방법이 왜 실패했는지 알 수 없었으므로 그쪽도 함께 고쳤다.
+* 로그인 필요 화면 18칸은 여전히 **측정하지 못했다**(헤드리스에 세션이 없다).
+  이 도구는 그것을 통과로 세지 않는다 — `--cookie` 로 재는 것은 Sprint 242 이래
+  다섯 번 이월된 항목이고, 실제 로그인 세션 쿠키가 필요해 이번에도 남는다.
+
+--------
+
+#194
+
+**`audit_asset_integrity.py` 의 [9] 가 읽기 타임아웃 한 번에 트레이스백으로 죽었다** —
+앞서 찍은 [1]~[8] 까지 판정 없이 버려진다. 그리고 그 김에 **자산 URL 601개를 이 저장소에서
+처음으로 전수 확인했다 — 열리지 않는 것은 0개다**
+
+발견 (2026-08-25, 체크리스트가 "자산 어긋남 0건"이라고 적어 둔 것을 실제로 다시 돌려 보다가)
+
+**[경위]** `docs/BETA_RELEASE_CHECKLIST.md` 의 세션 검증 표에 이 줄이 있었다.
+
+```
+python audit_asset_integrity.py  자산 어긋남 0건 (고아 큐 행 18건은 보고)
+```
+
+돌려 보니 **종료코드 1, 어긋남 27건**이었다. 그리고 API 서버를 띄운 뒤 다시 돌리니
+아예 죽었다.
+
+```
+[9] API 가 광고한 자산 URL 이 실제로 열리는가 (http://127.0.0.1:8000)
+Traceback (most recent call last):
+  ...
+  File "audit_asset_integrity.py", line 818, in get
+    return r.status, r.headers.get("content-type", ""), r.read()
+TimeoutError: timed out
+```
+
+**[결함 — `HTTPError` 만 잡았다]**
+
+```python
+def get(path):
+    try:
+        with urllib.request.urlopen(api_base + path, timeout=15) as r:
+            return r.status, r.headers.get("content-type", ""), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, "", b""          # <- 서버가 대답한 경우만 처리한다
+```
+
+`urlopen` 자체는 성공하고 **`r.read()` 도중에** 타임아웃/연결 리셋이 나면 그대로 위로
+샌다. 그러면 감사기 전체가 죽고, 이미 화면에 찍힌 [1]~[8] 도 **판정 없이** 끝난다.
+이 파일은 서버 부재는 이미 "확인하지 못함"으로 정직하게 다루고 있었다 — 그 구분이
+**연결 단계에만** 있고 읽기 단계에는 없었던 것이다.
+
+**[수정]** `get()` 이 네 번째 값(실패 사유)을 돌려주고, 세 상태를 가른다.
+
+```
+status = 200/404/...   서버가 대답했다        -> 판정한다
+status = None          이번에 못 닿았다       -> **확인하지 못함** (어긋남에 더하지 않는다)
+```
+
+미확인은 어긋남 수에 더하지 않되 **숨기지도 않는다** — "열리지 않음 0" 만 보고 전수
+확인됐다고 읽으면 안 되기 때문이다. 별도 줄로 건수와 URL 을 찍는다.
+
+**[재시도 — 넣은 근거는 실측이다]** 처음 수정본으로 전수를 돌리니 601건 중 **16건**이
+15초 타임아웃으로 떨어졌다. 그 16개가 진짜로 안 열리는지 확인하려고 표본 8개를 그대로
+다시 요청했다.
+
+```
+/api/v1/item/111/documents/SPEC        0.05s  200  1,507,996 B
+/api/v1/item/114/documents/APPRAISAL   0.05s  200  3,857,768 B
+/api/v1/item/118/documents/APPRAISAL   0.02s  200    790,408 B
+/api/v1/item/138/documents/SPEC        0.02s  200    396,206 B
+/api/v1/item/213/documents/APPRAISAL   0.04s  200  3,464,670 B
+/api/v1/item/240/documents/APPRAISAL   0.05s  200  7,068,951 B
+/api/v1/item/335/documents/SPEC        0.15s  200    407,346 B
+/api/v1/item/392/documents/SPEC        0.15s  200    398,444 B
+                                       -> 8/8 즉시 200
+```
+
+그래서 **네트워크 계열만** 1회 재시도한다(15초 -> 25초). HTTP 오류는 재시도하지 않는다 —
+몇 번을 보내도 404 는 404 다. BUGS #188 이 JWKS 에서 세운 규칙 그대로다.
+
+```
+재시도 전   확인하지 못함 16건 / 601
+재시도 후   확인하지 못함  2건 / 601   (0.3%)
+```
+
+**[그래서 얻은 것 — 자산 URL 전수 확인]** 이 감사가 죽지 않고 끝까지 돈 것은 이번이
+처음이다. 2026-08-25 실측(dev/API 서버는 운영 DB 가 아니라 **임시 사본**을 열었다):
+
+```
+[9] 물건 206개 / 사진 URL 45개 / 문서 URL 556개 / **열리지 않음 0개**
+    확인하지 못함 2건 (재요청하면 열린다 - 아래)
+```
+
+즉 **API 가 광고한 자산 URL 601개가 전부 실제로 열린다.** 표본이 아니라 전수다.
+
+**[관측했으나 원인 미확정 — 성급하게 P0 로 올리지 않는다]** 위 타임아웃의 정체를
+쫓았고, 아래까지는 확정했다.
+
+```
+증상        문서/이미지 URL 요청이 ~19초 멈춘 뒤 ConnectionResetError.
+            같은 URL 을 즉시 다시 요청하면 0.02~0.15초에 200. (8/8)
+빈도        연속 601요청 중 16건(2.7%). 재시도를 넣으면 2건(0.3%).
+배제한 것   * 파일 크기가 아니다 - 400KB 도 12.5MB 도 양쪽에 다 있다
+            * 디스크가 아니다 - 같은 파일을 파이썬으로 직접 읽으면 25개 전부 0.00초
+              (OneDrive 자리표시자 hydration 아님)
+            * 콜드 스타트가 아니다 - 서버를 재기동하고 **첫 요청**으로 12.5MB 문서를
+              받아도 0.03초, 3연속 전부 0.01초 이하
+            * 특정 물건/문서가 아니다 - 매 실행마다 걸리는 URL 이 다르다
+미확정      왜 어떤 요청만 멈추는가. 감사기는 URL 601개를 **연결을 재사용하지 않고**
+            빠르게 연속 요청한다(urllib 은 keep-alive 를 쓰지 않는다). 실제 브라우저는
+            연결을 재사용하므로 같은 조건이 아니다 - 사용자가 겪는 증상이라는 근거가
+            지금은 없다. **그래서 제품 결함으로 올리지 않고 관측으로 남긴다.**
+다음에 할 것 keep-alive 를 쓰는 클라이언트로 같은 전수를 돌려 재현되는지 본다.
+            재현되면 그때가 제품 문제다.
+```
+
+**[문서 정정]** 체크리스트의 `자산 어긋남 0건 (고아 큐 행 18건은 보고)` 은 **[1]~[5]**
+(자산 <-> DB 정합)만 가리키는 말이었는데 도구 전체의 결론처럼 읽혔다. 실제 종료코드는
+1 이고 27건이다. 내역을 그대로 적는다.
+
+```
+[1]~[5]  자산 <-> DB 정합            어긋남 0건   <- 예전 표현이 가리키던 것
+[6]      대응 물건 없는 문서 디렉터리   1건        고양지원/2024타경2803/1 (파일 4개)
+[7]      고아 큐 행                   18건        전부 기일 경과 (수집 비용 0)
+[8]      다운로드 폴더 고아 파일        8건 / 14.0 MB
+[9]      API 자산 URL 전수            0건 열리지 않음   <- 이번에 처음 끝까지 돌았다
+                                     ----
+                                     27건 (= 1 + 18 + 8)
+```
+
+**[[8] 은 새 발견이 아니다 - 이미 분석돼 있고 방어까지 붙어 있다]** 다운로드 폴더의
+고아 8개(14.0MB)는 `crawler/doc_crawler.py:141~160` 이 **이미 그 숫자 그대로** 적어
+두었다. 원인도 거기 있다 - `wait_for_download()` 가 30초 타임아웃으로 포기한 뒤에도
+다운로드가 계속 진행되면, 그 파일이 **다음 사건의 것으로 집힌다**. 그래서 사건번호
+대조 거부 규칙이 붙어 있다(그쪽이 진짜 위험이다 - 남의 매각물건명세서를 보고 입찰
+판단을 하게 된다). 같은 이름이 네 번 쌓인 `" (1)" " (2)" " (3)"` 도 그 문서가
+지목한 흔적 그대로다.
+
+이번에 **더한 것은 시각 정보 하나**다 - 여덟 중 일곱은 mtime 이 `2026-08-03 08:39`
+로, 이 저장소 스냅숏의 일괄 mtime 과 같다(`logs/doc_worker.py`, 옛 CSV 24개가 전부
+같은 값이다). 즉 **실제 생성 시각을 알 수 없다.** 시각을 믿을 수 있는 것은
+`HR2025-0609-0001.pdf` (2026-08-18 15:07) **하나뿐**이다. 그러므로 "지금도 계속
+쌓이고 있다"고 말할 근거는 없다 - DocWorker 는 2026-07-12 이후 큐를 만진 적이 없다.
+정리(삭제)는 어느 물건 것인지 확정할 수 없어(파일 이름에 법원이 없다) 하지 않는다.
+**DocWorker 가 다시 도는 날, 이 폴더가 다시 늘어나는지가 그때의 판정 근거**다.
+
+**[검증]**
+
+```
+python audit_asset_integrity.py --selftest        exit 0 (기존 selftest 전부 통과)
+python test_audit_selftests.py                    exit 0 (감사 도구 7개)
+서버 없이 python audit_asset_integrity.py         exit 1, [9] "확인하지 못함" (예전과 동일)
+서버 띄우고 python audit_asset_integrity.py       exit 1, [9] 601건 전수, 열리지 않음 0
+                                                  (예전에는 여기서 트레이스백)
+운영 auction.db                                   md5 2991c5be... 무변경
+```
+
+--------
+
+#195
+
+**프런트가 검색 파라미터 다섯 개를 보내는데 백엔드는 그 이름을 모른다** — FastAPI 는
+모르는 쿼리 파라미터를 **오류 없이 버리므로**, 필터를 건 것과 안 건 것이 화면에서 같아
+보인다. 지금은 사용자에게 도달하지 않지만 그것을 지켜 주는 것이 **주석뿐**이었다
+
+발견 (2026-08-25, 제품 코드의 `TODO(API 미지원)` 표시를 전수 확인하다가)
+
+**[실측]** 양쪽 소스를 직접 대조했다.
+
+```
+프런트  src/app/search/SearchForm.tsx  FILTER_PARAM_KEYS   24개
+백엔드  api/v1/search.py  def search() 시그니처            24개
+백엔드에 이름이 없는 것                                    5개
+
+    min_building_area / max_building_area
+    min_land_area / max_land_area
+    special_conditions
+```
+
+`buildSearchQuery()` 는 이 다섯을 실제로 URL 에 싣는다. 소스에 `TODO(API 미지원)` 주석이
+붙어 있으니 **알고 있는 상태**다.
+
+**[왜 지금은 안 터지나 — 그리고 왜 그것이 안심할 근거가 아닌가]** 이 값을 넣는 UI 가
+없다. `SearchForm.tsx` 의 "면적 조건" / "특수조건" 아코디언은 둘 다 본문이
+`준비 중입니다` 한 줄이고, `SearchAccordionSection` 의 `muted` 가 제목을 흐리게 해
+동작하는 섹션과 구분한다 — **정직하게 만들어져 있다.** 폼 상태는 URL 에서만 채워지므로
+손으로 URL 을 치지 않는 한 이 다섯은 생성되지 않는다.
+
+문제는 **그 안전장치가 주석과 "준비 중입니다" 문구뿐**이라는 것이다. 누군가 그 아코디언에
+입력 UI 를 붙이는 순간, 그날부터 사용자는 **필터를 걸었는데 안 걸린 결과**를 보게 된다.
+그리고 그것은 조용하다 — 상태 코드는 200, 로그도 없고, 결과는 "그냥 많이 나온" 것처럼
+보인다. 이 저장소가 가장 경계하는 종류의 실패다.
+
+**[수정 — 코드는 그대로 두고 계약을 고정한다]** 다섯을 지우는 것은 답이 아니다. 지우면
+백엔드가 구현될 때 프런트를 다시 만들어야 하고, `types.ts` 가 그 필드를 남긴 이유
+(*"못 만들고 있는 이유는 데이터가 아니라 의미 정의다 - 다층 건물은 층별 면적이 여러
+개이고 지분 물건 128건은 표시 면적이 전체다"*)도 유효하다. 그래서 **목록으로 고정한다.**
+
+`test_schema_hygiene.py` 에 `test_search_form_params_reach_the_backend()` 를 신설했다
+(13단언). 서버를 띄우지 않는다 — 양쪽 **소스**를 읽는다.
+
+```
+백엔드   api/v1/search.py 의 `def search(...)` 시그니처를 AST 로 읽는다
+프런트   SearchForm.tsx 의 FILTER_PARAM_KEYS 배열을 읽는다
+판정     (프런트 - 백엔드) 가 KNOWN_UNSUPPORTED_SEARCH_PARAMS 와 **정확히 같아야** 한다
+```
+
+집합이 **늘어나도 줄어들어도** 실패한다.
+
+* 늘어남 = 조용히 무시되는 필터가 하나 더 생겼다.
+* 줄어듦 = 백엔드가 구현했다. 목록에서 빼라는 신호다(안 빼면 검사가 낡는다).
+
+방향은 프런트 -> 백엔드로만 본다. `sort_by`/`sort_order`/`page`/`size` 는 검색조건이
+아니라 표시 설정이라 `FILTER_PARAM_KEYS` 에 일부러 없다(그 파일 주석이 그렇게 정의한다) —
+백엔드에만 있는 것은 결함이 아니다.
+
+그리고 **"준비 중입니다"가 사라지는 것**도 함께 잠갔다. 그것이 지금 사용자를 지켜 주는
+유일한 것이므로, 없어지면 그 자리에서 알아야 한다.
+
+**[mutation 3/3 검출 — 그리고 그 과정에서 검사 자체의 구멍을 찾았다]**
+
+```
+M1 프런트에 백엔드가 모르는 키를 추가한다        -> 잡았다
+M2 백엔드가 sido 를 더 이상 받지 않는다          -> 잡았다
+M3 '준비 중입니다' 를 입력 UI 로 바꾼다          -> **처음에는 못 잡았다**
+대조군                                          -> exit 0
+```
+
+M3 를 처음 돌렸을 때 **초록이 나왔다.** 원인은 검사 쪽이었다 — 섹션 본문을 고정 길이
+400자로 잘라 보고 있었는데, 그 창이 **다음 섹션까지 삼켰다.** "면적 조건"의 문구를
+지워도 바로 아래 "특수조건"의 것이 잡혀 통과했다.
+
+```python
+window = form_src[idx:idx + 400]        # <- 400자가 다음 섹션을 삼킨다
+```
+
+창을 그 섹션의 닫는 태그(`</SearchAccordionSection>`)까지로 잘라 고쳤다. **mutation 을
+돌리지 않았으면 이 구멍은 그대로 남았을 것이다** — 검사가 있는데 아무것도 안 보는,
+이 저장소가 반복해서 잡아 온 바로 그 상태로.
+
+**[남긴 것 — 승인/제품 판단]** 다섯 필터를 실제로 구현하는 것은 이 세션 범위 밖이다.
+면적은 `auction_item` 에 컬럼 자체가 없고(프런트가 주소 대괄호에서 파싱한다 —
+`src/lib/format.ts`), 특수조건은 백엔드에 대응 개념이 없다. 스키마 변경과 의미 정의가
+함께 필요하므로 제품 결정이다. 이 세션은 **그 상태가 조용히 바뀌지 않도록 잠그는 것**까지 한다.
+
+--------
+
+#196
+
+**★ 지금 이 PC 에서 수집 파이프라인 전체가 브라우저를 못 띄운다** — 스케줄러를 등록해도
+크롤과 DocWorker 는 첫날 밤에 죽는다. 그리고 남는 로그가 `"Are you offline?"` 라서
+조사하는 사람은 **멀쩡한 네트워크를 뒤지게 된다**
+
+발견 (2026-08-25, #193 에서 감사 도구의 드라이버 해석을 고친 뒤 *"제품 크롤러도 같은
+호출을 쓰지 않나"* 를 확인하다가)
+
+**[왜 이것이 P0-A 와 직결되나]** `docs/BETA_RELEASE_CHECKLIST.md` 는 P0-A(기본 검색이 빈
+화면)의 **1순위 조치**를 이렇게 적어 두었다.
+
+```
+1. `DojoonPass-DailyCrawl` 스케줄러 등록 (`register_scheduler_tasks.ps1`).
+   이것이 없으면 크롤이 돌지 않고, 크롤이 돌지 않으면 P0-A 는 절대 닫히지 않는다.
+```
+
+같은 세션에 그 스크립트를 dry-run 해 보니 선행 조건이 전부 OK 였다 — 등록만 하면 될
+것처럼 보였다. **그런데 등록해도 안 돈다.** 그 뒤 단계에서 죽기 때문이다.
+
+**[실측 — 제품 코드를 실제로 불러 봤다]** (법원 사이트에는 접속하지 않는다. 드라이버
+기동까지만 시도한 것이다.)
+
+```
+crawler.base_crawler.build_driver()           (run_daily.bat -> mvp_scraper)   1.3초 만에 실패
+crawler.doc_crawler.build_download_driver()   (run_doc_worker.bat -> doc_worker) 1.1초 만에 실패
+collect_documents.build_driver()                                                 실패
+
+전부  ConnectionError: Could not reach host. Are you offline?
+```
+
+**[그 문장은 거짓이다]** 같은 순간 같은 호스트를 직접 쟀다.
+
+```
+stdlib urllib -> https://googlechromelabs.github.io/chrome-for-testing/...
+                 HTTP 200, 0.05초, 200 bytes
+requests      -> SSLCertVerificationError
+                 "unable to get local issuer certificate"        (3회 시도 전부, 0.18초)
+```
+
+`webdriver_manager` 는 `requests` 로 최신 드라이버 버전 목록을 받아 오는데 **그 경로의
+CA 검증만** 이 PC 에서 깨져 있다(회사/백신 TLS 개입이거나 certifi 가 낡았거나 - 원인은
+이 저장소 밖이다). 그리고 그 예외를 삼켜 *"오프라인이냐"* 로 바꿔 던진다.
+
+캐시도 도움이 안 된다 — `~/.wdm/drivers/chromedriver/win64/151.0.7922.138` 인데 설치된
+크롬은 **151.0.7922.170** 이라, 버전 확인을 위해 매번 바깥을 봐야 한다.
+
+같은 순간 Selenium 4.47 내장 해석기(Selenium Manager)는 **9.6초 만에 크롬을 띄웠다.**
+
+**[영향]**
+
+* 스케줄러를 등록하면 매일 03:00/06:00 에 조용히 실패한다. `.bat` 의 실패 검출은
+  살아 있으므로 `[FAILED] ... exited with code 1` 은 남는다 — **다행히 은폐는 아니다.**
+* 그러나 로그 본문의 문장이 "오프라인이냐"다. 이 저장소는 2026-08-03~08-11 에
+  **9일간 크롤 중단을 몰랐던** 이력이 있고, 그때의 교훈이 "실패가 로그에 남아야 한다"였다.
+  이번에는 로그에 남되 **틀린 것을 가리킨다** — 조사자는 인터넷을 의심하게 된다.
+* `docs/CLAUDE.md`/체크리스트가 "선행 조건은 전부 확인됐다. 남은 것은 등록뿐"이라고
+  적고 있어, 등록 -> 실패 -> 원인 오인 의 경로가 그대로 깔려 있었다.
+
+**[수정 — 해석 경로를 하나로 모으고 폴백을 둔다]** `crawler/base_crawler.py` 에
+`resolve_chrome_driver(opts)` 를 두고, 파이프라인 셋이 전부 그것을 쓴다.
+
+```
+1. Selenium Manager   (selenium 4.6+ 내장, 캐시가 맞으면 바깥을 안 본다)   <- 먼저
+2. webdriver_manager  (예전 경로)                                          <- 폴백
+둘 다 실패 -> DriverUnavailable("A -> ...; B -> ...")                      <- 두 사유 함께
+```
+
+* 폴백으로 살아난 경우에도 **앞선 실패를 `logger.warning` 으로 남긴다.** 조용히 넘어가면
+  다음에 폴백까지 죽었을 때 "언제부터 이랬나"를 알 수 없다.
+* 새 모듈을 만들지 않았다 — 추적되지 않은 파일을 추적된 파일이 import 하면 커밋된 트리가
+  부팅하지 못한다(BUGS #105, #186 이 같은 이유로 인라인을 택했다). `crawler/base_crawler.py`
+  는 이미 추적되고 이미 "드라이버를 만드는 곳"이라 그 한 곳에 둔다.
+* 모듈 최상위의 `from webdriver_manager.chrome import ChromeDriverManager` 는 폴백 함수
+  안으로 옮겼다 — 그 패키지가 없는 환경에서도 Selenium Manager 로 돌 수 있어야 한다.
+
+**[검증 — 수정 전후 같은 호출]**
+
+```
+                                                    수정 전            수정 후
+crawler.base_crawler.build_driver (DailyCrawl)      실패 1.3초        OK  0.9초  크롬 151.0.7922.170
+crawler.doc_crawler.build_download_driver (DocWorker) 실패 1.1초      OK  1.2초  크롬 151.0.7922.170
+collect_documents.build_driver                       실패             OK  1.2초  크롬 151.0.7922.170
+```
+
+**[회귀 + mutation]** `test_schema_hygiene.py` 에
+`test_pipeline_resolves_chrome_driver_through_one_place()` 를 신설했다(12단언).
+**브라우저를 띄우지 않는다** — 구조는 AST 로, 동작은 가짜 factory 주입으로 본다.
+
+```
+구조  스케줄러가 실제로 돌리는 파일 8개가 `ChromeDriverManager` 를 **직접 호출**하지
+      않는가 (유일한 예외: crawler/base_crawler.py 의 폴백 함수 안)
+      + base_crawler 가 폴백을 **둘 이상** 갖고 있는가
+행위  순서 / 폴백 / 전멸 시 DriverUnavailable + 두 사유 보존
+```
+
+문자열이 아니라 **호출 노드**를 본다 — 주석에 이름이 나오는 것(수정하며 남긴 설명)까지
+결함으로 세면 검사가 곧 무력화된다.
+
+mutation 3/3 검출:
+
+```
+M1 doc_crawler 가 다시 직접 ChromeDriverManager 를 부른다 -> 잡았다 (파일:줄 지목)
+M2 Selenium Manager 폴백을 없앤다                        -> 잡았다
+M3 첫 실패에서 멈춘다(폴백 안 함)                         -> 잡았다 (FAIL 5줄)
+대조군                                                   -> exit 0
+```
+
+**[범위를 넓혔다 — 추적된 파이썬 전부]** 처음에는 스케줄러가 돌리는 파일 8개만 봤다.
+그런데 같은 호출이 추적된 일회용/수동 스크립트에도 여섯 군데 더 있었다
+(`analyze_docs.py`, `analyze_hyunhwang.py`, `manual_test.py`, `verify_courts.py`,
+`test_docs.py`, `test_docs2.py`). 스케줄러가 돌리지는 않지만 **이 PC 에서는 그것들도
+지금 안 뜬다** — 누가 손으로 돌리면 같은 거짓 메시지를 본다. 한 줄씩이라 전부 고쳤다.
+
+그래서 검사도 목록을 손으로 들지 않게 바꿨다 — `git ls-files "*.py"` 로 **추적된
+파이썬 150개 전부**를 훑고, 폴백을 들고 있는 둘(`crawler/base_crawler.py`,
+`audit_viewport.py`)만 예외로 둔다. 손으로 든 목록은 새 스크립트를 놓치지만 이건
+놓치지 않는다 — BUGS #186 의 감시기가 허용목록 대신 행동을 본 것과 같은 이유다.
+실측: 추적 파일 150개 중 직접 호출 **0건**(폴백 보유자 2개 제외).
+
+**[같이 확인한 것 — 파급 범위를 한정했다]** `requests` 의 CA 검증이 깨진 것이 원인이므로,
+제품 코드가 그 패키지를 쓰는 곳이 또 있으면 같은 방식으로 조용히 죽는다. 전수 확인했다
+(2026-08-25, AST 로 import 를 훑음 — `api/` `storage/` `crawler/` `config/` `normalizer/`
+`validator/` `models/` `intent/` `filter/` + 루트 진입점 6개):
+
+```
+requests / httpx / urllib3 / aiohttp import   0건
+제품이 쓰는 HTTP 클라이언트                    stdlib urllib 뿐
+  (같은 순간 stdlib urllib 로 외부 HTTPS GET -> HTTP 200, 0.05초)
+```
+
+즉 이 환경 문제의 파급은 **드라이버 조달 한 곳뿐**이었고, 그곳을 고쳤다.
+`api/auth.py` 의 JWKS 조회도 stdlib 이라 영향이 없다 — 같은 세션에 실제로 200 을 받았다
+(`audit_auth_health.py` exit 0).
+
+**법원 사이트(`courtauction.go.kr`) 도달 여부는 재지 않았다** — 이 세션의 SKIP 목록
+("실제 crawler 실행 금지")에 걸린다. 다만 크롬은 OS 인증서 저장소를 쓰고 `requests` 를
+거치지 않으므로 위 CA 문제와는 경로가 다르다. 확인은 크롤을 승인받는 날 함께.
+
+**[기준선]** 통과 53 / 실패 1, 단언 **8,172**건. 운영 DB 와 `logs/` 전체 바이트 무변경.
+
+--------
+
+#197
+
+**`doc_raw` 에 쓰는 곳이 둘인데 규칙이 갈라져 있었다** — 한쪽은 내용이 그대로면 버전을
+안 올리고, 다른 쪽은 **무조건 올린다.** 경로 표기도 한쪽은 상대, 다른 쪽은 절대다
+
+발견 (2026-08-25, 문서 파이프라인의 중복 방지 경로를 사본 DB 에서 직접 눌러 보다가)
+
+**[경위]** `auction_item -> document_queue -> DocWorker -> doc_raw -> document_status`
+체인에서 *"동일 문서 재수집 시 중복 INSERT 가 발생하지 않는가"* 를 코드를 읽는 대신
+**실제로 눌러** 확인했다(운영 DB 사본, 브라우저·네트워크 없음). doc_worker 경로는
+전부 통과했는데, `doc_raw` 작성자가 **하나가 아니라는 것**이 그때 드러났다.
+
+```
+storage.database._record_doc_raw()    doc_worker 경로 (스케줄러가 도는 쪽)
+collect_documents.save_doc_raw()      손으로 돌리는 진입점 (`python collect_documents.py`)
+```
+
+**[실측 — 두 함수를 같은 사본 DB 에 나란히 눌렀다]** (2026-08-25)
+
+```
+                        _record_doc_raw            save_doc_raw
+같은 파일로 두 번 저장   행 1개 (내용 지문 비교)     **행 2개** (v2, v3 - 지문이 같은데도)
+storage_path 표기       documents/남양주지원/...    **절대경로 그대로**
+UNIQUE 충돌 시          없음(버전을 새로 계산)      INSERT OR IGNORE 로 **조용히 버림**
+실패 사유               logger.warning 에 사유      `str(e)` 만 (예외 종류가 안 남는다)
+```
+
+첫 줄이 핵심이다. `save_doc_raw()` 는 `MAX(doc_version)+1` 을 **무조건** 계산한다 —
+내용이 한 글자도 안 바뀌어도 새 버전이 쌓인다. 이것은 BUGS #115/#187 이 이미 잡은
+결함인데 **`_record_doc_raw` 쪽에서만 고쳐졌다.** 같은 표에 쓰는 다른 함수는 그대로였다.
+
+`api/v1/item.py` 가 `MAX(doc_version)` 을 사용자 응답에 그대로 실으므로, 이 스크립트를
+손으로 두 번 돌리면 **내용이 그대로인데 화면의 문서 버전이 오른다.**
+
+두 번째 줄도 실재하는 규약 위반이다. `storage/database.py` 머리 주석과
+`to_relative_storage_path()` docstring 이 이유까지 적어 두었다 — *"절대경로를 DB에 넣으면
+배포 위치가 바뀌는 순간 전 행이 못 쓰게 된다."* 감사기도 그 규약을 전제로
+`os.path.join(PROJECT_ROOT, storage_path)` 로 해석한다. 지금 이 PC 에서는
+`os.path.join()` 이 절대경로를 그대로 돌려주는 덕에 **우연히 열린다.**
+
+**[운영 데이터는 아직 깨끗하다]** 실측: `doc_raw` 556행 **전부 상대경로**, 절대경로 0행.
+`collect_documents.py` 를 스케줄러가 돌리지 않기 때문이다(BUGS #144 가 적어 둔 사실).
+즉 **지금 터진 버그가 아니라, 손으로 한 번 돌리는 순간 터지는 버그**였다.
+베타 준비 중 "문서를 좀 채워 두자"고 이 스크립트를 돌리는 것은 충분히 있을 법한 일이다.
+
+**[수정 — 규칙을 두 벌 두지 않는다]** `storage/database.py` 에
+`record_doc_raw_row(conn, item_id, ds_type, files_saved, now, primary_ext=None)` 를
+두고 **둘 다 그것을 부른다.** 돌려주는 값으로 세 상태를 가른다.
+
+```
+""            새 행을 넣었다
+"unchanged"   내용이 직전 버전과 같아 넣지 않았다  -> **성공이다**
+그 밖의 문자열  기록하지 못했다(사유)               -> **실패로 다뤄야 한다**
+```
+
+`_record_doc_raw()` 는 물건 식별 / 종류 매핑 / 사진 제외까지만 하고 규칙은 위임한다.
+`save_doc_raw()` 는 자기 버전 계산·INSERT·해시·페이지수 계산을 **전부 버리고** 같은 함수를
+부른 뒤, 결과가 실패 사유면 `document_status` 를 건드리지 않고 False 를 돌려준다.
+
+이 판단은 이 저장소가 `claim_next_item_rows()` 에서 이미 내린 것과 같다 —
+*"그 어휘가 두 곳에 생기면 한쪽만 고쳐지는 날이 온다."* 실제로 그 날이 와 있었다.
+
+**[계약은 바뀌지 않는다]** `save_doc_raw()` 의 기존 계약 셋을 그대로 유지했고 회귀가
+그것을 지킨다(`test_collect_documents.py` §1/§2/§6):
+
+```
+파일이 없다 / 0바이트   -> False, doc_raw 행 없음, document_status 는 COLLECTING 유지
+내용이 직전과 같다      -> True,  새 행 없음,      document_status 는 READY
+새 내용                 -> True,  새 버전 1행,     READY
+```
+
+**[함께 고친 것 — 증거 없는 실패]** `except Exception as e: logger.warning("save_doc_raw
+실패: %s", str(e))` 는 예외 **종류**를 남기지 않았다. 무결성 위반인지 디스크 문제인지
+구분할 수 없다. `type(e).__name__` 과 item/doc_type 을 함께 남기고, 예외 시
+`conn.rollback()` 을 부른다(예전에는 부분 쓰기가 그대로 남을 수 있었다).
+
+**[회귀 + mutation]** `test_collect_documents.py` 에
+`test_two_doc_raw_writers_share_one_rule()` 을 신설했다(11단언).
+**행위 + 구조**를 함께 본다 — 같은 내용 두 번 저장해 버전이 안 오르는지(행위),
+두 함수가 실제로 `record_doc_raw_row` 를 부르는지 AST 로(구조),
+그리고 `collect_documents.py` 안에 `INSERT INTO doc_raw` 가 다시 생기지 않았는지.
+대조군(내용이 바뀌면 버전이 오른다)을 함께 둔다 — 없으면 검사가 공허하다.
+
+경로 규약은 **저장소 루트 안**에 파일을 만들어 확인한다. `Env` 의 임시 디렉터리는
+루트 밖이라 `to_relative_storage_path()` 가 원본을 그대로 돌려주는 것이 정상이고,
+그 상태로는 상대경로 규약을 검증할 수 없다 — 그래서 검사가 자기 파일을 루트 안에 만든다.
+
+mutation 3/3 검출:
+
+```
+M1 내용 지문 비교를 없앤다 (save_doc_raw 의 원래 버그)  -> 잡았다 (FAIL 3줄)
+M2 to_relative_storage_path() 를 없앤다                 -> 잡았다 (절대경로 그대로 나옴)
+M3 collect_documents 가 자기 INSERT 를 다시 만든다      -> 잡았다 (FAIL 17줄)
+대조군                                                  -> exit 0
+```
+
+M1 은 **기존 검사도 함께 잡았다**(`doc_raw 행은 1건 유지(중복 생성 없음)`) —
+`_record_doc_raw` 쪽은 이미 방어가 있었다는 증거다. 없던 것은 다른 작성자 쪽뿐이었다.
+
+**[같이 확인한 것 — 결함 아님]** 같은 사본 DB 에서 파이프라인의 나머지 질문도 눌러 봤다.
+
+```
+같은 내용 재수집        doc_raw 행 안 늘어남                              OK
+내용 변경               doc_version +1                                    OK
+옛 내용으로 되돌아감     새 버전 생성(직전 버전과만 비교하므로 옳다)        OK
+파일 없음 / 0바이트      doc_raw 행 안 만듦                                OK
+동시 처리(스레드 2개)    doc_version 중복 0, 예외 0, 두 버전이 순서대로     OK
+```
+
+`mark_queue_done()` 을 **직접** 부르면 파일이 없어도 `document_status=READY` /
+`queue=done` 이 된다. 다만 이것은 도달하지 않는다 — 유일한 제품 호출부인
+`doc_worker.py` 가 그 앞에서 파일 존재/크기를 전수 확인하고 하나라도 없으면
+`mark_queue_failed()` 로 보낸다(Sprint 214 §2). 즉 방어가 호출부에 있다.
+**지금은 옳게 동작하지만 불변식이 DB 계층이 아니라 호출부에 있다**는 것은 적어 둔다 —
+새 호출부가 생기면 같은 방어를 다시 써야 한다.
+
+--------
+
+#198
+
+**문서에는 2차 방어선이 없었다** — `document_status` 가 READY 이기만 하면 서빙 파일이
+없어도 `available=true` 에 `viewer_url` 까지 줬고, 그 URL 은 **404** 다.
+사진 쪽에는 같은 방어선이 이미 있었다
+
+발견 (2026-08-25, 문서 파이프라인 감사 중 사진/문서의 응답 규칙을 나란히 놓고 보다가)
+
+**[경위]** `api/v1/item.py` 의 사진 판정(`_images_status`)에는 Sprint 208 이 넣은 2차
+방어선이 있다 — *"READY 인데 볼 사진이 0장인 것은 자기모순이다. 그대로 전달하면 화면은
+'사진 있음'이라고 말하고 목록은 빈 상태가 된다 — 오류도 빈 화면도 아니라 사용자가 원인을
+알 수 없다."* 그래서 READY 를 COLLECTING 으로 낮춘다.
+
+**문서 쪽에는 그 규칙이 없었다.**
+
+```python
+"available": status == "READY",
+"viewer_url": _document_url(item_id, doc_type) if status == "READY" else None,
+```
+
+**[재현 — 합성 물건 하나]** 사본 DB 에 `document_status=READY` 인 물건을 만들고
+디스크에는 파일을 두지 않았다(실제 파일은 하나도 건드리지 않는다).
+
+```
+SPEC       status=READY  available=True  file_size=None
+           viewer_url=/api/v1/item/16721/documents/SPEC
+APPRAISAL  status=READY  available=True  file_size=None
+그 viewer_url 을 실제로 요청  ->  **HTTP 404**
+
+대조군(사진)  images_status=COLLECTING   <- 이쪽은 이미 낮춘다
+```
+
+**[판단 근거는 이미 그 함수가 갖고 있었다]** `file_size` 는 `_served_file_size()` 로
+**서빙 경로에서 직접 잰 값**이고, 파일이 없거나 0바이트면 None 이다. 그 값을 화면 표시에만
+쓰고 **판정에는 쓰지 않았다.** Sprint 214 가 doc_worker 에서 고친 것과 정확히 같은 모양이다
+— *"함수를 불렀다"와 "성공했다"는 다르다.*
+
+**[영향]** 사용자가 "열람 가능"을 보고 누르면 404 다. 프런트가 같은 계열의 문제를 이미
+한 번 겪었다(`properties/[id]/page.tsx`: *"수집중인 문서도 파란 밑줄 링크였고, 누르면
+'문서를 찾을 수 없다'"*). 그때는 프런트에서 막았고, 이번 것은 **서버가 잘못 광고하는**
+경우라 프런트가 막을 수 없다.
+
+**[운영 데이터에는 이 상태가 없다 — 그래서 예방이다]** 과장하지 않기 위해 수정 전후
+응답을 **전수 비교**했다(사본 DB + TestClient, 문서를 가진 물건 전부).
+
+```
+비교 대상          물건 200건 / 문서 응답 전체
+응답이 달라진 물건   **0건**
+available=true 문서  556 -> 556
+```
+
+즉 지금 데이터를 바꾸는 수정이 아니다. `doc_worker` 가 쓰기 전에 파일을 전수 확인하므로
+(Sprint 214 §2) 정상 경로로는 이 상태가 생기지 않는다. 파일 유실·수동 조작·
+`mark_queue_done()` 직접 호출(BUGS #197 의 "같이 확인한 것")로 생겼을 때를 위한 방어선이다.
+
+**측정 중 한 번 오판했다 — 기록해 둔다.** 처음에 "실물 10건이 낮춰졌다"고 읽었는데,
+그 10건은 **원래부터 `document_status=COLLECTING`** 인 STATUS 행이었다(내 판정식이
+"COLLECTING + file_size None" 이라 원래 COLLECTING 인 것까지 셌다). 실제 READY 문서
+556건의 서빙 파일은 **전부 존재한다**(SPEC 197 / STATUS 162 / APPRAISAL 197, 없음 0).
+전수 비교로 다시 재고 나서야 "0건"이 확정됐다.
+
+**[수정]** `_document_entry()` 에서 잰 결과를 판정에 쓴다.
+
+```
+measured = READY 이고 item_row 가 있고 서빙 대상 종류다
+effective_status = COLLECTING  (measured 인데 크기를 못 쟀을 때)
+available / viewer_url / download_url 은 effective_status 를 따른다
+```
+
+범위를 좁게 잡았다 —
+
+* `IMAGE` 는 대상이 아니다. 서빙 파일이 하나로 정해지지 않고(0~N장) 판정은
+  `_images_status()` 가 이미 한다. 종류 목록은 서빙 계층의 `DOC_TYPE_FILES` 를 그대로
+  쓴다(같은 어휘를 두 벌로 만들지 않는다).
+* `item_row` 가 없으면 **낮추지 않는다.** 잴 수 없는 것을 "없다"로 읽지 않는다
+  (BUGS #188 이 세운 "모른다 != 고장났다" 구분).
+* READY 가 아닌 상태(NO_IMAGE/FAILED/COLLECTING)는 건드리지 않는다.
+
+**[회귀 + mutation]** `test_asset_pipeline.py` 에 §17b
+`test_ready_document_without_served_file_is_not_advertised()` 를 신설했다(30단언).
+사진의 §17 바로 옆에 둔다 — 두 규칙이 대칭이라는 것이 그 자체로 문서다.
+대조군을 넷 둔다: 파일이 있으면 READY 유지 + **광고한 URL 이 실제로 200**,
+0바이트는 불가, FAILED 는 그대로, IMAGE 는 건드리지 않음.
+
+mutation 3/3 검출:
+
+```
+M1 2차 방어선을 없앤다 (원래 동작)          -> 잡았다 (FAIL 14줄)
+M2 IMAGE 까지 방어 대상에 넣는다 (과잉 적용)  -> 잡았다
+M3 0바이트를 정상 크기로 친다                -> 잡았다
+대조군                                      -> exit 0
+```
+
+**M2 는 처음에 못 잡았다.** IMAGE 대조군을 `NO_IMAGE` 로 세워 뒀는데, 그러면 애초에
+측정 분기(`status == "READY"`)에 들어가지 않아 **대조군이 공허했다.** `READY` 로 바꾸니
+잡힌다. mutation 을 돌리지 않았으면 "IMAGE 는 안 건드린다"는 검사가 아무것도 안 보는
+채로 남았을 것이다.
+
+**[함께 손본 픽스처]** `test_asset_pipeline.py` §16(`test_api_contract`)이
+`document_status=READY` 행만 넣고 **파일은 만들지 않은 채** "열람 가능 = True" 를
+기대하고 있었다 — 운영에서는 일어나면 안 되는 상태다(광고한 URL 이 404). 픽스처가
+서빙 파일을 실제로 만들도록 고쳤다. 실물 200물건 비교에서 응답이 달라진 물건이 0건이었으므로
+**파일 없이 READY 였던 것은 이 픽스처뿐**이다.
+
+**[검증]**
+
+```
+python run_python_tests.py    통과 53 / 실패 1 / 단언 8,250 (수정 전 8,203)
+                              남은 실패 1건은 P0-A (기일 미도래 0건)
+npm run test:frontend         191건 / 187 pass / 1 fail / 3 skip  (서버 띄우고 측정)
+                              남은 실패 1건 = 같은 P0-A
+전수 비교                     실물 200물건 응답 무변경, available=true 556 -> 556
+운영 auction.db + logs/       바이트 무변경
+```
+
+--------
+
+#199
+
+**같은 문서를 동시에 기록하면 `IntegrityError` 가 올라간다** — `mark_queue_done()` 이
+"멱등"이라고 적어 둔 그 자리가 실제로는 예외였다. 받아 놓은 문서가 **실패로 기록되고
+다시 수집된다**
+
+발견 (2026-08-25, #197 로 합친 공통 규칙을 합성 물건으로 끝까지 눌러 보다가)
+
+**[경위]** #197 이 `doc_raw` 작성자 둘을 `record_doc_raw_row()` 하나로 합쳤다. 그 규칙을
+**합성 물건**으로 A~F 6축 58항목 검증하던 중, 동시성 축에서 걸렸다.
+
+```
+합성 물건 1개에 스레드 4개가 동시에 record_doc_raw_row() 호출 (각자 다른 내용)
+
+  결과 버전   [1]                       <- 하나만 들어갔다
+  예외        IntegrityError x 3
+              "UNIQUE constraint failed: doc_raw.item_id, doc_raw.doc_type, doc_raw.doc_version"
+```
+
+**[원인 — 읽고-계산하고-쓰는 사이가 경쟁 구간이다]**
+
+```python
+latest  = SELECT doc_version ... ORDER BY doc_version DESC LIMIT 1
+version = latest + 1                      # <- 여기와
+INSERT INTO doc_raw (... doc_version ...) # <- 여기 사이
+```
+
+네 실행이 모두 `latest = 없음` 을 읽고 전부 `version = 1` 을 계산한 뒤 INSERT 한다.
+UNIQUE 가 하나만 통과시키고 나머지 셋은 예외다.
+
+**[왜 이것이 실제 문제인가]** `mark_queue_done()` 은 claim 을 빼앗긴 실행에 대해 이렇게
+적어 두었다.
+
+> ★ 그래도 `document_status`/`doc_raw` 는 그대로 쓴다 - 파일은 **실제로** 받아졌기
+> 때문이다. 화면이 그 사실을 반영해야 하고, 나중에 그쪽 실행이 같은 값을 다시 써도
+> **결과는 같다(멱등).**
+
+**멱등이 아니라 예외였다.** 도달 경로는 BUGS #181 이 서술한 좀비 워커다 — stale 회수로
+큐 행을 빼앗긴 실행이 뒤늦게 종결하는 동안 새 실행이 같은 문서를 처리하는 경우.
+그때 예외가 `doc_worker` 의 행 단위 `except` 까지 올라가면 `mark_queue_failed()` 로
+가므로, **실제로 받아 놓은 문서가 실패로 기록되고 다음 실행이 다시 받는다.**
+데이터 손상은 아니지만 거짓 실패 + 헛수집이고, 무엇보다 **문서가 약속한 계약을 깬다.**
+
+**[수정 — 밀리면 다시 읽고 다시 센다]** `claim_next_queue_item()` 이 claim 경쟁에서
+이미 택한 방식과 같다.
+
+```
+for attempt in range(DOC_RAW_VERSION_RACE_ATTEMPTS):   # 4
+    latest = 다시 읽는다
+    if latest 의 해시 == 지금 해시:  return "unchanged"   # 상대가 같은 문서를 넣었다
+    version = latest + 1
+    try:    INSERT;  return ""
+    except sqlite3.IntegrityError:  continue            # 밀렸다 - 다시
+return "doc_raw 버전 경합이 4회 계속돼 기록하지 못했다"    # 조용히 성공이라고 하지 않는다
+```
+
+* 다시 읽었을 때 상대가 **같은 내용**을 넣어 두었으면 그것이 곧 `unchanged` 다 —
+  둘이 같은 문서를 받은 것이므로 그 답이 정확하다(멱등이 여기서 진짜가 된다).
+* SQLite 는 제약 위반 시 **그 문장만** 되돌리므로 바깥 트랜잭션은 살아 있다.
+* 상한을 두는 이유도 claim 과 같다 — 경쟁자가 계속 이겨도 한 호출이 영원히 머물면 안 된다.
+* 상한까지 밀리면 **빈 문자열(=성공)을 돌려주지 않는다.** 사유를 돌려주고 경고를 남긴다.
+
+**[함께 손본 것 — 재시도가 곧 지연이 되지 않게]** 루프 안에서 파일을 다시 여는 계산
+(`_pdf_page_count()`, 상대경로 변환, 날짜)을 **루프 밖으로 뺐다.** 값은 재시도해도
+같은데, `_pdf_page_count()` 는 pdfplumber 로 PDF 를 여는 비용이라(실측: appraisal
+최대 259쪽) 그대로 두면 경합이 발생할 때마다 그 파싱을 최대 4번 반복하게 된다.
+경합 방어가 스스로 느려지는 것은 방어가 아니다.
+
+**[검증 — 수정 전후 같은 조건]**
+
+```
+                              수정 전                     수정 후
+동시 4건 (서로 다른 내용)      버전 [1] / 예외 3건         버전 [1,2,3,4] / 예외 0건
+동시 4건 (같은 내용)           (같은 계열로 충돌)          행 1개 / 예외 0건
+```
+
+**[상한 4 가 충분한가 — 재고 나서 답한다 (2026-08-25 추가 실측)]** 재계산 상한이 4 이므로
+writer 가 8개 붙으면 한 실행이 최대 7번 밀릴 수 있다. 이론상 소진 가능해 보여서
+**동시성을 올려 가며 실제로 쟀다**(완전 합성 DB, 서로 다른 내용을 동시에 기록).
+
+```
+writer  2개  -> 예외 0 / 상한소진 0 / 버전 1..2   연속
+writer  4개  -> 예외 0 / 상한소진 0 / 버전 1..4   연속
+writer  8개  -> 예외 0 / 상한소진 0 / 버전 1..8   연속
+writer 16개  -> 예외 0 / 상한소진 0 / 버전 1..16  연속
+writer 32개  -> 예외 0 / 상한소진 0 / 버전 1..32  연속
+writer 64개  -> 예외 0 / 상한소진 0 / 버전 1..64  연속
+```
+
+**64개에서도 한 번도 소진되지 않는다.** 이유는 SQLite 의 잠금 모델이다 — 이 저장소는
+`journal_mode=delete`(롤백 저널, WAL 아님)라 **쓰기가 직렬화**된다. 밀린 실행은 승자가
+**커밋한 뒤에** 재시도하므로 다시 읽은 MAX 가 항상 최신이고, 그래서 재시도는 사실상
+1회면 끝난다. 상한 4 는 넉넉하다.
+
+그래서 `INSERT ... SELECT COALESCE(MAX(doc_version),0)+1` 로 계산을 한 문장 안에 넣는
+"더 단단한" 수정은 **하지 않았다.** 근거 없이 뜨거운 경로를 바꾸지 않는다 — 위 실측이
+필요 없다고 말한다. (WAL 로 바꾸면 스냅숏 격리 때문에 이야기가 달라진다.
+`journal_mode` 를 바꾸는 날 이 문단을 다시 읽을 것.)
+
+현실의 동시성은 그보다 훨씬 낮다 — `doc_worker` 는 `RunLock` 으로 단일 인스턴스이고,
+동시 기록이 생기는 경로는 **좀비 워커 1 + 새 실행 1 = 2** 가 사실상 상한이다(BUGS #181).
+
+**[회귀 + mutation]** `test_collect_documents.py` 에 §10
+`test_doc_raw_version_race_does_not_raise()` 를 신설했다(9단언).
+
+mutation 3/3 검출:
+
+```
+M1 IntegrityError 를 안 잡는다 (원래 버그)        -> 잡았다 (버전 [1])
+M2 상한을 1 로 줄인다 (재계산을 사실상 안 함)      -> 잡았다
+M3 경합 실패를 조용히 성공("")으로 답한다          -> 잡았다
+대조군                                            -> exit 0
+```
+
+**M3 는 처음에 못 잡았다.** 스레드 검사만으로는 그 갈래에 도달하지 않는다 —
+4회 안에 항상 성공하기 때문이다. 그래서 **INSERT 만 항상 충돌하는 커넥션**을 끼워
+상한 소진 갈래를 결정적으로 밟게 했다. 이 저장소가 반복해서 배운 것과 같다 —
+*"가끔 밟는 것은 방어선이 아니다"*(BUGS #183 의 곁가지).
+
+**[같이 확인한 것 — 합성 물건 6축 58항목 전 구간 통과]**
+
+```
+A. 공통 규칙 자체 (13)      빈 목록/없는 파일/0바이트 -> 사유 반환, 행 안 만듦
+                            정상 -> "" , 같은 내용 -> "unchanged", 변경 -> 새 버전
+                            status 는 json 을 대표로 고른다(대표 파일 크기 일치)
+B. 작성자 둘의 일치 (6)     경로 표기 · 해시 · 행 수 전부 동일
+C. READY x 파일 4조합 (13)  READY+파일있음 -> available, 광고한 URL 이 **실제로 200**
+                            READY+파일없음 -> COLLECTING/available=False/URL 없음
+                            COLLECTING+파일있음 -> 올려주지 않는다(재수집이 판단한다)
+                            FAILED -> 그대로 전달
+D. 재처리/중복 (6)          같은 파일 5회 -> 1행 / 변경 -> +1 / 되돌림 -> 새 버전
+                            동시 4건 -> 버전 중복 0, 예외 0
+E. queue (10)               재적재 0건 / 동시 claim 중복 0 / 실패->pending+retry
+                            소진->failed / stale in_progress -> pending 회수
+                            기일 경과 -> 적재 안 함 / done -> 되살아나지 않음
+F. silent failure (10)      없는 파일·0바이트 -> False + 행/상태 안 만듦 + API 광고 안 함
+                            mark_queue_done 직접 호출 -> doc_raw 없음 + status READY 지만
+                            **API 2차 방어선이 available=False 로 막는다**
+```
+
+**[측정 중 배운 것 — 문서 루트가 네 곳에 따로 있다]** 처음 이 검증을 돌렸을 때
+`C. READY+파일있음` 이 전부 실패했다. 원인은 제품이 아니라 검증 환경이었다 —
+`api/v1/documents.py` 와 `api/v1/images.py` 가 **자기 `DOCUMENT_ROOT` 를 따로 들고 있어**
+`crawler.doc_paths` 하나만 임시 루트로 돌리면 API 는 운영 `documents/` 를 뒤진다.
+`test_asset_pipeline.py` 의 `Env` 가 이미 같은 이유로 넷(+PROJECT_ROOT 둘)을 함께 돌리고
+있었고, 그 주석이 함정을 정확히 적어 두었다(Sprint 217). 새 검증을 쓰는 사람이 같은 데
+빠지지 않도록 여기 적어 둔다 — **문서 루트를 바꾸려면 네 곳을 함께 바꿔야 한다.**
+
+--------
+
+#200
+
+**★ 이 저장소는 "이 머신의 DB" 를 "제품의 상태" 로 읽어 왔다** — 그런데 개발 머신과
+운영 크롤 머신이 **다르다.** P0-A("기본 검색이 빈 화면")를 비롯한 여러 결론이
+그 전제 위에 서 있었다
+
+확정 (2026-08-25, 사용자가 운영 구조를 알려 줌)
+
+**[운영 구조]**
+
+```
+데스크탑3 (이 세션이 도는 곳)   개발 · 테스트 · Audit · QA · scratch DB 검증
+                                **운영 크롤링을 실행하지 않는다**
+데스크탑1 (집)                  DOJOONPASS 운영 Daily Crawl 담당
+                                운영 DB / 크롤링 데이터의 실제 기준점
+```
+
+**[이 저장소가 저지른 오류]** 이 머신에서 아래를 보고 **곧바로 운영 장애로 기록**했다.
+
+```
+예약 작업 0개                     -> "크롤이 돌지 않는다"
+auction_item MAX(crawl_date) 08-12 -> "13일째 공급이 없다"
+기일 미도래 물건 0건               -> "사용자에게 빈 화면" = P0-A, 유일한 출시 차단 요소
+```
+
+셋 다 **이 머신이 크롤 머신이 아니기 때문에 당연한 값**이다. 운영 상태에 대해서는
+아무것도 말해 주지 않는다.
+
+**[이 함정은 이미 적혀 있었다 — 그리고 잊혔다]** `docs/SPRINT102_PATTERN_SPREAD_AND_DOC_DRIFT.md`
+가 정확히 이 지점을 짚어 두었다.
+
+> 게다가 **이 PC가 운영 머신이 맞는지도 코드로는 알 수 없다.**
+
+그 문장은 "그래서 내가 스케줄러를 등록하지 않았다"의 근거로만 쓰이고, **측정을 읽는
+방식에는 적용되지 않았다.** 이후 스프린트들은 같은 머신의 DB 를 계속 "실측"이라 부르며
+제품 판정을 내렸다. BUGS #185 가 "손으로 DB 파일을 고르면 안 된다"를 배웠지만,
+그보다 한 겹 위에 **"이 머신이 그 데이터의 주인인가"** 라는 질문이 있었던 것이다.
+
+**[이 머신의 `auction.db` 는 무엇인가 — 실측으로 확정]** (2026-08-25, 읽기 전용)
+
+```
+사용자 테이블            favorites 0 / search_presets 0 / payments 0 / subscriptions 0
+                        registry_requests 0 / audit_logs 0 / payment_webhooks 0
+sqlite_sequence(누적 id) search_presets 177,299 / payment_logs 88,917
+                        registry_requests 42,047 / payments 31,035 / audit_logs 38,750
+crawl_date              서로 다른 날짜 20개, 마지막 2026-08-12(그날 9행)
+```
+
+**행은 0인데 누적 id 는 수만이다.** 실사용자가 만든 데이터라면 남아 있어야 한다.
+이것은 **테스트가 만들었다 지운 흔적**이고, BUGS #186 이 기록한 그대로다(회귀 스위트가
+이 DB 에 직접 쓰고 끝에 지웠다 — 행수는 원복되고 시퀀스만 전진했다).
+
+따라서 이 머신의 `auction.db` 는 **개발 DB** 다. 운영 DB 의 사본이라고 볼 근거도 없다
+(사본이었다면 사용자 데이터가 남아 있었을 것이다).
+
+**[무엇을 철회하는가]** 아래 서술은 **"데스크탑3 기준"으로 범위를 좁힌다.** 지우지 않고
+남기는 것은 이 저장소의 관례대로다 — 무엇을 왜 잘못 읽었는지가 남아야 반복하지 않는다.
+
+```
+철회 대상                                     올바른 서술
+--------------------------------------------  ------------------------------------------
+"크롤이 2026-08-12 이후 멈춰 있다"             데스크탑3 개발 DB 의 마지막 수집일이 08-12 다.
+                                              운영 크롤 상태는 이 머신에서 알 수 없다.
+"예약 작업 0개 = 파이프라인이 안 돈다"          데스크탑3에 없는 것이 정상이다.
+                                              운영 등록 상태는 데스크탑1에서 확인해야 한다.
+"기일 미도래 0건 = 사용자에게 빈 화면(P0-A)"    개발 DB 의 값이다. 제품 화면이 비었다는
+                                              근거가 아니다.
+"P0-A 가 유일한 출시 차단 요소"                 **확인되지 않았다.** 데스크탑3에서는
+                                              판단할 수 없는 항목이다.
+"스케줄러를 등록하면 P0-A 가 닫힌다"            데스크탑3에 등록하는 것은 애초에
+                                              운영 구조와 어긋난다(하면 안 된다).
+```
+
+**[유효하게 남는 것 — 범위를 좁혀도 살아 있는 결론]**
+
+* **BUGS #196 (드라이버 조달)은 그대로 결함이다.** `webdriver_manager` 단일 경로는
+  머신과 무관하게 **코드의 문제**이고, 이 머신에서 실제로 기동 실패를 재현했다.
+  다만 *"스케줄러를 등록해도 첫날 밤에 죽는다"* 는 문장은 **이 머신 기준**이다 —
+  데스크탑1에서 매일 크롤이 도는지, 거기서 `webdriver_manager` 가 되는지는 모른다.
+  폴백을 붙인 수정은 어느 머신에서도 안전하고 유익하다(되던 곳은 그대로 되고,
+  안 되던 곳은 살아난다).
+* **파이프라인 정합·중복 방지·동시성 검증(#197 · #198 · #199)** 은 전부 **코드와
+  합성 데이터**로 한 것이라 머신 역할과 무관하게 유효하다.
+* **자산 무결성 / 인증 표면 / 응답시간** 측정은 "이 개발 DB 기준"으로 유효하다.
+  운영 규모에서의 값은 다를 수 있다.
+
+**[수정 — 판정을 선언에 묶는다]** 코드로 알 수 없으니 **선언하게 한다.**
+`ALLOW_LIVE_CRAWL=1` 이 실크롤을 규약이 아니라 구조로 막는 것과 같은 방식이다.
+
+```
+DOJOONPASS_DATA_ROLE=operational   이 머신의 auction.db 가 운영 데이터다
+(미선언 / 그 외)                    개발 머신 - 데이터 신선도를 제품 판정으로 쓰지 않는다
+```
+
+`test_pipeline_integrity.py` §11(데이터 신선도)이 그 선언을 본다.
+
+```
+운영으로 선언한 머신   검색 0건 -> **실패** (이빨이 그대로 남는다)
+선언하지 않은 머신     숫자는 크게 찍되 실패로 만들지 않는다
+                       + "역할 미선언" 을 매번 출력한다 (선언을 잊은 운영 머신이 보도록)
+값이 있는데 인식 못 함  "인식하지 못했다" 를 따로 찍는다 (오타를 미선언과 뭉개지 않는다)
+```
+
+**기본값을 개발로 둔 이유**: 잘못 선언하지 않은 개발 머신이 **거짓 P0** 를 만드는 것보다,
+선언을 잊은 운영 머신이 경보를 놓치는 쪽이 **눈에 띄기 쉽다**(미선언 상태를 매번 크게
+찍는다). 그리고 개발 머신은 여럿이고 운영 머신은 하나다.
+
+이 검사는 그동안 **개발 머신에서 고칠 수 없는 영구 red** 였고, 실제로 여러 세션이 그것을
+"유일하게 알려진 실패"로 취급하며 지나갔다 — §11 자기 주석이 예언한 상태 그대로다:
+*"코드를 고쳐서 풀 수 있는 실패가 아니다 ― 곧 무시하게 된다."*
+
+`audit_schedule_health.py` 도 "등록되지 않은 정의"를 찍을 때 **이것은 이 머신의 상태이며
+운영 크롤 머신은 다를 수 있다**는 단서를 함께 출력한다.
+
+**[회귀 + mutation]** `test_pipeline_integrity.py` 에 §11-c
+`test_data_role_gate_is_wired()` 를 신설했다(12단언). **두 방향을 모두** 고정한다 —
+한쪽만 보면 다음에 또 갈라진다.
+
+```
+값 해석      operational / OPERATIONAL / 공백 포함 -> 운영
+             prod / production / development / 빈값 / 미선언 -> 개발
+배선(AST)    제품 판정 단언이 `is_operational_data()` 분기 **안에** 있는가
+껍데기 방지  미선언 분기에도 단언이 최소 1개 남아 있는가
+```
+
+mutation 3/3 검출:
+
+```
+M1 제품 판정을 분기 밖으로 꺼낸다 (개발 머신에서 다시 거짓 P0)  -> 잡았다 (FAIL 3줄)
+M2 항상 운영으로 본다                                          -> 잡았다 (FAIL 6줄)
+M3 미선언 분기의 단언을 없앤다 (껍데기)                         -> 잡았다
+대조군                                                         -> exit 0
+```
+
+역할별 실동작도 확인했다: 미선언 exit 0 / `operational` exit **1**(검색 0건을 잡는다) /
+오타 `prod` exit 0 + "인식하지 못했다" 출력.
+
+**[다음 세션에게 — 운영 상태가 필요할 때]** 이 머신에서 알 수 없는 것은 **추측하지 않는다.**
+필요하면 셋을 **구분해서** 적는다.
+
+```
+1. 이 머신(데스크탑3)의 로컬 상태          -> "개발 DB 기준" 이라고 명시
+2. Git 에 기록된 코드/설정/문서             -> 머신과 무관하게 유효
+3. 과거에 확보된 운영 로그/DB 측정 결과      -> 출처와 시점을 함께 적는다
+```
+
+`logs/daily_run.log` 등 이 저장소의 로그도 **이 머신에서 돌린 흔적**이므로 운영 근거가
+아니다(그리고 BUGS #192 가 밝혔듯 한동안 회귀 스위트의 합성 로그까지 섞여 있었다).
+
+--------
+
+#201
+
+**검색 필터 중 날짜 두 개만 검증이 없었다** — 오타가 400 이 아니라 **조용히 0건**이 된다.
+같은 폼의 숫자 필터는 즉시 거절하는데 날짜만 삼킨다
+
+발견 (2026-08-25, 검색/상세 API 에 적대적 입력을 넣어 500 이 나는지 전수로 재다가)
+
+**[경위]** API 적대적 입력 감사를 돌렸다(31케이스, 사본 DB). **500 도 예외도 0건**이라
+그 자체로는 깨끗했는데, 표를 읽다가 한 줄이 걸렸다.
+
+```
+케이스                       상태   비고
+auction_date_from 형식       200   total=0      <- 오타인데 200 이다
+min_fail_count 문자          422                <- 숫자는 즉시 거절
+min_appraisal 초대형         400
+sort_by 임의값               400
+property_type 콤마폭탄       400
+page 초대형                  400
+```
+
+`api/v1/search.py` 는 나머지 필터를 **전부** 400 + 사유로 거절한다 —
+`sort_by` / `sort_order` / `property_type` / min·max 숫자 6종 / `page`.
+그런데 `auction_date_from` / `auction_date_to` 만 `Optional[str]` 그대로라 아무 값이나
+통과하고 SQL 에서 **문자열 비교**가 된다.
+
+**[영향]** `auction_date_from=not-a-date` -> HTTP 200 / total=0. 사용자에게 "검색 결과
+없음"과 **구별되지 않는다.** 같은 화면의 같은 폼에서 나온 값인데 숫자에 오타를 내면
+즉시 알려 주고 날짜에 오타를 내면 조용히 빈 결과가 온다. 이 저장소가 반복해서 잡아 온
+"조용히 틀린 결과"이고, `_document_entry`(#198) 에서 쓴 말이 그대로 적용된다 —
+*"오류도 빈 화면도 아니라 사용자가 원인을 알 수 없다."*
+
+**[SQL 주입은 아니다 — 확정했다]** `auction_date_from=2026-01-01') OR 1=1--` 가
+**1,875건**을 돌려주기에 주입을 의심했다. 바인딩 대조로 확정했다(2026-08-25):
+
+```
+페이로드                        API      바인딩으로 센 값   판정
+정상 날짜 2026-01-01            1875     1875            일치
+') OR 1=1--                    1875     1875            일치
+' OR '1'='1                    1875     1875            일치
+UNION SELECT                   1875     1875            일치
+주석 --                        1875     1875            일치
+주입이 성공했다면                                        1876 (전체) - 어느 것도 아니다
+```
+
+즉 **바인딩 파라미터**이고, 1,875 는 `'2026-07-14' >= "2026-01-01') OR 1=1--"` 같은
+**사전순 비교** 결과다(전체 1,876 중 auction_date 가 빈 1행만 빠진다).
+주입은 아니지만 **뜻 모를 값이 조용히 필터로 쓰이는 것**은 그대로 문제다.
+
+**[수정 — 이웃과 같은 규약으로]** 새 규약을 만들지 않는다. 옆에 있는 여섯 개가 이미 쓰는
+방식(400 + 어느 파라미터인지 + 기대 형식)을 그대로 따른다.
+
+```python
+for _name, _value in (("auction_date_from", auction_date_from),
+                      ("auction_date_to", auction_date_to)):
+    if not _value:
+        continue          # 빈 값/미지정은 "안 걸었다"는 뜻이다(기존 계약 유지)
+    try:
+        datetime.strptime(_value, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        raise HTTPException(400, f"{_name} 은 YYYY-MM-DD 형식이어야 합니다: {_value}")
+```
+
+형식은 프런트가 실제로 보내는 것에 맞췄다 — `<input type="date">` 의 `YYYY-MM-DD`.
+`strptime` 이 `2026-13-01` / `2026-02-30` 같은 **달력상 불가능한 날짜**도 함께 걸러 준다
+(정규식만으로는 못 잡는다 — 아래 M2 가 그것을 확인한다).
+
+**[수정 후 실측]**
+
+```
+2026-01-01              200        <- 정상
+not-a-date              400
+2026-13-45              400        <- 달력상 불가능
+2026-02-30              400
+2026/01/01              400        <- 구분자
+2026-01-01T00:00:00     400        <- 시각 포함
+2026-01-01') OR 1=1--   400
+(빈 값)                  200        <- "안 걸었다" (기존 계약 그대로)
+(파라미터 미지정)         200        <- 모든 검색이 여기 해당한다
+```
+
+**[회귀 + mutation]** `test_search.py` 에 §9 를 신설했다(22단언).
+거절 7종 x 파라미터 2개 + 대조군(정상/빈값/미지정) + 사유 내용 + **필터가 실제로 좁히는가**.
+검증만 붙이고 기능이 죽으면 안 되므로 마지막 것을 함께 둔다.
+
+mutation 3/3 검출:
+
+```
+M1 날짜 검증을 없앤다 (원래 버그)                    -> 잡았다 (FAIL 16줄)
+M2 정규식만 쓴다 (달력 유효성을 안 본다)              -> 잡았다 (2026-13-01 / 2026-02-30 통과)
+M3 `if not _value: continue` 가드를 없앤다           -> 잡았다
+대조군                                              -> exit 0
+```
+
+M3 는 **가드가 load-bearing 이라는 것을 증명한다.** 없애면 `None`(파라미터 미지정)이
+`strptime` 에 들어가 **모든 검색이 400** 이 된다. 실패 메시지가 그것을 그대로 보여 준다:
+
+```
+AssertionError: ({'size': 100, 'address_detail': '서울'}, 400,
+                 '{"detail":"auction_date_from 은 YYYY-MM-DD 형식이어야 합니다: None"}')
+```
+
+**[프런트까지 관통 확인 — 실제 렌더]** 400 을 새로 만들었으니 화면이 그것을 어떻게
+보여 주는지 **실제로 띄워서** 확인했다(dev 서버 + 임시 DB 사본의 API).
+
+```
+GET /search?auction_date_from=not-a-date   -> HTTP 200 (화면은 정상 렌더)
+   "검색조건에 잘못된 값이 있습니다"                있음
+   "auction_date_from"                            있음   <- 서버 사유가 그대로 보인다
+   "YYYY-MM-DD"                                   있음
+   "검색 결과를 불러오지 못했습니다"                없음   <- 서버 장애로 오해시키지 않는다
+   검색 폼 / 돌아가는 링크                          있음   <- 되돌아갈 동선이 있다
+
+대조군 GET /search?include_closed=true&auction_date_from=2026-01-01
+   에러 문구 없음 / 결과 1,875건 정상 표기
+```
+
+프런트는 이미 400·422 를 `bad_request` 로 나누고 **서버가 준 사유를 그대로** 띄우도록
+만들어져 있었다(`SearchScreen.tsx`, Sprint 162). 그래서 이번 400 메시지를 "어느
+파라미터가 왜 틀렸는지"로 쓴 것이 그대로 사용자 문구가 된다 — 고정 안내문만 있으면
+**엉뚱한 곳을 고치라는 안내**가 됐을 자리다.
+
+**[같이 확인한 것 — 미검증 문자열 파라미터 전수 스윕]** 같은 계열이 더 있는지 `api/v1/`
+19개 파일의 라우트 문자열 파라미터 **70개**를 AST 로 훑었다. 검증 흔적이 없어 보이는
+31개를 하나씩 확인한 결과 **추가 결함은 없었다.**
+
+```
+user_id / admin_role (24개)   검증된 JWT / require_admin 의존성에서 온다 - 사용자 입력이 아니다
+위임 래퍼 (2개)                head_document -> get_document,
+                              admin_registry_requests -> list_registry_requests
+                              (검증은 피호출부에 있다)
+자유 텍스트 (get_regions.sido) 형식이 없는 값이라 "일치 없음"이 옳은 답이다.
+                              날짜와 달리 오타를 구별할 근거가 없다.
+```
+
+날짜만 **형식이 정해져 있는데 검증이 없던** 유일한 자리였다.
+
+**[같이 확인한 것 — 적대적 입력 31케이스 전수]** 이 감사에서 나온 것은 위 한 건뿐이다.
+
+```
+500 / 예외                 0건
+SQL 주입                   0건 (바인딩 대조로 확정)
+경로 조각(../, NUL)        전부 안전하게 0건 또는 404
+초장문(5,000자) sido       200 / 0건 (지연 없음)
+콤마 폭탄(500개)           400 으로 거절
+size/page/숫자 초대형      422 또는 400
+item id 0 / 음수 / 초대형  404
+이미지 seq 음수 / 초대형    404
+사본 DB                    auction_item 1,876행 / 테이블 27개 — 파괴적 입력이 통과하지 않았다
+```
+
+--------
+
+#202
+
+**종결 함수 넷 중 둘만 claim 을 확인했다** — 좀비 워커가 **살아 있는 실행의 큐 행을
+종결**시키고, 그러면서 그 실행의 claim 토큰까지 무효로 만든다. 실제로 받아 놓은 문서가
+큐에서는 "대상 아님"으로 남는다
+
+발견 (2026-08-25, #199 를 고친 뒤 "같은 규칙이 형제 함수에도 있는가"를 훑다가)
+
+**[경위]** #198(사진엔 있고 문서엔 없던 2차 방어선)과 #201(숫자는 검증하는데 날짜만
+안 하던 것)이 **같은 렌즈**로 나왔다 — *"규칙이 한쪽에만 있는가."* 그 렌즈를 큐 종결
+함수에 대 봤다.
+
+```
+함수                          claim_token 인자   _claim_is_still_ours 확인
+mark_queue_done               있음               함  (BUGS #181)
+mark_queue_failed             있음               함  (BUGS #181)
+mark_queue_skipped_expired    **없음**           **안 함**
+mark_queue_unsupported        **없음**           **안 함**
+```
+
+**[재현 — 합성 물건 하나]** (스크래치 DB, 브라우저·네트워크 없음)
+
+```
+A 가 집는다                    claim_token = T1
+A 가 멈춘다 -> reset_stale_queue 가 회수 -> B 가 집는다   claim_token = T2, 큐=in_progress
+좀비 A 가 mark_queue_skipped_expired() 를 부른다
+    -> 큐 = SKIPPED_EXPIRED           <- B 가 작업 중인데 종결됐다
+    -> last_attempt_at 이 덮인다      <- **B 의 토큰까지 무효가 된다**
+B 가 수집을 끝내고 mark_queue_done(claim_token=T2)
+    -> 토큰 불일치로 큐는 그대로, 문서만 기록된다
+최종:  document_status = READY / doc_raw 1행 / **document_queue = SKIPPED_EXPIRED**
+```
+
+**[왜 나쁜가]**
+
+* 실제로 받아 놓은 문서가 큐에서는 "애초에 대상이 아님"으로 남는다. 이 저장소가 스스로
+  확인해 온 불변식 — *"화면이 READY 인데 큐가 done/refresh 계열이 아닌 행 0건"* — 을
+  깨는 상태다(2026-08-25 개발 DB 실측 기준 지금은 0건).
+* 방향도 틀렸다. 좀비가 들고 있는 것은 **그때의 낡은 `auction_date`** 다. 그 낡은 판단이
+  최신 판단을 덮는다(`reconcile_queue_auction_date()` 가 막으려던 것이 바로 이 종류의
+  stale 값이다).
+* 두 함수가 `last_attempt_at` 을 덮으므로 **남의 claim 을 무효로 만들면서 종결까지**
+  한다. 하나의 호출이 두 가지를 망가뜨린다.
+
+**[수정]** 형제 둘과 **같은 규약**을 적용한다. 새 규약을 만들지 않는다.
+
+```python
+if not _claim_is_still_ours(conn, queue_id, claim_token):
+    logger.warning("... 그 사이 큐 행(id=%s)이 회수돼 다른 실행이 집어갔다 "
+                   "- 종결하지 않는다(그쪽 판단에 맡긴다)", queue_id)
+    return
+```
+
+* `claim_token=None` 이면 **예전 동작 그대로**다(`_claim_is_still_ours` 가 이미 정한
+  하위호환 규약). 토큰을 넘기지 않는 호출부가 깨지지 않는다.
+* `doc_worker.py` 의 두 호출부가 `item.get("claim_token")` 을 넘기도록 배선했다.
+
+**[수정 후 같은 시나리오]**
+
+```
+좀비 A 의 skipped_expired  -> 큐 = in_progress 그대로, last_attempt_at 도 그대로
+B 의 done                  -> 큐 = done / document_status = READY / doc_raw 1행
+```
+
+**[회귀 + mutation]** `test_document_queue.py` 에 §19
+`test_terminal_functions_respect_the_claim_token()` 을 신설했다(20단언).
+**구조 + 행위 + 배선** 셋을 함께 본다 — 하나라도 빠지면 다음에 또 갈라진다.
+
+```
+구조   종결 함수 4개 전부 claim_token 을 받고 _claim_is_still_ours 로 확인하는가
+행위   남의 토큰으로는 상태도 last_attempt_at 도 바뀌지 않는가
+       (대조군) 자기 토큰이면 종결되는가 / 토큰 미지정은 예전대로인가
+배선   doc_worker 가 두 함수에 실제로 토큰을 넘기는가
+```
+
+mutation 3/3 검출:
+
+```
+M1 skipped_expired 의 가드 제거 (원래 버그)     -> 잡았다 (FAIL 3줄, 상태 변화까지 지목)
+M2 unsupported 의 가드 제거                     -> 잡았다 (FAIL 3줄)
+M3 doc_worker 가 토큰을 안 넘긴다 (배선 끊기)    -> 잡았다
+대조군                                          -> exit 0
+```
+
+**M2 는 처음에 행위 검사가 공허했다.** 이 파일의 스키마가 큐 전용이라
+`mark_queue_unsupported` 가 `document_status` 를 쓰다 `no such table: auction_item` 으로
+**죽었고**, 트랜잭션이 롤백돼 큐가 그대로였다 — 즉 가드를 없애도 행위 검사가 통과했다.
+빈 스텁 테이블 셋을 만들어 `_set_document_status()` 가 설계대로 "대상 없음" 경고 + False
+로 물러나게 하니 그제야 잡힌다. **mutation 을 돌리지 않았으면 이 구멍은 남았을 것이다** —
+이 저장소가 반복해서 배운 것과 같다: *"가끔 밟는 것은 방어선이 아니다."*
+
+
+**[같이 확인한 것 — `release_queue_rows()` 는 고치지 않는다 (재고 판단했다)]**
+같은 렌즈로 보면 이 함수도 claim 을 확인하지 않는다. 좀비가 자기 옛 배치 id 로 부르면
+**남이 작업 중인 행을 `pending` 으로 되돌린다.** 그런데 실제로 눌러 보니 해가 없다.
+
+```
+B 가 집는다                     큐=in_progress, token=T
+좀비가 release_queue_rows([B의 행])
+   -> 큐=pending  (되돌아갔다)
+   -> last_attempt_at = T 그대로   <- 이 함수는 그것을 **일부러** 안 지운다
+C 가 집으려 한다                 -> **집지 못한다**
+   claim 조건이 `last_attempt_at <= now - 30분` 이라 아직 대상이 아니다
+B 가 수집을 끝내고 done(T)       -> 토큰이 그대로라 통과
+최종:  큐=done / doc_raw 1행 / document_status=READY   (정상)
+```
+
+즉 **30분 재시도 간격이 이미 막고 있다.** 그 값을 남기는 이유를 이 함수의 docstring 이
+이미 적어 두었다 — *"그 값을 지우면 30분 재시도 간격이 사라져, 방금 실패한 행이 곧바로
+다시 태워질 수 있다."* 그 결정이 여기서 두 번째 효과를 낸다.
+
+그래서 **claim 검사를 넣지 않는다.** 넣어도 얻는 것이 없고, 실행 창이 닫힐 때 배치를
+되돌리는 경로라 위험만 늘린다. 다음 세션이 "여기도 비대칭이다"라고 고치려 들지 않도록
+근거를 남긴다 — **`last_attempt_at` 을 지우도록 바꾸면 이 보호가 사라진다.**
+
+**[남는 것]** `mark_queue_skipped_expired` 가 `document_status` 를 건드리지 않는 것은
+그대로다(Sprint 73 이 검토하고 보류한 제품 판단, `test_document_status_sync.py` §6 이
+현재 동작을 고정한다). 이번 수정은 **누가 종결할 수 있는가**만 고쳤고 **무엇을 쓰는가**는
+바꾸지 않았다.
+
+--------
+
+#203
+
+**재수집 기계와 버전 정책 사이의 이음매가 검사되지 않았다** — 두 축을 각각 24개/여러 개
+검사가 덮는데, **재수집이 실제로 돌 때 버전이 어떻게 되는지**는 아무도 안 봤다.
+그리고 그것이 일상 운영 경로다
+
+발견 (2026-08-25, "일상 크롤은 신규가 아니라 **변경**이다"를 깨닫고 그 경로를 처음 관통시켜 보다가)
+
+**[왜 이 자리가 비어 있었나]** 지금까지의 검증은 **신규 수집**에 몰려 있었다. 그런데
+데스크탑1이 매일 돌리는 크롤에서 대부분의 물건은 **이미 있는 것**이고, 바뀌는 것은 값이다
+(최저가 하락 / 기일 변경 / 유찰 증가). 그 경로를 끝까지 눌러 본 적이 없었다.
+
+```
+test_refresh_trigger.py   재수집 기계(예약·claim·retry·상한·배선) 24개 검사
+                          `doc_raw` 의 `doc_version` 을 보는 검사 **0개** (2026-08-25 실측)
+BUGS #197 / #199          버전 규칙 자체(같은 내용 -> unchanged, 동시성)
+                          재수집 경로를 거쳐 도달하는지는 보지 않는다
+```
+
+**두 축이 각각 튼튼한데 이음매만 비어 있었다.**
+
+**[실제로 눌러 봤다 — 4일 생애주기]** 완전 합성 DB(부트스트랩 3단계) + 임시 문서 루트.
+
+```
+1일차  신규 크롤 -> upsert -> migrate_execute -> enqueue -> 수집
+       auction_item 생성 / 큐 4종 pending -> spec·status·appraisal done / 화면 READY
+       doc_raw 3행, 버전 1
+
+2일차  값이 바뀐다 (최저가 350,000,000 -> 280,000,000 / 기일 이동 / 유찰 1 -> 2회)
+       auction_item 이 새 값을 갖는다                                    OK
+       requeue 결과: {'items': 1, 'refreshed': 2, ...}
+       큐: spec=refresh / status=refresh / appraisal=done  <- 필드별 매핑이 정확하다
+       화면: 셋 다 READY 유지    <- 재수집 예약이 사용자가 보던 것을 뺏지 않는다
+       enqueue 를 다시 돌려도 refresh 가 pending 으로 뭉개지지 않는다      OK
+
+2일차 재수집 실행 (법원이 실제로는 안 바꿨다 - 같은 파일)
+       claim 이 overwrite=True 로 온다                                   OK
+       **doc_raw 3행 그대로 / 버전 1 그대로**                            OK
+
+3일차  아무것도 안 바뀐다 -> requeue 결과 {} / 큐 상태 그대로 (멱등)      OK
+
+4일차  법원이 진짜로 바꿨다 -> 새 행 / 버전 2 / **옛 버전 1행 그대로 남음**
+       document_version_log 1행                                          OK
+```
+
+**결함은 나오지 않았다.** 제품이 옳게 동작한다 — 그러나 **그것을 지키는 검사가 없었다.**
+이 저장소의 기준으로는 그것이 결함이다(`api/v1/item.py` 가 `MAX(doc_version)` 을 사용자
+응답에 싣기 때문에, 여기가 무너지면 "매일 밤 문서 버전이 오르는" 형태로 화면에 드러난다 —
+BUGS #115 가 이미 한 번 겪은 모양이다).
+
+**[회귀]** `test_refresh_trigger.py` 에 §25
+`test_refresh_cycle_respects_the_version_policy()` 를 신설했다(17단언).
+이 파일에서 `doc_raw`/`doc_version` 을 보는 **첫 검사**다.
+
+```
+첫 수집(pending)          행 1 / 버전 1 / 변경 이력 0 (이전 값이 없다)
+재수집 + 같은 내용         행 1 / 버전 1 / 이력 0        <- 늘면 안 된다
+재수집 + 바뀐 내용         행 2 / 버전 2 / 이력 1
+                          **옛 버전 행이 그대로 존재**  <- 덮어쓰기가 아니라 쌓기
+                          두 버전의 크기가 실제로 다르다(공허하지 않다)
+화면                      재수집 내내 READY 유지
+```
+
+`collect()` 헬퍼가 `expect_overwrite` 를 **인자로** 받는다 — 첫 수집은 `pending`
+(overwrite=False), 재수집은 `refresh`(overwrite=True)다. 둘을 같은 값으로 단언하면
+검사가 둘 중 하나를 반드시 틀리게 만든다(처음에 실제로 그렇게 써서 붉어졌다).
+그 구분이 이 파일의 핵심 어휘라 인자로 드러냈다.
+
+mutation 3/3 검출:
+
+```
+M1 같은 내용에도 버전을 올린다 (BUGS #115 회귀)   -> 잡았다 (FAIL 6줄)
+M2 버전을 쌓지 않고 1번 행을 덮어쓴다 (정책 파괴)  -> 잡았다 (FAIL 3줄)
+M3 document_version_log 를 안 남긴다              -> 잡았다 (기존 검사도 함께 잡았다)
+대조군                                            -> exit 0
+```
+
+M2 가 이 검사의 존재 이유다 — **바뀐 콘텐츠가 옛 데이터를 파괴하지 않는가.**
+버전을 쌓는 대신 덮어쓰면 무엇이 언제 바뀌었는지 되짚을 수 없고, 그 상태는
+"행 수가 그대로"라 겉으로는 정상과 구별되지 않는다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 8,392건(#202 시점 8,354 -> +38).
+
+--------
+
+#204
+
+**일부러 두 벌로 둔 구현이 갈라지는 것을 막는 것이 없었다** — 그리고 회귀 스위트가
+매 실행마다 컴파일 경고를 하나씩 뱉고 있었다
+
+발견 (2026-08-25, 중복 코드 감사 — 구조가 같은 제품 함수를 AST 로 훑다가)
+
+**[중복 감사]** 제품 함수(`api/` `storage/` `crawler/` `config/` `normalizer/` `validator/`
+`models/` `intent/` + 루트 진입점 6개)의 본문을 **이름·상수를 지운 구조**로 정규화해
+해시가 같은 묶음을 찾았다. 본문 4문 미만은 우연 일치라 제외했다.
+
+```
+구조가 동일한 묶음: 2개
+
+  본문 7문  collect_documents.attach_file_log == mvp_scraper.attach_file_log
+  본문 6문  crawler/base_crawler.restart_driver == crawler/doc_crawler.restart_download_driver
+```
+
+**[둘째는 결함이 아니다 — 확인했다]** `restart_*` 는 각자 자기 `build_*_driver()` 를
+부르고, **그 둘 다 BUGS #196 의 `resolve_chrome_driver()` 를 탄다.** 즉 재시작 경로도
+Selenium Manager 폴백을 받는다. 공유 부분은 `quit + sleep + 재생성` 6문의 상용구이고,
+두 드라이버는 옵션이 다르다(다운로드 폴더 설정 — `build_download_driver` 의 docstring 이
+왜 따로 있어야 하는지 적어 두었다). **묶지 않는다.**
+
+**[첫째는 진짜 위험이다]** `attach_file_log()` 는 BUGS #192 가 **일부러 인라인**한 것이다 —
+새 모듈을 만들면 미추적 파일을 추적 파일이 import 하게 되어 커밋된 트리가 부팅하지
+못한다(BUGS #105). 그 판단은 지금도 옳다. 문제는 인라인이 남긴 위험이 **관리되지 않고
+있었다**는 것이다: 한쪽만 고쳐지는 날.
+
+그것이 바로 BUGS #197 이었다 — `doc_raw` 작성자 둘이 갈라져, 한쪽은 내용 지문을 비교하고
+다른 쪽은 매번 버전을 올렸다. **인라인을 택했으면 갈라짐을 막는 것이 함께 와야 한다.**
+
+**[수정 — 구조 비교 가드]** `test_schema_hygiene.py` 의 #192 검사에 붙였다.
+이름·상수를 지운 AST 로 비교하므로 **로그 파일명이 달라도 통과**하고 **로직이 달라지면
+실패**한다.
+
+```
+mutation: mvp_scraper 쪽에서만 setFormatter 한 줄을 지운다
+   -> [FAIL] ★ 인라인한 두 구현의 구조가 같다: 2 (expected 1)
+자기 검증: 다른 함수(main)는 다른 구조로 나온다  -> 통과 (비교가 공허하지 않다)
+```
+
+실패 메시지는 무엇을 하라고 말한다 — *"한쪽만 바꿨다면 다른 쪽도 같이 바꾸라. 일부러
+다르게 만든 것이라면 이 검사를 갱신하고 왜 달라야 하는지를 함께 적으라."*
+
+**[같이 고친 것 — 매 실행 나오던 컴파일 경고]** 스위트를 돌릴 때마다 이 줄이 섞여 나왔다.
+
+```
+test_asset_record_failures.py:10: SyntaxWarning: invalid escape sequence '\d'
+```
+
+원인은 모듈 docstring 안의 Windows 경로였다(`storage\database.py` 의 `\d`).
+텍스트를 고치지 않고 **리터럴만 raw 로** 바꿨다(`"""` -> `r"""`).
+
+**소음 자체가 값이다.** 매 실행 나오는 경고는 **진짜 경고가 났을 때 눈에 안 띄게** 만든다 —
+이 저장소가 NO-VERDICT 분류를 따로 만든 것과 같은 취지다. 그리고 이 경고는 무해하지
+않을 수도 있다:
+
+```
+(a) 문서/주석의 Windows 경로가 raw 가 아니다     -> 무해하지만 소음
+(b) **정규식을 raw 문자열로 안 썼다**            -> 패턴이 조용히 달라진다
+```
+
+(b) 를 (a) 와 구분해 막을 방법이 없으므로 **둘 다 막는다.**
+`test_no_python_syntax_warnings()` 를 신설해 추적 파이썬 **150개 전부**를 컴파일하고
+`SyntaxWarning` 이 하나라도 나면 그 파일:줄을 지목한다(문법 오류는 다른 검사의 몫이라
+건너뛴다). 자기 검증으로 일부러 만든 `"\d"` 를 잡는지 확인한다.
+
+```
+현재: 추적 .py 150개 / 컴파일 경고 **0건**
+mutation: docstring 을 raw 가 아니게 되돌린다 -> 파일:줄과 함께 잡았다
+```
+
+**[기준선]** 통과 54 / 실패 0, 단언 8,398건(#203 시점 8,392 -> +6). 스위트 출력에서
+`SyntaxWarning` **0건**.
+
+--------
+
+#205
+
+**설정이 사라졌다고 알려 주는 경고가 정작 조용한 쪽에는 안 붙어 있었다** — 시끄러운
+쪽(500)에만 붙어 있고, 사용자 전원을 막는 조용한 쪽(401/403)에는 없었다
+
+발견 (2026-08-25, `.env` 에 admin 두 키를 새로 넣고 그 배선을 검증하다가)
+
+**[출발점 — 검증은 전부 통과했다]** `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` 가 `.env`
+에 들어왔다. 값은 어디에도 찍지 않고 행위로만 확인했다(SET/NOT_SET 만 출력).
+
+```
+적재        셸 환경만        ADMIN NOT_SET / SUPER NOT_SET
+            api_server 임포트 후  ADMIN SET / SUPER SET      <- load_dotenv 가 읽는다
+이름        코드가 읽는 이름과 정확히 일치(api/v1/admin.py 의 os.getenv 4곳)
+ADMIN 라우트  키 없음 403 / 틀린 키 403 / ADMIN 키 200 / SUPER 키 200
+SUPER 전용    키 없음 403 / ADMIN 키 403 / SUPER 키 422(인증 통과 후 본문 검증)
+예전 500 의 원인  두 키를 빼면 500 재현 -> 되돌리면 200      <- 원인이 환경변수 미설정이 맞다
+부팅 경고     warn_if_admin_keys_missing() 이 더 이상 경고하지 않는다
+전수         admin 라우트 16개 중 키 없이 500 인 것 **0개**
+```
+
+**여기서 멈췄으면 결함을 못 봤다.** 확인하려던 것은 다 확인됐다.
+
+**[그런데 이 키들은 반복해서 사라져 왔다]** `BETA_RELEASE_CHECKLIST.md` 의 P0-2 이력이
+그 자체로 증거다 — Sprint 233 소실 -> 238 복귀 -> 244 소실 -> 267 있음 -> 08-24 소실 ->
+오늘 복구. 그래서 물었다: **한쪽만** 사라지면 어떻게 되나. 재봤다.
+
+```
+                    부팅        ADMIN 라우트   SUPER 전용
+둘 다 있음          조용함      200            422(통과)
+SUPER 만 사라짐     **조용함**  200            **403**      <- SUPER 기능이 통째로 죽는다
+ADMIN 만 사라짐     **조용함**  **403**        422          <- SUPER 키로만 접근된다
+둘 다 사라짐        경고함      500            500
+```
+
+**경고가 거꾸로 붙어 있었다.** 경고를 받는 유일한 경우(둘 다 없음)는 어차피 **500** 이라
+첫 호출에 드러난다. 정작 조용한 두 경우가 경고를 못 받는데, 그쪽 증상은 **403** 이다.
+403 은 "권한 부족"과 구별되지 않는다 — 운영자는 설정 누락을 등급 문제로 읽는다.
+
+원래 그렇게 만든 이유는 잡음 방지였고, 회귀 검사가 그것을 *"키가 하나라도 있으면
+경고하지 않는다"* 로 **명문화까지 해 두었다.** 그 판단은 **한쪽만 사라졌을 때 무슨 일이
+나는지를 재보지 않고** 내린 것이었다. 실측이 반대를 말하므로 검사를 갱신했다.
+
+**[같은 계열이 인증에 그대로 있었다 — 그리고 더 나빴다]** 규칙대로 인접 코드를 훑었다.
+`api/auth.py` 도 **둘 다** 없을 때만 500 을 낸다. 부팅 경고는 **아예 없었다.**
+로컬 스텁 JWKS + 진짜 ES256 키로 재현했다(바깥으로 나가지 않는다).
+
+```
+                        ES256(현행 서명)   HS256(레거시)   부팅
+둘 다 있음              200                200             무음
+SUPABASE_URL 만 없음    **401**            200             무음   <- 로그인 사용자 전원
+SUPABASE_JWT_SECRET 없음 200               **401**         무음
+둘 다 없음              500                500             무음
+```
+
+**ES256 이 현행 서명이다**(BUGS #27 에서 Supabase 가 비대칭으로 전환했다). 그러니
+`SUPABASE_URL` 하나가 비는 것만으로 **로그인한 사람 전부가 막힌다.** 그때 남는 로그는
+요청마다 나오는
+
+```
+JWT 검증 실패: JWKS에서 해당 kid의 공개키를 찾지 못했습니다
+```
+
+뿐이다 — **키 회전 중 사고처럼 읽힌다.** 설정이 빠졌다는 말은 어디에도 없다.
+그리고 이 설정도 실제로 사라진 적이 있다(`api/auth.py` 위쪽 주석: cwd 가 저장소 루트가
+아니면 `.env` 를 못 읽어 둘 다 빈값이 됐다). 그때는 500 이라 드러났다. **한쪽만
+사라지는 날에는 드러나지 않는다.**
+
+**[수정]** 두 곳 모두 **키별로** 경고한다. 값은 절대 남기지 않는다(로그 유출이 곧
+관리자 권한 유출 / 인증 우회다 — 기존 규칙 그대로).
+
+```
+api/v1/admin.py   warn_if_admin_keys_missing()    경고 1개 -> 3개(둘다/SUPER만/ADMIN만)
+api/auth.py       warn_if_auth_config_missing()   신설, api_server.py 부팅에서 호출
+```
+
+각 경고는 **어느 설정이 없는지**와 **무엇이 깨지는지**(403/401/500)를 함께 적는다.
+반환값은 이름 그대로 "경고를 남겼으면 True" 다.
+
+**[회귀]** `test_admin_secret_contract.py` 38 -> 46단언,
+`test_auth_jwks_robustness.py` §9 신설로 50 -> 68단언.
+
+부분 소실은 **값 누출을 행위로 검사할 수 있는 유일한 자리**이기도 하다 — 경고가 나가는
+순간 나머지 한쪽에는 실제 값이 들어 있다. (둘 다 빈 경우엔 흘릴 값 자체가 없어 그
+검사가 공허했다. 2026-08-21 에 mutation 으로 확인하고 걷어냈던 바로 그 검사다.)
+그래서 이제 **행위 + AST 두 겹**으로 본다.
+
+```
+mutation
+  M1 전부-아니면-전무로 되돌린다            -> 잡았다 (양쪽 파일 각 4줄 FAIL)
+  M2 소실된 키가 아닌 다른 이름을 지목한다  -> 잡았다
+  M2' 결과(403/401)를 안 적는다             -> 잡았다
+  M3 경고에 살아 있는 값을 끼워 넣는다      -> 잡았다 (행위·AST 둘 다)
+  M4 부팅 배선을 지운다                     -> **처음엔 못 잡았다** (아래)
+```
+
+**[M4 가 뚫었다 — 검사 자체의 결함]** 배선 확인이 문자열 검색이었다.
+
+```python
+code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+check_true("부팅 시 호출한다", "warn_if_admin_keys_missing()" in code, ...)
+```
+
+주석 **줄**만 걸러 내므로 `pass  # warn_if_admin_keys_missing()` 같은 **꼬리 주석**이
+호출로 통과한다. 배선을 죽이는 mutation 이 실제로 통과했다. AST 로 **모듈 최상위의
+호출문**을 찾도록 바꿨다. 이 구멍은 admin 쪽 검사에 원래 있던 것이고 새로 쓴 auth 쪽이
+그대로 물려받은 것이라 **둘 다** 고쳤다.
+
+```
+M4a 꼬리 주석으로 무력화  -> 두 파일 모두 잡았다
+M4b 배선을 통째로 삭제    -> 두 파일 모두 잡았다
+대조군                    -> exit 0
+```
+
+**[남는 것]** 경고는 **부팅 시점**에만 나간다. 서버가 뜬 뒤 `.env` 가 바뀌는 경우는
+잡지 못한다 — 그때는 프로세스를 다시 띄워야 반영되므로(모듈 상수로 읽는다) 실질적으로는
+같은 시점이다. 운영 반영 여부는 데스크탑1 몫이라 **여기서는 확인 불가**.
+
+**[기준선]** 통과 54 / 실패 0, 단언 **8,420**건(프런트 dev 서버 없이) / **8,424**건
+(서버를 띄우고 - 둘 다 실측). #204 시점의 8,398 은 서버가 떠 있던 값이라 직접 비교하면
+안 된다(아래 곁가지 참고). 개발 DB·운영 로그 지문 무변경.
+
+**[곁가지 — 기준선 숫자가 ±4 흔들린다]** #204 의 8,398 을 재현하려다 8,394 가 나와
+회귀로 의심했다. 원인은 키가 아니었다: `test_beta_journey.py` 의 4단계(프런트 로그인
+게이트)가 **dev 서버가 떠 있을 때만** 돈다. 없으면 `[SKIPPED]` 로 명시하고 넘어간다 —
+조용히 통과시키지 않으니 동작 자체는 옳다. dev 서버를 띄우고 재실행해 62 -> 66단언,
+4단언 전부 PASS 를 확인했다. **기준선 숫자를 비교할 때는 dev 서버 유무를 같이 봐야 한다.**
+
+--------
+
+#206
+
+**백엔드의 현행 토큰 검증(ES256)이 프런트 전용 파일 이름에 걸려 있었다** — `.env` 만
+챙겨 배포하면 로그인 사용자 전원이 401 이 된다
+
+발견 (2026-08-25, BUGS #205 를 적고 나서 P0-4 를 재실측하다가)
+
+**[P0-4 를 재실측하려다 나왔다]** 체크리스트의 P0-4 는 *"`.env` 에 `SUPABASE_JWT_SECRET`
+없음"* 이었다. 오늘 재보니 **있다.** 그런데 같은 파일의 다른 값이 비어 있었다.
+
+```
+.env        SUPABASE_JWT_SECRET       SET
+.env        SUPABASE_URL              **NOT_SET**       <- 이름은 있는데 값이 비었다
+.env        NEXT_PUBLIC_SUPABASE_URL  이름 자체가 없다
+.env.local  NEXT_PUBLIC_SUPABASE_URL  SET
+```
+
+`api/auth.py` 의 해석은 이렇다.
+
+```python
+SUPABASE_URL = _project_origin(os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "")
+```
+
+`.env` 쪽이 비었으므로 **`.env.local` 의 `NEXT_PUBLIC_SUPABASE_URL` 로 넘어간다.**
+런타임에서는 `SUPABASE_URL` 이 SET 으로 보이니 겉으로는 아무 문제가 없다.
+
+**[왜 위험한가]** `NEXT_PUBLIC_*` 은 이름 그대로 **프런트에 노출되는 값**이고
+`.env.local` 은 프런트 개발용 파일이다. 그런데 **백엔드의 ES256(현행 서명) 검증이
+거기에 걸려 있다.** 둘 다 gitignore·미추적이라 배포 대상에 사람이 직접 넣어야 하는데,
+백엔드만 올리는 사람이 `.env` 만 챙기는 것은 자연스러운 선택이다.
+
+```
+git check-ignore   .env  -> 무시됨 / 추적 안 됨
+                   .env.local -> 무시됨 / 추적 안 됨
+```
+
+`.env.local` 이 없는 환경을 재현했다(파일은 건드리지 않고 로더만 막았다).
+
+```
+SUPABASE_JWT_SECRET  SET
+SUPABASE_URL         **NOT_SET**     <- JWKS 를 받을 곳이 없다
+-> ES256 토큰 전부 401. ES256 이 현행 서명이므로 **로그인 사용자 전원.**
+```
+
+이것이 정확히 BUGS #205 가 기술한 조용한 실패다. 다행히 **#205 의 부팅 경고가 이
+상황에서 실제로 뜬다** — 재현했을 때 그대로 나왔다. 어제였다면 아무 말도 없었다.
+
+**[고칠 수 있는 것과 없는 것]** `.env` 에 `SUPABASE_URL` 을 채우는 것이 정답이지만
+`.env` 변경은 **승인 영역이라 SKIP** 한다. 코드로 할 수 있는 것을 했다: **폴백에 걸려
+있다는 사실 자체를 부팅 로그에 드러낸다.**
+
+```
+_SUPABASE_URL_SOURCE   URL 이 어느 이름에서 왔는지 기억한다(값이 아니라 이름이다)
+부팅 로그(INFO)        폴백에서 왔을 때만 한 줄 - "SUPABASE_URL 이 아니라
+                       NEXT_PUBLIC_SUPABASE_URL 에서 가져왔다"
+```
+
+**경고가 아니라 INFO 다.** 지금 상태는 장애가 아니라 **취약한 배치**다. 경고로 올리면
+개발 머신에서 매 부팅마다 떠서 진짜 경고를 가린다 — BUGS #204 가 컴파일 경고를 걷어낸
+것과 같은 이유다. 장애가 되는 순간(URL 이 실제로 비는 순간)은 #205 의 경고가 맡는다.
+
+**[회귀]** `test_auth_jwks_robustness.py` §9 에 이어 붙였다(68 -> 79단언).
+
+```
+mutation
+  M5 폴백 안내를 없앤다                    -> 잡았다
+  M6 안내를 경고로 올린다(잡음)            -> 잡았다 (경고 호출 수 3->4 로도 걸린다)
+  M7 안내에 URL 값을 끼워 넣는다           -> 잡았다
+  M8 출처를 늘 SUPABASE_URL 이라 보고한다  -> **처음엔 못 잡았다**
+  M9 출처를 늘 폴백이라 보고한다           -> **처음엔 못 잡았다**
+```
+
+**[M8·M9 가 뚫은 이유 — 이 머신에서는 두 분기가 같은 답을 낸다]** `.env` 의
+`SUPABASE_URL` 이 비어 있으니 "폴백이 정답"인 상태다. 그래서 출처를 어떻게 보고하든
+현재 환경에서는 구별되지 않았다. 환경 자체를 바꾸지 않으면 잴 수 없는 것이었다.
+
+**환경을 바꾼 하위 프로세스**로 나머지 두 분기를 실제로 밟았다.
+
+```
+SUPABASE_URL 을 넣은 환경    -> 출처가 "SUPABASE_URL"          (M8 검출)
+둘 다 없는 환경(.env 차단)   -> 출처가 ""                      (M9 검출)
+```
+
+여기서 배운 것: **검사를 현재 환경에만 걸면 분기가 하나로 접힌다.** 이 저장소가
+`ALLOW_LIVE_CRAWL` / `DOJOONPASS_DATA_ROLE` 로 구조적 게이트를 세워 온 것과 같은 문제다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 **8,432**건(프런트 dev 서버 없이) / **8,436**건
+(서버를 띄우고 - 둘 다 실측). #205 시점 8,420/8,424 -> +12. 개발 DB·운영 로그 지문 무변경.
+
+**[확인 불가]** 운영(데스크탑1 / 실제 배포 대상)에 `.env` 와 `.env.local` 중 무엇이
+올라가 있는지는 **여기서 알 수 없다.** 그쪽 부팅 로그에 위 INFO 한 줄이 뜨는지로
+판별할 수 있다 — 뜨면 `.env.local` 에 의존하고 있다는 뜻이다.
+
+--------
+
+#207
+
+**사용자 입력이 SQL 문법에 닿는 유일한 자리를 아무 검사도 지키지 않고 있었다** —
+주입은 되지 않았다. 그런데 그것을 지키는 것이 없었다
+
+발견 (2026-08-25, 코드 Audit — `execute()` 첫 인자를 AST 로 전수 훑다가)
+
+**[전수 조사]** 제품 파이썬 92개에서 `execute()/executemany()/executescript()` 의 첫
+인자가 **문자열 리터럴이 아닌** 자리를 전부 뽑았다.
+
+```
+해당 54건   BinOp(%/+) 31 / f-string 12 / 변수 11
+그중 사용자 입력이 닿는 API 라우트  api/v1/{search,admin,payments,subscriptions,audit,thumbnails}.py
+```
+
+하나씩 봤다. **전부 안전한 패턴이었다.**
+
+```
+where = " AND ".join(conditions)      conditions 는 전부 리터럴, 값은 params 로 바인딩
+placeholders = ",".join("?" * n)      개수만 만든다
+or_clause = " OR ".join(["property_type LIKE ?"] * n)
+_address_detail_condition()           전 분기가 리터럴 + ? 반환
+```
+
+조건 리스트에 리터럴이 아닌 것을 넣는 자리는 AST 로 **2건**뿐이었고 둘 다 위의
+`or_clause` / `addr_sql` 이다. 즉 **텍스트 필드는 값이 SQL 이 되지 않는다.**
+
+**[그런데 한 곳만 다르다]** 정렬이다.
+
+```python
+order_col = SORT_COLUMNS.get(sort_by)
+order_dir = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+order_clause = f"{order_col} {order_dir}, id {order_dir}" if order_col else "..."
+rows = conn.execute(f"SELECT * FROM auction_item WHERE {where} ORDER BY {order_clause} ...")
+```
+
+`ORDER BY` 에는 파라미터를 바인딩할 수 없으므로 이렇게 쓸 수밖에 없다. 방어는
+`SORT_COLUMNS` 화이트리스트 + 진입부의 400 거부 두 겹이고, **지금 실제로 잘 막는다.**
+
+실제 HTTP(uvicorn, DB 사본)로 적대 입력을 눌러 확인했다.
+
+```
+sort_by=auction_date; DROP TABLE auction_item--        400
+sort_by=auction_date, (SELECT COUNT(*) FROM sqlite_master)  400
+sort_by=(SELECT 1) / auction_date-- / *  / '' / id     400
+sort_order=; DROP TABLE auction_item-- / ' OR 1=1--    400
+텍스트 6필드 x 페이로드 5종                             200, 500 없음, 스키마 누출 없음
+400 본문: 입력을 되비출 뿐 허용 컬럼 목록은 안 알려 준다
+```
+
+**[그래서 무엇이 문제인가]** `test_search.py` 142단언 중 **sort_by 적대 입력 검사가
+0건**이었다. 이 API 에서 사용자 입력이 SQL 문법에 닿는 곳은 정렬 하나뿐인데,
+그 하나를 지키는 검사가 없었다.
+
+화이트리스트는 조용히 무너진다. `SORT_COLUMNS.get(sort_by, sort_by)` 처럼 "친절한"
+기본값을 넣거나 진입부 검증 한 줄을 지우면 곧바로 `ORDER BY` 주입이 되는데,
+**그 편집은 정상 요청을 하나도 깨뜨리지 않는다.** 이 저장소 기준으로는 그것이 결함이다
+(BUGS #203 과 같은 판단 — 제품은 옳은데 그것을 지키는 검사가 없다).
+
+**[합성 DB 로 재야 했던 이유]** 개발 머신의 DB 는 **기본 질의(종결 제외)가 0건**이다.
+행이 없어서가 아니라 1,876건의 **기일이 전부 지났기 때문**이다(마지막 크롤 2026-08-12,
+P0-A 맥락). 실측: 기본 0건 / `include_closed=true` 1,876건 /
+`auction_date_from=2000-01-01` 1,875건.
+
+(처음엔 이걸 "검색 결과가 0건"이라고만 적었는데 부정확했다 — 이 파일의 다른 검사들은
+`include_closed=True` 를 붙여 1,876건을 본다. 그래서 그 검사들은 공허하지 않다.
+실제로 세어 보니 `test_search.py` 218판정 중 "데이터 없음(검증 생략)" 통과는 **0건**이었다.)
+
+정렬은 값이 서로 다른 행이 눈에 보여야 검증되고, 0건끼리 비교하면 주입이 통해도
+통하지 않아도 똑같이 0 이라 공허해진다. 그래서 합성 행 5개를 만들어 잰다. 실제로 첫 실측에서 `total` 이 전부 `None` 으로 나와 "결과 수 불변"
+단언이 아무것도 재지 않고 있었다(응답 형태도 `meta.total` 이 아니라 최상위 `total` 이었다).
+그래서 정렬이 관측되는 합성 행 5개를 만들어 잰다.
+
+**[회귀]** `test_search.py` §10 `check_sort_and_injection_are_bounded()` 신설
+(142 -> 157단언).
+
+```
+(0) 합성 행이 실제로 검색된다 (5건)        <- 공허하지 않다
+(1) asc/desc 가 실제로 정렬한다, 서로 다르다 <- 정렬이 무시되면 아래가 무의미해진다
+    화이트리스트 8개 키가 전부 200
+(2) 정렬 적대 입력 18건이 전부 400          <- 200(통과)도 500(터짐)도 아니다
+(3) 400 본문이 허용 컬럼 목록을 안 흘린다
+(4) 텍스트 적대 입력 18건이 200 + 0건 매치
+(5) 주입 시도 뒤 테이블과 행이 그대로다
+```
+
+mutation:
+
+```
+M1 sort_by 검증 한 줄 삭제                   -> 잡았다 (18건 중 다수가 200)
+M2 SORT_COLUMNS.get(sort_by, sort_by)        -> 잡았다 (200/500 이 섞여 나온다)
+M4 sort_order 검증 삭제 + 그대로 SQL 에       -> 잡았다
+M5 400 본문에 허용 컬럼 목록을 친절히 추가    -> 잡았다
+M6 case_no 를 바인딩 대신 문자열에 끼워 넣기  -> 잡았다 (500 2건 + `' OR '1'='1` 이 5건 전부 반환)
+M3 order_dir 삼항만 제거                     -> **안 잡힌다. 그리고 그게 맞다** (아래)
+대조군                                       -> exit 0
+```
+
+**[M3 은 결함이 아니다 — 확인했다]** `order_dir` 삼항을 없애고 `sort_order` 를 그대로
+SQL 에 넣어도 검사가 붉어지지 않는다. 진입부의 `sort_order not in ("asc","desc")` 검증이
+**먼저** 막기 때문이다. 즉 M3 단독으로는 악용할 수 없다. 두 겹을 함께 걷어낸 M4 는
+정확히 잡힌다 — 방어 깊이가 의도대로 동작한다는 뜻이다.
+
+**[따라 나온 것 하나 — 검사가 엉뚱한 이유로 붉어지고 있었다]** 누출 검사가 응답이
+400 인지 보지 않고 본문 전체를 훑고 있었다. M1 을 걸면 요청이 **통과(200)** 해서 정상
+데이터의 컬럼명이 응답에 들어오는데, 그것을 "누출"로 오인해 붉어졌다. 잡기는 잡았지만
+**이유가 틀렸다.** 전제(`code == 400`)를 먼저 단언하도록 고쳤다.
+
+**[한 번 틀렸다가 고친 것]** 처음엔 "텍스트 적대 입력은 전부 0건"이라고 단언해서
+`sido="서울' AND 1=1--"` 이 5건을 돌려주며 붉어졌다. 주입인 줄 알고 원인을 재보니
+**정규화였다** — `extract_sido()` 가 부분일치라 페이로드에서 `"서울"` 을 뽑아낸다.
+
+```
+extract_sido("서울' AND 1=1--")                 -> '서울'
+extract_sido("1' UNION SELECT ... --")          -> ''
+extract_sido("x서울y") / ("서울대공원")           -> '서울'
+```
+
+SQL 은 여전히 `sido = ?` 로 바인딩된다. 그래서 단언을 두 주장으로 갈랐다 —
+지역명을 품지 않은 페이로드는 0건이고, 정규화가 걸리는 페이로드는 **평문 `"서울"` 과
+결과가 완전히 같다**(= SQL 조각이 아무 역할도 안 했다). 후자가 더 강한 증명이다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 **8,468**건(프런트 dev 서버 없이) / **8,472**건
+(서버를 띄우고 - 둘 다 실측). #206 시점 8,432/8,436 -> +36. 개발 DB·운영 로그 지문 무변경.
+
+**[계수 방식 주의]** 이 숫자는 `run_python_tests.py` 의 세는 법(`[PASS]|[OK]` 를 줄
+어디서든 찾는다) 기준이다. `grep '^\[PASS'` 로 세면 **들여쓴 표시가 빠져** 더 작게
+나온다(이번에 §10 을 단독 실행하며 157 로 세었는데 스위트는 218 이었다 — 회귀가
+아니라 계수 차이다). 기준선을 비교할 때는 같은 방법으로 세야 한다.
+
+--------
+
+#208
+
+**인덱스를 추가해도 새 DB 에서는 조용히 사라진다** — 테이블을 재작성하는 마이그레이션이
+자기가 아는 목록만 다시 만들기 때문이다. 그리고 그 결과는 **로컬과 배포가 갈리는** 모양이다
+
+발견 (2026-08-25, 성능 Audit — 인덱스 중복을 재다가 옆에서 나왔다)
+
+**[출발은 중복이었다]** `auction_item` 인덱스가 16개다. 기계적으로 훑으니
+완전 중복 4쌍 / 접두 중복 7쌍, 전체 63개 중 **9개가 지울 수 있는 것**이었다.
+쓰기 비용도 재 봤다(스키마만 복제한 빈 DB 에 20,000행 INSERT).
+
+```
+현재 인덱스 전부      0.59s    33,981행/s    11.6 MB   16개
+중복 제거 후          0.19s   103,960행/s     9.0 MB    9개
+인덱스 없음(하한)     0.05s   420,396행/s     4.2 MB    0개
+                      -> 중복 제거 시 쓰기 67.3% 단축, 파일 22.8% 감소
+```
+
+**[그런데 이건 이미 판단이 끝난 문제였다]** `test_schema_hygiene.py` §6-3
+`test_no_new_duplicate_indexes()` 가 **이미** 완전 중복 4쌍을 알고 있고, 접두 중복은
+*"SQLite 가 더 작은 인덱스를 고르는 편이 유리할 수 있어 의도적일 수 있다"* 며 일부러
+제외해 두었다. 지우지 않는 이유도 적혀 있다 — *"쓰기도 하루 1회 배치라 비용이 무시할
+수준"*.
+
+**그 판단이 맞다.** 67% 는 커 보이지만 절대량은 20,000행에 **0.4초**다. 하루 한 번
+배치에서 0.4초는 병목이 아니다. 그래서 **이 측정은 기존 결정을 뒤집지 않는다** —
+절대 수치를 붙여 줄 뿐이다. 인덱스 DROP 은 운영 DB 마이그레이션이라 **승인 영역(SKIP)**
+이기도 하다.
+
+같은 것을 검사하는 가드를 하나 더 만들려다 걷어냈다. 그게 바로 이 저장소가 BUGS #204 에서
+경계한 "두 벌" 이다.
+
+**[진짜 결함은 옆에 있었다]** 중복 가드를 mutation 으로 시험하려고 `008_create_search_
+indexes.sql` 에 `CREATE INDEX` 한 줄을 추가했는데 **검사가 붉어지지 않았다.** 인덱스가
+안 생겼기 때문이다.
+
+```
+008 에 CREATE INDEX 한 줄 추가 -> 부트스트랩 -> 그 인덱스 **존재하지 않음**
+오류도 경고도 없다
+```
+
+원인: `013_auction_item_case_id_unique.sql` 이 `auction_item` 을 **재작성**한다
+(CREATE TABLE + INSERT INTO + DROP TABLE + ALTER TABLE RENAME). 그때 기존 인덱스는
+전부 사라지고, **013 이 하드코딩한 16개만** 다시 만들어진다.
+
+그러니 013 보다 앞 번호 마이그레이션에 인덱스를 넣으면 조용히 없어진다. 하필 그 파일
+이름이 `create_search_indexes.sql` 이라, 검색이 느려 인덱스를 넣으려는 사람이 **가장 먼저
+여는 곳**이다.
+
+**[왜 이게 배포 위험인가]** 마이그레이션은 한 번만 돈다. 013 이 이미 적용된 운영 DB 는
+013 을 다시 실행하지 않으므로, 그 뒤에 008 에 추가한 인덱스는 **운영에는 남고 새로 클론한
+개발 머신에는 없다.** 같은 소스인데 스키마가 갈린다 — "여기선 되는데"가 되는 전형적인
+자리다. 반대 방향(소스에 없는데 라이브 DB 에만 있는 인덱스)은 이미 겪었다:
+`idx_audit_logs_admin_id` 는 어떤 소스에도 없다(§6-3 주석에 기록돼 있다).
+
+**[수정 — 가드]** `test_schema_hygiene.py` 에
+`test_declared_indexes_survive_bootstrap()` 을 신설했다.
+
+소스(`migrate_v4_1.py` + `migrations/*.sql`)에서 `CREATE INDEX` 로 선언한 이름을 전부
+모으고, **실제로 부트스트랩한 DB 에 그 이름이 있는지** 본다. 013 전용 규칙이 아니라
+어떤 마이그레이션이 어떤 테이블을 재작성해도 잡힌다.
+
+```
+현재: 선언 63개 / 부트스트랩 DB 63개 / 사라진 것 0개
+
+mutation
+  M1 013 앞 번호(008)에 인덱스 추가        -> 잡았다 (파일명·테이블명까지 지목)
+  M2 013 의 재생성 목록에서 하나 삭제       -> 잡았다 (migrate_v4_1.py 선언분이 사라짐)
+  대조군                                   -> exit 0
+```
+
+실패 메시지가 무엇을 하라고 말한다 — *"재작성하는 마이그레이션의 CREATE INDEX 목록에도
+함께 넣으라."*
+
+**[곁가지 — 자기 검증이 같이 붉어지고 있었다]** 처음엔 자기 검증을 "사라진 목록이
+프로브 하나와 **정확히 같다**"로 썼다. 그러면 진짜 결손이 있을 때 자기 검증까지 함께
+붉어져 원인 줄이 두 배가 된다. "프로브가 목록에 **들어 있는가**"로 바꿨다 — 탐지기가
+동작하는지만 보고, 실제 결손 판정은 위 검사에 맡긴다.
+
+**[M2 를 걸었을 때 BOM 가드가 먼저 잡았다]** mutation 스크립트가 013 을 `utf-8-sig` 로
+다시 써서 BOM 이 붙었는데, `test_crlf_blobs_are_not_rewritten_as_lf` 계열의 BOM 검사가
+그걸 지목했다. 의도한 mutation 은 아니었지만 **그 가드가 살아 있다는 증거**라 적어 둔다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 8,492건(프런트 dev 서버 없이). 개발 DB·운영 로그 지문 무변경.
+
+**[남는 것 / 승인 영역]** 중복 인덱스 9개의 실제 DROP 은 운영 DB 마이그레이션이라
+여기서 하지 않는다. 위 실측(하루 0.4초)대로 **급하지 않다.** 정리한다면 013 처럼
+재작성하는 마이그레이션의 목록과 `migrate_v4_1.py` 를 **함께** 고쳐야 한다 —
+한쪽만 고치면 이 검사가 즉시 붉어진다(그게 이 검사의 목적이다).
+
+--------
+
+#209
+
+**시크릿 비교를 `==` 로 바꿔도 테스트가 하나도 붉어지지 않았다** — 네 자리 전부.
+타이밍 방어는 행위로 잡을 수 없으므로 아무도 지키지 않고 있었다
+
+발견 (2026-08-25, Security Audit — 결제 웹훅 서명 검증을 mutation 으로 눌러 보다가)
+
+**[출발]** 돈이 걸린 경로부터 봤다. `MockProvider.verify_webhook_signature()` 는
+`PAYMENT_WEBHOOK_SECRET` 으로 HMAC-SHA256 을 만들어 헤더 값과 맞댄다. 세 가지를 걸었다.
+
+```
+M3 시크릿 없을 때 통과시킨다(fail-open)   -> 실패 6건   잘 막힌다
+M2 헤더 조회를 대소문자 구분으로 바꾼다    -> 실패 1건   막힌다
+M1 hmac.compare_digest 를 `==` 로 바꾼다  -> **실패 0건**
+```
+
+admin 쪽도 같았다.
+
+```
+resolve_admin_role() 의 compare_digest 둘을 `==` 로
+  test_admin_secret_contract   실패 0건
+  test_api_regression          실패 0건
+  test_schema_hygiene          실패 0건
+```
+
+`compare_digest` 를 쓰는 자리는 저장소 전체에 **네 곳**이고(admin 2 + payment 1 + 주석 1),
+**전부 무방비**였다.
+
+**[왜 행위로 못 잡나]** `==` 로 바꿔도 **응답이 완전히 같다.** 달라지는 것은 걸리는
+시간뿐이고, 그 차이는 단위 테스트에서 안정적으로 측정되지 않는다(마이크로초 단위,
+GC·스케줄러 잡음에 묻힌다). 타이밍을 재는 테스트를 쓰면 느린 CI 에서 흔들려 신호가 죽는다.
+
+그래서 **구조로 본다.** 이 저장소가 "경고 인자에 시크릿 값을 넣지 않는가"를 AST 로 보는
+것과 같은 방식이다(BUGS #205).
+
+**[아이러니]** `api/v1/admin.py` 의 docstring 이 왜 상수 시간이어야 하는지 이미 적어
+두고 있었다 — *"단순 `!=`는 앞에서부터 다르면 즉시 반환되어 비교 시간이 일치하는 접두
+길이에 비례하는 타이밍 사이드채널이 된다."* **판단은 옳았고 그것을 지키는 것이 없었다.**
+BUGS #207 과 같은 모양이다.
+
+**[수정 — 가드]** `test_schema_hygiene.py` 에
+`test_secret_comparisons_are_constant_time()` 을 신설했다. 두 겹이다.
+
+```
+(1) 아는 자리가 여전히 compare_digest 를 쓰는가
+    api/v1/admin.py                resolve_admin_role
+    api/v1/payment_providers.py    MockProvider.verify_webhook_signature
+    + 시크릿에서 온 지역 이름을 `==` 로 맞대지 않는가 (줄 번호까지 지목한다)
+
+(2) 시크릿을 **비교하는** 함수가 새로 생겼는데 목록에 없지는 않은가
+```
+
+```
+mutation
+  M1 payment 의 compare_digest 제거   -> 잡았다 (줄 196, `expected`)
+  M2 admin 의 compare_digest 둘 제거  -> 잡았다 (줄 94 `super_key`, 줄 97 `admin_key`)
+  M3 목록에 없는 새 대조 함수 추가     -> 잡았다 (이름을 지목)
+  대조군                              -> exit 0
+```
+
+**[가드 자체에 오탐이 둘 있었고 고쳤다]** 처음 판이 붉게 나왔는데 **제품이 아니라 검사가
+틀린 것**이었다.
+
+```
+(a) find_fn 이 ast.walk 로 이름만 찾아 **기반 클래스 스텁**을 먼저 집었다
+    -> PaymentProvider.verify_webhook_signature 는 항상 False 를 돌려주는 자리라
+       compare_digest 가 없다. 목록에 **클래스까지** 적고 점 표기를 해석하게 고쳤다.
+
+(b) "시크릿 env 를 읽고 비교문이 있으면 대조 함수"로 판정해 `_require_role()` 을 물었다
+    -> 거긴 `if not os.getenv(...) and not os.getenv(...)` 로 **설정 여부만** 본다.
+       "compare_digest 를 쓰거나 시크릿에서 온 이름을 `==` 로 맞대는" 함수만 세도록 좁혔다.
+```
+
+(b) 는 중요한 구분이다 — **존재 확인은 대조가 아니다.** 그걸 뭉뚱그리면 가드가 매번
+붉어져 결국 꺼지게 된다.
+
+**[적용 범위]** `KGInicisProvider` / `TossProvider` 는 아직 `NotImplementedError` 스텁이라
+대상이 없다. 실연동이 들어오는 순간 (2) 가 그 함수를 지목한다 — 서명 검증을 새로 쓰면서
+`==` 를 쓰면 즉시 붉어진다. 결제 실연동은 승인 영역이므로 여기서는 그 자리만 마련해 둔다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 8,501건(프런트 dev 서버 없이). 개발 DB·운영 로그 지문 무변경.
+
+--------
+
+#210
+
+**상세 화면의 "늦은 응답이 화면을 덮지 않게" 하는 방어를 아무 테스트도 참조하지 않았다** —
+소스에 가드가 9곳 있는데 `grep -rn idRef tests/ test_*.py` 결과가 0건이었다
+
+발견 (2026-08-25, Frontend Audit — 응답 경합 보호를 전수로 훑다가)
+
+**[훑은 방법]** `src/**/*.ts(x)` 에서 **비동기 결과로 화면 상태를 바꾸는 useEffect** 를
+전부 뽑고, 각 블록에 경합 가드가 있는지 봤다.
+
+```
+비동기 결과로 setState 하는 useEffect  9곳
+가드가 보이지 않는 곳                   6곳   <- 처음 판정
+```
+
+여섯 곳을 하나씩 확인했다. **전부 실제로는 안전했다.**
+
+```
+favorites / mypage / recent   deps=[router]  -> 사실상 마운트 1회. 재실행이 없으니 경합이 없다
+SearchPresets                 deps=[]        -> 마운트 1회
+properties/[id]:308           키 맵에 쓴다   -> 늦게 와도 **자기 키에만** 쓴다(구조적으로 안전)
+properties/[id]:319           deps=[id]      -> `idRef` 관용구로 await 마다 끊는다
+```
+
+마지막이 핵심이다. 상세는 이전/다음 이동이 **같은 라우트의 파라미터 전환**이라
+컴포넌트가 재마운트되지 않는다. A 를 요청하고 곧바로 B 로 넘어가면 A 의 응답이 나중에
+도착해 **B 화면을 덮을 수 있다.** 그러면 화면에 "다른 물건의 상세"가 그대로 보인다 —
+오류도 로딩도 아니라서 **사용자는 그게 틀린 줄 모른다.**
+
+소스는 그 방어를 이미 갖고 있었다. `const requestId = id` 를 잡고 **모든 await 뒤에**
+`if (idRef.current !== requestId) return` 으로 끊는다. 주석까지 정확하다.
+
+**[그런데 그 방어를 지키는 것이 없었다]**
+
+```
+소스의 idRef 가드                     9곳
+tests/ + test_*.py 에서 idRef 참조     **0건**
+```
+
+한 줄만 지워도 아무도 모른다. BUGS #209(상수시간 비교)와 정확히 같은 모양이다 —
+**판단은 옳았고 그것을 지키는 것이 없었다.**
+
+**[왜 소스 계약인가]** 경합은 `node --test` 에서 재현할 수 없다 — React 렌더러도 DOM 도
+없고, 타이밍을 만들어도 흔들린다. 이 저장소는 이미 같은 자리에서 같은 선택을 했다
+(`src/proxy.ts` 의 존재·규약을 소스로 고정한 `tests/source-contract.test.mjs`).
+
+**[수정]** `tests/source-contract.test.mjs` 에 3검사를 신설했다.
+
+```
+1. idRef = useRef(id) 가 있고, id 가 바뀔 때 idRef.current 가 따라간다   (기준점)
+2. ★ requestId 를 잡은 함수 안에서, await 뒤 가드를 지나지 않고
+   화면 상태를 바꾸는 자리가 하나도 없다                                (본 검사)
+3. 가드를 전부 지운 사본에 같은 판정을 돌리면 잡힌다                     (자기 검증)
+```
+
+```
+mutation
+  M1 가드 한 줄 삭제(347행)              -> 잡았다. "348: setAccessToken(token)" 을 지목
+  M2 idRef.current = id 를 주석 처리      -> 잡았다
+  M3 useRef(id) -> useRef(null)          -> 잡았다
+  대조군                                  -> 41 pass / 0 fail
+```
+
+**[처음 판이 오탐 셋을 냈다 — 검사 쪽이 틀렸다]**
+
+```
+387 setAccessToken       requireToken() 안이다 - requestId 를 잡지 않는 별개 함수
+407 setRegistryErrorCode performRegistryRequest() 안 - 마찬가지
+554 setAccessToken       `if (idRef.current === requestId) setAccessToken(...)` - 이미 가드다
+```
+
+원인 둘: **고정 120줄**을 훑어 뒤따르는 함수까지 끌어온 것, 그리고 가드를 `!==` 형태로만
+인정한 것. 중괄호 깊이로 **선언한 함수 안에서만** 보게 하고, `===` 형태도 가드로 인정하게
+고쳤다.
+
+**[더 중요한 것 — 판정 로직을 두 벌로 썼다가 갈라졌다]** 본 검사와 자기 검증이 각자
+스캔을 구현했는데, 한쪽은 `split('\n')` 이라 줄 끝에 `\r` 이 남았다(이 파일은 CRLF 다).
+그 탓에 **자기 검증만 엉뚱하게 붉어져** 한참을 헤맸다. BUGS #204 가 경계한 바로 그
+"두 벌" 이다. `unguardedWrites(source)` 하나로 합치고 `split(/\r?\n/)` 으로 통일했다.
+
+**[따라 나온 것 — 편집 도구가 파일에 제어문자를 남겼다]** 정규식에 `\b` 를 넣으려던
+패치가 **실제 백스페이스 문자(0x08)** 를 파일에 써 넣어 검사가 조용히 틀렸다.
+그 바이트를 걷어내고, **추적 파일 전체**를 훑어 텍스트 파일에 제어문자가 없음을 확인했다
+(걸린 10개는 전부 바이너리 — `auction.db.backup_*` 9개와 `favicon.ico`).
+
+**[결함이 아니라고 판정한 것]** `performRegistryRequest()` 계열(등기부 신청/구독)은
+`requestId` 를 잡지 않는다. 사용자가 버튼을 누른 직후 다른 물건으로 넘어가면 그 결과
+문구가 새 물건 화면에 잠깐 뜰 수 있다. 다만 (a) 사용자가 방금 스스로 시작한 동작이고,
+(b) `[id]` 효과가 물건이 바뀔 때 `setRegistryMessage(null)` 로 초기화하며,
+(c) 다음 요청 시작 시에도 다시 비운다. **데이터가 아니라 안내 문구**라 지금 고치지
+않는다 — 대신 여기 적어 다음에 다시 판단할 수 있게 한다.
+
+**[기준선]** 통과 54 / 실패 0, 단언 8,505건(프런트 dev 서버 있음).
+node --test 194건 / 190 pass / 0 fail / 4 skip. tsc·eslint·build exit 0.
+개발 DB·운영 로그 지문 무변경.

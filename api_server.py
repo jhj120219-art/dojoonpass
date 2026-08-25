@@ -35,6 +35,7 @@ from api.v1.documents import router as documents_router
 from api.v1.images import router as images_router
 from api.v1.payments import router as payments_router
 from api.v1.admin import router as admin_router, warn_if_admin_keys_missing
+from api.auth import warn_if_auth_config_missing
 from api.v1.subscriptions import router as subscriptions_router
 
 # 설정 누락을 **부팅 시점에** 알린다 (2026-08-21 Sprint 246).
@@ -42,6 +43,9 @@ from api.v1.subscriptions import router as subscriptions_router
 #   더 위로 올리면 .env 를 읽기 전이라 멀쩡한 설정에도 거짓 경고가 나간다.
 #   키 값은 남기지 않는다 - 설정 여부만.
 warn_if_admin_keys_missing()
+#   인증 설정도 같은 이유로 여기서 본다 - 한쪽만 사라지면 500 이 아니라 401 이라
+#   "토큰이 틀렸다"로 읽혀 조용히 묻힌다 (BUGS #205).
+warn_if_auth_config_missing()
 
 app = FastAPI(
     title="도준패스 법원경매 API",

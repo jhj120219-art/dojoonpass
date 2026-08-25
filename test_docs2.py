@@ -29,15 +29,16 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 from crawler.doc_crawler import get_download_driver_options, wait_loading, crawl_documents
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 def main():
     opts = get_download_driver_options()
-    svc = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=svc, options=opts)
+    # ★ 드라이버 해석은 crawler.base_crawler 한 곳에 있다 (2026-08-25, docs/BUGS.md #196).
+    #   직접 ChromeDriverManager 를 부르면 이 PC 에서 기동에 실패한다.
+    from crawler.base_crawler import resolve_chrome_driver
+    driver = resolve_chrome_driver(opts)
 
     try:
         print("1. 안동지원 접속...")

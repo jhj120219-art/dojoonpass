@@ -26,15 +26,52 @@ from storage.checkpoint import RunLock
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
 
+# ★ 파일 로그는 **이 파일을 직접 실행할 때만** 붙인다 (2026-08-25, docs/BUGS.md #192).
+#   왜 — 예전에는 아래 basicConfig 가 **import 시점에** 루트 로거에 FileHandler 를
+#   붙였다. 그런데 이 모듈을 import 하는 것은 제품 코드가 아니라 **테스트뿐**이다
+#   (2026-08-25 전수 확인: 제품 모듈의 import 0건). 루트 로거에 붙으므로 그 프로세스
+#   안의 **모든** 로그(crawler/* 포함)가 운영 로그 파일로 흘러들었다. 실측(2026-08-25):
+#
+#       logs/scraper.log      36,420줄 중 08-24~25 자 2,346줄이 QA 산출물
+#                             (가짜 법원 'QA1'/'QA2', "전 법원(2곳) 수집 실패" 등)
+#       logs/doc_collect.log   4,136줄 중 1,651줄(40%)이 QA 산출물('QA법원')
+#
+#   마지막 실제 크롤은 **2026-08-12** 다. 즉 이 로그만 보면 "오늘 크롤이 돌았고 전 법원이
+#   실패했다"로 읽힌다 — 이 저장소가 9일간 크롤 중단을 몰랐던 그 함정(거짓 증거)와
+#   같은 계열이다. BUGS #186 이 DB 축에서 고친 것을 파일 축에서 다시 고친다.
+#
+#   **운영 경로는 전혀 바뀌지 않는다** — `.bat` 은 이 파일을 `python <파일>` 로 부르므로
+#   아래 `__main__` 분기에서 같은 FileHandler 가 그대로 붙는다. 나머지 진입점 둘
+#   (`doc_worker.py` / `refresh_priority.py`)은 애초에 StreamHandler 하나뿐이라,
+#   이 수정으로 네 진입점의 import 시점 동작이 같아진다.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(_HERE, "logs", "scraper.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+SCRAPER_LOG_PATH = os.path.join(_HERE, "logs", "scraper.log")
+
+
+def attach_file_log():
+    """운영 파일 로그를 루트 로거에 붙인다. `__main__` 에서만 부른다.
+
+    두 번 불러도 핸들러가 겹치지 않는다(같은 경로가 이미 붙어 있으면 그대로 둔다) —
+    테스트가 이 함수를 직접 검증할 수 있어야 하기 때문이다(부수효과를 쓰지 않는다).
+    """
+    root = logging.getLogger()
+    target = os.path.abspath(SCRAPER_LOG_PATH)
+    for h in root.handlers:
+        if isinstance(h, logging.FileHandler) and os.path.abspath(h.baseFilename) == target:
+            return h
+    handler = logging.FileHandler(SCRAPER_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root.addHandler(handler)
+    return handler
 
 # 동시 실행 방지 (2026-08-18 Sprint 194).
 # ---------------------------------------------------------------------------
@@ -228,4 +265,5 @@ def main() -> int:
         lock.release()
 
 if __name__ == "__main__":
+    attach_file_log()   # 운영 파일 로그는 직접 실행할 때만 (docs/BUGS.md #192)
     sys.exit(main())

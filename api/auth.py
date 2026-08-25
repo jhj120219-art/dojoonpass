@@ -75,7 +75,98 @@ def _project_origin(url: str) -> str:
 
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_URL = _project_origin(os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "")
+
+# 위 URL 이 **어느 이름에서 왔는지**를 기억한다 (2026-08-25, BUGS #205 후속 실측).
+#
+#   지금 이 저장소의 실제 상태가 그렇다:
+#
+#       .env        SUPABASE_URL              **비어 있다**
+#       .env.local  NEXT_PUBLIC_SUPABASE_URL  SET      <- ES256 검증이 여기에 걸려 있다
+#
+#   즉 백엔드의 **현행 토큰 검증 경로(ES256/JWKS)가 프런트 전용 파일 이름에 의존한다.**
+#   `.env` 와 `.env.local` 은 둘 다 gitignore 이므로 배포 대상에 따로 넣어야 하는데,
+#   백엔드만 올리는 사람은 `.env` 만 챙기는 것이 자연스럽다. 그러면 URL 이 비고,
+#   **로그인 사용자 전원이 401** 이 된다(BUGS #205 의 바로 그 시나리오다).
+#
+#   그 상황 자체는 `warn_if_auth_config_missing()` 이 부팅에서 잡는다. 여기서는 한 걸음
+#   앞을 본다 - **아직 멀쩡하지만 폴백에 걸려 있는 상태**를 부팅 로그에 드러내,
+#   장애가 났을 때 "어느 파일이 빠졌나"를 되짚을 수 있게 한다. 값은 남기지 않는다.
+_SUPABASE_URL_SOURCE = ("SUPABASE_URL" if os.getenv("SUPABASE_URL")
+                        else "NEXT_PUBLIC_SUPABASE_URL" if os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+                        else "")
+
 bearer_scheme = HTTPBearer()
+
+def warn_if_auth_config_missing() -> bool:
+    """Supabase 인증 설정이 **하나라도** 없으면 부팅 시점에 경고한다. 남겼으면 True.
+
+    ## 왜 필요한가 - 한쪽만 사라지면 로그인 사용자 전원이 401 이 된다
+
+    `get_current_user()` 는 **둘 다** 없을 때만 500 "JWT 검증 설정 미비" 를 낸다.
+    그 경우는 500 이라 즉시 드러난다. 문제는 **한쪽만** 사라진 경우다 - 실측하면
+    이렇다(2026-08-25, 로컬 스텁 JWKS + 진짜 ES256 키로 재현. BUGS #205).
+
+        둘 다 있음            ES256 200 / HS256 200      (정상)
+        SUPABASE_URL 없음     ES256 **401** / HS256 200  <- 로그인 사용자 전원 401
+        JWT_SECRET 없음       ES256 200 / HS256 **401**  <- 레거시 토큰 전원 401
+        둘 다 없음            전부 500
+
+    **ES256 이 현행 서명이다**(BUGS #27 에서 Supabase 가 비대칭으로 전환했다).
+    그러니 `SUPABASE_URL` 하나가 비는 것만으로 로그인한 사람 전부가 막힌다.
+    그런데 그때 남는 로그는 요청마다 나오는
+
+        JWT 검증 실패: JWKS에서 해당 kid의 공개키를 찾지 못했습니다
+
+    뿐이다 - **키 회전 중 사고처럼 읽힌다.** 설정이 빠졌다는 말은 어디에도 없다.
+    401 은 "토큰이 틀렸다"와 구별되지 않는다. `_require_role()` 의 403 이 "권한
+    부족"과 구별되지 않는 것과 같은 모양이고(BUGS #205), 같은 방식으로 고친다.
+
+    이 파일 위쪽 주석이 기록하듯 **설정이 실제로 사라진 적이 있다**(cwd 가 저장소
+    루트가 아니면 `.env` 를 못 읽어 둘 다 빈값이 됐다). 그때는 500 이라 드러났다.
+    한쪽만 사라지는 날에는 드러나지 않는다.
+
+    ## 값은 절대 남기지 않는다
+
+    시크릿이 로그에 들어가면 로그 유출이 곧 인증 우회다. `_get_jwk()` 와
+    `get_current_user()` 의 기존 규칙(토큰·키·비밀값을 로그에 넣지 않는다)을 그대로
+    따라 **설정 여부만** 남긴다.
+    """
+    has_secret = bool(SUPABASE_JWT_SECRET)
+    has_url = bool(SUPABASE_URL)
+    if has_secret and has_url:
+        # 멀쩡하지만 **폴백에 걸려 있는** 경우는 남겨 둔다 - 경고는 아니다(장애가 아니다).
+        # 배포에서 `.env` 만 챙기면 이 폴백이 사라져 로그인 전원 401 이 되므로,
+        # 사고가 났을 때 "어느 파일이 빠졌나"를 되짚을 단서를 부팅 로그에 남긴다.
+        if _SUPABASE_URL_SOURCE == "NEXT_PUBLIC_SUPABASE_URL":
+            logger.info(
+                "JWKS 조회 URL 을 SUPABASE_URL 이 아니라 NEXT_PUBLIC_SUPABASE_URL 에서 "
+                "가져왔다(.env 의 SUPABASE_URL 이 비어 있다). 백엔드만 배포하면서 그 "
+                "파일을 빠뜨리면 ES256 검증이 끊긴다 - BUGS #205."
+            )
+        return False
+
+    if not has_secret and not has_url:
+        logger.warning(
+            "SUPABASE_JWT_SECRET / SUPABASE_URL 이 모두 미설정이다 - "
+            "인증이 필요한 모든 API 가 500(JWT 검증 설정 미비)으로 응답한다. "
+            "cwd 가 저장소 루트인지, .env 가 읽히는지 확인하라."
+        )
+        return True
+
+    if not has_url:
+        logger.warning(
+            "SUPABASE_URL 이 미설정이다(NEXT_PUBLIC_SUPABASE_URL 도 없다) - JWKS 를 "
+            "받을 곳이 없어 ES256 토큰을 검증하지 못한다. ES256 이 현행 서명이므로 "
+            "로그인 사용자 전원이 401 이 된다. 401 은 '토큰이 틀렸다'와 구별되지 "
+            "않으니 설정 누락이 조용히 묻힌다. .env 설정을 확인하라."
+        )
+    else:
+        logger.warning(
+            "SUPABASE_JWT_SECRET 이 미설정이다 - HS256(레거시) 토큰을 검증하지 "
+            "못해 그 토큰을 쓰는 요청이 전부 401 이 된다. ES256 경로는 살아 있어 "
+            "증상이 일부에게만 나타난다. .env 설정을 확인하라."
+        )
+    return True
 
 # ---------------------------------------------------------------------------
 # JWT 검증: ES256(JWKS) + HS256(레거시 공유 시크릿)
@@ -127,7 +218,26 @@ def _get_jwk(kid: str):
         fresh = (now - _jwks_fetched_at) < _JWKS_TTL_SECONDS
         if kid in _jwks_keys and fresh:
             return _jwks_keys[kid]
-        if (now - _jwks_fetched_at) >= _JWKS_MIN_REFETCH_SECONDS or not _jwks_keys:
+        # ★ 2026-08-25 (BUGS #191) — 예전에는 이 조건에 `or not _jwks_keys` 가 붙어
+        #   있었다. 캐시가 비어 있는 동안 **하한이 통째로 무효**가 되어, JWKS 가
+        #   응답하지 않는 상태에서는 들어오는 요청마다 5초짜리 바깥 호출이 하나씩
+        #   나갔다. 게다가 그 호출이 `_jwks_lock` 을 **잡은 채** 일어나므로 요청들이
+        #   직렬화된다 — 재현(스레드 8개, 응답 없는 JWKS): 바깥 호출 8회 / 마지막
+        #   요청이 8×타임아웃을 대기. 실제 timeout=5 면 동시 8요청에 40초다.
+        #   JWKS 한 곳이 느려지는 것이 **API 전체 정지**로 번진다.
+        #
+        #   `_JWKS_MIN_REFETCH_SECONDS` 의 원래 취지가 바로 그 폭주 방지였는데
+        #   (위 상수 주석) 그 예외 조항이 정확히 캐시가 빈 순간 취지를 무효화했다.
+        #   `_fetch_jwks_locked()` 가 **시도 전에** `_jwks_fetched_at` 을 갱신하므로
+        #   시간 조건만으로 실패 후 재시도까지 올바르게 눌린다. 남는 것은
+        #   "한 번도 시도한 적 없다"뿐이라 그것만 따로 본다 — 0.0 을 시간 비교로
+        #   대신하면 부팅 직후(monotonic 이 작은 환경)에 첫 조회를 건너뛸 수 있다.
+        #
+        #   바뀌는 것: JWKS 장애 중 401 이 **빠르게** 난다(예전에는 5초씩 매달린 뒤
+        #   같은 401). 결과는 같고 서버가 살아 있다. 캐시가 살아 있을 때의 동작은
+        #   전혀 바뀌지 않는다(아래 `fresh` 분기가 그대로 먼저 걸린다).
+        never_fetched = _jwks_fetched_at == 0.0
+        if never_fetched or (now - _jwks_fetched_at) >= _JWKS_MIN_REFETCH_SECONDS:
             try:
                 _fetch_jwks_locked()
             except Exception as exc:

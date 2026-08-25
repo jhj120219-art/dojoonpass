@@ -21,6 +21,31 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ★ 운영 `auction.db` 를 건드리지 않는다 (2026-08-25). 이 파일은 `get_connection()` 으로
+#   합성 행을 심고 지우는데, 예전에는 그 대상이 **운영 DB 자체**였다. 끝에 지우므로
+#   행수는 원복돼 아무도 몰랐지만, `sqlite_sequence` 는 영구히 전진했고(1회 실측:
+#   search_presets +210 / payment_logs +112 / registry_requests +53 ...) 중간에 죽으면
+#   지우는 코드에 도달하지 못해 합성 행이 운영 테이블에 그대로 남았다.
+#
+#   `test_admin_failure_injection.py` 와 같은 방식으로 임시 사본에 대고 돌린다.
+#   `get_connection()` 은 `sqlite3.connect(DB_PATH)` 로 **호출 시점에** 모듈 전역을
+#   읽으므로, 이 재지정 한 줄이 API 라우터까지 함께 돌린다(제품 코드 중 `DB_PATH` 를
+#   직접 import 하는 곳은 없다 - 2026-08-25 전수 확인). 문서 파일은 사본을 만들지
+#   않고 저장소 루트 기준으로 그대로 읽힌다(읽기만 한다).
+#
+#   감시는 `run_python_tests.py` 가 한다 - 파일마다 운영 DB 지문을 재서 바뀌면
+#   그 파일을 지목하고 게이트를 붉게 만든다. 경위는 docs/BUGS.md #186.
+import atexit as _qa_atexit
+import shutil as _qa_shutil
+import tempfile as _qa_tempfile
+import storage.database as _qa_dbmod
+_qa_tmp = _qa_tempfile.mkdtemp(prefix="dojoonpass-qa-")
+_qa_atexit.register(_qa_shutil.rmtree, _qa_tmp, True)
+_qa_scratch = os.path.join(_qa_tmp, "auction.db")
+if os.path.exists(_qa_dbmod.DB_PATH):
+    _qa_shutil.copy2(_qa_dbmod.DB_PATH, _qa_scratch)
+_qa_dbmod.DB_PATH = _qa_scratch
+
 os.environ.setdefault("ADMIN_API_KEY", "qa-race-admin-key")
 os.environ.setdefault("SUPER_ADMIN_API_KEY", "qa-race-super-admin-key")
 if not os.getenv("SUPABASE_JWT_SECRET"):

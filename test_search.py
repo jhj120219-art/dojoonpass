@@ -800,6 +800,202 @@ def check_authed_screens_get_the_same_address():
         db.DB_PATH = prev
         shutil.rmtree(tmp, ignore_errors=True)
 
+def check_sort_and_injection_are_bounded():
+    """정렬 파라미터와 적대 입력이 **SQL 을 바꾸지 못하는가** (2026-08-25 신설, BUGS #207).
+
+    ## 왜 이 자리인가
+
+    `/api/v1/search` 는 사용자 입력을 두 갈래로 다룬다.
+
+        텍스트 필드(case_no/sido/dong/...)  ->  전부 `?` 바인딩. 값이 SQL 이 되지 않는다.
+        **정렬(sort_by / sort_order)**      ->  **SQL 문자열에 직접 들어간다**
+                                                (`f"ORDER BY {order_clause}"`)
+
+    즉 이 API 에서 사용자 입력이 SQL 문법에 닿는 곳은 정렬 하나뿐이다. 방어는
+    `SORT_COLUMNS` 화이트리스트 + `sort_order` 고정 삼항인데, **그 방어를 확인하는
+    검사가 하나도 없었다**(2026-08-25 실측: 이 파일 142단언 중 sort_by 적대 입력 0건).
+
+    화이트리스트는 조용히 무너지기 쉽다 - 누가 `SORT_COLUMNS.get(sort_by, sort_by)`
+    처럼 "친절한" 기본값을 넣거나 검증 한 줄을 지우면 곧바로 `ORDER BY` 주입이 된다.
+    그 편집은 정상 요청을 하나도 깨뜨리지 않으므로 다른 검사에 걸리지 않는다.
+
+    ## 합성 DB 로 재는 이유
+
+    개발 머신의 DB 는 **기본 질의(종결 제외)가 0건**이다 - 1,876건이 다 있지만 기일이
+    전부 지났다(마지막 크롤 2026-08-12, 이 저장소의 P0-A 맥락). 이 파일의 다른 검사들은
+    `include_closed=True` 를 붙여 1,876건을 보지만, 여기서는 **정렬 결과를 눈으로 확인**
+    해야 하므로 값이 서로 다른 소수의 행이 필요하다. 0건끼리 비교하면 주입이 통해도
+    통하지 않아도 똑같이 0 이라 검사가 공허해지기도 한다.
+
+    (2026-08-25 실측: 기본 0건 / `include_closed=true` 1,876건 /
+     `auction_date_from=2000-01-01` 1,875건.)
+
+    실제 HTTP(uvicorn)로도 같은 입력을 눌러 400/누출 없음을 확인했다. 여기서는
+    TestClient 로 고정한다 - 이 파일의 나머지와 같은 방식이고 서버 기동이 필요 없다.
+    """
+    import contextlib
+    import io as _io
+    import json as _json
+    import sqlite3 as _sqlite3
+    import tempfile
+
+    print("\n--- 10. 정렬/적대 입력이 SQL 을 바꾸지 못한다 (BUGS #207) ---")
+    tmp = tempfile.mkdtemp(prefix="qa_inject_")
+    import storage.database as db
+    prev = db.DB_PATH
+    try:
+        path = os.path.join(tmp, "auction.db")
+        db.DB_PATH = path
+        import storage.migrate_v4_1 as mig
+        import storage.migrations.run_migrations as runmig
+        with contextlib.redirect_stdout(_io.StringIO()):
+            db.init_db(); mig.migrate(); runmig.run()
+
+        conn = db.get_connection()
+        today = datetime.now().strftime("%Y-%m-%d")
+        cur = conn.execute("INSERT INTO auction_case (case_no,court_code,court_name)"
+                           " VALUES ('2025타경9','B9','서울중앙지방법원')")
+        case_id = cur.lastrowid
+        # 정렬이 **관측 가능하도록** 값을 서로 다르게 넣는다
+        ROWS = 5
+        for i in range(ROWS):
+            d = (datetime.now() + timedelta(days=10 + i)).strftime("%Y-%m-%d")
+            conn.execute(
+                "INSERT INTO auction_item (case_id,case_no,item_no,court_name,property_type,"
+                "sido,sigungu,dong,full_address,appraisal_price,minimum_bid_price,bid_rate,"
+                "auction_date,status,fail_count,crawl_date)"
+                " VALUES (?,'2025타경9',?,'서울중앙지방법원','아파트','서울','강남구','역삼동',"
+                "?,?,?,?,?,'유찰 1회',?,?)",
+                (case_id, str(i + 1), "서울특별시 강남구 역삼동 %d" % (i + 1),
+                 300000000 + i, 100000000 + i * 1000, 0.8, d, i, today))
+        conn.commit(); conn.close()
+
+        from fastapi.testclient import TestClient
+        from api_server import app
+        c = TestClient(app)
+
+        def q(**kw):
+            r = c.get("/api/v1/search", params={k: v for k, v in kw.items() if v is not None})
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, r.text
+
+        # (0) 검사가 공허하지 않다 - 합성 행이 실제로 검색에 잡힌다
+        code, body = q(size=50, page=1)
+        base_total = body.get("total") if isinstance(body, dict) else None
+        check("검사가 공허하지 않다(합성 행이 검색된다) - %s건" % base_total,
+              code == 200 and base_total == ROWS, "-> %s / %s" % (code, base_total))
+
+        # (1) 정렬이 **실제로 동작한다** - 이게 아래 적대 입력 검사의 대조군이다
+        _, asc = q(size=50, page=1, sort_by="minimum_bid_price", sort_order="asc")
+        _, desc = q(size=50, page=1, sort_by="minimum_bid_price", sort_order="desc")
+        a = [it["minimum_bid_price"] for it in (asc.get("items") or [])]
+        d_ = [it["minimum_bid_price"] for it in (desc.get("items") or [])]
+        check("오름차순이 실제로 오름차순이다", a == sorted(a), "-> %s" % a[:5])
+        check("내림차순이 실제로 내림차순이다", d_ == sorted(d_, reverse=True), "-> %s" % d_[:5])
+        check("두 방향이 서로 다르다(정렬이 무시되지 않는다)", a != d_,
+              "-> %s vs %s" % (a[:3], d_[:3]))
+
+        # 화이트리스트의 **모든** 키가 실제로 받아들여지는가 (목록이 죽은 값이 아니다)
+        from api.v1.search import SORT_COLUMNS
+        bad_keys = [k for k in SORT_COLUMNS if q(size=1, page=1, sort_by=k)[0] != 200]
+        check("화이트리스트 %d개 키가 전부 200 이다" % len(SORT_COLUMNS), not bad_keys,
+              "-> 거부된 키: %s" % bad_keys)
+
+        # (2) 적대 입력은 전부 400 이다 - 200(통과)도 500(터짐)도 아니다
+        SORT_PAYLOADS = [
+            "auction_date; DROP TABLE auction_item--",
+            "auction_date, (SELECT COUNT(*) FROM sqlite_master)",
+            "(SELECT 1)", "auction_date--", "auction_date/**/", "auction_date)--",
+            "1", "*", "", "id", "rowid",
+            "auction_date COLLATE NOCASE", "CASE WHEN 1 THEN 1 ELSE 2 END",
+        ]
+        ORDER_PAYLOADS = ["asc--", "; DROP TABLE auction_item--", "x",
+                          "asc, (SELECT 1)", "1"]
+        bad = []
+        for p in SORT_PAYLOADS:
+            code, _b = q(size=5, page=1, sort_by=p)
+            if code != 400:
+                bad.append(("sort_by", p, code))
+        for p in ORDER_PAYLOADS:
+            code, _b = q(size=5, page=1, sort_order=p)
+            if code != 400:
+                bad.append(("sort_order", p, code))
+        check("★ 정렬 적대 입력 %d건이 전부 400 이다"
+              % (len(SORT_PAYLOADS) + len(ORDER_PAYLOADS)),
+              not bad, "-> 400 이 아닌 것: %s" % bad[:4])
+
+        # (3) 400 본문이 **스키마를 흘리지 않는다** - 입력 반향은 허용, 컬럼 목록 노출은 아니다
+        code, body = q(size=5, page=1, sort_by="nonexistent_column")
+        # 먼저 **거부됐는지**를 본다. 이걸 빼면 통과했을 때(200) 응답 본문 전체를 훑게 돼
+        # 정상 데이터의 컬럼명을 "누출"로 오인한다(2026-08-25 mutation 에서 실제로 그랬다).
+        check("미등록 sort_by 는 거부된다(아래 누출 검사의 전제)", code == 400, "-> %s" % code)
+        detail = _json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)
+        leaked = [col for col in SORT_COLUMNS if col in detail] if code == 400 else []
+        check("★ 400 본문이 허용 컬럼 목록을 흘리지 않는다", not leaked,
+              "-> %s 가 오류 본문에 들어 있다. 공격자에게 정렬 가능한 컬럼을 알려 준다" % leaked)
+        check("400 본문에 SQL 조각이 없다",
+              not any(w in detail.upper() for w in ("SELECT ", "ORDER BY", "SQLITE_MASTER")),
+              detail[:120])
+
+        # (4) 텍스트 필드는 바인딩된다 - 값이 SQL 이 되지 않는다
+        #
+        #     주의: "아무 행도 안 나온다"를 그대로 단언하면 **틀린 검사**가 된다.
+        #     `sido` 는 `extract_sido()` 로 정규화되는데 이게 **부분일치**라
+        #     "서울' AND 1=1--" 에서 "서울" 을 뽑아낸다 -> `sido = '서울'` -> 전부 매치.
+        #     (2026-08-25 실측. 처음에 그렇게 써서 붉어졌고, 원인을 재보니 주입이 아니라
+        #      정규화였다.) 그러니 **유효한 지역명을 품지 않은** 입력으로 바인딩을 재고,
+        #     정규화 쪽은 아래에서 따로 "주입이 아니라 정규화임"을 증명한다.
+        TEXT = ["1' UNION SELECT name FROM sqlite_master--",
+                "'; DROP TABLE auction_item;--",
+                "' OR '1'='1"]
+        wrong = []
+        for f in ("case_no", "court_name", "address_detail", "sido", "dong", "status"):
+            for p in TEXT:
+                code, body = q(size=50, page=1, **{f: p})
+                if code != 200:
+                    wrong.append((f, p, code))
+                elif isinstance(body, dict) and body.get("total"):
+                    # 주입이 통했다면 필터가 무력화돼 전체가 나온다. 바인딩되면 0건이다.
+                    wrong.append((f, p, "total=%s" % body["total"]))
+        check("★ 텍스트 적대 입력 %d건이 200 이고 아무 행도 매치하지 않는다" % (6 * len(TEXT)),
+              not wrong, "-> %s" % wrong[:4])
+
+        # (4-b) 정규화가 지역명을 뽑아내는 경우는 **주입이 아니라 정규화**임을 증명한다.
+        #       같은 요청이 평문 "서울" 과 **정확히 같은 결과**를 내면, 페이로드의
+        #       SQL 조각은 아무 역할도 하지 않은 것이다.
+        from normalizer.normalizer import extract_sido as _ex
+        payload = "서울' AND 1=1--"
+        check("정규화가 페이로드에서 지역명만 뽑는다", _ex(payload) == "서울",
+              "-> %r" % _ex(payload))
+        _, poisoned = q(size=50, page=1, sido=payload)
+        _, plain = q(size=50, page=1, sido="서울")
+        check("★ 페이로드 결과 == 평문 '서울' 결과 (SQL 조각이 무력하다)",
+              [it["id"] for it in (poisoned.get("items") or [])]
+              == [it["id"] for it in (plain.get("items") or [])],
+              "-> %s vs %s" % (poisoned.get("total"), plain.get("total")))
+        # 그리고 지역명을 **품지 않은** 같은 모양의 페이로드는 0건이어야 한다
+        _, none_match = q(size=50, page=1, sido="zzz' AND 1=1--")
+        check("지역명 없는 같은 모양 페이로드는 0건", none_match.get("total") == 0,
+              "-> %s" % none_match.get("total"))
+
+        # (5) 주입 시도 뒤에도 DB 가 그대로인가 - 이게 최종 증거다
+        code, body = q(size=50, page=1)
+        check("주입 시도 뒤 검색 결과가 그대로다", body.get("total") == ROWS,
+              "-> %s" % body.get("total"))
+        raw = _sqlite3.connect(path)
+        names = {r[0] for r in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        cnt = raw.execute("SELECT COUNT(*) FROM auction_item").fetchone()[0]
+        raw.close()
+        check("★ auction_item 테이블이 살아 있다", "auction_item" in names,
+              "-> %s" % sorted(names)[:8])
+        check("★ 행이 하나도 지워지지 않았다", cnt == ROWS, "-> %s" % cnt)
+    finally:
+        db.DB_PATH = prev
+
+
 def run():
     print("=" * 70)
     print(" /api/v1/search 주소 Intent 회귀 (건수 비의존)")
@@ -1185,12 +1381,72 @@ def run():
     check("알 수 없는 sido -> 200 + 빈 목록", r.status_code == 200 and r.json()["sigungu"] == [],
           "-> %d %s" % (r.status_code, r.text[:60]))
 
+
+    # --- 9. 날짜 파라미터 검증 (2026-08-25, docs/BUGS.md #201) --------------
+    #
+    # 이 엔드포인트는 나머지 필터를 전부 400 + 사유로 거절하는데
+    # (sort_by / sort_order / property_type / min·max 숫자 6종 / page),
+    # 날짜 두 개만 검증이 없어 **오타가 조용히 0건**이 됐다.
+    # 실측(수정 전): `auction_date_from=not-a-date` -> HTTP 200 / total=0.
+    # 같은 폼에서 나온 값인데 숫자는 즉시 거절하고 날짜는 조용히 삼키는 것이
+    # 이 저장소가 반복해서 잡아 온 "조용히 틀린 결과"다.
+    print("\n--- 9. 날짜 파라미터 검증 (BUGS #201) ---")
+
+    def date_status(key, value):
+        r = client.get("/api/v1/search",
+                       params={"include_closed": True, key: value, "size": 1})
+        return r.status_code
+
+    # ★ 날짜를 **아예 안 넘긴** 경우(None)를 검증하면 모든 검색이 400 이 된다.
+    #   `if not _value: continue` 가드가 load-bearing 이라는 뜻이라 따로 잠근다.
+    r_nodate = client.get("/api/v1/search", params={"include_closed": True, "size": 1})
+    check("날짜 파라미터를 안 넘긴 검색은 그대로 200",
+          r_nodate.status_code == 200, "-> %s %s" % (r_nodate.status_code, r_nodate.text[:120]))
+
+    REJECT = [
+        ("형식이 아닌 문자열", "not-a-date"),
+        ("달력상 불가능한 달", "2026-13-01"),
+        ("달력상 불가능한 날", "2026-02-30"),
+        ("슬래시 구분자", "2026/01/01"),
+        ("시각이 붙은 값", "2026-01-01T00:00:00"),
+        ("SQL 조각", "2026-01-01') OR 1=1--"),
+        ("숫자만", "20260101"),
+    ]
+    for key in ("auction_date_from", "auction_date_to"):
+        for label, value in REJECT:
+            got = date_status(key, value)
+            check("%s - %s 는 400 으로 거절" % (key, label),
+                  got == 400, "-> %s" % got)
+
+    # 대조군 - 정상 값은 통과해야 한다. 없으면 "전부 400" 으로도 통과해 공허해진다.
+    for key in ("auction_date_from", "auction_date_to"):
+        got = date_status(key, "2026-01-01")
+        check("%s - 정상 YYYY-MM-DD 는 통과" % key, got == 200, "-> %s" % got)
+        # 빈 값은 "안 걸었다"는 뜻이다(기존 계약을 바꾸지 않는다).
+        got = date_status(key, "")
+        check("%s - 빈 값은 필터를 걸지 않은 것으로 본다" % key, got == 200, "-> %s" % got)
+
+    # 거절 사유가 **어느 파라미터인지** 말해 주는가 (증거 없는 400 을 만들지 않는다)
+    r = client.get("/api/v1/search",
+                   params={"include_closed": True, "auction_date_from": "bad", "size": 1})
+    body = r.text
+    check("400 사유에 파라미터 이름이 들어 있다",
+          "auction_date_from" in body, body[:200])
+    check("400 사유에 기대 형식이 들어 있다",
+          "YYYY-MM-DD" in body, body[:200])
+
+    # 필터가 실제로 **동작**하는지도 함께 본다 - 검증만 붙이고 기능이 죽으면 안 된다.
+    wide = total(auction_date_from="1900-01-01")
+    narrow = total(auction_date_from="2999-12-31")
+    check("정상 날짜 필터가 실제로 좁힌다(1900 >= 2999)", wide >= narrow, (wide, narrow))
+
     check_search_list_contract()
     check_no_stale_read_path()
     check_every_list_screen_contract()
     check_search_issues_a_constant_number_of_queries()
     check_declared_filters_actually_filter()
     check_authed_screens_get_the_same_address()
+    check_sort_and_injection_are_bounded()
 
     print()
     if FAILURES:

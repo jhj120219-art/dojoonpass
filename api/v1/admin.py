@@ -100,7 +100,7 @@ def resolve_admin_role(x_admin_key: Optional[str]) -> Optional[str]:
 
 
 def warn_if_admin_keys_missing() -> bool:
-    """두 관리자 키가 모두 없으면 **부팅 시점에** 경고를 남긴다. 남겼으면 True.
+    """관리자 키가 **하나라도** 없으면 부팅 시점에 경고를 남긴다. 남겼으면 True.
 
     ## 왜 필요한가 - 지금은 첫 admin 호출까지 아무도 모른다
 
@@ -109,8 +109,25 @@ def warn_if_admin_keys_missing() -> bool:
     열어 500 을 볼 때까지 서버는 아무 말도 하지 않는다. 그때 오류 문구만 보면
     코드 문제인지 설정 문제인지도 바로 알기 어렵다.
 
-    로그 한 줄이면 서버를 띄우는 순간 안다. 이번 세션에서 고친 결함들과 같은 계열이다 -
-    **조용한 실패를 시끄럽게 만든다.**
+    로그 한 줄이면 서버를 띄우는 순간 안다. **조용한 실패를 시끄럽게 만든다.**
+
+    ## 한쪽만 사라진 경우가 더 위험하다 (2026-08-25, BUGS #205)
+
+    처음에는 "둘 다 없을 때만" 경고했다. 잡음을 줄이려는 판단이었는데, **한쪽만
+    사라졌을 때 무슨 일이 나는지를 재보지 않고 내린 판단**이었다. 실측하면 이렇다.
+
+        둘 다 있음      ADMIN 라우트 200 / SUPER 전용 통과      부팅 조용함
+        SUPER 만 없음   ADMIN 라우트 200 / SUPER 전용 **403**   부팅 조용함  <- 위험
+        ADMIN 만 없음   ADMIN 키로 403   / SUPER 키로만 통과    부팅 조용함  <- 위험
+        둘 다 없음      전부 500                                부팅 경고함
+
+    **경고가 거꾸로 붙어 있었다.** 시끄러운 쪽(둘 다 없음)은 어차피 500 이라 즉시
+    드러난다. 정작 조용한 쪽이 경고를 못 받았다 - 그리고 그쪽이 **403** 이다.
+    403 은 "권한 부족"과 구별되지 않는다. 운영자는 설정 누락을 등급 문제로 읽는다.
+
+    이 저장소에서 키는 실제로 반복해서 사라졌다(BETA_RELEASE_CHECKLIST 의 P0-2 이력:
+    Sprint 233 소실 -> 238 복귀 -> 244 소실 -> 267 있음 -> 08-24 소실). 한쪽만
+    사라지는 날이 오면 지금까지는 아무도 몰랐을 것이다.
 
     ## 값은 절대 남기지 않는다
 
@@ -118,14 +135,32 @@ def warn_if_admin_keys_missing() -> bool:
     `_require_role()` 의 기존 규칙(값 대신 "미제공"/"불일치"만 기록)을 그대로 따라
     **설정 여부만** 남긴다.
     """
-    if os.getenv("ADMIN_API_KEY", "") or os.getenv("SUPER_ADMIN_API_KEY", ""):
+    has_admin = bool(os.getenv("ADMIN_API_KEY", ""))
+    has_super = bool(os.getenv("SUPER_ADMIN_API_KEY", ""))
+    if has_admin and has_super:
         return False
-    logger.warning(
-        "ADMIN_API_KEY / SUPER_ADMIN_API_KEY 가 모두 미설정이다 - "
-        "Admin API %d개 라우트가 전부 500(관리자 키 미설정)으로 응답한다. "
-        ".env 설정을 확인하라.",
-        len(router.routes),
-    )
+
+    if not has_admin and not has_super:
+        logger.warning(
+            "ADMIN_API_KEY / SUPER_ADMIN_API_KEY 가 모두 미설정이다 - "
+            "Admin API %d개 라우트가 전부 500(관리자 키 미설정)으로 응답한다. "
+            ".env 설정을 확인하라.",
+            len(router.routes),
+        )
+        return True
+
+    if not has_super:
+        logger.warning(
+            "SUPER_ADMIN_API_KEY 가 미설정이다 - SUPER_ADMIN 전용 라우트가 "
+            "누구에게도 열리지 않는다(403). 403 은 '권한 부족'과 구별되지 않아 "
+            "설정 누락이 조용히 묻힌다. .env 설정을 확인하라."
+        )
+    else:
+        logger.warning(
+            "ADMIN_API_KEY 가 미설정이다 - ADMIN 등급 키로는 어떤 라우트도 "
+            "통과하지 못한다(403). 지금은 SUPER 키로만 Admin API 에 접근된다. "
+            ".env 설정을 확인하라."
+        )
     return True
 
 

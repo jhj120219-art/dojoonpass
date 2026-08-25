@@ -157,10 +157,16 @@ def audit_images(conn):
 
     ★ migration 020 미적용 DB 를 대상으로 돌 수 있다 — `api/v1/item.py` /
       `images.py` / `thumbnails.py` 가 이미 이 상태를 "사진 없음"으로 우아하게
-      내려받는 것과 같은 이유다(2026-08-24 실측: 이 저장소의 운영 `auction.db`
-      자체가 지금 이 상태다). 여기만 그 방어가 없어서 감사기가 통째로 죽고
+      내려받는 것과 같은 이유다. 여기만 그 방어가 없어서 감사기가 통째로 죽고
       있었다 — 종료코드도 문서가 약속한 2(실행 자체 실패)가 아니라 파이썬
       기본 1(uncaught exception)이라 "어긋남 발견"과 구별되지 않았다.
+
+      ★ 2026-08-25 정정 — 이 주석은 원래 "2026-08-24 실측: 이 저장소의 운영
+      `auction.db` 자체가 지금 이 상태다"라고 적었다. **사실이 아니다** — 운영 DB 는
+      020 이 2026-08-17 에 적용돼 있고 `auction_image` 45행이 실재하며 디스크 파일과의
+      어긋남도 0건이다(docs/BUGS.md #185). 그 측정은 pre-020 백업 파일을 잸 것으로 보인다.
+      방어 코드 자체는 그대로 유효하다 — 부트스트랩 직후의 새 DB 나, 백업을
+      `DB_PATH` 로 지정해 감사기를 돌리는 경우가 실제로 있다.
     """
     table_missing = False
     try:
@@ -806,12 +812,38 @@ def audit_api_promises(conn, api_base):
     import urllib.error
     import urllib.request
 
+    # ★ 네트워크 계층 실패를 **세 번째 값**으로 돌려준다 (2026-08-25, docs/BUGS.md #194).
+    #
+    #   예전에는 `HTTPError` 만 잡았다. 그래서 읽는 도중 타임아웃/연결 리셋이 나면
+    #   그대로 위로 새어 나가 **감사기 전체가 트레이스백으로 죽었다** - 앞서 찍은
+    #   [1]~[8] 결과까지 판정 없이 버려진다. 실측(2026-08-25): 문서 URL 두 개에서
+    #   19초 뒤 ConnectionResetError 가 나 이 함수가 그대로 터졌다.
+    #
+    #   "열리지 않았다"(결함)와 "이번에 확인하지 못했다"(미확인)는 조치가 정반대다.
+    #   BUGS #188 이 `audit_auth_health.py` 에서 세운 구분을 여기서도 지킨다.
+    # ★ 네트워크 계열 실패만 재시도한다. HTTP 오류는 재시도하지 않는다 -
+    #   몇 번을 보내도 404 는 404 다. (BUGS #188 이 JWKS 에서 세운 것과 같은 규칙.)
+    #
+    #   재시도를 넣은 근거는 실측이다(2026-08-25). 이 감사는 자산 URL 601개를
+    #   **연속으로** 요청하는데, 그중 16건이 15초 타임아웃으로 떨어졌다. 그 16개를
+    #   그대로 다시 요청하니 **8/8 이 0.02~0.15초에 200** 이었다(표본 8개 전수).
+    #   파일도 엔드포인트도 멀쩡하다는 뜻이다 - 빠른 연속 요청에서만 생기는
+    #   연결 계층 현상으로 보이며, 원인은 미확정으로 남긴다(docs/BUGS.md #194).
+    #   실제 브라우저는 연결을 재사용하므로 같은 조건이 아니다.
+    GET_ATTEMPT_TIMEOUTS = (15, 25)
+
     def get(path):
-        try:
-            with urllib.request.urlopen(api_base + path, timeout=15) as r:
-                return r.status, r.headers.get("content-type", ""), r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, "", b""
+        """(status, content-type, body, 실패사유). 못 닿았으면 status 가 None 이다."""
+        last = None
+        for timeout in GET_ATTEMPT_TIMEOUTS:
+            try:
+                with urllib.request.urlopen(api_base + path, timeout=timeout) as r:
+                    return r.status, r.headers.get("content-type", ""), r.read(), None
+            except urllib.error.HTTPError as e:
+                return e.code, "", b"", None      # 서버가 대답했다 - 판정할 수 있다
+            except Exception as e:                # noqa: BLE001 - 못 닿은 것은 결함이 아니다
+                last = "%s: %s" % (type(e).__name__, str(e)[:90])
+        return None, "", b"", "%s (%d회 시도)" % (last, len(GET_ATTEMPT_TIMEOUTS))
 
     _head("[9] API 가 광고한 자산 URL 이 실제로 열리는가 (%s)" % api_base)
     try:
@@ -829,9 +861,13 @@ def audit_api_promises(conn, api_base):
         ORDER BY 1""")]
 
     bad = []
+    unknown = []                 # 못 닿아서 판정하지 못한 것. **어긋남으로 세지 않는다**
     n_img = n_doc = 0
     for i in ids:
-        st, _, body = get("/api/v1/item/%d" % i)
+        st, _, body, why = get("/api/v1/item/%d" % i)
+        if st is None:
+            unknown.append("item %d 상세 - %s" % (i, why))
+            continue
         if st != 200:
             bad.append("item %d 상세가 %d" % (i, st))
             continue
@@ -839,8 +875,10 @@ def audit_api_promises(conn, api_base):
 
         for im in b.get("images") or []:
             n_img += 1
-            s2, ct, _b = get(im["url"])
-            if s2 != 200 or not ct.startswith("image/"):
+            s2, ct, _b, why2 = get(im["url"])
+            if s2 is None:
+                unknown.append("%s - %s" % (im["url"], why2))
+            elif s2 != 200 or not ct.startswith("image/"):
                 bad.append("%s -> %s %s" % (im["url"], s2, ct))
         if b.get("image_count") != len(b.get("images") or []):
             bad.append("item %d image_count 가 목록 길이와 다르다" % i)
@@ -859,14 +897,25 @@ def audit_api_promises(conn, api_base):
             if not url:
                 bad.append("item %d %s available 인데 URL 이 없다" % (i, d.get("doc_type")))
                 continue
-            s2, _ct, _b = get(url)
-            if s2 != 200:
+            s2, _ct, _b, why2 = get(url)
+            if s2 is None:
+                unknown.append("%s - %s" % (url, why2))
+            elif s2 != 200:
                 bad.append("%s -> %s" % (url, s2))
 
     print("    물건 %d개 / 사진 URL %d개 / 문서 URL %d개 / 열리지 않음 %d개"
           % (len(ids), n_img, n_doc, len(bad)))
     for x in bad[:SAMPLE]:
         print("      %s" % x)
+    if unknown:
+        # ★ 미확인은 **어긋남에 더하지 않는다.** 대신 숨기지도 않는다 -
+        #   "열리지 않음 0" 만 보고 전수 확인됐다고 읽으면 안 되기 때문이다.
+        print("    ** 확인하지 못함 %d건 ** (못 닿았다. 결함이라는 뜻이 아니다)"
+              % len(unknown))
+        for x in unknown[:SAMPLE]:
+            print("      %s" % x)
+        print("      -> 서버가 살아 있는데도 나면 그 URL 만 다시 요청해 보라."
+              " 재요청하면 즉시 200 이 오는 경우가 관측됐다(docs/BUGS.md #194)")
     return len(bad)
 
 
@@ -878,6 +927,9 @@ def main():
     print("=" * 70)
     print(" 자산 무결성 감사 (읽기 전용) - %s" % db_path())
     print("=" * 70)
+    print("    ※ 이 숫자는 **이 머신이 여는 DB** 기준이다."
+          " 개발 머신과 운영 크롤 머신이 다를 수 있고, 개발 DB 에서 나온 값을"
+          " 제품 상태로 읽으면 안 된다 (docs/BUGS.md #200).")
 
     conn = _connect()
     try:

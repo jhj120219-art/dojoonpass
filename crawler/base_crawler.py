@@ -9,7 +9,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 from config.settings import random_delay, CourtInfo, MAX_ITEMS
 from crawler.resume import case_no_matches_list_entry
@@ -21,14 +20,99 @@ ELEMENT_TIMEOUT = 20
 AJAX_TIMEOUT = 30
 COURT_SELECT_ID = "mf_wfm_mainFrame_sbx_rletDxdyCortOfc"
 
+class DriverUnavailable(RuntimeError):
+    """크롬 드라이버를 얻지 못했다. 시도한 방법과 사유를 **전부** 들고 있다.
+
+    이 예외를 따로 두는 이유는 `webdriver_manager` 가 **어떤 실패든**
+    "Could not reach host. Are you offline?" 로 바꿔 던지기 때문이다.
+    그 문장은 이 PC 에서 실제로 거짓이었다(아래 참고).
+    """
+
+
+# ---------------------------------------------------------------------------
+# 크롬 드라이버 해석 (2026-08-25 신설, docs/BUGS.md #196)
+#
+# ★ 이 함수가 생긴 이유 — 지금 이 PC 에서 **수집 파이프라인 전체가 브라우저를 띄우지
+#   못한다.** 실측(2026-08-25):
+#
+#       crawler.base_crawler.build_driver()        (DailyCrawl) -> 1.3초 만에 실패
+#       crawler.doc_crawler.build_download_driver() (DocWorker)  -> 1.1초 만에 실패
+#       둘 다 ConnectionError: "Could not reach host. Are you offline?"
+#
+#   그 문장은 **거짓이다.** 같은 순간 같은 호스트를 직접 재면:
+#
+#       stdlib urllib -> https://googlechromelabs.github.io/...  HTTP 200, 0.05초
+#       requests      -> SSLCertVerificationError
+#                        "unable to get local issuer certificate"   (3회 전부)
+#
+#   `webdriver_manager` 는 `requests` 로 최신 버전 목록을 받아 오는데, 그 경로의 CA
+#   검증이 이 PC 에서 깨져 있다. 그리고 그 예외를 삼켜 "오프라인이냐"로 바꾼다.
+#   캐시(`~/.wdm/.../151.0.7922.138`)도 설치된 브라우저(151.0.7922.170)와 어긋나 있어
+#   매번 바깥을 봐야 한다.
+#
+#   즉 **스케줄러를 등록해도 크롤은 돌지 않는다** — P0-A 의 1순위 조치가 무력해진다.
+#   그리고 로그에 남는 문장이 "오프라인이냐"라서, 조사하는 사람은 멀쩡한 네트워크를
+#   뒤지게 된다. 이 저장소가 가장 경계하는 "거짓 증거"다.
+#
+#   Selenium Manager(4.6+ 내장)는 같은 순간 9.6초 만에 크롬을 띄웠다. 그래서 **먼저
+#   시도**하고, 실패하면 예전 경로로 떨어진다. 둘 다 실패하면 두 사유를 함께 올린다 —
+#   어느 쪽이 왜 안 됐는지 모르면 고칠 수 없다.
+#
+#   같은 코드가 `crawler/doc_crawler.py` / `collect_documents.py` 에도 필요하지만
+#   **새 모듈을 만들지 않는다** — 추적되지 않은 파일을 추적된 파일이 import 하면
+#   커밋된 트리가 부팅하지 못한다(BUGS #105, #186 이 같은 이유로 인라인을 택했다).
+#   이 모듈은 이미 추적되고 이미 "드라이버를 만드는 곳"이므로 여기 한 벌만 둔다.
+# ---------------------------------------------------------------------------
+def _driver_via_selenium_manager(opts):
+    """Selenium 4.6+ 내장 해석기. 캐시가 맞으면 바깥 네트워크를 타지 않는다."""
+    return webdriver.Chrome(options=opts)
+
+
+def _driver_via_webdriver_manager(opts):
+    """예전 경로. 매번 googlechromelabs.github.io 에서 버전 목록을 받아 온다."""
+    from webdriver_manager.chrome import ChromeDriverManager
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+
+
+CHROME_DRIVER_FACTORIES = (
+    ("Selenium Manager", _driver_via_selenium_manager),
+    ("webdriver_manager", _driver_via_webdriver_manager),
+)
+
+
+def resolve_chrome_driver(opts, factories=None):
+    """옵션을 받아 크롬을 띄운다. 전부 실패하면 `DriverUnavailable` 을 올린다.
+
+    `factories` 는 검사용 주입구다 - 실제 브라우저 없이 순서/실패 처리를 검증한다.
+    """
+    reasons = []
+    for name, make in (CHROME_DRIVER_FACTORIES if factories is None else factories):
+        try:
+            driver = make(opts)
+        except Exception as exc:
+            reason = "%s -> %s: %s" % (name, type(exc).__name__,
+                                       " ".join(str(exc).split())[:160])
+            reasons.append(reason)
+            logger.warning("크롬 드라이버 해석 실패 - %s", reason)
+            continue
+        if reasons:
+            # 첫 방법이 실패하고 폴백으로 살아난 경우다. 조용히 넘어가면 다음에
+            # 폴백까지 죽었을 때 "언제부터 이랬나"를 알 수 없다.
+            logger.warning("크롬 드라이버를 폴백(%s)으로 얻었다 - 앞선 실패: %s",
+                           name, "; ".join(reasons))
+        return driver
+    raise DriverUnavailable(
+        "크롬 드라이버를 얻지 못했다. 시도한 방법과 사유: " + "; ".join(reasons)
+        if reasons else "크롬 드라이버를 얻지 못했다 (시도할 방법이 없다)")
+
+
 def build_driver() -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    svc = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=svc, options=opts)
+    driver = resolve_chrome_driver(opts)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
 

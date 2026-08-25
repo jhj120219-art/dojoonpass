@@ -757,6 +757,42 @@ def test_court_identity_convention():
 # 스위트가 빨개지고, 그건 코드를 고쳐서 풀 수 있는 실패가 아니다 ― 곧 무시하게 된다.
 # **제품이 실제로 망가진 상태(검색 0건)만 실패**로 두고, 남은 기간은 크게 출력한다.
 # ---------------------------------------------------------------------------
+DATA_ROLE_ENV = "DOJOONPASS_DATA_ROLE"
+DATA_ROLE_OPERATIONAL = "operational"
+
+
+def data_role():
+    """이 머신이 **운영 데이터의 주인인가**. 선언하지 않으면 개발 머신으로 본다.
+
+    ## 왜 이 구분이 필요한가 (2026-08-25, docs/BUGS.md #200)
+
+    DOJOONPASS 는 머신을 역할로 나눈다 — 운영 Daily Crawl 은 **데스크탑1**이 돌리고,
+    이 저장소에서 개발/테스트/Audit 을 하는 **데스크탑3** 은 크롤을 돌리지 않는다.
+
+    그런데 아래 §11 은 그 구분 없이 **이 머신의 `auction.db`** 를 재고
+    *"제품이 실제로 망가진 상태(검색 0건)"* 라고 판정해 왔다. 개발 머신에서는 그 값이
+    당연히 0으로 수렴하므로, 이 검사는 **고칠 수 없는 실패로 영구히 붉은** 상태가 됐고
+    실제로 여러 세션이 그것을 "유일하게 알려진 실패"로 취급하며 지나갔다.
+    이 함수 바로 위 주석이 예언한 바로 그 상태다 —
+    *"코드를 고쳐서 풀 수 있는 실패가 아니다 ― 곧 무시하게 된다."*
+
+    Sprint 102 는 이 함정을 이미 적어 두었다: *"이 PC가 운영 머신이 맞는지도 코드로는
+    알 수 없다."* 코드로 알 수 없으므로 **선언하게 한다.** `ALLOW_LIVE_CRAWL=1` 이
+    실크롤을 규약이 아니라 구조로 막는 것과 같은 방식이다.
+
+        DOJOONPASS_DATA_ROLE=operational   이 머신의 auction.db 가 운영 데이터다
+        (미선언/그 외)                      개발 머신 - 데이터 신선도를 제품 판정으로 쓰지 않는다
+
+    기본값을 **개발**로 두는 이유: 잘못 선언하지 않은 개발 머신이 거짓 P0 를 만드는 것보다,
+    선언을 잊은 운영 머신이 경보를 놓치는 쪽이 **눈에 띄기 쉽다**(§11 이 미선언 상태를
+    매번 크게 찍는다). 그리고 개발 머신은 다수, 운영 머신은 하나다.
+    """
+    return (os.environ.get(DATA_ROLE_ENV, "") or "").strip().lower()
+
+
+def is_operational_data():
+    return data_role() == DATA_ROLE_OPERATIONAL
+
 def test_data_freshness_runway():
     print("\n--- 11. 데이터 신선도 (검색 결과가 0이 되기까지) ---")
     conn = connect()
@@ -774,10 +810,32 @@ def test_data_freshness_runway():
     print("    마지막 crawl_date : %s" % last_crawl)
     print("    기본 검색에 뜨는 물건: %d건" % live)
 
-    # ★ 제품이 망가진 상태. 이것만 실패로 둔다.
-    check_true("기본 검색에 뜰 물건이 남아 있다(0이면 사용자에게 빈 화면)", live > 0,
-               "auction_date >= %s 인 물건이 0건이다 ― 수집 파이프라인을 먼저 확인하라"
-               % today)
+    # ★ 이 머신이 **운영 데이터의 주인일 때만** 제품 판정으로 쓴다 (BUGS #200).
+    if is_operational_data():
+        check_true("기본 검색에 뜰 물건이 남아 있다(0이면 사용자에게 빈 화면)", live > 0,
+                   "auction_date >= %s 인 물건이 0건이다 ― 수집 파이프라인을 먼저 확인하라"
+                   % today)
+    else:
+        # 값이 **있는데** 인식하지 못한 것은 오타일 수 있다. 선언하려던 사람은
+        # 자기가 선언했다고 믿으므로, 미선언과 같은 문구로 뭉개면 안 된다.
+        declared = data_role()
+        if declared:
+            print("    ** %s=%r 를 인식하지 못했다 ** 개발 머신으로 처리한다."
+                  " 운영으로 선언하려면 정확히 %r 이어야 한다."
+                  % (DATA_ROLE_ENV, declared, DATA_ROLE_OPERATIONAL))
+        # 개발 머신에서는 이 값이 당연히 0 으로 수렴한다. 그것을 제품 결함으로 찍으면
+        # **고칠 수 없는 실패**가 되고, 그러면 아무도 이 검사를 안 본다.
+        # 대신 **크게 찍는다** - 선언을 잊은 운영 머신이 이 줄을 보고 알아채도록.
+        print("    [역할 미선언] 이 머신은 운영 데이터의 주인이라고 선언되지 않았다"
+              " -> 위 숫자를 제품 판정으로 쓰지 않는다.")
+        print("    이 머신의 auction.db 가 운영 데이터라면 %s=%s 로 선언하라"
+              " (그러면 검색 0건이 실패로 잡힌다)."
+              % (DATA_ROLE_ENV, DATA_ROLE_OPERATIONAL))
+        # 검사가 공허해지지 않게, **재는 것은 실제로 했는지**를 고정한다.
+        check_true("측정 자체는 성공했다(crawl_date 를 읽을 수 있다)",
+                   last_crawl is not None,
+                   "-> auction_item 이 비어 있거나 crawl_date 가 전부 NULL 이다."
+                   " 이것은 머신 역할과 무관하게 부트스트랩이 깨졌다는 뜻이다")
 
     if not rows:
         return
@@ -873,7 +931,13 @@ def test_checklist_p0a_verdict_matches_reality():
         conn.close()
 
     expected = "OPEN" if live == 0 else "RESOLVED"
-    print("    실측 기일 미도래 물건 : %d건  -> 기대 판정 %s" % (live, expected))
+    # ★ 이 비교는 **이 머신의 DB** 기준이다 (BUGS #200).
+    #   문서와 이 머신의 숫자가 갈라지지 않게 하는 드리프트 가드이지,
+    #   **제품의 검색이 비었다는 판정이 아니다.** 운영 상태는 여기서 알 수 없다.
+    print("    이 머신의 DB 기준 기일 미도래 물건 : %d건  -> 기대 토큰 %s" % (live, expected))
+    if not is_operational_data():
+        print("    (이 머신은 운영 데이터의 주인으로 선언되지 않았다 -"
+              " 위 숫자를 제품 판정으로 읽지 말 것)")
     print("    문서에 적힌 판정      : %s" % verdict)
     check_true(
         "★ 체크리스트의 P0-A 판정이 실측과 일치한다",
@@ -881,6 +945,108 @@ def test_checklist_p0a_verdict_matches_reality():
         "-> 문서는 '%s' 라고 하는데 실측은 기일 남은 물건 %d건(=%s)이다. "
         "docs/BETA_RELEASE_CHECKLIST.md 의 P0A-VERDICT 토큰과 그 주변 서술을 함께 고칠 것"
         % (verdict, live, expected))
+
+def test_data_role_gate_is_wired():
+    """§11 의 제품 판정이 **머신 역할 선언에 묶여 있는가** (2026-08-25, BUGS #200).
+
+    ## 왜 이 검사가 필요한가
+
+    DOJOONPASS 는 머신을 역할로 나눈다 — 운영 Daily Crawl 은 데스크탑1이 돌리고,
+    이 저장소로 개발/QA 를 하는 데스크탑3 은 크롤을 돌리지 않는다. 그래서 개발 머신의
+    `auction.db` 에서 "기일 미도래 0건"은 **정상**이지 제품 결함이 아니다.
+
+    §11 은 그 구분 없이 이 머신의 DB 를 재고 "제품이 망가졌다"로 찍어 왔고,
+    개발 머신에서 **고칠 수 없는 영구 red** 가 됐다. 여러 세션이 그것을 "유일하게 알려진
+    실패"로 취급하며 지나갔다 — §11 자기 주석이 예언한 상태 그대로다.
+
+    이 검사는 두 방향을 **모두** 고정한다. 한쪽만 보면 다음에 또 갈라진다.
+
+        운영으로 선언한 머신   -> 검색 0건은 반드시 **실패**여야 한다 (이빨이 남아야 한다)
+        선언하지 않은 머신     -> 실패로 만들지 않는다 (거짓 P0 를 만들지 않는다)
+    """
+    print("\n--- 11-c. 데이터 역할 선언 게이트 (BUGS #200) ---")
+    import ast as _ast
+
+    saved = os.environ.get(DATA_ROLE_ENV)
+    try:
+        # --- 값 해석 ---------------------------------------------------
+        cases = [
+            ("operational", True),
+            ("OPERATIONAL", True),
+            ("  operational  ", True),
+            ("prod", False),
+            ("production", False),
+            ("development", False),
+            ("", False),
+        ]
+        for value, expected in cases:
+            os.environ[DATA_ROLE_ENV] = value
+            check("%s=%r -> 운영 데이터로 본다" % (DATA_ROLE_ENV, value),
+                  is_operational_data(), expected)
+        os.environ.pop(DATA_ROLE_ENV, None)
+        check("선언 자체가 없으면 개발로 본다", is_operational_data(), False)
+
+        # --- 배선: 제품 판정이 그 분기 **안에** 있는가 -------------------
+        #     문자열이 아니라 구문 트리로 본다 - 주석에 이름이 나오는 것은 배선이 아니다.
+        src = open(os.path.join(ROOT, "test_pipeline_integrity.py"),
+                   encoding="utf-8-sig").read()
+        tree = _ast.parse(src)
+        fn = next((n for n in tree.body
+                   if isinstance(n, _ast.FunctionDef) and n.name == "test_data_freshness_runway"),
+                  None)
+        check_true("§11 함수를 찾았다", fn is not None)
+        if fn is None:
+            return
+
+        PRODUCT_CLAIM = "기본 검색에 뜰 물건이 남아 있다"
+
+        def claim_calls(node):
+            out = []
+            for n in _ast.walk(node):
+                if not isinstance(n, _ast.Call):
+                    continue
+                if (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) != "check_true":
+                    continue
+                if n.args and isinstance(n.args[0], _ast.Constant) \
+                        and isinstance(n.args[0].value, str) \
+                        and PRODUCT_CLAIM in n.args[0].value:
+                    out.append(n)
+            return out
+
+        guarded, total = [], claim_calls(fn)
+        for node in _ast.walk(fn):
+            if not isinstance(node, _ast.If):
+                continue
+            test_src = _ast.dump(node.test)
+            if "is_operational_data" not in test_src:
+                continue
+            for n in node.body:
+                guarded.extend(claim_calls(n))
+
+        check_true("★ 제품 판정 단언이 소스에 있다(검사가 공허하지 않다)",
+                   len(total) == 1, len(total))
+        check_true("★ 그 단언이 is_operational_data() 분기 **안에** 있다",
+                   len(guarded) == 1,
+                   "-> 분기 밖으로 나오면 개발 머신에서 다시 거짓 P0 가 된다")
+
+        # --- 미선언 머신에도 남아 있어야 할 최소 단언 --------------------
+        #     전부 없애 버리면 §11 이 아무것도 검증하지 않는 껍데기가 된다.
+        else_claims = []
+        for node in _ast.walk(fn):
+            if isinstance(node, _ast.If) and "is_operational_data" in _ast.dump(node.test):
+                for n in node.orelse:
+                    for sub in _ast.walk(n):
+                        if isinstance(sub, _ast.Call) and \
+                                (getattr(sub.func, "id", None) or
+                                 getattr(sub.func, "attr", None)) == "check_true":
+                            else_claims.append(sub)
+        check_true("★ 미선언 머신에서도 최소 한 가지는 단언한다(껍데기 방지)",
+                   len(else_claims) >= 1, len(else_claims))
+    finally:
+        if saved is None:
+            os.environ.pop(DATA_ROLE_ENV, None)
+        else:
+            os.environ[DATA_ROLE_ENV] = saved
 
 def _report_scheduler_registration():
     """예약 작업에 이 저장소를 가리키는 항목이 있는지 **보고만** 한다(실패시키지 않는다)."""
@@ -1510,6 +1676,7 @@ def run():
     test_court_identity_convention()
     test_data_freshness_runway()
     test_checklist_p0a_verdict_matches_reality()
+    test_data_role_gate_is_wired()
     test_stored_normalization_matches_code()
     test_stale_region_contamination_detector()
     test_empty_sido_is_explained_by_the_address()

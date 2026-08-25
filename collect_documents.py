@@ -14,9 +14,8 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
-from storage.database import get_connection
+from storage.database import get_connection, record_doc_raw_row
 from config.settings import random_delay
 # 경로 규칙은 selenium 무의존 모듈에서 가져온다 — 여기서 규칙을 따로 만들면
 # 뷰어(api/v1/documents.py)·doc_worker와 갈라져 "READY인데 404"가 된다.
@@ -39,15 +38,52 @@ from crawler.doc_paths import canonical_doc_path, PDF_DOWNLOADABLE_DOC_TYPES
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(_HERE, "logs"), exist_ok=True)
 
+# ★ 파일 로그는 **이 파일을 직접 실행할 때만** 붙인다 (2026-08-25, docs/BUGS.md #192).
+#   왜 — 예전에는 아래 basicConfig 가 **import 시점에** 루트 로거에 FileHandler 를
+#   붙였다. 그런데 이 모듈을 import 하는 것은 제품 코드가 아니라 **테스트뿐**이다
+#   (2026-08-25 전수 확인: 제품 모듈의 import 0건). 루트 로거에 붙으므로 그 프로세스
+#   안의 **모든** 로그(crawler/* 포함)가 운영 로그 파일로 흘러들었다. 실측(2026-08-25):
+#
+#       logs/scraper.log      36,420줄 중 08-24~25 자 2,346줄이 QA 산출물
+#                             (가짜 법원 'QA1'/'QA2', "전 법원(2곳) 수집 실패" 등)
+#       logs/doc_collect.log   4,136줄 중 1,651줄(40%)이 QA 산출물('QA법원')
+#
+#   마지막 실제 크롤은 **2026-08-12** 다. 즉 이 로그만 보면 "오늘 크롤이 돌았고 전 법원이
+#   실패했다"로 읽힌다 — 이 저장소가 9일간 크롤 중단을 몰랐던 그 함정(거짓 증거)와
+#   같은 계열이다. BUGS #186 이 DB 축에서 고친 것을 파일 축에서 다시 고친다.
+#
+#   **운영 경로는 전혀 바뀌지 않는다** — `.bat` 은 이 파일을 `python <파일>` 로 부르므로
+#   아래 `__main__` 분기에서 같은 FileHandler 가 그대로 붙는다. 나머지 진입점 둘
+#   (`doc_worker.py` / `refresh_priority.py`)은 애초에 StreamHandler 하나뿐이라,
+#   이 수정으로 네 진입점의 import 시점 동작이 같아진다.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(_HERE, "logs", "doc_collect.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+DOC_COLLECT_LOG_PATH = os.path.join(_HERE, "logs", "doc_collect.log")
+
+
+def attach_file_log():
+    """운영 파일 로그를 루트 로거에 붙인다. `__main__` 에서만 부른다.
+
+    두 번 불러도 핸들러가 겹치지 않는다(같은 경로가 이미 붙어 있으면 그대로 둔다) —
+    테스트가 이 함수를 직접 검증할 수 있어야 하기 때문이다(부수효과를 쓰지 않는다).
+    """
+    root = logging.getLogger()
+    target = os.path.abspath(DOC_COLLECT_LOG_PATH)
+    for h in root.handlers:
+        if isinstance(h, logging.FileHandler) and os.path.abspath(h.baseFilename) == target:
+            return h
+    handler = logging.FileHandler(DOC_COLLECT_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root.addHandler(handler)
+    return handler
 
 BASE_STORAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "docs")
 
@@ -69,8 +105,10 @@ def build_driver(download_dir: str) -> webdriver.Chrome:
         "plugins.always_open_pdf_externally": True,
     }
     opts.add_experimental_option("prefs", prefs)
-    svc = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=svc, options=opts)
+    # ★ 드라이버 해석은 `crawler.base_crawler` 한 곳에 있다 (2026-08-25, BUGS #196).
+    #   `ChromeDriverManager().install()` 직접 호출은 이 PC 에서 실제로 깨져 있다.
+    from crawler.base_crawler import resolve_chrome_driver
+    driver = resolve_chrome_driver(opts)
     driver.set_page_load_timeout(30)
     return driver
 
@@ -266,48 +304,49 @@ def finalize_download(downloaded_path: str, court_name: str, case_no: str,
 
 
 def save_doc_raw(conn, item_id: int, doc_type: str, pdf_path: str) -> bool:
+    """다운로드한 문서를 `doc_raw` + `document_status` 에 기록한다. 성공이면 True.
+
+    ## 기록 규칙을 여기서 만들지 않는다 (2026-08-25, docs/BUGS.md #197)
+
+    예전에는 이 함수가 자기 규칙을 따로 갖고 있었고, `doc_worker` 경로가 쓰는
+    `storage.database._record_doc_raw()` 와 **실제로 갈라져 있었다.** 사본 DB 에
+    두 함수를 나란히 눌러 잰 값(2026-08-25):
+
+        같은 파일로 두 번 저장   _record_doc_raw -> 행 1개 (내용 지문 비교)
+                                 save_doc_raw    -> **행 2개** (MAX(version)+1 무조건)
+        storage_path 표기        _record_doc_raw -> documents/... (루트 기준 상대경로)
+                                 save_doc_raw    -> 절대경로 그대로
+
+    앞의 것은 BUGS #115/#187 이 한쪽에서만 고친 결함 그대로다 —
+    `api/v1/item.py` 가 `MAX(doc_version)` 을 사용자 응답에 실으므로, 이 스크립트를
+    손으로 두 번 돌리면 내용이 그대로인데 화면의 문서 버전이 오른다.
+    뒤의 것은 이 저장소가 명시한 경로 규약 위반이다(`to_relative_storage_path()`
+    docstring: *"절대경로를 DB에 넣으면 배포 위치가 바뀌는 순간 전 행이 못 쓰게 된다"*).
+
+    이제 둘 다 `record_doc_raw_row()` 하나를 부른다.
+
+    ## 계약은 그대로다
+
+        파일이 없다 / 0바이트   -> False, `doc_raw` 행 없음, `document_status` 도 그대로
+        내용이 직전과 같다      -> True,  새 행 없음, `document_status` 는 READY
+        새 내용                 -> True,  새 버전 1행, READY
+    """
     try:
-        size = os.path.getsize(pdf_path)
-
-        # 0바이트 파일을 "수집 완료"로 기록하지 않는다 (2026-08-12 Sprint 67).
-        # 이 저장소에는 "완료"의 기준이 이미 있다 — `doc_paths.doc_exists()`는
-        # **크기가 0보다 커야** 완료로 본다. 그런데 여기서는 크기를 보지 않고
-        # document_status를 READY로 바꿔서 두 정의가 어긋났다:
-        #   화면        READY (열람 가능하다고 표시)
-        #   뷰어        0바이트 파일을 그대로 서빙 -> 깨진 문서
-        #   재수집 판정  doc_exists()=False (미완료로 보고 계속 재시도)
-        # 다운로드가 시작 직후 끊기면 실제로 0바이트 .pdf가 남을 수 있다.
-        # 새 정책을 만드는 것이 아니라 **이미 있는 완료 기준에 맞추는** 수정이다.
-        # (BUGS #50 / #61과 같은 부류 — "READY인데 실제로는 못 쓰는 파일")
-        if size <= 0:
-            logger.warning("[item %s] %s 다운로드 파일이 0바이트다. 실패로 처리한다: %s",
-                           item_id, doc_type, pdf_path)
-            return False
-
-        fhash = file_hash(pdf_path)
         now = datetime.now().isoformat()
-
-        # 버전 계산
-        existing = conn.execute(
-            "SELECT MAX(doc_version) as v FROM doc_raw WHERE item_id=? AND doc_type=?",
-            (item_id, doc_type)
-        ).fetchone()
-        version = (existing["v"] or 0) + 1
-
-        import pdfplumber
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                page_count = len(pdf.pages)
-        except Exception:   # bare 는 Ctrl-C 도 삼킨다 (Sprint 217)
-            page_count = 0
-
-        conn.execute("""
-            INSERT OR IGNORE INTO doc_raw
-            (item_id, doc_type, storage_path, file_hash, file_size,
-             doc_version, page_count, crawl_date, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (item_id, doc_type, pdf_path, fhash, size,
-              version, page_count, datetime.today().strftime("%Y-%m-%d"), now))
+        # ★ 대표 확장자를 넘기지 않는다 - 이 경로는 PDF 한 개만 넘긴다
+        #   (STATUS 는 호출부에서 `PDF_DOWNLOADABLE_DOC_TYPES` 로 걸러진다).
+        reason = record_doc_raw_row(conn, item_id, doc_type, [pdf_path], now)
+        if reason and reason != "unchanged":
+            # 0바이트 파일을 "수집 완료"로 기록하지 않는다 (2026-08-12 Sprint 67).
+            # 이 저장소에는 "완료"의 기준이 이미 있다 - `doc_paths.doc_exists()` 는
+            # **크기가 0보다 커야** 완료로 본다. 예전에는 크기를 보지 않고
+            # document_status 를 READY 로 바꿔서 두 정의가 어긋났다:
+            #   화면        READY (열람 가능하다고 표시)
+            #   뷰어        0바이트 파일을 그대로 서빙 -> 깨진 문서
+            #   재수집 판정  doc_exists()=False (미완료로 보고 계속 재시도)
+            # (BUGS #50 / #61 과 같은 부류 - "READY 인데 실제로는 못 쓰는 파일")
+            logger.warning("[item %s] %s doc_raw 기록 실패 - %s", item_id, doc_type, reason)
+            return False
 
         conn.execute("""
             INSERT OR REPLACE INTO document_status
@@ -318,7 +357,14 @@ def save_doc_raw(conn, item_id: int, doc_type: str, pdf_path: str) -> bool:
         conn.commit()
         return True
     except Exception as e:
-        logger.warning("save_doc_raw 실패: %s", str(e))
+        # ★ 사유를 반드시 남긴다. 예전에는 `str(e)` 하나뿐이라 무결성 위반인지
+        #   디스크 문제인지 구분할 수 없었다(이 저장소의 "증거 없는 실패" 함정).
+        logger.warning("save_doc_raw 실패 (item %s, %s): %s: %s",
+                       item_id, doc_type, type(e).__name__, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return False
 
 def save_failure(conn, item_id: int, doc_type: str, error: str):
@@ -419,6 +465,7 @@ def collect_all(limit: int = 10):
         conn.close()
 
 if __name__ == "__main__":
+    attach_file_log()   # 운영 파일 로그는 직접 실행할 때만 (docs/BUGS.md #192)
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=5, help="수집할 물건 수")

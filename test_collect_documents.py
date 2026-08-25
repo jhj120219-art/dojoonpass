@@ -465,6 +465,277 @@ def test_worker_failure_then_retry_converges():
         env.close()
 
 
+
+def test_two_doc_raw_writers_share_one_rule():
+    """`doc_raw` 에 쓰는 두 곳이 **같은 규칙**을 쓰는가 (2026-08-25, docs/BUGS.md #197).
+
+    ## 왜 이 검사가 생겼나
+
+    `doc_raw` 작성자는 둘이다.
+
+        storage.database._record_doc_raw()   doc_worker 경로 (스케줄러가 도는 쪽)
+        collect_documents.save_doc_raw()     손으로 돌리는 진입점
+
+    사본 DB 에 나란히 눌러 재 보니 규칙이 **갈라져 있었다**(2026-08-25 실측):
+
+        같은 파일로 두 번    _record_doc_raw -> 행 1개   /  save_doc_raw -> **행 2개**
+        storage_path        _record_doc_raw -> 상대경로 /  save_doc_raw -> **절대경로**
+
+    앞의 것은 BUGS #115/#187 이 한쪽에서만 고친 결함 그대로이고
+    (`api/v1/item.py` 가 MAX(doc_version) 을 사용자에게 노출한다),
+    뒤의 것은 `to_relative_storage_path()` 가 세운 규약 위반이다.
+
+    지금은 `record_doc_raw_row()` 하나를 둘 다 부른다. 이 검사는 **그것이 유지되는지**를
+    본다 - 규칙이 다시 갈라지면 여기서 붉어진다.
+    """
+    print("\n--- 9. doc_raw 작성자 둘이 같은 규칙을 쓴다 (BUGS #197) ---")
+    env = Env()
+    try:
+        import collect_documents as CD
+        court, case_no, item_no = env.seed_item()
+
+        # (a) 같은 내용으로 두 번 -> 버전이 오르지 않는다
+        src = env.make_pdf("same1.pdf", b"%PDF-1.4 SAME")
+        final = CD.finalize_download(src, court, case_no, item_no, "SPEC")
+        conn = env.conn()
+        try:
+            ok1 = CD.save_doc_raw(conn, 1, "SPEC", final)
+        finally:
+            conn.close()
+        # 같은 내용을 그대로 다시 저장한다(파일 내용을 바꾸지 않는다)
+        src2 = env.make_pdf("same2.pdf", b"%PDF-1.4 SAME")
+        final2 = CD.finalize_download(src2, court, case_no, item_no, "SPEC")
+        conn = env.conn()
+        try:
+            ok2 = CD.save_doc_raw(conn, 1, "SPEC", final2)
+            vers = [r["doc_version"] for r in conn.execute(
+                "SELECT doc_version FROM doc_raw WHERE item_id=1 AND doc_type='SPEC'"
+                " ORDER BY doc_version")]
+        finally:
+            conn.close()
+        check("첫 저장은 성공", ok1, True)
+        check("★ 내용이 같으면 두 번째도 성공으로 보되 버전을 올리지 않는다", ok2, True)
+        check("★ 같은 내용에 버전이 쌓이지 않는다", vers, [1])
+        check("내용이 같아도 상태는 READY 로 유지", env.status_of(1, "SPEC"), "READY")
+
+        # (b) 내용이 바뀌면 버전이 오른다 (대조군 - 없으면 (a)는 공허하다)
+        src3 = env.make_pdf("diff.pdf", b"%PDF-1.4 DIFFERENT CONTENT")
+        final3 = CD.finalize_download(src3, court, case_no, item_no, "SPEC")
+        conn = env.conn()
+        try:
+            CD.save_doc_raw(conn, 1, "SPEC", final3)
+            vers2 = [r["doc_version"] for r in conn.execute(
+                "SELECT doc_version FROM doc_raw WHERE item_id=1 AND doc_type='SPEC'"
+                " ORDER BY doc_version")]
+        finally:
+            conn.close()
+        check("대조군: 내용이 바뀌면 버전이 오른다", vers2, [1, 2])
+
+        # (c) 두 작성자가 **같은 함수**를 부른다 (규칙이 다시 갈라지지 않게 구조로 고정)
+        import ast as _ast
+        import storage.database as _db
+
+        def calls_in(path, fname):
+            tree = _ast.parse(open(path, encoding="utf-8-sig").read())
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.FunctionDef) or node.name != fname:
+                    continue
+                return {getattr(c.func, "id", None) or getattr(c.func, "attr", None)
+                        for c in _ast.walk(node) if isinstance(c, _ast.Call)}
+            return set()
+
+        cd_calls = calls_in(os.path.join(ROOT, "collect_documents.py"), "save_doc_raw")
+        db_calls = calls_in(os.path.join(ROOT, "storage", "database.py"), "_record_doc_raw")
+        check_true("collect_documents.save_doc_raw 가 공유 규칙을 부른다",
+                   "record_doc_raw_row" in cd_calls, sorted(x for x in cd_calls if x))
+        check_true("storage.database._record_doc_raw 가 공유 규칙을 부른다",
+                   "record_doc_raw_row" in db_calls, sorted(x for x in db_calls if x))
+        # 자기 규칙을 다시 만들면(버전 계산/INSERT 를 직접 하면) 갈라진 것이다.
+        check_true("save_doc_raw 안에 doc_raw INSERT 가 다시 생기지 않았다",
+                   "INSERT INTO doc_raw" not in
+                   open(os.path.join(ROOT, "collect_documents.py"), encoding="utf-8-sig").read(),
+                   "-> 규칙이 두 벌이 됐다. record_doc_raw_row() 를 쓰라")
+        check_true("공유 함수가 실재한다", hasattr(_db, "record_doc_raw_row"))
+
+        # (d) 저장 경로 규약: 루트 안이면 상대경로로 적는다
+        #     (Env 의 임시 디렉터리는 저장소 밖이라 그대로 남는 것이 맞다 - 그 경우도 고정한다)
+        inside = os.path.join(ROOT, "storage", "docs", "QA규약", "QA-2026", "1")
+        os.makedirs(inside, exist_ok=True)
+        probe = os.path.join(inside, "spec.pdf")
+        try:
+            with open(probe, "wb") as fh:
+                fh.write(b"%PDF-1.4 INSIDE-ROOT")
+            conn = env.conn()
+            try:
+                CD.save_doc_raw(conn, 1, "APPRAISAL", probe)
+                got = conn.execute("SELECT storage_path FROM doc_raw"
+                                   " WHERE item_id=1 AND doc_type='APPRAISAL'").fetchone()
+            finally:
+                conn.close()
+            check("★ 루트 안 파일은 루트 기준 상대경로로 적는다",
+                  got["storage_path"] if got else None,
+                  "storage/docs/QA규약/QA-2026/1/spec.pdf")
+            check_true("적힌 경로가 PROJECT_ROOT 기준으로 실제 열린다",
+                       os.path.isfile(os.path.join(ROOT, got["storage_path"])))
+        finally:
+            for p in (probe,):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            for d in (inside, os.path.dirname(inside), os.path.dirname(os.path.dirname(inside))):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+    finally:
+        env.close()
+
+
+
+def test_doc_raw_version_race_does_not_raise():
+    """같은 문서를 **동시에** 기록해도 예외가 아니라 버전이 갈린다 (2026-08-25, BUGS #199).
+
+    ## 왜 이 검사가 생겼나
+
+    `record_doc_raw_row()` 는 `latest` 를 읽어 `version = latest + 1` 을 계산한 뒤
+    INSERT 한다. 그 사이가 경쟁 구간이라, 다른 실행이 먼저 넣으면
+    `UNIQUE(item_id, doc_type, doc_version)` 에 걸려 **IntegrityError 가 올라갔다.**
+    합성 물건에 스레드 4개로 재현했다(2026-08-25): 성공 1 / IntegrityError 3.
+
+    `mark_queue_done()` 은 claim 을 빼앗긴 실행에 대해 *"나중에 그쪽 실행이 같은 값을
+    다시 써도 결과는 같다(멱등)"* 이라고 적어 두었는데 실제로는 멱등이 아니었다.
+    도달 경로는 BUGS #181 의 좀비 워커다 — 예외가 호출부까지 올라가면 **실제로 받아 둔
+    문서가 실패로 기록되고 다시 수집된다**(손상은 아니지만 거짓 실패 + 헛수집).
+
+    ## 무엇을 고정하는가
+
+        동시 N건, 서로 다른 내용   -> 예외 0, 버전이 1..N 으로 갈린다
+        동시 N건, **같은** 내용    -> 예외 0, 행은 1개 (둘 다 같은 문서를 받은 것이다)
+    """
+    print("\n--- 10. doc_raw 버전 경합 (BUGS #199) ---")
+    import threading
+    import traceback
+
+    env = Env()
+    try:
+        import collect_documents as CD
+        court, case_no, item_no = env.seed_item()
+
+        # (a) 서로 다른 내용 4건 동시
+        errs = []
+        barrier = threading.Barrier(4)
+
+        def writer(tag, body):
+            try:
+                src = env.make_pdf("race_%s.pdf" % tag, body)
+                barrier.wait(timeout=20)
+                c = env.conn()
+                try:
+                    CD.save_doc_raw(c, 1, "SPEC", src)
+                finally:
+                    c.close()
+            except Exception:
+                errs.append("%s: %s" % (tag, traceback.format_exc(limit=2).splitlines()[-1]))
+
+        ts = [threading.Thread(target=writer,
+                               args=("t%d" % i, b"%PDF-1.4 R" + bytes([65 + i]) * (60 + i)))
+              for i in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=90)
+
+        c = env.conn()
+        try:
+            vers = [r["doc_version"] for r in c.execute(
+                "SELECT doc_version FROM doc_raw WHERE item_id=1 AND doc_type='SPEC'"
+                " ORDER BY doc_version")]
+        finally:
+            c.close()
+        check("★ 동시 4건에 예외가 없다", errs, [])
+        check("★ 버전이 1..4 로 갈린다", vers, [1, 2, 3, 4])
+        check("버전 번호에 중복이 없다", len(set(vers)), len(vers))
+
+        # (b) **같은** 내용 4건 동시 -> 행이 늘지 않는다
+        env2 = Env()
+        try:
+            court2, case2, item2 = env2.seed_item()
+            same = b"%PDF-1.4 IDENTICAL" + b"z" * 90
+            errs2 = []
+            barrier2 = threading.Barrier(4)
+
+            def writer_same(tag):
+                try:
+                    src = env2.make_pdf("same_%s.pdf" % tag, same)
+                    barrier2.wait(timeout=20)
+                    c2 = env2.conn()
+                    try:
+                        CD.save_doc_raw(c2, 1, "SPEC", src)
+                    finally:
+                        c2.close()
+                except Exception:
+                    errs2.append("%s: %s" % (tag, traceback.format_exc(limit=2).splitlines()[-1]))
+
+            ts2 = [threading.Thread(target=writer_same, args=("s%d" % i,)) for i in range(4)]
+            for t in ts2:
+                t.start()
+            for t in ts2:
+                t.join(timeout=90)
+            c2 = env2.conn()
+            try:
+                n = c2.execute("SELECT COUNT(*) FROM doc_raw WHERE item_id=1"
+                               " AND doc_type='SPEC'").fetchone()[0]
+            finally:
+                c2.close()
+            check("★ 같은 내용 동시 4건에 예외가 없다", errs2, [])
+            check("★ 같은 내용이면 행은 1개", n, 1)
+        finally:
+            env2.close()
+
+        # (c) 상한이 실재한다 — 무한 재시도로 바꾸면 이 검사가 잡는다
+        import storage.database as _db
+        check_true("경합 재계산 상한 상수가 있다",
+                   isinstance(getattr(_db, "DOC_RAW_VERSION_RACE_ATTEMPTS", None), int))
+        check_true("상한이 2 이상이다(1이면 재계산을 안 하는 것)",
+                   _db.DOC_RAW_VERSION_RACE_ATTEMPTS >= 2,
+                   getattr(_db, "DOC_RAW_VERSION_RACE_ATTEMPTS", None))
+
+        # (d) 상한까지 밀렸을 때 **조용히 성공했다고 말하지 않는다**
+        #
+        #     스레드 검사만으로는 이 갈래에 도달하지 않는다(4회 안에 항상 성공한다).
+        #     그러면 "경합 실패를 '' 로 답한다"는 변이를 못 잡는다 — 실제로
+        #     2026-08-25 mutation 에서 그랬다. 그래서 INSERT 가 **항상** 충돌하는
+        #     커넥션을 끼워 그 갈래를 결정적으로 밟는다.
+        import sqlite3 as _sq
+
+        class _AlwaysConflict:
+            """INSERT 만 IntegrityError 를 내고 나머지는 진짜 커넥션에 넘긴다."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args):
+                if sql.strip().upper().startswith("INSERT"):
+                    raise _sq.IntegrityError(
+                        "UNIQUE constraint failed: doc_raw.item_id, doc_raw.doc_type,"
+                        " doc_raw.doc_version")
+                return self._real.execute(sql, *args)
+
+        probe = env.make_pdf("conflict.pdf", b"%PDF-1.4 CONFLICT" + b"c" * 70)
+        c = env.conn()
+        try:
+            reason = _db.record_doc_raw_row(_AlwaysConflict(c), 1, "APPRAISAL",
+                                            [probe], "2026-08-25T00:00:00")
+        finally:
+            c.close()
+        check_true("★ 상한까지 밀리면 빈 문자열(=성공)이 아니다", reason != "", reason)
+        check_true("★ unchanged 로도 답하지 않는다", reason != "unchanged", reason)
+        check_true("사유에 '경합' 이 들어 있다", "경합" in (reason or ""), reason)
+    finally:
+        env.close()
+
+
 def run():
     test_success_path_records_viewer_path_and_ready()
     test_failure_path_does_not_mark_ready()
@@ -474,6 +745,8 @@ def run():
     test_zero_byte_download_is_not_ready()
     test_queue_converges_after_collect_documents()
     test_worker_failure_then_retry_converges()
+    test_two_doc_raw_writers_share_one_rule()
+    test_doc_raw_version_race_does_not_raise()
 
     print("\n" + "=" * 55)
     if failures:

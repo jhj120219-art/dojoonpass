@@ -9,7 +9,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 def build_driver():
     opts = Options()
@@ -17,8 +16,10 @@ def build_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    svc = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=svc, options=opts)
+    # ★ 드라이버 해석은 crawler.base_crawler 한 곳에 있다 (2026-08-25, docs/BUGS.md #196).
+    #   직접 ChromeDriverManager 를 부르면 이 PC 에서 기동에 실패한다.
+    from crawler.base_crawler import resolve_chrome_driver
+    return resolve_chrome_driver(opts)
 
 def main():
     driver = build_driver()

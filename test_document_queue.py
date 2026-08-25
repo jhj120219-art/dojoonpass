@@ -1239,6 +1239,136 @@ def test_queue_terminal_functions_screen_status_contract():
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+def test_terminal_functions_respect_the_claim_token():
+    """종결 함수 **넷 전부**가 claim 을 확인하는가 (2026-08-25, docs/BUGS.md #202).
+
+    ## 왜 이 검사가 생겼나
+
+    BUGS #181 은 `mark_queue_done` / `mark_queue_failed` 에 claim 토큰 검사를 넣었다.
+    그런데 **`mark_queue_skipped_expired` / `mark_queue_unsupported` 는 빠져 있었다.**
+    그 비대칭을 합성 물건으로 재현했다:
+
+        A 가 집는다 -> 멈춘다 -> reset_stale_queue 가 회수 -> B 가 집어 실제로 수집
+        -> 좀비 A 가 뒤늦게 skipped_expired 를 부른다
+           => 큐 = SKIPPED_EXPIRED (B 가 작업 중인데 종결됐다)
+           => 그 함수가 last_attempt_at 을 덮으므로 **B 의 토큰까지 무효가 된다**
+        -> B 가 수집을 끝내고 done(claim_token=B) 을 부른다
+           => 토큰 불일치로 큐는 그대로, 문서만 기록된다
+           => 최종: document_status=READY / doc_raw 1행 / **큐=SKIPPED_EXPIRED**
+
+    실제로 받아 놓은 문서가 큐에서는 "대상 아님"으로 남는다 — 이 저장소가 스스로
+    확인해 온 불변식("화면이 READY 인데 큐가 done 계열이 아닌 행 0건")을 깨는 상태다.
+
+    ## 무엇을 고정하는가
+
+        남의 claim 이면   큐를 건드리지 않는다 (상태도 last_attempt_at 도 그대로)
+        내 claim 이면     예전처럼 종결한다
+        토큰 미지정(None) 예전 동작 그대로 (호출부 호환 - `_claim_is_still_ours` 규약)
+    """
+    print("\n--- 19. 종결 함수가 claim 토큰을 존중하는가 (BUGS #202) ---")
+    import inspect
+    import storage.database as dbmod
+
+    # (a) 구조: 넷 다 claim_token 을 받고 `_claim_is_still_ours` 로 확인하는가
+    TERMINALS = ("mark_queue_done", "mark_queue_failed",
+                 "mark_queue_skipped_expired", "mark_queue_unsupported")
+    for name in TERMINALS:
+        fn = getattr(dbmod, name)
+        params = inspect.signature(fn).parameters
+        check_true("%s 가 claim_token 인자를 받는다" % name, "claim_token" in params,
+                   sorted(params))
+        src = inspect.getsource(fn)
+        check_true("%s 가 _claim_is_still_ours 로 확인한다" % name,
+                   "_claim_is_still_ours" in src,
+                   "-> 확인하지 않으면 좀비가 남의 행을 종결시킨다")
+
+    # (b) 행위: 남의 토큰으로는 종결되지 않는다
+    d, conn = make_db()
+    try:
+        saved = dbmod.DB_PATH
+        dbmod.DB_PATH = os.path.join(d, "t.db")
+        try:
+            # `mark_queue_unsupported` 는 화면 상태까지 쓴다. 이 파일의 스키마는 큐 전용이라
+            # 그대로 두면 **행위 검사가 예외로 죽어** 판정문 없이 끝난다(가드를 없애는
+            # 변이에서 실제로 그랬다). 빈 테이블만 만들어 두면 `_set_document_status`
+            # 가 설계대로 "대상 없음" 경고 + False 로 물러난다(Sprint 78 규약).
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS auction_case ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, court_code TEXT, case_no TEXT);"
+                "CREATE TABLE IF NOT EXISTS auction_item ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER,"
+                " case_no TEXT, item_no TEXT);"
+                "CREATE TABLE IF NOT EXISTS document_status ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER,"
+                " doc_type TEXT, status TEXT, updated_at TEXT,"
+                " UNIQUE(item_id, doc_type));")
+            enqueue(conn, "QA법원", "2026타경1", "1", "spec")
+            conn.commit()
+            qid = conn.execute("SELECT id FROM document_queue").fetchone()["id"]
+
+            a = dbmod.claim_next_queue_item()
+            check_true("A 가 집었다", a is not None and a["id"] == qid)
+            token_a = a["claim_token"]
+
+            # 회수 -> B 가 집는다
+            conn.execute("UPDATE document_queue SET status='pending',"
+                         " last_attempt_at=NULL WHERE id=?", (qid,))
+            conn.commit()
+            b = dbmod.claim_next_queue_item()
+            check_true("B 가 다시 집었다", b is not None and b["id"] == qid)
+            token_b = b["claim_token"]
+            check_true("두 토큰이 다르다(검사가 공허하지 않다)", token_a != token_b,
+                       (token_a, token_b))
+
+            def state():
+                r = conn.execute("SELECT status, last_attempt_at FROM document_queue"
+                                 " WHERE id=?", (qid,)).fetchone()
+                return r["status"], r["last_attempt_at"]
+
+            before = state()
+
+            # 좀비 A 가 자기 토큰으로 종결 시도 -> 아무것도 바뀌면 안 된다
+            dbmod.mark_queue_skipped_expired(qid, "QA법원", "2026타경1", "1", "spec",
+                                             "2020-01-01", token_a)
+            check("★ 좀비의 skipped_expired 는 큐를 바꾸지 않는다", state(), before)
+
+            dbmod.mark_queue_unsupported(qid, "QA법원", "2026타경1", "1", "spec", token_a)
+            check("★ 좀비의 unsupported 도 큐를 바꾸지 않는다", state(), before)
+
+            # 대조군 - **자기** claim 이면 종결된다(막기만 하고 기능이 죽으면 안 된다)
+            dbmod.mark_queue_skipped_expired(qid, "QA법원", "2026타경1", "1", "spec",
+                                             "2020-01-01", token_b)
+            check("대조군: 자기 claim 이면 종결된다", state()[0], "SKIPPED_EXPIRED")
+
+            # 대조군 - 토큰 미지정은 예전 동작 그대로(호출부 호환).
+            #   `skipped_expired` 로 확인한다 - `unsupported` 는 document_status 까지
+            #   써서 이 파일의 큐 전용 스키마에는 없는 테이블이 필요하다
+            #   (그쪽 계약은 §18 과 test_unsupported_item_does_not_retry_forever 가 본다).
+            conn.execute("UPDATE document_queue SET status='in_progress' WHERE id=?", (qid,))
+            conn.commit()
+            dbmod.mark_queue_skipped_expired(qid, "QA법원", "2026타경1", "1", "spec",
+                                             "2020-01-01")
+            check("대조군: 토큰 미지정은 예전처럼 종결한다", state()[0], "SKIPPED_EXPIRED")
+        finally:
+            dbmod.DB_PATH = saved
+    finally:
+        conn.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+    # (c) 호출부가 실제로 토큰을 넘기는가 (배선이 없으면 위 방어는 죽은 코드다)
+    worker_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "doc_worker.py"), encoding="utf-8-sig").read()
+    for name in ("mark_queue_skipped_expired", "mark_queue_unsupported"):
+        idx = worker_src.find(name + "(")
+        check_true("doc_worker 가 %s 를 부른다" % name, idx != -1)
+        if idx == -1:
+            continue
+        call = worker_src[idx:idx + 400]
+        call = call[:call.index(")\n") + 1] if ")\n" in call else call
+        check_true("doc_worker 가 %s 에 claim_token 을 넘긴다" % name,
+                   "claim_token" in call, call[:200])
+
 def test_supported_item_still_retries():
     """미지원 종결이 **정상 실패의 재시도까지** 죽이지 않는가 (반대 방향 회귀).
 
@@ -1304,6 +1434,7 @@ def run():
     test_upsert_batch_partial_and_total_failure()
     test_unsupported_item_does_not_retry_forever()
     test_queue_terminal_functions_screen_status_contract()
+    test_terminal_functions_respect_the_claim_token()
     test_supported_item_still_retries()
 
     print("\n" + "=" * 55)

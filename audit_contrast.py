@@ -173,14 +173,206 @@ return true;
 """
 
 
+def console_safe(text, enc=None):
+    """콘솔 인코딩으로 못 내보내는 글자를 대체 문자로 바꾼다 (2026-08-25, BUGS #193).
+
+    ## 왜 필요한가 - 실제로 리포트가 중간에서 끊겼다
+
+    2026-08-25 이 도구를 dev 서버에 대고 처음 끝까지 돌렸더니, 기준 미달 43곳을
+    **다 찾아 놓고** 목록을 찍다가 죽었다:
+
+        UnicodeEncodeError: 'cp949' codec can't encode character '—'
+
+    화면에서 긁어 온 문구에 엠대시가 있었기 때문이다. 즉 **측정은 성공했는데
+    보고가 실패**했고, 종료코드도 1(결함 있음)이 아니라 트레이스백이 됐다.
+
+    이 저장소의 `test_console_encoding.py` 는 **소스에 박힌 문자열**을 검사한다.
+    그런데 여기서 터진 것은 소스가 아니라 **측정 대상 데이터**다 - 화면 문구에는
+    어떤 글자든 올 수 있으므로 검사로 막을 수 없고, 찍는 쪽에서 처리해야 한다.
+
+    stdout 을 통째로 재설정하지 않는 이유: 이 도구는 다른 도구가 import 하기도 하고
+    (`audit_contrast` -> `audit_viewport`), 전역 스트림을 바꾸면 호출부의 인코딩까지
+    바뀐다. 바꾸는 범위를 **찍는 문자열 하나**로 좁힌다.
+    """
+    enc = enc or getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(enc, "replace").decode(enc, "replace")
+    except (LookupError, UnicodeError):
+        return text
+
+
+def _encodable(text, enc):
+    try:
+        text.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+def contrast_verdict(per_screen, all_bad):
+    """(종료코드, 사유). 0=기준 미달 없음 / 1=결함 있음 / 2=재지 못했다.
+
+    ## 왜 이 함수가 따로 있는가 (2026-08-25, docs/BUGS.md #193)
+
+    예전에는 main() 끝이 이랬다.
+
+        if not all_bad:
+            return 0
+
+    `all_bad` 가 비는 경우는 **둘**인데 코드는 하나로 봤다:
+
+        (a) 진짜로 기준 미달이 없다                  -> 0 이 맞다
+        (b) 화면이 안 그려져 **잰 글자가 없다**       -> 0 은 거짓이다
+
+    (b) 는 서버가 죽었거나, 라우트가 바뀌었거나, 렌더가 20초 안에 안 끝났을 때 나온다.
+    그때 이 도구는 "합계: 텍스트 노드 0개 / 기준 미달 0개" 를 찍고 **종료코드 0** 을
+    돌려준다 - 즉 아무것도 재지 않고 "정상"이라고 말한다. 이 저장소가 반복해서 당한
+    거짓 통과 그 자체다(`audit_viewport.py` 는 같은 함정을 `nodes < 15 -> UNUSABLE`
+    로 이미 막고 있었다. 이 도구만 빠져 있었다).
+
+    ## 하한을 왜 "0 개" 로만 두는가
+
+    화면별 텍스트 노드 수의 **정상 범위를 아직 재지 않았다**(dev 서버가 떠 있어야
+    잴 수 있다). 재지 않은 값을 상수로 박으면 그것이 다음 오판의 근거가 된다.
+    그래서 지금은 부정할 수 없는 것만 판정한다 - **그려진 화면에 텍스트 노드가
+    0 개일 수는 없다.** 실측 기준선이 생기면 그때 하한을 올린다.
+    """
+    empty = [path for path, seen in per_screen if seen <= 0]
+    if not per_screen:
+        return 2, "측정한 화면이 하나도 없다"
+    if empty:
+        return 2, ("텍스트 노드를 하나도 못 본 화면이 있다: %s"
+                   " - 화면이 그려지지 않았다는 뜻이라 '기준 미달 0'은 근거가 없다"
+                   % ", ".join(empty))
+    if all_bad:
+        return 1, "기준 미달 %d곳" % len(all_bad)
+    return 0, "기준 미달 없음"
+
+
+def selftest() -> int:
+    """브라우저도 서버도 네트워크도 쓰지 않고 판정 로직을 검증한다.
+
+    이 도구에는 원래 `--selftest` 가 없었다(BUGS #188 이 "남은 것"으로 적어 둔 항목).
+    실제 명암비 계산은 브라우저 안 JS 라 회귀 스위트에 넣을 수 없지만,
+    **종료코드 계약**은 여기서 전부 잠근다.
+    """
+    fails = []
+
+    def check(name, cond, detail=""):
+        print("[%s] %s%s" % ("PASS" if cond else "FAIL", name,
+                             "" if cond else " -- %s" % (detail,)))
+        if not cond:
+            fails.append(name)
+
+    print("--- contrast_verdict(): 재지 못한 것을 정상으로 뭉개지 않는가 ---")
+    full = [("/", 400), ("/search", 350), ("/login", 40)]
+
+    code, why = contrast_verdict(full, [])
+    check("전부 재고 기준 미달이 없으면 0", code == 0, (code, why))
+
+    code, why = contrast_verdict(full, [{"text": "x"}])
+    check("기준 미달이 있으면 1", code == 1, (code, why))
+
+    # ★ 이 도구의 원래 결함이 정확히 이 자리였다.
+    code, why = contrast_verdict([("/", 0), ("/search", 350), ("/login", 40)], [])
+    check("한 화면이라도 0 개면 2(측정 불가)", code == 2, (code, why))
+    check("어느 화면이 비었는지 이름을 남긴다", "/" in why, why)
+
+    code, why = contrast_verdict([("/", 0), ("/search", 0), ("/login", 0)], [])
+    check("전 화면이 0 개면 2", code == 2, (code, why))
+
+    code, why = contrast_verdict([], [])
+    check("잰 화면이 없으면 2", code == 2, (code, why))
+
+    # 빈 화면이면 **기준 미달이 있어도** 결과를 믿을 수 없다 -> 1 이 아니라 2 다.
+    code, why = contrast_verdict([("/", 0)], [{"text": "x"}])
+    check("못 잰 화면이 있으면 결함 목록이 있어도 2", code == 2, (code, why))
+
+    check("자기 검증: 세 종류 판정이 실제로 갈린다",
+          len({contrast_verdict(full, [])[0],
+               contrast_verdict(full, [{"t": 1}])[0],
+               contrast_verdict([("/", 0)], [])[0]}) == 3)
+
+    print("--- console_safe(): 화면 문구가 콘솔 인코딩을 넘어도 죽지 않는다 ---")
+    # 실제로 여기서 죽었다 - cp949 콘솔 + 엠대시(U+2014). 측정은 다 해 놓고
+    # 보고를 못 해서 트레이스백이 됐다(BUGS #193).
+    hard = "— ★ 안녕 😀"
+    out = console_safe(hard)
+    check("반환값은 문자열이다", isinstance(out, str), type(out))
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        out.encode(enc)
+        encodable = True
+    except Exception as exc:
+        encodable = exc
+    check("현재 콘솔 인코딩(%s)으로 내보낼 수 있다" % enc, encodable is True, encodable)
+    # ★ 주변 환경(PYTHONIOENCODING)에 흔들리지 않게 인코딩을 **명시해서** 잰다.
+    #   회귀 스위트는 utf-8 로 돌리므로, stdout 에만 기대면 이 검사가 공허해진다.
+    cp = console_safe(hard, enc="cp949")
+    check("cp949 를 지정하면 cp949 로 내보낼 수 있다", _encodable(cp, "cp949"), cp)
+    check("cp949 에 없는 글자는 남지 않는다",
+          "—" not in cp and "😀" not in cp, cp)
+    check("utf-8 을 지정하면 원문 그대로", console_safe(hard, enc="utf-8") == hard,
+          console_safe(hard, enc="utf-8"))
+    check("ASCII 는 그대로 둔다", console_safe("plain-ascii") == "plain-ascii",
+          console_safe("plain-ascii"))
+
+    print("--- build_driver(): 이 도구도 트레이스백 대신 판정을 낸다 ---")
+    err = None
+    try:
+        AV.build_driver(False, 390, 900, factories=[
+            ("A", lambda h, w, ht: (_ for _ in ()).throw(RuntimeError("SSL 실패")))])
+    except AV.DriverUnavailable as exc:
+        err = str(exc)
+    except Exception as exc:
+        err = "WRONG:%s" % type(exc).__name__
+    check("드라이버 실패는 DriverUnavailable 이다",
+          err is not None and not err.startswith("WRONG:"), err)
+    check("사유가 남는다", err is not None and "SSL 실패" in err, err)
+
+    print()
+    if fails:
+        print("FAILED (%d): %s" % (len(fails), ", ".join(fails)))
+        return 1
+    print("ALL SELFTESTS PASSED (audit_contrast.py)")
+    return 0
+
+
 def main():
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+
     print("=" * 92)
     print(" 렌더링된 글자의 명암비 (WCAG 1.4.3) - %dpx" % WIDTH)
     print("=" * 92)
 
-    drv = AV.build_driver(headed=False, width=WIDTH, height=1000)
+    # 서버부터 확인한다 - 없는데 "기준 미달 0" 이라고 말하지 않기 위해서다
+    # (`audit_viewport.py` 는 이미 이렇게 한다. 이 도구만 빠져 있었다).
+    import urllib.request
+    try:
+        urllib.request.urlopen(BASE, timeout=8).read(1)
+    except Exception as e:
+        print("WEB 서버(%s)에 연결할 수 없다: %s: %s"
+              % (BASE, type(e).__name__, str(e)[:160]))
+        print("먼저 `npm run dev` 로 띄운 뒤 다시 실행하라. (측정 불가 = 종료코드 2)")
+        return 2
+
+    try:
+        drv = AV.build_driver(headed=False, width=WIDTH, height=1000)
+    except AV.DriverUnavailable as e:
+        # 예전에는 여기서 40줄짜리 트레이스백이 그대로 나왔다(BUGS #193).
+        print("브라우저를 띄우지 못했다 - 시도한 방법과 사유:")
+        for reason in str(e).split("; "):
+            print("    %s" % reason)
+        print("(측정 불가 = 종료코드 2. 정상으로 뭉개지 않는다.)")
+        return 2
+    except Exception as e:
+        print("브라우저를 띄우지 못했다: %s: %s" % (type(e).__name__, str(e)[:200]))
+        print("(측정 불가 = 종료코드 2. 정상으로 뭉개지 않는다.)")
+        return 2
     total_seen = 0
     all_bad = []
+    per_screen = []      # (경로, 잰 텍스트 노드 수) - 재지 못한 화면을 구분하기 위해 (#193)
     try:
         AV.set_viewport(drv, WIDTH, 1000)
 
@@ -231,6 +423,7 @@ def main():
             time.sleep(1.2)
             r = drv.execute_script(CONTRAST_JS)
             total_seen += r["seen"]
+            per_screen.append((path.split("?")[0], r["seen"]))
             for b in r["bad"]:
                 b["path"] = path.split("?")[0]
             all_bad.extend(r["bad"])
@@ -244,7 +437,15 @@ def main():
 
     print()
     print("  합계: 텍스트 노드 %d개 / 기준 미달 %d개" % (total_seen, len(all_bad)))
-    if not all_bad:
+
+    code, why = contrast_verdict(per_screen, all_bad)
+    if code == 2:
+        print("  ★ 측정 불가: %s" % why)
+        print("     화면별: %s"
+              % ", ".join("%s=%d" % (pth, n) for pth, n in per_screen))
+        print("     (종료코드 2. 재지 못한 것을 \"기준 미달 0\" 으로 돌려주지 않는다 - docs/BUGS.md #193)")
+        return 2
+    if code == 0:
         return 0
 
     print()
@@ -254,10 +455,11 @@ def main():
     for b in all_bad:
         g[(b["color"], b["bg"], b["size"], b["need"], b["ratio"])].append(b)
     for (color, bg, size, need, ratio), items in sorted(g.items(), key=lambda kv: kv[0][4]):
-        print("    %s on %s  %gpx  실측 %.2f:1  (기준 %.1f:1)  %d곳"
-              % (color, bg, size, ratio, need, len(items)))
+        print(console_safe("    %s on %s  %gpx  실측 %.2f:1  (기준 %.1f:1)  %d곳"
+                           % (color, bg, size, ratio, need, len(items))))
         for b in items[:3]:
-            print("        %-9s %-26s %s" % (b["path"], repr(b["text"])[:26], b["cls"][:44]))
+            print(console_safe("        %-9s %-26s %s"
+                               % (b["path"], repr(b["text"])[:26], b["cls"][:44])))
     return 1
 
 

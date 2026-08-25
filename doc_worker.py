@@ -292,7 +292,9 @@ def main() -> int:
                     item["id"], case_no, item_no, auction_date, court_code
                 )
             if auction_date and auction_date < today:
-                mark_queue_skipped_expired(item["id"], court_code, case_no, item_no, doc_type, auction_date)
+                mark_queue_skipped_expired(item["id"], court_code, case_no, item_no,
+                                           doc_type, auction_date,
+                                           item.get("claim_token"))
                 continue
 
             # 2026-08-17 Sprint 144: 물건 사진('image')은 **버튼이 없다.** 상세페이지에
@@ -313,7 +315,8 @@ def main() -> int:
             if needs_button and not btn_id:
                 logger.error("[%s-%s] %s 버튼 id 미지원(추가 DOM 분석 필요). 수집 대상에서 종결",
                              case_no, item_no, doc_type)
-                mark_queue_unsupported(item["id"], court_code, case_no, item_no, doc_type)
+                mark_queue_unsupported(item["id"], court_code, case_no, item_no,
+                                       doc_type, item.get("claim_token"))
                 continue
 
             processed += 1

@@ -2187,6 +2187,20 @@ def test_api_contract():
         c.commit()
         c.close()
 
+        # ★ 서빙 파일을 실제로 만든다 (2026-08-25, BUGS #198).
+        #   예전에는 `document_status=READY` 행만 넣고 파일은 만들지 않은 채
+        #   "열람 가능 표시 = True" 를 기대했다. 그런데 그 상태는 **운영에서
+        #   일어나면 안 되는 상태**다 - 광고한 `viewer_url` 이 404 가 난다.
+        #   API 가 이제 그 자기모순을 COLLECTING 으로 낮추므로(사진의 §17 과 같은
+        #   2차 방어선), 픽스처도 **운영과 같은 상태**를 만든다.
+        #   실물 200물건 비교에서 응답이 달라진 물건은 0건이었다 - 이 픽스처만
+        #   파일 없이 READY 였다.
+        import crawler.doc_paths as _dp
+        _spec_dir = _dp.get_doc_dir(court, case_no, item_no)
+        os.makedirs(_spec_dir, exist_ok=True)
+        with open(os.path.join(_spec_dir, "spec.pdf"), "wb") as _f:
+            _f.write(b"%PDF-1.4 fixture" + b"x" * 40)
+
         from api_server import app
         client = TestClient(app)
         r = client.get("/api/v1/item/1")
@@ -2624,6 +2638,116 @@ def test_api_images_status_variants():
     finally:
         env.close()
 
+
+
+def test_ready_document_without_served_file_is_not_advertised():
+    """`document_status=READY` 인데 **서빙 파일이 없으면** 열람 가능이라고 답하지 않는다
+    (2026-08-25, docs/BUGS.md #198).
+
+    ## 왜 이 검사가 생겼나 - 사진에는 있고 문서에만 없던 2차 방어선
+
+    바로 위 §17 이 사진에 대해 잠근 규칙("READY 인데 볼 사진이 0장이면 COLLECTING")이
+    **문서에는 없었다.** 그래서 `document_status` 가 READY 이기만 하면 파일이 실제로
+    없어도 `available=true` 에 `viewer_url` 까지 줬다. 실측(2026-08-25, 합성 물건):
+
+        SPEC  status=READY  available=True  file_size=None
+              viewer_url=/api/v1/item/<id>/documents/SPEC
+        그 URL 을 실제로 요청 -> **HTTP 404**
+
+    판단 근거는 이미 응답을 만드는 그 함수가 갖고 있었다 - `file_size` 는 **서빙 경로에서
+    직접 잰 값**이라 파일이 없으면 None 이다. 그 값을 표시에만 쓰고 판정에는 쓰지 않았다.
+
+    ## 운영 데이터에는 이 상태가 없다(그래서 예방이다)
+
+    수정 전후로 실물 200물건 556문서의 응답을 통째로 비교했다 - **다른 물건 0건**,
+    `available=true` 문서 수 556 -> 556. 즉 지금 데이터를 바꾸는 수정이 아니라,
+    `doc_worker` 바깥 경로나 파일 유실로 그 상태가 생겼을 때를 위한 방어선이다.
+    """
+    print("\n--- 17b. READY 인데 서빙 파일이 없는 문서 (BUGS #198) ---")
+    from fastapi.testclient import TestClient
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        from api_server import app
+        client = TestClient(app)
+
+        c = env.conn()
+        for dt in ("SPEC", "APPRAISAL", "STATUS"):
+            c.execute("INSERT INTO document_status (item_id,doc_type,status)"
+                      " VALUES (1,?, 'READY')", (dt,))
+        c.commit()
+        c.close()
+
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        for dt in ("SPEC", "APPRAISAL", "STATUS"):
+            d = docs.get(dt)
+            check_true("%s 문서가 응답에 있다" % dt, d is not None)
+            if d is None:
+                continue
+            check("★ %s 파일이 없으면 available=False" % dt, d["available"], False)
+            check("★ %s 파일이 없으면 viewer_url 없음" % dt, d["viewer_url"], None)
+            check("★ %s 파일이 없으면 download_url 없음" % dt, d["download_url"], None)
+            check("%s 상태는 COLLECTING 으로 낮춘다" % dt, d["status"], "COLLECTING")
+            check("%s file_size 는 모른다(None)" % dt, d["file_size"], None)
+
+        # --- 대조군 1: 파일이 실제로 있으면 그대로 READY 다 --------------------
+        #     이것이 없으면 "전부 available=False" 로도 통과해 검사가 공허해진다.
+        import crawler.doc_paths as _dp
+        d1 = _dp.get_doc_dir(court, case_no, item_no)
+        os.makedirs(d1, exist_ok=True)
+        with open(os.path.join(d1, "spec.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 real" + b"x" * 50)
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check("대조군: 파일이 있으면 available=True", docs["SPEC"]["available"], True)
+        check("대조군: 그때는 READY 그대로", docs["SPEC"]["status"], "READY")
+        check_true("대조군: viewer_url 을 준다", bool(docs["SPEC"]["viewer_url"]))
+        check("대조군: file_size 는 실제 크기", docs["SPEC"]["file_size"],
+              os.path.getsize(os.path.join(d1, "spec.pdf")))
+        # 광고한 URL 이 실제로 열려야 한다 (advertise != serve 가 이 저장소의 반복 결함이다)
+        check("대조군: 광고한 URL 이 실제로 200",
+              client.get(docs["SPEC"]["viewer_url"]).status_code, 200)
+        # 옆 문서는 여전히 낮춰진 상태여야 한다(한 파일이 다른 문서를 구제하지 않는다)
+        check("한 파일이 다른 종류를 구제하지 않는다", docs["APPRAISAL"]["available"], False)
+
+        # --- 대조군 2: 0바이트는 '있다'로 치지 않는다 -------------------------
+        with open(os.path.join(d1, "appraisal.pdf"), "wb") as fh:
+            fh.write(b"")
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check("0바이트 파일은 available=False", docs["APPRAISAL"]["available"], False)
+
+        # --- 대조군 3: READY 가 아닌 상태는 건드리지 않는다 -------------------
+        c = env.conn()
+        c.execute("UPDATE document_status SET status='FAILED' WHERE doc_type='STATUS'")
+        c.commit()
+        c.close()
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check("FAILED 는 그대로 전달한다", docs["STATUS"]["status"], "FAILED")
+
+        # --- 대조군 4: IMAGE 는 이 방어의 대상이 아니다 ----------------------
+        #     사진은 서빙 파일이 하나로 정해지지 않는다(0~N장) - `DOC_TYPE_FILES` 에
+        #     없으므로 크기를 잴 수 없고, 그것을 "없다"로 읽으면 **볼 수 있는 사진이
+        #     있는 물건까지 수집중으로 가린다.** 판정은 `_images_status()` 가 한다.
+        #
+        #     ★ `READY` 로 두고 확인해야 한다. NO_IMAGE/FAILED 로 두면 애초에
+        #       측정 분기(status==READY)에 들어가지 않아 **이 대조군이 공허해진다**
+        #       (2026-08-25 mutation 에서 실제로 그랬다 - 적용 범위를 IMAGE 까지
+        #        넓히는 변이를 못 잡았다).
+        c = env.conn()
+        c.execute("INSERT INTO document_status (item_id,doc_type,status)"
+                  " VALUES (1,'IMAGE','READY')")
+        c.commit()
+        c.close()
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check("★ IMAGE 는 READY 여도 문서 방어선이 낮추지 않는다",
+              docs["IMAGE"]["status"], "READY")
+        c = env.conn()
+        c.execute("UPDATE document_status SET status='NO_IMAGE' WHERE doc_type='IMAGE'")
+        c.commit()
+        c.close()
+        docs = {d["doc_type"]: d for d in client.get("/api/v1/item/1").json()["documents"]}
+        check("IMAGE 의 NO_IMAGE 도 그대로 전달", docs["IMAGE"]["status"], "NO_IMAGE")
+    finally:
+        env.close()
 
 def test_oversized_ids_are_404_not_500():
     """SQLite INTEGER 범위를 벗어난 id에 **인증 없이 500을 만들 수 있었다.**
@@ -5234,6 +5358,7 @@ if __name__ == "__main__":
     test_missing_auction_image_table_degrades_not_crashes()
     test_file_size_describes_what_download_url_serves()
     test_stored_resolution_is_never_lower_than_the_source()
+    test_ready_document_without_served_file_is_not_advertised()
 
     print("\n" + "=" * 55)
     if failures:

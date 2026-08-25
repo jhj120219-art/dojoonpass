@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from typing import Optional
-from datetime import date
+from datetime import date, datetime
 from storage.database import get_connection
 from api.auth import decode_supabase_jwt
 from api.constants import is_sqlite_int
@@ -254,6 +254,36 @@ def search(
             raise HTTPException(
                 status_code=400,
                 detail=f"{_name} 값이 허용 범위를 벗어났습니다",
+            )
+
+    # ★ 날짜 파라미터만 검증이 없었다 (2026-08-25, docs/BUGS.md #201).
+    #
+    #   이 엔드포인트는 나머지 필터를 **전부** 400 + 사유로 거절한다 —
+    #   sort_by / sort_order / property_type / min·max 숫자 6종 / page.
+    #   그런데 `auction_date_from` / `auction_date_to` 는 `Optional[str]` 그대로라
+    #   아무 값이나 통과하고, SQL 에서는 **문자열 비교**가 된다.
+    #
+    #   실측(2026-08-25): `auction_date_from=not-a-date` -> HTTP 200 / total=0.
+    #   오타 하나가 "검색 결과 없음"과 **구별되지 않는다.** 숫자에 오타를 내면
+    #   422/400 으로 즉시 알려 주는데 날짜만 조용히 0건이 된다 — 같은 화면의 같은
+    #   폼에서 나온 값인데 처리 규약이 갈린다.
+    #
+    #   (`2026-01-01') OR 1=1--` 같은 값도 200 을 돌려주는데, 그것은 주입이 아니라
+    #    바인딩된 문자열 비교다 — 같은 세션에 바인딩 대조로 확인했다(#201 참고).
+    #    주입은 아니지만 **뜻 모를 값이 조용히 필터로 쓰이는 것**은 그대로 문제다.)
+    #
+    #   형식은 프런트가 실제로 보내는 것에 맞춘다 — `<input type="date">` 의 `YYYY-MM-DD`.
+    #   `datetime.strptime` 이 `2026-13-45` 같은 **달력상 불가능한 날짜**도 함께 걸러 준다.
+    for _name, _value in (("auction_date_from", auction_date_from),
+                          ("auction_date_to", auction_date_to)):
+        if not _value:
+            continue          # 빈 값은 "안 걸었다"는 뜻이다(아래 필터 조건과 같은 규약)
+        try:
+            datetime.strptime(_value, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{_name} 은 YYYY-MM-DD 형식이어야 합니다: {_value}",
             )
 
     # page는 값 자체가 아니라 **곱한 결과**가 넘친다 — OFFSET은 `(page-1)*size`다.

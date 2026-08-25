@@ -6,7 +6,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 
@@ -22,8 +21,10 @@ def build_driver():
         "plugins.always_open_pdf_externally": True,
     }
     opts.add_experimental_option("prefs", prefs)
-    svc = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=svc, options=opts)
+    # ★ 드라이버 해석은 crawler.base_crawler 한 곳에 있다 (2026-08-25, docs/BUGS.md #196).
+    #   직접 ChromeDriverManager 를 부르면 이 PC 에서 기동에 실패한다.
+    from crawler.base_crawler import resolve_chrome_driver
+    return resolve_chrome_driver(opts)
 
 def wait_loading(driver):
     try:

@@ -125,10 +125,42 @@ before(async () => {
   }
 })
 
+// 이 머신이 **운영 데이터의 주인인가**. 코드로는 알 수 없으므로 선언하게 한다
+// (2026-08-25, docs/BUGS.md #200 — 파이썬 쪽 `test_pipeline_integrity.py` §11 과 같은 규약).
+//
+// DOJOONPASS 는 머신을 역할로 나눈다 — 운영 Daily Crawl 은 데스크탑1이 돌리고,
+// 이 저장소로 개발/QA 를 하는 머신은 크롤을 돌리지 않는다. 그 머신에서 "기본 검색 0건"은
+// 정상이지 제품 결함이 아니다. 그런데 이 검사는 그 구분 없이 실패로 찍어 왔고,
+// 개발 머신에서 **고칠 수 없는 영구 red** 가 됐다.
+const DATA_ROLE_ENV = 'DOJOONPASS_DATA_ROLE'
+const isOperationalData =
+  (process.env[DATA_ROLE_ENV] || '').trim().toLowerCase() === 'operational'
+
 describe('백엔드 데이터 전제 (Sprint 224)', () => {
   // 이 검사 **하나만** 데이터 부족을 보고한다. 아래의 다른 검사들은 그것과 무관하게
   // 각자 판정한다. 빨간불 93개 대신 원인을 정확히 가리키는 빨간불 1개다.
-  test('기본 검색에 판정 가능한 물건이 있다 (다른 검사의 전제)', () => {
+  test('기본 검색에 판정 가능한 물건이 있다 (다른 검사의 전제)', (t) => {
+    if (!isOperationalData) {
+      // 개발 머신에서는 실패로 만들지 않되 **크게 남긴다** — 선언을 잊은 운영 머신이
+      // 이 줄을 보고 알아채도록. 값을 숨기지는 않는다.
+      const declared = (process.env[DATA_ROLE_ENV] || '').trim()
+      if (declared) {
+        console.log(
+          `    ** ${DATA_ROLE_ENV}=${JSON.stringify(declared)} 를 인식하지 못했다 **` +
+            ` 개발 머신으로 처리한다. 운영으로 선언하려면 정확히 "operational" 이어야 한다.`
+        )
+      }
+      console.log(
+        `    [역할 미선언] 이 머신은 운영 데이터의 주인이라고 선언되지 않았다` +
+          ` -> 기본 검색 ${dataAvailable ? '정상' : '0건'}을 제품 판정으로 쓰지 않는다.`
+      )
+      if (!dataAvailable) console.log(`    ${dataDiagnosis}`)
+      console.log(
+        `    이 머신의 데이터가 운영이라면 ${DATA_ROLE_ENV}=operational 로 선언하라.`
+      )
+      t.skip('이 머신은 운영 데이터의 주인이 아니다 (DOJOONPASS_DATA_ROLE 미선언)')
+      return
+    }
     assert.ok(
       dataAvailable,
       `백엔드 기본 검색이 0건이다 — 결과 데이터를 단언하는 검사는 판정할 수 없다.` +
