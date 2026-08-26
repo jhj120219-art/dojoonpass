@@ -1484,6 +1484,7 @@ def run():
     check_declared_filters_actually_filter()
     check_authed_screens_get_the_same_address()
     check_sort_and_injection_are_bounded()
+    check_area_filter_survives_missing_migration_025()
 
     print()
     if FAILURES:
@@ -1491,6 +1492,219 @@ def run():
         return 1
     print(f"전체 {PASS}건 통과")
     return 0
+
+
+
+# ---------------------------------------------------------------------------
+# 면적 필터가 migration 025 미적용 DB 에서 검색 전체를 죽이지 않는가
+# (2026-08-26, `docs/BUGS.md` #220)
+# ---------------------------------------------------------------------------
+def check_area_filter_survives_missing_migration_025():
+    """면적 필터의 **두 반쪽이 같은 방향으로** 동작하는지 본다.
+
+    ## 무엇이 틀려 있었나
+
+    면적 검색은 2026-08-26 에 한 번에 들어왔는데, 그 안에서 응답 쪽과 필터 쪽이
+    **정반대로** 쓰여 있었다.
+
+        응답  `_area_of(row, "building_area")`  -> 컬럼이 없으면 그 필드만 null
+              (주석: *"검색 전체가 500 이 되는 것보다 그 필드만 null 이 낫다"*)
+        필터  `conditions.append("building_area >= ?")` -> 컬럼이 없으면 그대로 500
+
+    그래서 migration 025 가 적용되지 않은 DB 에서는 사용자가 면적을 **건드리는 순간**
+    검색이 통째로 깨졌다. 프런트는 같은 날 '준비 중입니다' 를 걷어내고 실제 입력을
+    열었으므로 도달 가능한 경로다. 실제로 이 저장소의 `test_id_bounds_sweep` 이
+    `min_building_area=1.5 -> 500` 을 포함해 **20개 조합 전부**를 잡아 붉었다.
+
+    ## 이 검사가 잠그는 것 — 그리고 왜 '0건' 만 봐서는 안 되는가
+
+    `check_declared_filters_actually_filter()` 는 면적에 **극단값(10^9, 1)** 만 보내고
+    0건을 기대한다. 그 검사는 "면적 조건이 오면 무조건 빈 결과" 라는 잘못된 고침으로도
+    **그대로 통과한다** — 즉 이 결함의 수정을 검증하지 못한다.
+
+    그래서 여기서는 컬럼이 **있는** DB 에서 중간값으로 걸러 *남을 것은 남고 빠질 것은
+    빠지는* 것을 먼저 못박는다. 그 뒤에 컬럼을 실제로 **DROP** 해서 결손을 재현한다.
+    두 쪽을 같이 봐야 방어가 공허해지지 않는다.
+    """
+    print("\n=== 면적 필터 x migration 025 미적용 (BUGS #220) ===")
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+    from api.v1.search import _area_columns_available
+
+    workdir = tempfile.mkdtemp(prefix="qa_area_")
+    orig_db = dbmod.DB_PATH
+    try:
+        # 스키마는 실제 부트스트랩 3단계 그대로 만든다 — 테스트가 스키마를 손으로
+        # 베끼면 진짜 마이그레이션과 어긋나도 초록불을 유지한다.
+        dbmod.DB_PATH = os.path.join(workdir, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        # 면적이 서로 다른 3건 + 면적을 모르는 1건.
+        # 기일은 넉넉히 미래로 둬 기본 필터(auction_date >= 오늘)에 걸리지 않게 한다.
+        rows = [
+            (1, "2024타경901", 30.0, 55.0),
+            (2, "2024타경902", 85.0, 120.0),
+            (3, "2024타경903", 150.0, 300.0),
+            (4, "2024타경904", None, None),   # 차량/선박처럼 면적을 뽑을 수 없는 물건
+        ]
+        c = dbmod.get_connection()
+        try:
+            for item_id, case_no, b, l in rows:
+                case_id = c.execute(
+                    "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                    ("서울중앙지방법원", case_no)).lastrowid
+                c.execute(
+                    "INSERT INTO auction_item"
+                    " (id, case_id, case_no, item_no, court_name, property_type,"
+                    "  sido, sigungu, full_address, auction_date,"
+                    "  building_area, land_area)"
+                    " VALUES (?,?,?,'1','서울중앙지방법원','아파트','서울','강남구',"
+                    "         '서울 강남구 역삼동 1', '2099-01-01', ?, ?)",
+                    (item_id, case_id, case_no, b, l))
+            c.commit()
+        finally:
+            c.close()
+
+        def q(**params):
+            return client.get("/api/v1/search", params={"size": 100, **params})
+
+        # ------------------------------------------------------------------
+        # A. 컬럼이 있는 DB — 필터가 진짜로 거른다
+        #    (이 부분이 없으면 아래 방어 검사가 공허해진다)
+        # ------------------------------------------------------------------
+        conn = dbmod.get_connection()
+        try:
+            check("전제: 부트스트랩 DB 에 면적 컬럼이 있다(025 적용)",
+                  _area_columns_available(conn) is True)
+        finally:
+            conn.close()
+
+        r = q()
+        check("전제: 씨앗 4건이 기본 검색에 보인다",
+              r.status_code == 200 and r.json()["total"] == 4,
+              (r.status_code, r.text[:160]))
+
+        r = q(min_building_area=50)
+        got = sorted(i["id"] for i in r.json()["items"])
+        check("★ 건물면적 >= 50 은 2·3만 남긴다(빈 결과가 아니다)", got == [2, 3], got)
+
+        r = q(min_building_area=50, max_building_area=100)
+        got = sorted(i["id"] for i in r.json()["items"])
+        check("★ 건물면적 50~100 은 2만 남긴다", got == [2], got)
+
+        r = q(min_land_area=200)
+        got = sorted(i["id"] for i in r.json()["items"])
+        check("★ 토지면적 >= 200 은 3만 남긴다", got == [3], got)
+
+        r = q(min_building_area=0)
+        got = sorted(i["id"] for i in r.json()["items"])
+        check("★ 면적 미상(4번)은 면적 조건이 붙는 순간 빠진다(NULL 규약)",
+              got == [1, 2, 3], got)
+
+        got = [i["id"] for i in q(min_building_area=85).json()["items"]]
+        check("★ 경계값은 포함이다(>= 85 에 85 가 든다)", 2 in got, got)
+
+        # ------------------------------------------------------------------
+        # B. 컬럼이 없는 DB — 결손을 **실제로 재현**한다 (DROP COLUMN)
+        # ------------------------------------------------------------------
+        # B-0. **한쪽만** 없는 결손을 먼저 본다.
+        #
+        #   두 컬럼을 한꺼번에 지워 놓고 보면 "면적 컬럼 목록에서 land_area 를 빠뜨린다"는
+        #   실수를 잡지 못한다 — building_area 하나만 봐도 판정이 False 로 같기 때문이다.
+        #   실제로 변이 M7(`AREA_COLUMNS` 에서 land_area 제거)이 이 단계 없이는
+        #   **살아남는 것**을 확인하고 추가했다. 025 는 두 컬럼을 함께 넣으므로 흔한
+        #   상태는 아니지만, 방어가 무엇을 근거로 참이 되는지는 정확해야 한다.
+        conn = dbmod.get_connection()
+        try:
+            # 인덱스가 걸린 컬럼은 그대로 DROP 되지 않는다 — 025 가 만든 인덱스를 먼저 지운다.
+            conn.execute("DROP INDEX IF EXISTS idx_auction_item_land_area")
+            conn.execute("ALTER TABLE auction_item DROP COLUMN land_area")
+            conn.commit()
+            check("전제: 한쪽(land_area)만 없는 결손이 재현됐다",
+                  _area_columns_available(conn) is False)
+        finally:
+            conn.close()
+        rr = q(min_land_area=1)
+        check("★★ 한쪽만 없어도 500 이 아니다(없는 쪽 조건)", rr.status_code == 200,
+              (rr.status_code, rr.text[:160]))
+        rr = q(min_building_area=50)
+        check("★★ 한쪽만 없으면 남아 있는 쪽 조건도 빈 결과로 통일한다",
+              rr.status_code == 200 and rr.json()["total"] == 0, rr.text[:160])
+
+        conn = dbmod.get_connection()
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_auction_item_building_area")
+            conn.execute("ALTER TABLE auction_item DROP COLUMN building_area")
+            conn.commit()
+            check("전제: 결손이 실제로 재현됐다(면적 컬럼 없음)",
+                  _area_columns_available(conn) is False)
+        finally:
+            conn.close()
+
+        r = q(min_building_area=50)
+        check("★★ 컬럼이 없어도 500 이 아니다", r.status_code == 200,
+              (r.status_code, r.text[:160]))
+        check("★★ 면적 조건은 빈 결과가 된다(조건을 조용히 버리지 않는다)",
+              r.status_code == 200 and r.json()["total"] == 0, r.text[:160])
+        check("★★ 빈 응답도 계약 모양을 유지한다",
+              r.status_code == 200
+              and set(r.json()) >= {"total", "page", "size", "total_pages", "items"}
+              and r.json()["items"] == [],
+              r.text[:160])
+
+        for name, params in (("min_land_area", {"min_land_area": 1}),
+                             ("max_building_area", {"max_building_area": 10 ** 6}),
+                             ("max_land_area", {"max_land_area": 10 ** 6}),
+                             ("음수", {"min_building_area": -1}),
+                             ("소수", {"min_building_area": 1.5})):
+            rr = q(**params)
+            check("★★ %s 도 500 이 아니다" % name, rr.status_code == 200,
+                  (rr.status_code, rr.text[:120]))
+
+        # ------------------------------------------------------------------
+        # C. 방어가 **좁은가** — 면적을 안 준 검색은 그대로 살아 있어야 한다
+        #    (여기가 없으면 "컬럼 없으면 늘 빈 결과" 라는 과잉 방어를 못 잡는다)
+        # ------------------------------------------------------------------
+        r = q()
+        check("★ 면적을 안 주면 결손 DB 에서도 결과가 그대로다", r.json()["total"] == 4,
+              r.json()["total"])
+        check("★ 면적 필드는 null 로 응답한다(_area_of 계약)",
+              all(i["building_area"] is None and i["land_area"] is None
+                  for i in r.json()["items"]),
+              [(i["id"], i["building_area"]) for i in r.json()["items"]])
+        check("★ 다른 필터는 결손 DB 에서도 그대로 거른다",
+              q(sido="서울").json()["total"] == 4, q(sido="서울").json()["total"])
+        check("★ 다른 필터의 0건도 그대로다",
+              q(sido="부산").json()["total"] == 0, q(sido="부산").json()["total"])
+
+        # ------------------------------------------------------------------
+        # D. 판정을 캐시하지 않는다 — 마이그레이션이 적용되면 **같은 프로세스에서** 되살아난다
+        #    (`run_daily.bat` 가 매일 새벽 러너를 부른다, BUGS #219)
+        # ------------------------------------------------------------------
+        conn = dbmod.get_connection()
+        try:
+            conn.execute("ALTER TABLE auction_item ADD COLUMN building_area REAL")
+            conn.execute("ALTER TABLE auction_item ADD COLUMN land_area REAL")
+            conn.execute("UPDATE auction_item SET building_area=85.0, land_area=120.0"
+                         " WHERE id=2")
+            conn.commit()
+        finally:
+            conn.close()
+        got = sorted(i["id"] for i in q(min_building_area=50).json()["items"])
+        check("★★ 025 를 뒤늦게 적용하면 같은 프로세스에서 곧바로 다시 거른다(캐시 없음)",
+              got == [2], got)
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

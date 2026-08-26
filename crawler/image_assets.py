@@ -317,8 +317,23 @@ def image_path(court_code: str, case_no: str, item_no: str, seq: int, ext: str) 
 def image_exists(court_code: str, case_no: str, item_no: str, seq: int, ext: str) -> bool:
     """이 사진이 "쓸 수 있는 상태"로 저장돼 있는지.
 
-    `doc_paths.doc_exists()`와 같은 기준을 쓴다 — 존재 + 크기가 하한 초과.
+    `doc_paths.doc_exists()`와 **같은 모양**의 기준을 쓴다 — 존재 + 크기 하한.
     쓰는 쪽과 읽는 쪽의 "있다" 정의가 갈라지면 "화면은 READY인데 뷰어는 404"가 된다.
+
+    ★ 다만 **하한 값과 비교 방향은 문서 쪽과 다르다** (2026-08-26 실측, `docs/BUGS.md` #238).
+      예전 문구는 *"같은 기준 ... 하한 초과"* 였는데 둘 다 부정확했다.
+
+          문서  `getsize(path) > 0`                하한 0,    **초과**  -> 1바이트도 '있다'
+          사진  `getsize(path) >= MIN_IMAGE_BYTES` 하한 1024, **이상**  -> 1024바이트부터 '있다'
+
+      실측: 1023 -> False / 1024 -> True. 하한이 다른 것은 **의도**다 —
+      1KB 미만짜리는 잘린 내려받기라 뷰어가 열지 못한다.
+
+      "초과"라고 적어 두면 다음 사람이 `>=` 를 `>` 로 "고쳐" **정확히 1024바이트인 사진을
+      조용히 잃는다.** 그래서 값과 방향을 여기 명시한다.
+
+      ★ 서빙 쪽(`api/v1/images.py:99`)은 `getsize < MIN_IMAGE_BYTES` 로 거절한다 —
+        이 함수의 정확한 여집합이라 **두 쪽이 어긋나지 않는다**(확인함).
     """
     path = image_path(court_code, case_no, item_no, seq, ext)
     try:

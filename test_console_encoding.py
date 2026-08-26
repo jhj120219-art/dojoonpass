@@ -484,6 +484,114 @@ def test_no_escape_frozen_into_a_control_character():
     print("    훑은 소스 %d개" % len(files))
 
 
+
+# ---------------------------------------------------------------------------
+# 배치/PowerShell 스크립트의 파일 인코딩 계약 (2026-08-26, `docs/BUGS.md` #221)
+# ---------------------------------------------------------------------------
+#
+# 이 파일의 나머지 검사는 **파이썬이 콘솔에 쓰는 글자**를 본다. 이 검사는 한 칸 위
+# — **셸이 스크립트 파일 자체를 읽는 순간**을 본다. 둘은 다른 사고다.
+#
+#   `.bat`  cmd 는 시스템 OEM 코드페이지(여기서는 cp949)로 읽는다. UTF-8 한글
+#           바이트를 cp949 로 읽으면 2바이트 조합이 **뒤따르는 ASCII 를 트레일
+#           바이트로 삼켜** 토큰 경계가 밀린다. 그러면 주석 한가운데에서 파싱이
+#           재개되고 남은 조각이 **명령으로 실행된다.**
+#           BOM 은 해법이 아니라 악화다(`'癤?echo'` 가 명령이 된다, BUGS #219).
+#           cp949 저장도 불가하다(em-dash 를 인코딩하지 못한다).
+#           => 남는 규칙은 하나, **ASCII 로 쓴다.**
+#
+#   `.ps1`  Windows PowerShell 5.1 은 **BOM 이 없으면 ANSI 로 읽는다.**
+#           그래서 여기서는 반대로 **BOM 이 있어야** 한글이 안전하다.
+#
+# 2026-08-26 실측 (작업 사본 + 스텁, `chcp 949`, 끝까지 실행):
+#
+#     HEAD  run_daily.bat             exit=255, cmd stderr 7줄, daily_run.log **없음**
+#           run_doc_worker.bat        exit=0,   cmd stderr 7줄
+#           run_priority_refresh.bat  exit=0,   cmd stderr 5줄
+#     수정후 셋 다                     exit=0,   cmd stderr **0줄**, 마커 정상
+#
+# `run_daily.bat` 의 255 가 특히 나쁘다 — **성공 경로에서** 종료 코드가 실패가 되고
+# `[SUCCESS]`/`[FAILED]` 어느 마커도 남지 않는다. 이 저장소가 오래 싸워 온
+# "실패 은폐"(BUGS #47)의 정확한 거울상이다.
+SHELL_SCRIPT_DIRS_SKIPPED = (".claude", "node_modules", ".next", ".git")
+
+
+def _shell_scripts(suffix):
+    """저장소가 **실제로 쓰는** 셸 스크립트만 훑는다.
+
+    `.claude/worktrees/` 아래에는 옛 worktree 의 사본이 남아 있다. 그것까지 세면
+    고칠 수 없는 과거 파일 때문에 이 검사가 영구 red 가 된다 - 그러면 사람이
+    검사를 끄게 되고, 그게 가드를 죽이는 흔한 경로다.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SHELL_SCRIPT_DIRS_SKIPPED]
+        for fn in filenames:
+            if fn.lower().endswith(suffix):
+                found.append(os.path.join(dirpath, fn))
+    return sorted(found)
+
+
+def test_batch_files_are_ascii():
+    """`.bat` 는 ASCII 만, `.ps1` 는 비ASCII 를 쓰려면 BOM 을 가진다."""
+    print("\n--- 8. 셸 스크립트 파일 인코딩 계약 (BUGS #221) ---")
+
+    bats = _shell_scripts(".bat")
+    # 검사가 공허하지 않다는 것부터 — 파일을 못 찾았는데 통과하면 아무 뜻이 없다.
+    check("훑을 .bat 를 찾았다(검사가 공허하지 않다)", len(bats) >= 3, True)
+
+    for path in bats:
+        rel = os.path.relpath(path, ROOT)
+        raw = io.open(path, "rb").read()
+        check("%s: BOM 이 없다" % rel, raw.startswith(b"\xef\xbb\xbf"), False)
+        try:
+            raw.decode("ascii")
+            ok, detail = True, ""
+        except UnicodeDecodeError as e:
+            # 어느 줄인지까지 알려 준다 - "어딘가 한글이 있다"는 고치기 어렵다.
+            head = raw[:e.start]
+            ok = False
+            detail = "L%d 부근: %r" % (head.count(b"\n") + 1, raw[e.start:e.start + 20])
+        check("%s: ASCII 로만 이루어져 있다%s" % (rel, (" (%s)" % detail) if detail else ""),
+              ok, True)
+
+        # ★ 왜 ASCII 여야 하는지를 **직접** 확인한다. 규칙만 적어 두면 다음 사람이
+        #   "주석인데 뭐 어때" 로 되돌린다 - cmd 가 보는 바이트가 우리가 쓴 것과
+        #   같은지를 그 자리에서 재는 편이 낫다.
+        as_cmd_sees_it = raw.decode("cp949", errors="replace")
+        as_written = raw.decode("utf-8", errors="replace")
+        check("%s: cmd 가 읽는 내용이 우리가 쓴 내용과 같다(cp949 == utf-8)" % rel,
+              as_cmd_sees_it == as_written, True)
+
+    for path in _shell_scripts(".ps1"):
+        rel = os.path.relpath(path, ROOT)
+        raw = io.open(path, "rb").read()
+        try:
+            raw.decode("ascii")
+            continue                      # ASCII 면 BOM 유무와 무관하게 안전하다
+        except UnicodeDecodeError:
+            pass
+        # Windows PowerShell 5.1 은 BOM 이 없으면 ANSI 로 읽는다.
+        check("%s: 비ASCII 를 쓰므로 UTF-8 BOM 이 있어야 한다" % rel,
+              raw.startswith(b"\xef\xbb\xbf"), True)
+
+    # ★ 검출기 자체 검증 - known-bad 를 정말 잡는가, known-good 을 잘못 잡지 않는가.
+    #   (이 저장소가 반복해 겪은 "가드가 자기 자신만 검사한다"를 여기서도 막는다)
+    bad = "REM 한글 주석\r\necho ok\r\n".encode("utf-8")
+    good = "REM ascii comment\r\necho ok\r\n".encode("utf-8")
+    def _is_ascii(b):
+        try:
+            b.decode("ascii"); return True
+        except UnicodeDecodeError:
+            return False
+    check("검출기 자체 검증: 한글 주석이 든 .bat 를 잡는다", _is_ascii(bad), False)
+    check("검출기 자체 검증: ASCII 주석은 잡지 않는다", _is_ascii(good), True)
+    check("검출기 자체 검증: cp949 대조가 known-bad 에서 어긋난다",
+          bad.decode("cp949", errors="replace") == bad.decode("utf-8", errors="replace"),
+          False)
+    print("    훑은 .bat %d개" % len(bats))
+
+
 def run():
     test_scan_scope_excludes_snapshots()
     test_all_output_literals_are_console_encodable()
@@ -492,6 +600,7 @@ def run():
     test_logger_record_is_not_lost_on_cp949()
     test_known_operator_warnings_are_safe()
     test_no_escape_frozen_into_a_control_character()
+    test_batch_files_are_ascii()
 
     print("\n" + "=" * 55)
     if failures:

@@ -435,6 +435,63 @@ def test_rollback_calls_present_in_source():
                src.count("finally:") >= 4 and "conn.close()" in src)
 
 
+
+def test_refund_with_no_remaining_balance_reports_the_right_code():
+    """잔여 환불액이 **정확히 0** 일 때 어떤 오류 코드가 나가는가.
+
+    ## 왜 필요했나 - 경계 변이가 살아남았다
+
+    `refund_payment()` 는 `if refundable <= 0:` 으로 막는다. 2026-08-26 에 그 경계를
+    `< 0` 으로 바꿔 봤더니 **어떤 검사도 붉어지지 않았다.**
+
+    변이본에서도 환불은 거절된다(뒤의 `amount <= 0` 에 걸린다). 그러나 **오류 코드가
+    바뀐다** - `PAY_ALREADY_PROCESSED` 대신 `PAY_AMOUNT_MISMATCH` 가 나가고, 문구도
+    "환불 가능한 잔액이 없습니다"에서 "환불 금액은 1원 이상이어야 합니다"로 바뀐다.
+
+    돈이 새지는 않는다. 다만 오류 코드는 `docs/ERROR_CODES.md` 가 두 값을 **서로 다른
+    의미로 정의한** 공개 계약이고, 운영자는 그 문구로 원인을 찾는다.
+
+    ## 이 검사가 만드는 상황
+
+    부분 환불로 **전액이 이미 환불됐지만 status 는 PARTIAL_REFUND 인** 결제.
+    (status 가 REFUNDED 면 위쪽 멱등 분기에서 먼저 끝나 이 경로에 닿지 않는다.)
+    """
+    print("\n--- 8. 잔여 0 환불의 오류 코드 (경계 변이 대응) ---")
+    import api.v1.payments as pay
+    from api.constants import ErrorCode
+    from api.v1.payment_logs import log_payment_event, EVENT_CANCEL, LOG_SUCCESS
+
+    amount = 10000
+    pid = _seed_payment(status="PARTIAL_REFUND", amount=amount)
+    conn = _conn()
+    try:
+        log_payment_event(conn, EVENT_CANCEL, LOG_SUCCESS, user_id="qa-fi-user",
+                          payment_id=pid, provider="mock", pg_transaction_id=None,
+                          amount=amount, request_payload={"reason": "qa-seed"})
+        conn.commit()
+        already = pay.get_refunded_amount(conn, pid)
+    finally:
+        conn.close()
+    check("전제: 원장상 이미 전액 환불됐다", already, amount)
+
+    conn = _conn()
+    try:
+        try:
+            pay.refund_payment(conn, pid, None, "qa-zero-balance", actor="qa")
+            check_true("★ 잔여 0 이면 거절해야 한다", False, "거절 없이 통과했다")
+        except pay.RefundError as e:
+            check("★ 잔여 0 의 오류 코드는 PAY_ALREADY_PROCESSED 다",
+                  e.code, ErrorCode.PAY_ALREADY_PROCESSED)
+            check_true("★ 문구가 '잔액 없음'을 말한다(금액 오류가 아니다)",
+                       "잔액" in e.message, e.message)
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
 if __name__ == "__main__":
     _setup()
     try:
@@ -445,6 +502,7 @@ if __name__ == "__main__":
         test_registry_credit_failure_rolls_back()
         test_failure_response_has_no_internals()
         test_rollback_calls_present_in_source()
+        test_refund_with_no_remaining_balance_reports_the_right_code()
     finally:
         if _tmpdir:
             shutil.rmtree(_tmpdir, ignore_errors=True)

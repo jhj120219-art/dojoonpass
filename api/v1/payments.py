@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from storage.database import get_connection
@@ -74,24 +74,119 @@ PLAN_CATALOG = {
     },
 }
 VALID_PLANS = tuple(PLAN_CATALOG.keys())
+# 이 표의 불변식은 `validate_plan_catalog()` 가 **모듈을 읽는 순간** 확인한다 (BUGS #227).
+# 정의가 아래에 있어 호출도 그 뒤에 둔다.
+
+
+# ---------------------------------------------------------------------------
+# 카탈로그 검증 (2026-08-26 신설, `docs/BUGS.md` #227)
+#
+# 위 주석이 적어 둔 이 표의 설계 의도는 **"이벤트를 붙일 때 값만 바꾼다"** 이다.
+# 즉 프로그래머가 아닌 사람이 이 표를 고치는 것을 전제로 한다. 그런데 예전 판정은
+# 날짜를 **문자열로 비교**했다 — `YYYY-MM-DD` 로 영점을 채웠을 때만 맞는 방식이다.
+#
+# 실측(2026-08-26): 월을 한 자리로 적으면 두 방향 모두 조용히 틀린다.
+#
+#     discount_end   "2026-9-1"  + 오늘 2026-10-05  -> 할인이 **끝나지 않는다**
+#                                                      (274,800 받을 것을 198,000 만 받는다)
+#     discount_start "2026-9-1"  + 오늘 2026-09-15  -> 할인이 **시작되지 않는다**
+#
+# 둘 다 오류도 로그도 없이 금액만 달라진다. 그래서 판정을 문자열이 아니라 **날짜 객체**로
+# 하고, 잘못된 값은 **모듈을 읽는 순간** 큰 소리로 막는다.
+#
+# 왜 부팅에서 막나 — 이 표는 소스 리터럴이다. 여기서 raise 하면 배포 시점에 즉시 드러나고
+# **운영에 조용히 도달할 수 없다.** 이 저장소가 반복해 지켜 온 규칙 그대로다:
+# 틀린 값으로 돈을 받느니 뜨지 않는 편이 낫다.
+def _parse_catalog_date(value, where: str) -> date:
+    """카탈로그의 날짜를 **문서가 약속한 형식 그대로만** 받는다.
+
+    ★ `date.fromisoformat()` 만 쓰면 부족하다 — 파이썬 3.11+ 는 대시 없는 기본 형식
+      `"20260901"` 도 받아들인다. 그 값은 검증을 통과하지만 **사전순 비교와 시간순
+      비교가 갈린다**(`"2026-09-15" < "20260901"` 은 참이다). 지금 판정은 날짜 객체로
+      하므로 문제가 없지만, 표에 그런 값이 들어오는 것 자체를 막아 두면 이 파일이
+      다시 문자열 비교로 되돌아가도 조용히 틀리지 않는다.
+
+      확장 형식(YYYY-MM-DD)만 놓고 보면 사전순 == 시간순이다
+      (2024-01-01~2030-12-31 2,557일 전수 확인: 어긋난 쌍 0건).
+    """
+    if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
+        raise ValueError(
+            "%s: 날짜는 'YYYY-MM-DD' 형식이어야 한다(월/일에 0을 채울 것). 받은 값: %r"
+            % (where, value)
+        )
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            "%s: 날짜로 해석할 수 없다. 받은 값: %r" % (where, value)
+        ) from exc
+
+
+def validate_plan_catalog(catalog: dict) -> None:
+    """가격표의 **돈이 걸린 불변식**을 확인한다. 어기면 ValueError 로 즉시 멈춘다.
+
+    날짜 형식만 보지 않는다 — 같은 표에 있는 다른 값들도 어긋나면 조용히 금액을 바꾼다.
+    """
+    for plan, entry in catalog.items():
+        prices = entry.get("prices") or {}
+        if not prices:
+            raise ValueError("PLAN_CATALOG[%r]: prices 가 비어 있다" % plan)
+        for cycle, price in prices.items():
+            where = "PLAN_CATALOG[%r].prices[%r]" % (plan, cycle)
+
+            list_price = price.get("list_price")
+            if not isinstance(list_price, int) or list_price <= 0:
+                raise ValueError("%s.list_price 는 양의 정수여야 한다: %r" % (where, list_price))
+
+            sale = price.get("sale_price")
+            if sale is not None:
+                if not isinstance(sale, int) or sale <= 0:
+                    raise ValueError("%s.sale_price 는 양의 정수여야 한다: %r" % (where, sale))
+                # 할인가가 정상가보다 비싸면 **할인이라며 더 받는다.**
+                if sale > list_price:
+                    raise ValueError(
+                        "%s.sale_price(%d) 가 list_price(%d) 보다 크다" % (where, sale, list_price))
+
+            percent = price.get("discount_percent")
+            if percent is not None:
+                if not isinstance(percent, (int, float)) or not (0 < percent < 100):
+                    raise ValueError(
+                        "%s.discount_percent 는 0 초과 100 미만이어야 한다: %r" % (where, percent))
+
+            start = price.get("discount_start")
+            end = price.get("discount_end")
+            s = _parse_catalog_date(start, where + ".discount_start") if start else None
+            e = _parse_catalog_date(end, where + ".discount_end") if end else None
+            # 뒤집힌 기간은 "할인이 영원히 적용되지 않는다"로 조용히 끝난다.
+            if s and e and s > e:
+                raise ValueError(
+                    "%s: discount_start(%s) 가 discount_end(%s) 보다 늦다" % (where, start, end))
+
+
+# ★ 정의 직후에 **실제로 부른다.** 정의만 해 두면 아무것도 지키지 못한다 —
+#   이 저장소가 여러 번 겪은 "가드는 있는데 아무도 부르지 않는다"를 여기서 막는다.
+validate_plan_catalog(PLAN_CATALOG)
 
 
 def _is_discount_active(price_entry: dict, at: datetime = None) -> bool:
     """
     할인 적용 기간인지 판단한다.
 
-    `discount_start`/`discount_end`(ISO 날짜 문자열, 둘 다 선택)가 없으면 기간 제한이 없는
-    상시 할인으로 본다. 한쪽만 지정하는 것도 허용한다(시작만 = 그 이후 계속,
-    종료만 = 그때까지). 종료일은 그날까지 포함한다(`<=` 비교).
+    `discount_start`/`discount_end`(ISO 날짜 문자열 "YYYY-MM-DD", 둘 다 선택)가 없으면
+    기간 제한이 없는 상시 할인으로 본다. 한쪽만 지정하는 것도 허용한다(시작만 = 그 이후
+    계속, 종료만 = 그때까지). 종료일은 **그날까지 포함**한다.
+
+    ★ 비교는 문자열이 아니라 `date` 로 한다 (BUGS #227). 형식이 틀린 값은 위
+      `validate_plan_catalog()` 가 부팅에서 이미 막으므로 여기까지 오지 않는다.
     """
     start = price_entry.get("discount_start")
     end = price_entry.get("discount_end")
     if not start and not end:
         return True
-    today = (at or datetime.now()).date().isoformat()
-    if start and today < start:
+    today = (at or datetime.now()).date()
+    if start and today < _parse_catalog_date(start, "discount_start"):
         return False
-    if end and today > end:
+    if end and today > _parse_catalog_date(end, "discount_end"):
         return False
     return True
 

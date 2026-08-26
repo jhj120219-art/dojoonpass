@@ -319,6 +319,369 @@ def test_readonly_lookup_never_creates_directories():
     check("읽기 전용 스캐너가 get_doc_dir()를 import하지 않는다", offenders, [])
 
 
+
+# ---------------------------------------------------------------------------
+# 9. 서빙 쪽 가드가 **막아야 할 입력에서 스스로 죽지 않는가**
+#    (2026-08-26, `docs/BUGS.md` #229)
+# ---------------------------------------------------------------------------
+#
+# 위 5번은 **경로를 만드는 쪽**(크롤러)이 root 를 벗어나지 않는지 본다.
+# 이 검사는 반대쪽 — **DB 에 이미 이상한 값이 들어 있을 때 서빙 라우트가 어떻게 되는가**다.
+#
+# 실측으로 드러난 것: `os.path.commonpath()` 는 두 경로의 **드라이브가 다르면
+# ValueError 를 던진다**(Windows). 그리고 `os.path.join(root, "D:/evil")` 은
+# 베이스를 통째로 갈아치워 정확히 그 상황을 만든다.
+#
+#     os.path.join('C:/proj/documents', 'D:/evil')  ->  'D:/evil'
+#     os.path.commonpath(['C:/proj/documents', 'D:/evil.txt'])  ->  ValueError
+#
+# 그래서 **막아야 할 입력에서 가드 자신이 죽어** 404 가 아니라 500 이 나갔다.
+# 파일이 새지는 않았지만, 방어가 거절 대신 붕괴하는 것은 그 자체로 결함이다.
+#
+# ★ 저장소는 이 함정을 **이미 알고 있었다.** `api/v1/admin.py` /
+#   `crawler/image_assets.py` / `repair_document_status.py` 세 곳은 ValueError 를
+#   잡아 "밖"으로 처리한다. 그런데 **서빙 라우트 세 곳이 그 정리에서 빠져 있었다** —
+#   심지어 `api/v1/registry.py` 는 주석으로 *"documents.py 와 동일한 방식"* 이라며
+#   고쳐지지 않은 판을 베껴 왔다. 복제된 판정은 결함까지 함께 복제된다.
+
+
+def test_serving_guard_survives_uncomparable_paths():
+    """DB 에 드라이브가 다른 경로가 들어 있어도 404 로 거절한다(500 이 아니다)."""
+    print("\n--- 9. 서빙 가드가 비교 불가 경로에서 죽지 않는다 (BUGS #229) ---")
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    work = tempfile.mkdtemp(prefix="qa_serve_")
+    orig_db = dbmod.DB_PATH
+    secret = os.path.join(work, "SECRET.txt")
+    _io.open(secret, "w", encoding="utf-8").write("TOP-SECRET-CONTENT")
+    try:
+        dbmod.DB_PATH = os.path.join(work, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        conn = dbmod.get_connection()
+        cid = conn.execute("INSERT INTO auction_case (court_code,case_no) VALUES (?,?)",
+                           ("서울중앙지방법원", "2024타경1")).lastrowid
+        conn.execute("INSERT INTO auction_item (id,case_id,case_no,item_no,court_name,auction_date)"
+                     " VALUES (1,?,'2024타경1','1','서울중앙지방법원','2099-01-01')", (cid,))
+        # ★ 핵심 입력: 드라이브가 다른 절대경로. join 이 베이스를 갈아치운다.
+        hostile = ["D:/evil.txt", "D:evil.txt", "Z:/x/y.jpg",
+                   "../../../../Windows/win32.ini", os.path.abspath(secret)]
+        for seq, p in enumerate(hostile, 1):
+            conn.execute("INSERT INTO auction_image (item_id,seq,kind,storage_path,file_size,width,height)"
+                         " VALUES (1,?,'PHOTO',?,10,4,4)", (seq, p))
+        # 문서 경로는 court_name 으로 만들어진다 — 드라이브 문자를 넣어 escape 시킨다.
+        conn.execute("INSERT INTO auction_case (court_code,case_no) VALUES ('D:','2024타경9')")
+        conn.execute("INSERT INTO auction_item (id,case_id,case_no,item_no,court_name,auction_date)"
+                     " VALUES (2,(SELECT id FROM auction_case WHERE court_code='D:'),"
+                     "'2024타경9','1','D:','2099-01-01')")
+        conn.commit()
+        conn.close()
+
+        from fastapi.testclient import TestClient
+        from api_server import app
+        client = TestClient(app)
+
+        checked = 0
+        for seq, p in enumerate(hostile, 1):
+            try:
+                r = client.get("/api/v1/item/1/images/%d" % seq)
+                code, body = r.status_code, r.content[:64]
+            except Exception as exc:  # noqa: BLE001
+                code, body = "EXC:%s" % type(exc).__name__, b""
+            checked += 1
+            check("사진 %r 는 404" % p[:26], code, 404)
+            check_true("사진 %r 가 root 밖 내용을 주지 않는다" % p[:26],
+                       b"SECRET" not in body, body[:40])
+        for doc_type in ("SPEC", "STATUS"):
+            try:
+                code = client.get("/api/v1/item/2/documents/%s" % doc_type).status_code
+            except Exception as exc:  # noqa: BLE001
+                code = "EXC:%s" % type(exc).__name__
+            checked += 1
+            check("문서(court_name='D:') %s 는 404" % doc_type, code, 404)
+
+        check_true("검사가 공허하지 않다(실제로 요청을 보냈다)", checked >= 7, checked)
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_every_containment_check_handles_uncomparable_paths():
+    """제품 코드의 **모든** `commonpath` 담기 검사가 ValueError 를 다루는가.
+
+    위 검사는 라우트 세 개를 직접 태운다. 이 검사는 **다음에 생길 네 번째**를 막는다 —
+    결함이 "여섯 곳 중 세 곳만 고쳐져 있었다" 였으므로, 라우트별로 세는 것만으로는
+    같은 일이 또 일어난다.
+    """
+    print("\n--- 9-b. commonpath 담기 검사가 전부 ValueError 를 다루는가 ---")
+    import glob
+    import io as _io
+
+    targets = []
+    for pattern in ("api/**/*.py", "crawler/**/*.py", "storage/**/*.py", "*.py"):
+        for path in glob.glob(os.path.join(ROOT, pattern), recursive=True):
+            rel = os.path.relpath(path, ROOT).replace("\\", "/")
+            if rel.startswith("test_") or "/worktrees/" in rel:
+                continue
+            targets.append((rel, path))
+
+    sites, unsafe = 0, []
+    for rel, path in sorted(set(targets)):
+        try:
+            src = _io.open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        lines = src.split("\n")
+        for i, line in enumerate(lines):
+            if "os.path.commonpath" not in line or line.strip().startswith("#"):
+                continue
+            sites += 1
+            # 이 호출을 감싸는 try 가 위쪽 12줄 안에 있고, 아래쪽에 ValueError 를 잡는가.
+            window_up = "\n".join(lines[max(0, i - 12):i + 1])
+            window_dn = "\n".join(lines[i:i + 12])
+            # ★ `except (OSError, ValueError)` 같은 튜플 형태도 안전하다.
+            #   처음에는 `"except ValueError"` 문자열만 봤다가 `crawler/image_assets.py`
+            #   를 **거짓 양성으로 잡았다** — 그 자리는 이미 튜플로 막고 있었다.
+            #   가드가 멀쩡한 코드를 결함이라고 부르면 사람이 가드를 끄게 된다.
+            guarded = ("try:" in window_up) and any(
+                ln.lstrip().startswith("except") and "ValueError" in ln
+                for ln in window_dn.split("\n"))
+            if not guarded:
+                unsafe.append("%s:%d  %s" % (rel, i + 1, line.strip()[:60]))
+
+    # 검사가 공허하지 않다 — 대상을 실제로 찾았는가.
+    check_true("commonpath 사용처를 실제로 찾았다(검사가 공허하지 않다)", sites >= 5, sites)
+    check("★ ValueError 를 다루지 않는 commonpath 검사", unsafe, [])
+    if unsafe:
+        print("      드라이브가 다른 경로가 오면 이 자리에서 500 이 난다:")
+        for u in unsafe:
+            print("        " + u)
+    print("    훑은 commonpath 사용처 %d곳" % sites)
+
+    # ★ 검출기 자체 검증 — 규칙이 실제로 두 모양을 가려내는가.
+    def _judge(snippet):
+        ls = snippet.split("\n")
+        for i, ln in enumerate(ls):
+            if "os.path.commonpath" in ln and not ln.strip().startswith("#"):
+                up = "\n".join(ls[max(0, i - 12):i + 1])
+                dn = "\n".join(ls[i:i + 12])
+                return ("try:" in up) and any(
+                    x.lstrip().startswith("except") and "ValueError" in x
+                    for x in dn.split("\n"))
+        return None
+    good = "    try:\n        x = os.path.commonpath([a, b])\n    except ValueError:\n        x = None"
+    tup = "    try:\n        x = os.path.commonpath([a, b])\n    except (OSError, ValueError):\n        x = None"
+    bad = "    x = os.path.commonpath([a, b]) != a"
+    other = "    try:\n        x = os.path.commonpath([a, b])\n    except OSError:\n        x = None"
+    check("검출기 자체 검증: 감싼 형태를 안전하다고 본다", _judge(good), True)
+    check("검출기 자체 검증: 튜플 except 도 안전하다고 본다", _judge(tup), True)
+    check("검출기 자체 검증: 맨 호출을 위험하다고 본다", _judge(bad), False)
+    check("검출기 자체 검증: ValueError 를 안 잡으면 위험하다고 본다", _judge(other), False)
+
+
+# ---------------------------------------------------------------------------
+# 10. "있다"의 크기 하한을 **실제 파일로** 못박는다 (2026-08-26, `docs/BUGS.md` #238)
+#
+# 경계 변이(`getsize >= MIN_IMAGE_BYTES` -> `>`)가 살아남아 추가했다.
+# 정확히 하한값인 파일이 어느 쪽으로 판정되는지를 아무도 검사하지 않고 있었다.
+#
+# 문서와 사진은 **하한도 방향도 다르다.** 그 차이가 의도라는 것을 값으로 고정한다 —
+# 나중에 누가 "둘을 통일하자"며 한쪽을 옮기면 여기서 먼저 걸린다.
+#
+#     문서  getsize > 0                 -> 1바이트도 '있다'
+#     사진  getsize >= MIN_IMAGE_BYTES  -> 1024바이트부터 '있다'
+# ---------------------------------------------------------------------------
+def test_existence_size_floor_is_exact():
+    print("\n--- 10. '있다'의 크기 하한 경계 (BUGS #238) ---")
+    import shutil
+    import tempfile
+    import crawler.image_assets as ia
+    import crawler.doc_paths as dp
+
+    work = tempfile.mkdtemp(prefix="qa_floor_")
+    old_ia, old_dp = ia.DOCUMENT_ROOT, dp.DOCUMENT_ROOT
+    ia.DOCUMENT_ROOT = dp.DOCUMENT_ROOT = work
+    try:
+        check_true("전제: 사진 하한이 양수다(검사가 공허하지 않다)",
+                   ia.MIN_IMAGE_BYTES > 0, ia.MIN_IMAGE_BYTES)
+        floor = ia.MIN_IMAGE_BYTES
+
+        p = ia.image_path("법원", "2024타경1", "1", 1, "jpg")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        for size, expected in ((floor - 1, False), (floor, True), (floor + 1, True), (0, False)):
+            with open(p, "wb") as fh:
+                fh.write(b"\0" * size)
+            check("★ 사진 %d바이트 -> image_exists" % size,
+                  ia.image_exists("법원", "2024타경1", "1", 1, "jpg"), expected)
+        os.remove(p)
+
+        # 문서 쪽은 하한이 **0** 이고 방향도 다르다 — 같이 고정해 둔다.
+        d = dp.get_doc_dir("법원", "2024타경1", "1")
+        os.makedirs(d, exist_ok=True)
+        fp = os.path.join(d, dp.CANONICAL_DOC_FILENAME["SPEC"])
+        for size, expected in ((0, False), (1, True), (floor - 1, True)):
+            with open(fp, "wb") as fh:
+                fh.write(b"\0" * size)
+            check("★ 문서 %d바이트 -> doc_exists" % size,
+                  dp.doc_exists("법원", "2024타경1", "1", "SPEC"), expected)
+        os.remove(fp)
+
+        # ★ 서빙 쪽이 이 함수의 **여집합**인지도 소스로 고정한다.
+        #   한쪽만 옮기면 "화면은 READY인데 뷰어는 404" 가 된다 — 이 파일의 docstring 이
+        #   경고하는 바로 그 상태다.
+        img_src = open(os.path.join(ROOT, "api", "v1", "images.py"),
+                       encoding="utf-8-sig").read()
+        check_true("★ 서빙도 같은 상수를 쓴다(하드코딩하지 않는다)",
+                   "MIN_IMAGE_BYTES" in img_src,
+                   "-> 서빙이 자기 숫자를 들면 두 쪽이 조용히 갈라진다")
+        check_true("★ 서빙의 거절 조건이 여집합(`< MIN_IMAGE_BYTES`)이다",
+                   "< MIN_IMAGE_BYTES" in img_src,
+                   "-> `<=` 로 바뀌면 정확히 하한인 사진이 404 가 된다")
+
+        # ★★ 세 번째 다리 — **DB 행을 만드는 단계**도 같은 경계여야 한다.
+        #
+        #   처음 이 검사를 쓸 때는 쓰기(image_exists)와 서빙만 못박았다. 그런데
+        #   변이 `size < MIN` -> `size <= MIN` (`storage/database.py:save_auction_images`)이
+        #   **살아남았다.** 그 상태에서 벌어지는 일은 #148 의 정반대다:
+        #
+        #       정확히 1024바이트 사진 -> 파일은 디스크에 있고 서빙도 200 인데
+        #       auction_image 행이 **안 생긴다** -> image_count=0, 썸네일 없음
+        #       => 받아 놓고도 사용자에게 영원히 안 보인다
+        #
+        #   `api/v1/thumbnails.py` 는 크기를 보지 않고 `auction_image` 행만 읽으므로,
+        #   이 단계가 어긋나면 목록·상세·서빙 셋이 서로 다른 말을 한다.
+        #   **세 다리가 같은 경계를 써야 한다.**
+        db_src = open(os.path.join(ROOT, "storage", "database.py"), encoding="utf-8-sig").read()
+        # ★ 이름이 **등장하는지**가 아니라 **정본에서 import 하는지**를 본다.
+        #   `"MIN_IMAGE_BYTES" in db_src` 로 썼다가 변이
+        #   `_MIN_IMAGE_BYTES = 2048  # 자기 숫자` 를 **놓쳤다** — 그 줄에도 이름이 들어 있다.
+        #   BUGS #232 에서 겪은 부분 문자열 함정과 같은 모양이다.
+        _imports_const = re.search(r"from\s+crawler\.image_assets\s+import[^\n]*\bMIN_IMAGE_BYTES\b", db_src)
+        check_true("★ DB 기록 단계가 정본 상수를 **import** 한다(자기 숫자를 들지 않는다)",
+                   _imports_const is not None,
+                   "-> 하드코딩하면 목록/서빙과 조용히 갈라진다")
+        check_true("★ DB 기록 단계에 하드코딩된 하한이 없다",
+                   re.search(r"_MIN_IMAGE_BYTES\s*=\s*\d+", db_src) is None,
+                   "-> 숫자를 직접 대입한 자리가 있다")
+        check_true("★ DB 기록의 거절 조건이 `< MIN` 이다(하한 자체는 받아들인다)",
+                   "size < _MIN_IMAGE_BYTES" in db_src,
+                   "-> `<=` 면 정확히 하한인 사진이 **행 없이** 디스크에만 남는다")
+        # 썸네일이 크기를 보지 않는다는 전제도 함께 고정한다 — 이 전제가 깨지면
+        # 위 세 다리 말고 네 번째 판정자가 생긴 것이다.
+        th_src = open(os.path.join(ROOT, "api", "v1", "thumbnails.py"), encoding="utf-8-sig").read()
+        check_true("전제: 썸네일은 크기를 판정하지 않는다(auction_image 행만 읽는다)",
+                   "MIN_IMAGE_BYTES" not in th_src and "getsize" not in th_src,
+                   "-> 썸네일이 자기 기준을 가지면 판정자가 넷이 된다")
+    finally:
+        ia.DOCUMENT_ROOT, dp.DOCUMENT_ROOT = old_ia, old_dp
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_size_floor_holds_end_to_end_at_runtime():
+    """하한 경계를 **소스가 아니라 실제 실행**으로 확인한다 (2026-08-26, BUGS #238).
+
+    위 10번은 세 다리가 같은 상수·같은 방향을 쓰는지를 **소스로** 본다. 그것만으로는
+    "정말 그렇게 동작하는가"를 말할 수 없다 — 경로 해석·호출 순서·조기 반환 같은 것이
+    끼면 소스가 옳아도 결과가 다를 수 있다.
+
+    그래서 임시 DB + 임시 documents 루트를 만들고 `save_auction_images()` 를 **실제로
+    불러** 세 값(하한-1 / 하한 / 하한+1)이 다음 넷에서 어떻게 되는지 한 번에 본다.
+
+        saved 개수 -> auction_image 행 -> 썸네일 seq -> 서빙 응답
+
+    ★ 이 검사를 쓰다가 **내가 먼저 틀렸다.** 처음에는 `path` 에 프로젝트 상대경로를
+      넘겼는데, `save_auction_images()` 는 `os.path.getsize(path)` 를 **준 그대로** 쓴다.
+      그래서 1024바이트도 `saved=0` 이 나왔고 하마터면 "하한 가드가 과하다"고 오판할
+      뻔했다. 실 호출부(`crawler/image_crawler.py`)가 넘기는 것은 `image_path()` 가
+      돌려주는 **절대경로**다. 이 검사도 같은 형태로 넘긴다.
+    """
+    print("\n--- 11. 하한 경계 end-to-end 실행 검증 (BUGS #238) ---")
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+    import crawler.image_assets as ia
+    import api.v1.images as apiimg
+    import api.v1.thumbnails as th
+
+    work = tempfile.mkdtemp(prefix="qa_floor_e2e_")
+    orig_db = dbmod.DB_PATH
+    old = (ia.DOCUMENT_ROOT, apiimg.DOCUMENT_ROOT, apiimg.PROJECT_ROOT)
+    try:
+        dbmod.DB_PATH = os.path.join(work, "t.db")
+        docs = os.path.join(work, "documents")
+        os.makedirs(docs)
+        ia.DOCUMENT_ROOT = apiimg.DOCUMENT_ROOT = docs
+        apiimg.PROJECT_ROOT = work
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+        conn = dbmod.get_connection()
+        try:
+            cid = conn.execute("INSERT INTO auction_case (court_code,case_no) VALUES (?,?)",
+                               ("서울중앙지방법원", "2024타경1")).lastrowid
+            conn.execute("INSERT INTO auction_item (id,case_id,case_no,item_no,court_name,auction_date)"
+                         " VALUES (1,?,'2024타경1','1','서울중앙지방법원','2099-01-01')", (cid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        from fastapi.testclient import TestClient
+        from api_server import app
+        client = TestClient(app)
+        floor = ia.MIN_IMAGE_BYTES
+
+        for seq, (size, want_row) in enumerate(
+                ((floor - 1, False), (floor, True), (floor + 1, True)), start=1):
+            path = ia.image_path("서울중앙지방법원", "2024타경1", "1", seq, "jpg")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"" + bytes([255, 216]) + bytes(size - 2))
+            res = dbmod.save_auction_images(
+                "서울중앙지방법원", "2024타경1", "1",
+                [{"seq": seq, "kind": "PHOTO", "path": path, "file_size": size,
+                  "file_hash": "h%d" % seq, "width": 4, "height": 4}], complete=False)
+            conn = dbmod.get_connection()
+            try:
+                rows = conn.execute("SELECT COUNT(*) FROM auction_image WHERE seq=?",
+                                    (seq,)).fetchone()[0]
+                thumb = th.fetch_thumbnail_seqs(conn, [1]).get(1)
+            finally:
+                conn.close()
+            served = client.get("/api/v1/item/1/images/%d" % seq).status_code
+
+            check("★ %d바이트: save_auction_images saved" % size,
+                  res.get("saved"), 1 if want_row else 0)
+            check("★ %d바이트: auction_image 행" % size, rows, 1 if want_row else 0)
+            check("★ %d바이트: 서빙 응답" % size, served, 200 if want_row else 404)
+            if not want_row:
+                # 행이 없으면 썸네일도 없어야 한다 -> "목록엔 보이는데 404" 가 성립 불가
+                check("★ %d바이트: 썸네일이 가리키지 않는다(#148 이 성립 불가)" % size,
+                      thumb, None)
+            else:
+                check_true("★ %d바이트: 썸네일이 이 사진을 가리킨다" % size,
+                           thumb is not None, thumb)
+    finally:
+        dbmod.DB_PATH = orig_db
+        ia.DOCUMENT_ROOT, apiimg.DOCUMENT_ROOT, apiimg.PROJECT_ROOT = old
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_normal_values_pass_through()
     test_multi_case_numbers()
@@ -328,6 +691,10 @@ if __name__ == "__main__":
     test_all_consumers_agree()
     test_no_new_copies_of_the_rule()
     test_readonly_lookup_never_creates_directories()
+    test_serving_guard_survives_uncomparable_paths()
+    test_every_containment_check_handles_uncomparable_paths()
+    test_existence_size_floor_is_exact()
+    test_size_floor_holds_end_to_end_at_runtime()
 
     print("\n" + "=" * 55)
     if failures:

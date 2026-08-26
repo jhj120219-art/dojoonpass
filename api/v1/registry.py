@@ -357,7 +357,14 @@ def download_registry(request_id: int, user_id: str = Depends(get_current_user))
         file_path = os.path.join(REGISTRY_DOCUMENT_ROOT, row["doc_url"])
         real_root = os.path.realpath(REGISTRY_DOCUMENT_ROOT)
         real_file_path = os.path.realpath(file_path)
-        if os.path.commonpath([real_root, real_file_path]) != real_root:
+        # ★ 2026-08-26 (`docs/BUGS.md` #229): 드라이브가 다르면 `commonpath` 가 ValueError 다.
+        #   위 주석이 가리키는 `documents.py` 를 그대로 베껴 왔는데 **그쪽도 같은 구멍**이었다
+        #   — 복제된 판정은 결함까지 함께 복제된다. 세 곳을 같은 방식으로 맞췄다.
+        try:
+            outside = os.path.commonpath([real_root, real_file_path]) != real_root
+        except ValueError:
+            outside = True
+        if outside:
             raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
         # "있다"의 기준을 **저장소의 다른 파일 서빙 경로와 같게** 맞춘다 (2026-08-14).
         #

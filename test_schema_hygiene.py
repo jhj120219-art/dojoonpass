@@ -538,9 +538,10 @@ def test_tracked_sources_do_not_import_untracked():
     py_untracked = [u for u in untracked if u.endswith(".py")]
     web_untracked = [u for u in untracked if u.endswith((".ts", ".tsx"))]
 
-    # 미추적 파이썬 모듈 -> 검색할 import 패턴
-    patterns = []           # (정규식, 미추적파일, 설명)
-    for u in py_untracked:
+    # ★ 패턴 만드는 규칙은 **한 곳에만** 둔다 (2026-08-26, `docs/BUGS.md` #235).
+    #   아래 자기 검증이 이 함수를 그대로 쓴다 — 규칙을 두 벌로 적으면 한쪽만 바뀌는 날
+    #   자기 검증이 진짜 검사와 다른 것을 확인하게 된다(BUGS #224/#234 와 같은 실수).
+    def _py_pattern(u):
         mod = u[:-3].replace("/", ".")                      # api/http_cache.py -> api.http_cache
         base = os.path.basename(u)[:-3]                     # -> http_cache
         pkg = mod.rsplit(".", 1)[0] if "." in mod else ""   # -> api
@@ -549,16 +550,54 @@ def test_tracked_sources_do_not_import_untracked():
             # `from api import http_cache` / `from .http_cache import x` 형태
             alts.append(re.escape(pkg) + r"\s+import\s+[^\n]*\b" + re.escape(base) + r"\b")
             alts.append(r"\.\s*" + re.escape(base) + r"\b")
-        rx = re.compile(r"^\s*(?:from|import)\s+[^\n]*(?:%s)" % "|".join(alts), re.M)
-        patterns.append((rx, u, mod))
-    for u in web_untracked:
+        return re.compile(r"^\s*(?:from|import)\s+[^\n]*(?:%s)" % "|".join(alts), re.M), mod
+
+    def _web_pattern(u):
         base = os.path.basename(u).rsplit(".", 1)[0]        # ResultThumbnail
-        rx = re.compile(r"""^\s*import[^\n]*from\s+['"][^'"]*/%s['"]""" % re.escape(base), re.M)
-        patterns.append((rx, u, base))
+        return re.compile(
+            r"""^\s*import[^\n]*from\s+['"][^'"]*/%s['"]""" % re.escape(base), re.M), base
+
+    # 미추적 파이썬 모듈 -> 검색할 import 패턴
+    patterns = []           # (정규식, 미추적파일, 설명)
+    for u in py_untracked:
+        rx, desc = _py_pattern(u)
+        patterns.append((rx, u, desc))
+    for u in web_untracked:
+        rx, desc = _web_pattern(u)
+        patterns.append((rx, u, desc))
+
+    # ------------------------------------------------------------------
+    # ★ 자기 검증 — 이 검사는 **미추적 소스 파일이 없으면 아무것도 하지 않는다.**
+    #   지금이 정확히 그 상태다(실측: 미추적 .py/.ts/.tsx **0개**). 그때 `[PASS]` 만
+    #   찍고 넘어가면 "검증했다"와 "검증할 것이 없었다"가 섞인다 — 이 저장소가
+    #   `run_python_tests.py` 를 만들면서 세운 규약을 검사 안에서 어기는 셈이다.
+    #
+    #   그래서 **합성 입력으로 판정 규칙을 실제로 태운다.** 진짜 미추적 파일이 생기는 날
+    #   이 검사가 동작한다는 것을 지금 증명해 둔다.
+    # ------------------------------------------------------------------
+    _rx_py, _ = _py_pattern("api/qa_ghost_module.py")
+    for line, should in [
+        ("from api.qa_ghost_module import x", True),
+        ("import api.qa_ghost_module", True),
+        ("from api import qa_ghost_module", True),
+        ("from .qa_ghost_module import x", True),
+        ("from api.other_module import x", False),
+        ("# from api.qa_ghost_module import x", False),      # 주석은 간선이 아니다
+        ("qa_ghost_module_lookalike = 1", False),
+    ]:
+        check("자기 검증(py): %-38r -> %s" % (line[:38], "간선" if should else "아님"),
+              bool(_rx_py.search(line)), should)
+    _rx_web, _ = _web_pattern("src/components/QaGhost.tsx")
+    for line, should in [
+        ("import QaGhost from '@/components/QaGhost'", True),
+        ("import X from '@/components/Other'", False),
+    ]:
+        check("자기 검증(web): %-38r -> %s" % (line[:38], "간선" if should else "아님"),
+              bool(_rx_web.search(line)), should)
 
     if not patterns:
         print("   미추적 소스 파일이 없다 - 검사할 간선 없음")
-        check("추적 파일이 미추적 파일을 import하지 않는다", [], [])
+        print("   (위 자기 검증이 '미추적 파일이 생기면 잡는다'를 대신 증명한다)")
         return
 
     scan = [t for t in tracked if t.endswith((".py", ".ts", ".tsx"))]
@@ -1058,6 +1097,7 @@ def test_court_list_integrity():
     print("\n--- 9. ALL_COURTS 무결성 (Sprint 78) ---")
     from config.courts import ALL_COURTS, get_courts_by_region
     from config.settings import SIDO_LIST
+    from config.settings import COURTS as SETTINGS_COURTS
 
     codes = [c.code for c in ALL_COURTS]
     names = [c.name for c in ALL_COURTS]
@@ -1075,6 +1115,129 @@ def test_court_list_integrity():
     grouped = sum(len(get_courts_by_region(r)) for r in sorted({c.region for c in ALL_COURTS}))
     check("지역별 조회의 합이 전체와 같다(누락/중복 없음)", grouped, len(ALL_COURTS))
     check("없는 지역은 빈 목록", get_courts_by_region("없는지역"), [])
+
+    # ------------------------------------------------------------------
+    # ★ 시도 어휘가 **세 곳**에 복사돼 있다 (2026-08-26, `docs/BUGS.md` #230)
+    #
+    #   config/settings.py SIDO_LIST    위 검사가 ALL_COURTS.region 의 기준으로 쓴다
+    #   src/app/search/SearchForm.tsx   **화면이 실제로 사용자에게 보여 주는 목록**
+    #   normalizer.SIDO_PATTERNS        백엔드가 주소에서 알아볼 수 있는 어휘
+    #
+    #   셋을 묶는 검사가 하나도 없었다. 화면에만 시도를 하나 더하면 어떻게 되는지 쟀다:
+    #
+    #       extract_sido("존재하지않는도") -> ''  (못 알아본다)
+    #       api/v1/search.py 는 `extract_sido(sido) or sido` 로 **원본을 그대로** 쓴다
+    #       -> WHERE sido = '존재하지않는도' -> **결과 0건, 오류도 안내도 없다**
+    #
+    #   사용자에게는 "그 지역만 매물이 없다"로 보인다. 화면이 고를 수 있게 해 준 값인데.
+    # ------------------------------------------------------------------
+    import re as _re
+    from normalizer.normalizer import extract_sido
+
+    _tsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "src", "app", "search", "SearchForm.tsx")
+    try:
+        tsx = open(_tsx_path, encoding="utf-8-sig").read()
+    except OSError:
+        tsx = ""
+    check_true("SearchForm.tsx 를 읽었다(검사가 공허하지 않다)", bool(tsx), _tsx_path)
+    if tsx:
+        m = _re.search(r"const SIDO_LIST\s*=\s*\[(.*?)\]", tsx, _re.S)
+        check_true("화면의 SIDO_LIST 를 찾았다(관용구가 바뀌면 함께 고칠 것)", bool(m), None)
+        if m:
+            fe = [x for x in _re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))]
+            # ★ **순서는 비교하지 않는다.** 화면 목록의 순서는 드롭다운 표시 순서라
+            #   UX 결정이고(현재 인구/행정 순), config 쪽은 `ALL_COURTS.region` 의
+            #   membership 어휘로만 쓰인다. 처음에 순서까지 같으라고 썼다가 **멀쩡한
+            #   코드를 붉게 만들었다** — 가드가 근거 없이 한쪽 순서를 강요하면
+            #   사람이 가드를 끄거나 UX 를 망가뜨리게 된다. 같아야 하는 것은 **집합**이다.
+            check("화면 목록과 config SIDO_LIST 가 같은 집합이다",
+                  sorted(fe), sorted(SIDO_LIST))
+            check("화면 목록에 중복이 없다", len(fe) - len(set(fe)), 0)
+
+            # ★ 가장 중요한 축 — 화면이 고르게 해 준 값을 백엔드가 **알아보는가**.
+            unknown = [s for s in fe if extract_sido(s) == ""]
+            check("★ 화면의 모든 시도를 normalizer 가 알아본다(모르면 조용히 0건)",
+                  unknown, [])
+            # 정규화 결과가 자기 자신이어야 `WHERE sido = ?` 가 맞는 행을 찾는다.
+            mismatched = [(s, extract_sido(s)) for s in fe
+                          if extract_sido(s) and extract_sido(s) != s]
+            check("화면 값이 그대로 정규화된다(다른 값으로 바뀌지 않는다)", mismatched, [])
+
+    # 검출기 자체 검증 — 없는 시도는 정말로 못 알아봐야 이 검사에 뜻이 있다.
+    check("검출기 자체 검증: 없는 시도는 normalizer 가 못 알아본다",
+          extract_sido("존재하지않는도"), "")
+    check("검출기 자체 검증: 아는 시도는 알아본다", extract_sido("서울"), "서울")
+
+    # ------------------------------------------------------------------
+    # ★ 위 검사들은 `ALL_COURTS` 가 **옳은가**를 본다.
+    #   그런데 **크롤이 그 목록을 쓰는가**는 아무도 보지 않았다 (2026-08-26, BUGS #233).
+    #
+    #   `config/settings.py` 에는 `COURTS` 라는 **다른 목록**이 있다 — 서울 5개,
+    #   `code="B000210"` 체계. 죽은 코드로 기록돼 있지만 **타입이 같아서**
+    #   (둘 다 `List[config.settings.CourtInfo]`) `run_courts()` 에 그대로 들어간다.
+    #
+    #   실제로 `mvp_scraper.py` 의 import 한 줄을 바꿔 봤더니
+    #   **전체 스위트가 통과했다**(2026-08-26 변이 실측). 그 상태에서 벌어지는 일:
+    #
+    #       크롤 대상  60개 법원 -> **5개**            (55개가 조용히 사라진다)
+    #       court_code '서울중앙지방법원' -> 'B000210'  (code == name 전제가 깨진다)
+    #                  -> document_queue.court_code / get_doc_dir() / 문서 서빙 경로가 전부 어긋난다
+    #
+    #   그래서 **크롤이 실제로 집어 드는 객체**를 여기서 못박는다.
+    # ------------------------------------------------------------------
+    import config.courts as _courts_mod
+    import mvp_scraper as _ms
+
+    check_true("★ 크롤이 쓰는 목록이 config/courts.py 의 ALL_COURTS 바로 그것이다",
+               _ms.ALL_COURTS is _courts_mod.ALL_COURTS,
+               "-> mvp_scraper 가 다른 목록(예: config/settings.py 의 COURTS)을 쓰고 있다. "
+               "법원 수와 court_code 체계가 통째로 바뀐다")
+    # 객체가 같더라도 **그 객체가 계약을 지키는지**는 위 검사들이 이미 본다.
+    # 여기서는 크롤이 집는 쪽에도 같은 잣대를 한 번 더 댄다(새 목록으로 갈아끼우는 경우 대비).
+    check("★ 크롤이 쓰는 목록의 법원 수", len(_ms.ALL_COURTS), 60)
+    check("★ 크롤이 쓰는 목록도 code == name 이다",
+          [c.code for c in _ms.ALL_COURTS if c.code != c.name], [])
+
+    # settings.COURTS 는 **크롤이 쓰는 것과 달라야 한다**(같아지면 위 함정이 현실이 된 것).
+    check_true("settings.COURTS 는 크롤 목록이 아니다(둘을 혼동하지 않았다)",
+               _ms.ALL_COURTS is not SETTINGS_COURTS,
+               "-> settings.COURTS 가 크롤에 쓰이고 있다")
+
+    # ★ 모듈 변수만 보면 **호출부에서 잘라 쓰는 것**을 놓친다.
+    #   변이 `run_courts(ALL_COURTS[:5], ...)` 가 위 검사들을 그대로 통과했다(실측) —
+    #   모듈의 ALL_COURTS 는 여전히 60개 그대로이기 때문이다.
+    #   그래서 **실제로 넘기는 인자**를 구문 트리로 본다. 슬라이스/필터가 끼면 잡힌다.
+    import ast as _ast2
+    _ms_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "mvp_scraper.py"), encoding="utf-8-sig").read()
+    _calls = [n for n in _ast2.walk(_ast2.parse(_ms_src))
+              if isinstance(n, _ast2.Call)
+              and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) == "run_courts"]
+    check_true("run_courts 호출을 찾았다(검사가 공허하지 않다)", len(_calls) >= 1, len(_calls))
+    _bad_args = []
+    for _c in _calls:
+        if not _c.args:
+            _bad_args.append("인자 없음")
+            continue
+        a = _c.args[0]
+        # 통과하는 것은 **맨 이름 `ALL_COURTS`** 하나뿐이다.
+        if not (isinstance(a, _ast2.Name) and a.id == "ALL_COURTS"):
+            _bad_args.append(_ast2.dump(a)[:60])
+    check("★ run_courts 에 넘기는 것이 자르지 않은 ALL_COURTS 그대로다", _bad_args, [])
+
+    # 검출기 자체 검증 — 슬라이스/다른 이름을 실제로 가려내는가.
+    def _first_arg_ok(code):
+        c = next(n for n in _ast2.walk(_ast2.parse(code))
+                 if isinstance(n, _ast2.Call)
+                 and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) == "run_courts")
+        a = c.args[0]
+        return isinstance(a, _ast2.Name) and a.id == "ALL_COURTS"
+    check("검출기 자체 검증: 맨 이름은 통과", _first_arg_ok("run_courts(ALL_COURTS, o)"), True)
+    check("검출기 자체 검증: 슬라이스는 잡는다", _first_arg_ok("run_courts(ALL_COURTS[:5], o)"), False)
+    check("검출기 자체 검증: 다른 이름은 잡는다", _first_arg_ok("run_courts(COURTS, o)"), False)
+    check("검출기 자체 검증: 필터도 잡는다",
+          _first_arg_ok("run_courts([c for c in ALL_COURTS if c.region=='서울'], o)"), False)
 
 
 def _old_schema_ddl():

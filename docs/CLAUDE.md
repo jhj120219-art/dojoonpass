@@ -98,8 +98,15 @@ Separately: `doc_worker.py` (~02:00, via `run_doc_worker.bat`) drains `document_
 작업 스케줄러 249개를 전수로 훑어 이 저장소를 가리키는 작업이 **0개**임을 확인했다.
 `register_scheduler_tasks.ps1` 이 정의하는 세 작업(`DojoonPass-PriorityRefresh` 01:50 /
 `DojoonPass-DocWorker` 02:00 / `DojoonPass-DailyCrawl` 06:00)이 **전부 미등록**이다.
-**[2026-08-26 갱신] 이 문단은 더 이상 사실이 아니다** — PriorityRefresh/DocWorker 를
-등록했다(DailyCrawl 은 기존 `DOJOONPASS_DAILY` 가 커버). 아래 "지금 사실인 상태" 절 참고.
+**[2026-08-26 갱신] 이 문단은 더 이상 사실이 아니다 — 단, 그것은 운영 데이터를 가진
+머신 이야기다.** 그 머신에서 PriorityRefresh/DocWorker 를 등록했다(DailyCrawl 은 기존
+`DOJOONPASS_DAILY` 가 커버). 아래 "지금 사실인 상태" 절 참고.
+
+> **★ 어느 머신 이야기인지 반드시 함께 읽는다 (2026-08-26 추가, BUGS #223 과 같은 부류).**
+> 위 갱신 문장에는 머신이 적혀 있지 않아, 개발 머신에서 `audit_schedule_health.py` 를
+> 돌려 **0개**를 보면 "등록이 풀렸다"로 오독하게 된다. 2026-08-26 재실측: 이 개발
+> 머신의 예약 작업 **248개 중 이 저장소를 가리키는 것은 0개**이고, 머신 역할상
+> **그것이 정상이다**(아래 "머신 역할" 절). 등록·크롤 실측은 운영 머신 기준이다.
 그 결과가 지금의 Release Blocker다:
 
 ```

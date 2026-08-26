@@ -53,11 +53,25 @@ PRICE_TOLERANCE = 1000
 # 기존 호출부는 그대로 동작한다.
 from normalizer.normalizer import extract_sido  # noqa: E402  (재노출)
 
-def parse_price(price_str: str) -> int:
-    if not price_str or price_str == "-":
-        return 0
-    digits = re.sub(r"[^\d]", "", price_str.split("(")[0])
-    return int(digits) if digits else 0
+# ★ 2026-08-26 (`docs/BUGS.md` #234) — `parse_price` 도 같은 이유로 합친다.
+#
+#   바로 위 주석이 `extract_sido` 에 대해 적어 둔 문제("같은 판정을 하는 함수가 두 벌이면
+#   한쪽만 고쳐질 수 있다")가 **그 바로 아래 함수에 그대로 남아 있었다.**
+#   `parse_price` 와 `normalizer.normalize_price` 는 본문이 **바이트 단위로 동일**했다
+#   (AST 해시 대조로 발견, 입력 12종 실측 결과 차이 0건).
+#
+#   두 벌인 채로 두면 위험한 이유는 `extract_sido` 때보다 오히려 크다 —
+#   이 둘은 **파이프라인의 서로 다른 단계**에서 같은 값을 해석한다.
+#
+#       validate_batch()  -> parse_price      로 PASS/FAIL 을 판정하고
+#       normalize_batch() -> normalize_price  로 **DB 에 저장할 값**을 만든다
+#
+#   한쪽만 고치면 "검증은 통과했는데 저장된 금액은 다른" 상태가 된다. 가격은 최저가·
+#   감정가라 화면과 검색 필터(min/max_bid_price)가 모두 그 값을 쓴다.
+#
+#   재노출이라 `from validator.validation_engine import parse_price` 를 쓰던 기존
+#   호출부(`test_validation_engine.py`)는 그대로 동작한다.
+from normalizer.normalizer import normalize_price as parse_price  # noqa: E402  (재노출)
 
 def is_adjacent(sido_a: str, sido_b: str) -> bool:
     return frozenset([sido_a, sido_b]) in ADJACENT_SIDO_PAIRS

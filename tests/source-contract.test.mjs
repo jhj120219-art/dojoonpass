@@ -945,4 +945,113 @@ describe('상세 화면의 늦은 응답 방어 (BUGS #210) — 소스 계약', 
     assert.ok(hits.length > 0,
       '가드를 전부 지웠는데도 탐지되지 않습니다 — 이 검사는 아무것도 지키지 못합니다')
   })
+
+  // ★★ 2026-08-26 (BUGS #225) — 위 검사에는 **구멍이 있었다.**
+  //
+  //   `unguardedWrites()` 는 `const requestId = id` 를 잡는 곳에서**만** 시작한다.
+  //   즉 가드를 **선언조차 하지 않은** 핸들러는 아예 훑지 않는다 — 검사 대상이 되려면
+  //   먼저 가드를 갖고 있어야 하는, 자기 참조적인 조건이다.
+  //
+  //   그래서 등기부/구독 핸들러 다섯 개(`performRegistryRequest`,
+  //   `handleRegistryRequest`, `handleSubscribe`, `handlePayOverage`,
+  //   `handleDownloadRegistry`)가 **전부 무방비인 채로 초록불**이었다.
+  //   `docs/BETA_RELEASE_CHECKLIST.md` 는 그것을 "다음 후보"로 적어 두기까지 했는데,
+  //   검사는 그동안 아무 말도 하지 않았다.
+  //
+  //   영향은 문구가 아니다. `registryRequest` 는 **다운로드 URL**
+  //   (`/api/v1/registry-requests/{id}/download`)과 **결제 금액**을 만든다 —
+  //   이전 물건의 값이 남으면 새 물건 화면에서 **다른 물건의 등기부를 받는다.**
+  //
+  //   이 검사는 방향을 뒤집는다: "가드를 선언한 곳이 옳은가"가 아니라
+  //   **"가드를 선언해야 하는 곳이 전부 선언했는가"** 를 본다.
+  function handlersNeedingGuard(source) {
+    const lines = source.split(/\r?\n/)
+    const out = []
+    lines.forEach((l, i) => {
+      const m = /^(\s*)(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/.exec(l)
+      if (!m) return
+      const [, , name, args] = m
+      // 함수 본문을 중괄호 깊이로 잘라 낸다(고정 줄 수로 훑으면 다음 함수를 끌어온다).
+      let depth = 0
+      let started = false
+      const body = []
+      for (let j = i; j < lines.length; j += 1) {
+        for (const ch of lines[j]) {
+          if (ch === '{') { depth += 1; started = true }
+          else if (ch === '}') depth -= 1
+        }
+        body.push(lines[j])
+        if (started && depth <= 0) break
+      }
+      const code = body.filter((x) => !x.trim().startsWith('//'))
+      const awaitAt = code.findIndex((x) => /\bawait\b/.test(x))
+      if (awaitAt < 0) return
+      const writesAfterAwait = code
+        .slice(awaitAt + 1)
+        .some((x) => /\bset[A-Z]\w*\(/.test(x))
+      if (!writesAfterAwait) return
+      const declares = code.some((x) => /const\s+requestId\s*=\s*id\b/.test(x))
+      const takesParam = /\brequestId\b/.test(args)
+      const writes = code
+        .slice(awaitAt + 1)
+        .flatMap((x) => [...x.matchAll(/\bset([A-Z]\w*)\(/g)].map((mm) => `set${mm[1]}`))
+      out.push({ name, line: i + 1, guarded: declares || takesParam, writes: [...new Set(writes)] })
+    })
+    return out
+  }
+
+  // ★ 면제는 **좁게** 준다 (BUGS #225).
+  //
+  //   `requireToken()` 은 await 뒤에 `setAccessToken()` 하나만 쓴다. 그 값은
+  //   **물건에 딸린 것이 아니라 사용자 세션 토큰**이라, 물건을 넘긴 뒤에 반영돼도
+  //   틀린 것이 아니다(오히려 같은 토큰이라 반영하는 편이 맞다).
+  //
+  //   그렇다고 함수 이름만으로 통째로 빼 주면, 나중에 그 함수에 **물건에 딸린**
+  //   상태 쓰기가 하나 들어와도 영원히 조용해진다 — 그것이 #218 이 지적한
+  //   "면제가 아니라 같은 강도로 검사하게 고친다" 는 자리다.
+  //   그래서 **어떤 상태를 쓰는지까지** 고정한다. 목록에 없는 쓰기가 생기면 다시 붉어진다.
+  const GUARD_EXEMPT = { requireToken: ['setAccessToken'] }
+
+  test('★ await 뒤에 화면을 바꾸는 핸들러는 **빠짐없이** 가드를 선언한다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(FILE, 'utf8')
+    const handlers = handlersNeedingGuard(src)
+    assert.ok(handlers.length >= 5,
+      `가드가 필요한 핸들러를 ${handlers.length}개밖에 못 찾았습니다 — 검사가 공허합니다`)
+
+    // 면제 대상은 **쓰는 상태가 목록과 정확히 같을 때만** 면제된다.
+    const exemptDrift = handlers
+      .filter((h) => GUARD_EXEMPT[h.name])
+      .filter((h) => h.writes.some((w) => !GUARD_EXEMPT[h.name].includes(w)))
+      .map((h) => `${h.line}: ${h.name} -> ${h.writes.join(', ')}`)
+    assert.deepEqual(exemptDrift, [],
+      '가드 면제 함수가 목록에 없는 상태를 쓰기 시작했습니다.\n' +
+      '그 상태가 **물건에 딸린 것**이면 면제를 거두고 requestId 가드를 넣으십시오 (BUGS #225).\n' +
+      exemptDrift.join('\n'))
+
+    const missing = handlers
+      .filter((h) => !h.guarded && !GUARD_EXEMPT[h.name])
+      .map((h) => `${h.line}: ${h.name}`)
+    assert.deepEqual(missing, [],
+      'await 뒤에 화면 상태를 바꾸면서 `requestId` 를 잡지 않는 핸들러가 있습니다.\n' +
+      '위 unguardedWrites() 검사는 requestId 를 잡는 곳에서만 시작하므로 ' +
+      '**이런 핸들러는 검사 대상에서 통째로 빠집니다**(BUGS #225).\n' +
+      '해당 함수 앞부분에 `const requestId = id` 를 넣고 await 뒤 쓰기마다 ' +
+      '`if (idRef.current !== requestId) return` 을 두십시오.\n' +
+      missing.join('\n'))
+  })
+
+  test('검사가 공허하지 않다 — requestId 선언을 지우면 잡힌다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(FILE, 'utf8')
+    // 실제 파일은 건드리지 않는다. 선언 줄만 지운 사본에 **같은 판정 함수**를 돌린다.
+    const mutated = src
+      .split(/\r?\n/)
+      .filter((l) => !/const\s+requestId\s*=\s*id\b/.test(l))
+      .join('\n')
+    const missing = handlersNeedingGuard(mutated)
+      .filter((h) => !h.guarded && !GUARD_EXEMPT[h.name])
+    assert.ok(missing.length > 0,
+      'requestId 선언을 전부 지웠는데도 탐지되지 않습니다 — 이 검사는 아무것도 지키지 못합니다')
+  })
 })

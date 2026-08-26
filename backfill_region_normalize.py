@@ -85,6 +85,38 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
 TARGET_COLUMNS = ("sido", "sigungu")
 
 
+def is_stale_contamination(stored: str, fresh: str, full_address: str) -> bool:
+    """저장된 지역값이 **다른 물건에서 흘러든 값**인가 (2026-08-26, `docs/BUGS.md` #224).
+
+    조건은 둘이다.
+
+        1) 지금 규칙으로 다시 계산한 값이 **비어 있다** (그 주소에는 그 성분이 없다)
+        2) 그런데 저장된 값이 **주소 원문(대괄호 제외)에도 없다**
+
+    (1)만이면 "정규화기가 못 읽었을 뿐"이라 지우면 정보를 잃는다. (2)까지 성립하면
+    그 값은 이 주소에서 나올 수 없는 값이다 — 남겨 두는 것이 정보 보존이 아니라
+    **오염 유지**다. 그런 행은 `sigungu=칠곡군` 같은 검색에 **엉뚱한 지역의 물건**으로
+    섞여 나온다.
+
+    대괄호(= 물건 표시)를 뺀 부분과 대조한다 — 대괄호 안에는 주소 성분이 없다.
+    예: `sigungu='갑구'` 는 "[토지 임야 297㎡ 갑구 2번 ...]" 의 등기부 용어를 잘못 읽은
+    것인데, 원문 전체와 대조하면 '갑구' 가 **있다**고 나와 그냥 남는다.
+
+    ★ 이 판정이 함수로 나와 있는 이유 (BUGS #224): 예전에는 이 규칙이 `plan_table()`
+      안에만 있었고, `test_pipeline_integrity.py` §12 의 드리프트 가드는 *"새 값이
+      비면 세지 않는다"* 로만 처리해 **이 부류를 통째로 못 봤다.** 같은 판정을 두 벌로
+      두면 한쪽만 바뀌는 날이 오고, 그때 두 검사가 서로를 눈감아 준다.
+      규칙은 여기 한 곳에만 있고 가드는 이것을 **불러 쓴다.**
+    """
+    if fresh:
+        return False
+    # 저장값이 비어 있으면 아래 대조가 **언제나 False** 다 (`"" not in s` 는 항상 거짓).
+    # 그래서 `if not stored: return False` 를 따로 두지 않는다 — 어떤 입력으로도 다른
+    # 결과를 낼 수 없는 분기라 변이가 그대로 살아남고(실측), 있으면 방어처럼 보이지만
+    # 아무것도 막지 않는다. 대조 방식을 바꾸는 날에는 이 문장을 다시 읽을 것.
+    return stored not in address_without_brackets(full_address or "")
+
+
 def plan_table(conn: sqlite3.Connection, table: str) -> dict:
     """이 테이블에서 무엇이 바뀌는지 계산한다(쓰지 않는다)."""
     rows = conn.execute(
@@ -116,8 +148,12 @@ def plan_table(conn: sqlite3.Connection, table: str) -> dict:
                 #     "[토지 임야 297㎡ 갑구 2번 ...]" 의 등기부 용어를 시군구로 잘못 읽은
                 #     것인데, 원문 전체와 대조하면 '갑구' 가 **있다**고 나와 그냥 남는다.
                 #     주소 부분만 보면 없다는 것이 바로 드러난다.
+                #
+                # ★ 판정은 `is_stale_contamination()` 한 곳에만 있다 (BUGS #224).
+                #   여기서 다시 적으면 §12 가드와 두 벌이 되고, 실제로 그래서 가드가
+                #   이 부류를 못 보고 있었다.
                 addr = address_without_brackets(row["full_address"] or "")
-                if stored and stored not in addr:
+                if is_stale_contamination(stored, new, row["full_address"] or ""):
                     changes.append((row["id"], col, stored, "", addr))
                     continue
                 skipped_empty += 1

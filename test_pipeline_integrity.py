@@ -989,20 +989,166 @@ def test_checklist_p0a_verdict_matches_reality():
         conn.close()
 
     expected = "OPEN" if live == 0 else "RESOLVED"
-    # ★ 이 비교는 **이 머신의 DB** 기준이다 (BUGS #200).
-    #   문서와 이 머신의 숫자가 갈라지지 않게 하는 드리프트 가드이지,
-    #   **제품의 검색이 비었다는 판정이 아니다.** 운영 상태는 여기서 알 수 없다.
     print("    이 머신의 DB 기준 기일 미도래 물건 : %d건  -> 기대 토큰 %s" % (live, expected))
-    if not is_operational_data():
-        print("    (이 머신은 운영 데이터의 주인으로 선언되지 않았다 -"
-              " 위 숫자를 제품 판정으로 읽지 말 것)")
     print("    문서에 적힌 판정      : %s" % verdict)
-    check_true(
-        "★ 체크리스트의 P0-A 판정이 실측과 일치한다",
-        verdict == expected,
-        "-> 문서는 '%s' 라고 하는데 실측은 기일 남은 물건 %d건(=%s)이다. "
-        "docs/BETA_RELEASE_CHECKLIST.md 의 P0A-VERDICT 토큰과 그 주변 서술을 함께 고칠 것"
-        % (verdict, live, expected))
+
+    # ★★ 2026-08-26 (BUGS #222) — 이 대조를 **역할 선언 안으로** 옮겼다.
+    #
+    #   Sprint 251 이 이 검사를 만들 때는 머신이 하나라고 보고 있었다. 그 다음 날
+    #   (2026-08-25, BUGS #200) 머신 역할이 갈렸다 — 운영 크롤은 데스크탑1이 돌리고
+    #   여기(데스크탑3)는 개발/QA 다. 그런데 이 검사만 그 정리에서 빠졌다.
+    #
+    #   그 결과 이 가드는 **어느 머신에서도 동시에 만족될 수 없다.** 판정 토큰은
+    #   git 이 추적하는 문서 한 줄인데, 요구하는 값이 머신마다 다르기 때문이다:
+    #
+    #       이 머신(개발)      기일 미도래 0건        -> OPEN 을 요구한다
+    #       데스크탑1(운영)    기일 미도래 110건      -> RESOLVED 를 요구한다
+    #
+    #   한쪽에 맞추면 다른 쪽이 붉어진다. 문서를 고치는 것으로는 끝나지 않고
+    #   **실패가 자리를 옮길 뿐**이다(2026-08-26 실측으로 확인).
+    #
+    #   그리고 방향이 애초에 틀렸다 — 개발 머신의 DB 신선도는 **제품 상태에 대해
+    #   아무 말도 할 수 없다.** 그것이 BUGS #200 이 세운 규칙이고, 바로 아래 11-c 가
+    #   §11 에 대해 이미 강제하고 있다. 같은 규칙을 같은 파일 안에서 한 검사만
+    #   비껴가고 있었다.
+    #
+    #   운영으로 선언한 머신에서는 **양방향 그대로** 문다 — 깨졌는데 RESOLVED 여도,
+    #   정상인데 OPEN 이어도 실패한다. 이빨은 그쪽에 남는다.
+    if is_operational_data():
+        check_true(
+            "★ 체크리스트의 P0-A 판정이 실측과 일치한다",
+            verdict == expected,
+            "-> 문서는 '%s' 라고 하는데 실측은 기일 남은 물건 %d건(=%s)이다. "
+            "docs/BETA_RELEASE_CHECKLIST.md 의 P0A-VERDICT 토큰과 그 주변 서술을 함께 고칠 것"
+            % (verdict, live, expected))
+    else:
+        print("    (이 머신은 운영 데이터의 주인으로 선언되지 않았다 -"
+              " 위 숫자를 제품 판정으로 읽지 말 것. 대조는 건너뛴다)")
+        # 껍데기 방지 — 선언하지 않은 머신에서도 **머신과 무관한 것**은 계속 문다.
+        # 대조는 못 해도 대조에 쓰이는 기계는 살아 있어야 한다. 이 단언이 없으면
+        # 개발 머신에서 이 검사가 아무것도 검증하지 않는 빈 함수가 된다.
+        check_true("판정 토큰이 아는 값이다(OPEN/RESOLVED)",
+                   verdict in ("OPEN", "RESOLVED"), verdict)
+        check_true("실측 경로가 실제로 돌았다(auction_item 을 셌다)",
+                   isinstance(live, int) and live >= 0, live)
+
+
+# ---------------------------------------------------------------------------
+# 11-d. 체크리스트에서 "가장 최신"을 주장하는 절이 하나뿐인가
+#       (2026-08-26, `docs/BUGS.md` #223)
+#
+# 왜 — 이 문서는 **출시를 막는 것이 무엇인가**를 사람이 판단하는 자리다. 그런데 절이
+# 시간 역순으로 쌓이면서 두 절이 동시에 *"이 절이 가장 최신이다"* 라고 말하게 됐고,
+# 둘의 숫자가 서로 달랐다(같은 2026-08-26 의 00:30 판과 07:40 판).
+#
+#     아침 절(07:40)   auction_item 2,558 / READY 보유 21 / 사진 보유 17
+#     야간 절(00:30)   auction_item 2,444 / READY 보유  4 / 사진 보유  0
+#
+# 어느 쪽을 먼저 읽느냐로 결론이 갈린다. 이 세션도 실제로 그것을 손으로 가려내야 했다.
+#
+# 11-b 와 달리 이 검사는 **머신과 무관하다** — 문서만 보면 판정되므로 개발 머신에서도
+# 그대로 이빨이 남는다. 역할 선언 게이트가 필요 없는 부류다.
+# ---------------------------------------------------------------------------
+NEWEST_CLAIM = "가장 최신"
+
+
+def test_checklist_has_one_newest_section():
+    print("\n--- 11-d. '가장 최신' 주장이 하나뿐인가 (BUGS #223) ---")
+    path = os.path.join(ROOT, "docs", "BETA_RELEASE_CHECKLIST.md")
+    if not os.path.exists(path):
+        check_true("체크리스트 문서가 있다", False, path)
+        return
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split("\n")
+
+    # "가장 최신"이라고 **주장하는** 줄만 센다. 인용부(> 로 시작하는 정정 기록)와
+    # 이 검사를 설명하는 줄은 주장이 아니다 - 세면 고쳐 놓은 기록 때문에 붉어진다.
+    claims = []
+    for i, raw in enumerate(lines, 1):
+        s = raw.strip()
+        if NEWEST_CLAIM not in s:
+            continue
+        if s.startswith(">") or s.startswith("#"):
+            continue
+        # "더 최신이고", "가장 최신을 주장" 같은 서술은 자기가 최신이라는 주장이 아니다.
+        if "이 절이" not in s:
+            continue
+        claims.append((i, s[:70]))
+
+    for i, s in claims:
+        print("    L%-5d %s" % (i, s))
+    check_true("★ '이 절이 가장 최신이다' 라고 말하는 절이 정확히 하나다",
+               len(claims) == 1,
+               "-> %d개. 둘 이상이면 서로 다른 숫자를 동시에 최신이라고 말하게 된다"
+               % len(claims))
+
+    # 검출기 자체 검증 - 규칙이 실제로 문장을 가려내는가.
+    def _claiming(sample):
+        s = sample.strip()
+        if NEWEST_CLAIM not in s or s.startswith(">") or s.startswith("#"):
+            return False
+        return "이 절이" in s
+    check("검출기 자체 검증: 주장하는 문장을 잡는다",
+          _claiming("이 절이 **가장 최신**이다."), True)
+    check("검출기 자체 검증: 인용된 정정 기록은 잡지 않는다",
+          _claiming("> 이 절이 **가장 최신**이다 라고 적혀 있었다"), False)
+    check("검출기 자체 검증: 다른 절을 가리키는 서술은 잡지 않는다",
+          _claiming("위의 아침 절이 **더 최신**이고, 값이 다르면 그쪽이 이긴다"), False)
+
+
+
+# ---------------------------------------------------------------------------
+# 11-e. 체크리스트의 `Last Updated` 가 실제 최신 절과 맞는가
+#       (2026-08-26, `docs/BUGS.md` #228)
+#
+# 왜 — 이 문서 맨 위 `Last Updated:` 는 **손으로 적는 정적 필드**다. 아무도 갱신하지
+# 않아 2026-08-26 시점에 **2026-08-07 (19일 전)** 로 뒤처져 있었다. 출시 가능 여부를
+# 판단하는 문서가 스스로 "3주 전 기준"이라고 말하고 있으면, 읽는 사람은 그 안의 최신
+# 실측까지 낡은 것으로 취급한다(반대로 낡은 절을 최신으로 믿을 수도 있다 — 11-d 참고).
+#
+# 11-d 와 같은 부류이지만 **기제가 다르다.** 11-d 는 "여러 절이 서로 최신이라 주장"을
+# 보고, 이쪽은 "머리말이 본문보다 낡았다"를 본다. 둘 다 머신과 무관해 개발 머신에서도
+# 이빨이 그대로 남는다.
+# ---------------------------------------------------------------------------
+def test_checklist_last_updated_matches_newest_section():
+    print("\n--- 11-e. Last Updated vs 최신 절 날짜 (BUGS #228) ---")
+    import re as _re
+
+    path = os.path.join(ROOT, "docs", "BETA_RELEASE_CHECKLIST.md")
+    if not os.path.exists(path):
+        check_true("체크리스트 문서가 있다", False, path)
+        return
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        md = fh.read()
+
+    m = _re.search(r"^Last Updated:\s*(\d{4}-\d{2}-\d{2})", md, _re.M)
+    check_true("Last Updated 에 YYYY-MM-DD 날짜가 있다", m is not None,
+               "-> 형식이 바뀌면 이 검사가 조용히 공허해진다")
+    if not m:
+        return
+    header_date = m.group(1)
+
+    # 절 제목의 날짜만 센다 — 본문 아무 데나 있는 날짜를 세면 인용된 옛 실측까지 잡힌다.
+    section_dates = _re.findall(r"^##+\s*★*\s*\[(\d{4}-\d{2}-\d{2})", md, _re.M)
+    check_true("날짜가 붙은 절을 찾았다(검사가 공허하지 않다)",
+               len(section_dates) >= 5, len(section_dates))
+    if not section_dates:
+        return
+    newest = max(section_dates)
+    print("    Last Updated : %s" % header_date)
+    print("    가장 최신 절  : %s  (날짜 붙은 절 %d개)" % (newest, len(section_dates)))
+    check("★ Last Updated 가 가장 최신 절의 날짜와 같다", header_date, newest)
+
+    # 검출기 자체 검증 — 규칙이 실제로 두 값을 뽑아내는가.
+    sample = ("# T\n\nLast Updated: 2026-01-02\n\n"
+              "## ★★ [2026-03-04] 새 절\n\n본문 2025-12-31 은 절 제목이 아니다\n")
+    hm = _re.search(r"^Last Updated:\s*(\d{4}-\d{2}-\d{2})", sample, _re.M)
+    hs = _re.findall(r"^##+\s*★*\s*\[(\d{4}-\d{2}-\d{2})", sample, _re.M)
+    check("검출기 자체 검증: 머리말 날짜를 뽑는다", hm.group(1) if hm else None, "2026-01-02")
+    check("검출기 자체 검증: 절 제목 날짜만 뽑는다(본문 날짜는 제외)", hs, ["2026-03-04"])
+    check("검출기 자체 검증: known-bad 에서 어긋남을 잡는다",
+          (hm.group(1) if hm else None) == (max(hs) if hs else None), False)
+
 
 def test_data_role_gate_is_wired():
     """§11 의 제품 판정이 **머신 역할 선언에 묶여 있는가** (2026-08-25, BUGS #200).
@@ -1049,16 +1195,46 @@ def test_data_role_gate_is_wired():
         src = open(os.path.join(ROOT, "test_pipeline_integrity.py"),
                    encoding="utf-8-sig").read()
         tree = _ast.parse(src)
-        fn = next((n for n in tree.body
-                   if isinstance(n, _ast.FunctionDef) and n.name == "test_data_freshness_runway"),
-                  None)
-        check_true("§11 함수를 찾았다", fn is not None)
-        if fn is None:
-            return
 
-        PRODUCT_CLAIM = "기본 검색에 뜰 물건이 남아 있다"
+        # ★ 2026-08-26 (BUGS #222) — 지켜야 할 자리가 **둘**이다.
+        #
+        #   처음에는 §11 하나만 이름으로 못박아 뒀다. 그런데 §11-b 도 같은 부류의
+        #   제품 판정(문서의 P0-A 토큰 vs 이 머신의 DB)을 하면서 게이트 밖에 있었고,
+        #   그래서 개발 머신에서 **고칠 수 없는 red** 가 됐다 — 이 검사가 막으려던
+        #   상태 그대로다. 한 자리만 이름으로 잠그면 다음 자리가 그대로 새어 나간다.
+        GATED = (
+            ("test_data_freshness_runway", "기본 검색에 뜰 물건이 남아 있다"),
+            ("test_checklist_p0a_verdict_matches_reality",
+             "체크리스트의 P0-A 판정이 실측과 일치한다"),
+        )
 
-        def claim_calls(node):
+        # ★ 목록 자체가 줄어드는 것도 막는다 (2026-08-26, BUGS #222).
+        #
+        #   위 GATED 는 이 가드의 **설정**이다. 설정을 지우면 가드가 조용히 좁아진다 —
+        #   실제로 §11-b 가 그렇게 빠져 있었다. 그래서 목록이 **이 모듈에서 역할 선언을
+        #   보는 함수 전부**를 덮는지 대조한다. 새 판정이 생기면 여기서 먼저 걸린다.
+        #
+        #   이 가드 함수 자신은 제외한다 — 선언값을 바꿔 가며 해석을 검증하는 것이
+        #   일이라 당연히 그 이름을 부른다.
+        SELF = "test_data_role_gate_is_wired"
+        role_readers = set()
+        for node in tree.body:
+            if not isinstance(node, _ast.FunctionDef) or node.name == SELF:
+                continue
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Call) and \
+                        (getattr(sub.func, "id", None) or
+                         getattr(sub.func, "attr", None)) == "is_operational_data":
+                    role_readers.add(node.name)
+        check_true("★ 역할 선언을 보는 함수를 찾았다(검사가 공허하지 않다)",
+                   len(role_readers) >= 2, sorted(role_readers))
+        check_true("★ 게이트 목록이 그 함수 전부를 덮는다",
+                   role_readers == {name for name, _ in GATED},
+                   "-> 목록에 없는 함수: %s / 목록에만 있는 이름: %s"
+                   % (sorted(role_readers - {n for n, _ in GATED}),
+                      sorted({n for n, _ in GATED} - role_readers)))
+
+        def claim_calls(node, claim):
             out = []
             for n in _ast.walk(node):
                 if not isinstance(n, _ast.Call):
@@ -1067,39 +1243,45 @@ def test_data_role_gate_is_wired():
                     continue
                 if n.args and isinstance(n.args[0], _ast.Constant) \
                         and isinstance(n.args[0].value, str) \
-                        and PRODUCT_CLAIM in n.args[0].value:
+                        and claim in n.args[0].value:
                     out.append(n)
             return out
 
-        guarded, total = [], claim_calls(fn)
-        for node in _ast.walk(fn):
-            if not isinstance(node, _ast.If):
+        for fname, claim in GATED:
+            fn = next((n for n in tree.body
+                       if isinstance(n, _ast.FunctionDef) and n.name == fname), None)
+            check_true("%s 함수를 찾았다" % fname, fn is not None)
+            if fn is None:
                 continue
-            test_src = _ast.dump(node.test)
-            if "is_operational_data" not in test_src:
-                continue
-            for n in node.body:
-                guarded.extend(claim_calls(n))
 
-        check_true("★ 제품 판정 단언이 소스에 있다(검사가 공허하지 않다)",
-                   len(total) == 1, len(total))
-        check_true("★ 그 단언이 is_operational_data() 분기 **안에** 있다",
-                   len(guarded) == 1,
-                   "-> 분기 밖으로 나오면 개발 머신에서 다시 거짓 P0 가 된다")
+            guarded, total = [], claim_calls(fn, claim)
+            for node in _ast.walk(fn):
+                if not isinstance(node, _ast.If):
+                    continue
+                if "is_operational_data" not in _ast.dump(node.test):
+                    continue
+                for n in node.body:
+                    guarded.extend(claim_calls(n, claim))
 
-        # --- 미선언 머신에도 남아 있어야 할 최소 단언 --------------------
-        #     전부 없애 버리면 §11 이 아무것도 검증하지 않는 껍데기가 된다.
-        else_claims = []
-        for node in _ast.walk(fn):
-            if isinstance(node, _ast.If) and "is_operational_data" in _ast.dump(node.test):
-                for n in node.orelse:
-                    for sub in _ast.walk(n):
-                        if isinstance(sub, _ast.Call) and \
-                                (getattr(sub.func, "id", None) or
-                                 getattr(sub.func, "attr", None)) == "check_true":
-                            else_claims.append(sub)
-        check_true("★ 미선언 머신에서도 최소 한 가지는 단언한다(껍데기 방지)",
-                   len(else_claims) >= 1, len(else_claims))
+            check_true("★ %s: 제품 판정 단언이 소스에 있다(검사가 공허하지 않다)" % fname,
+                       len(total) == 1, len(total))
+            check_true("★ %s: 그 단언이 is_operational_data() 분기 **안에** 있다" % fname,
+                       len(guarded) == 1,
+                       "-> 분기 밖으로 나오면 개발 머신에서 다시 거짓 P0 가 된다")
+
+            # --- 미선언 머신에도 남아 있어야 할 최소 단언 --------------------
+            #     전부 없애 버리면 그 함수가 아무것도 검증하지 않는 껍데기가 된다.
+            else_claims = []
+            for node in _ast.walk(fn):
+                if isinstance(node, _ast.If) and "is_operational_data" in _ast.dump(node.test):
+                    for n in node.orelse:
+                        for sub in _ast.walk(n):
+                            if isinstance(sub, _ast.Call) and \
+                                    (getattr(sub.func, "id", None) or
+                                     getattr(sub.func, "attr", None)) == "check_true":
+                                else_claims.append(sub)
+            check_true("★ %s: 미선언 머신에서도 최소 한 가지는 단언한다(껍데기 방지)" % fname,
+                       len(else_claims) >= 1, len(else_claims))
     finally:
         if saved is None:
             os.environ.pop(DATA_ROLE_ENV, None)
@@ -1219,7 +1401,25 @@ def test_stored_normalization_matches_code():
         conn.close()
     check_true("검사 대상이 존재한다", len(rows) > 0, len(rows))
 
+    # ★★ 2026-08-26 (BUGS #224) — 축을 하나 더 센다.
+    #
+    #   아래 드리프트 계산은 *"새 값이 비어 있으면 세지 않는다"* 로 처리하면서
+    #   그 근거로 **"백필도 그런 행은 건너뛴다"** 고 적어 두고 있었다.
+    #   그 문장은 2026-08-26 부터 **사실이 아니다** — 백필은 그날 예외를 하나 얻었다.
+    #   저장값이 주소 원문(대괄호 제외)에 **아예 없으면** 그것은 "정규화기가 못 읽은 값"이
+    #   아니라 **다른 물건에서 흘러든 값**이라 지운다.
+    #
+    #   그래서 이 가드는 그 부류를 **통째로 못 보고 있었다.** 상한을 0 으로 조여 놓고도
+    #   "지역 데이터가 깨끗하다"고 읽히는데, 실제로는 한 축이 시야 밖이었다.
+    #   실측(2026-08-26, 이 머신): 드리프트 211 / **오염 1**(id=1768 `sigungu='갑구'`,
+    #   주소는 "세종특별자치시 전의면 관정리 578-31 [토지 임야 297㎡ 갑구 2번 ...]").
+    #
+    #   판정은 **백필과 같은 함수**를 불러 쓴다. 여기에 규칙을 다시 적으면 두 벌이 되고,
+    #   한쪽만 바뀌는 날 두 검사가 서로를 눈감아 준다 — 이 결함이 정확히 그렇게 생겼다.
+    from backfill_region_normalize import is_stale_contamination
+
     drift = {k: [] for k in NORMALIZE_DRIFT_CEILING}
+    contaminated = []
     crashed = []
     for row_id, addr, sido, sigungu, dong, lot in rows:
         try:
@@ -1231,10 +1431,11 @@ def test_stored_normalization_matches_code():
         for col in drift:
             s = (stored[col] or "").strip()
             f = (fresh.get(col) or "").strip()
-            # 새 값이 비어 있으면 "규칙이 못 잡는 주소"라 드리프트로 세지 않는다
-            # (백필도 그런 행은 건너뛴다 ― 채워진 값을 빈 값으로 덮지 않는다).
             if f and s != f:
                 drift[col].append((row_id, s, f))
+            elif col in ("sido", "sigungu") and is_stale_contamination(s, f, addr or ""):
+                # 새 값이 비었는데 저장값이 주소에도 없다 = 흘러든 값.
+                contaminated.append((row_id, col, s))
 
     # 정규화가 **예외로 죽는** 주소가 있으면 그것부터 문제다(백필도 못 돈다).
     check("정규화 중 예외가 나는 주소 없음", crashed, [])
@@ -1247,7 +1448,31 @@ def test_stored_normalization_matches_code():
         if n:
             print("      예: " + " / ".join("id=%s %r->%r" % d for d in detail))
 
-    if any(drift[c] for c in drift):
+    # 오염 축 (BUGS #224). 상한은 드리프트와 같은 이유로 0 이고, 고치는 명령도 같다 —
+    # 백필이 이 부류까지 함께 정리한다.
+    check_true("★ 다른 물건에서 흘러든 지역값이 없다 (현재 %d행, 상한 0)"
+               % len(contaminated),
+               len(contaminated) == 0, contaminated[:3])
+    if contaminated:
+        print("      예: " + " / ".join("id=%s %s=%r" % c for c in contaminated[:3]))
+
+    # ★ 검출기 자체 검증 — 이 축은 실 데이터가 0 이 되는 순간 **공허해진다.**
+    #   (백필을 돌리고 나면 정확히 그 상태가 된다.) 그때도 판정이 살아 있는지
+    #   합성 입력으로 못박는다. "검증 대상이 없으면 통과"를 만들지 않는다.
+    check("검출기 자체 검증: 주소에 없는 값은 오염이다",
+          is_stale_contamination("칠곡군", "", "세종특별자치시 나성로 96"), True)
+    check("검출기 자체 검증: 대괄호 안에만 있는 값도 오염이다",
+          is_stale_contamination("갑구", "", "세종특별자치시 전의면 [토지 갑구 2번]"), True)
+    check("검출기 자체 검증: 주소에 실제로 있으면 오염이 아니다",
+          is_stale_contamination("칠곡군", "", "경상북도 칠곡군 왜관읍 1"), False)
+    # ★ 이 자리는 **새 값이 있는데 저장값은 주소에 없는** 입력이어야 한다.
+    #   처음에는 '고양시' -> '고양시 일산동구' 처럼 저장값이 주소에 들어 있는 예를 썼는데,
+    #   그러면 `if fresh: return False` 를 지워도 뒤쪽 대조가 어차피 False 를 내서
+    #   변이가 살아남는다(실제로 P3 가 그렇게 통과했다). 두 조건을 갈라 놓는 입력을 쓴다.
+    check("검출기 자체 검증: 새 값이 있으면 (주소에 없어도) 오염이 아니라 드리프트다",
+          is_stale_contamination("칠곡군", "나성동", "세종특별자치시 나성로 96"), False)
+
+    if any(drift[c] for c in drift) or contaminated:
         print("      고치려면: python backfill_region_normalize.py --apply"
               "  (기본은 dry-run)")
 
@@ -1752,6 +1977,8 @@ def run():
     test_court_identity_convention()
     test_data_freshness_runway()
     test_checklist_p0a_verdict_matches_reality()
+    test_checklist_has_one_newest_section()
+    test_checklist_last_updated_matches_newest_section()
     test_data_role_gate_is_wired()
     test_stored_normalization_matches_code()
     test_stale_region_contamination_detector()

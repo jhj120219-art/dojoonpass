@@ -707,6 +707,109 @@ def test_db_path_does_not_depend_on_cwd():
                re.search(r"DB_PATH\s*=\s*os\.path\.join\(\s*PROJECT_ROOT", code) is not None,
                "-> 파일 위치 기준 절대경로여야 한다")
 
+
+# ---------------------------------------------------------------------------
+# 15. 제품이 **실제로 읽는** 환경변수가 전부 문서에 있는가
+#     (2026-08-26, `docs/BUGS.md` #232)
+#
+# 왜 — `docs/ENVIRONMENT_VARIABLES.md` 는 운영자가 "무엇을 설정해야 하는가"를 보는
+# 유일한 자리다. 코드가 새 변수를 읽기 시작했는데 문서에 없으면, 운영자는 그것을
+# 설정하지 않고 배포한다. 그리고 대부분의 환경변수는 **없어도 조용히 폴백**하므로
+# 배포 시점에는 아무 일도 안 일어난다(#206 이 정확히 그 모양이다).
+#
+# ★ 반대 방향(문서에는 있는데 코드가 안 읽는 것)은 **검사하지 않는다.**
+#   `KG_*` / `SMTP_*` / `SENTRY_DSN` 등은 **아직 도입하지 않은 연동의 계획 항목**이고,
+#   문서가 §B/§C 로 그렇게 분류하고 있다. 그것까지 실패로 만들면 계획을 적을 수 없다.
+#
+# ★ 이 검사는 **머신과 무관하다.** `.env` 의 값이 무엇인지는 보지 않는다 —
+#   그것은 머신마다 다르고(BUGS #222), git 이 추적하지도 않는다.
+#   보는 것은 "코드가 이 이름을 읽는가" 와 "문서가 이 이름을 아는가" 뿐이다.
+# ---------------------------------------------------------------------------
+def test_every_env_var_the_code_reads_is_documented():
+    print("\n--- 15. 코드가 읽는 환경변수가 전부 문서에 있는가 (BUGS #232) ---")
+    import glob
+    import io as _io
+    import re as _re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    targets = []
+    for pattern in ("api/**/*.py", "storage/**/*.py", "crawler/**/*.py",
+                    "config/*.py", "normalizer/*.py"):
+        targets += glob.glob(os.path.join(root, pattern), recursive=True)
+    targets += [os.path.join(root, f) for f in
+                ("api_server.py", "doc_worker.py", "collect_documents.py",
+                 "mvp_scraper.py", "migrate_execute.py", "refresh_priority.py")]
+
+    # ★ 직접 호출(`os.getenv("X")`)과 **간접 호출**(`_env_flag("X", ...)`) 을 모두 잡는다.
+    #   처음에 직접 호출만 정규식으로 찾았다가 `RATE_LIMIT_ENABLED` /
+    #   `RATE_LIMIT_TRUST_FORWARDED` 를 놓쳤다 — 그 둘은 이름을 **인자로 넘겨** 읽는다.
+    #   런타임 추적으로 확인하고 규칙을 넓혔다.
+    DIRECT = _re.compile(r'os\.(?:getenv|environ\.get)\(\s*["\']([A-Z][A-Z0-9_]{2,})["\']')
+    BRACKET = _re.compile(r'os\.environ\[\s*["\']([A-Z][A-Z0-9_]{2,})["\']')
+    HELPER = _re.compile(r'_env_flag\(\s*["\']([A-Z][A-Z0-9_]{2,})["\']')
+
+    read = {}
+    for path in sorted(set(targets)):
+        if not os.path.isfile(path):
+            continue
+        try:
+            src = _io.open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        for rx in (DIRECT, BRACKET, HELPER):
+            for name in rx.findall(src):
+                read.setdefault(name, set()).add(rel)
+
+    check_true("제품이 읽는 환경변수를 실제로 찾았다(검사가 공허하지 않다)",
+               len(read) >= 8, sorted(read))
+
+    doc_path = os.path.join(root, "docs", "ENVIRONMENT_VARIABLES.md")
+    doc = _io.open(doc_path, encoding="utf-8-sig").read() if os.path.exists(doc_path) else ""
+    check_true("ENVIRONMENT_VARIABLES.md 를 읽었다", bool(doc), doc_path)
+
+    # ★ 부분 문자열이 아니라 **단어 경계**로 찾는다.
+    #   `k in doc` 로 썼다가 변이 M3(문서의 `RATE_LIMIT_TRUST_FORWARDED` 를
+    #   `..._FORWARDEDX` 로 바꾼다)을 **놓쳤다** — 지운 이름이 새 이름의 부분 문자열이라
+    #   여전히 "문서에 있다"로 읽혔다. 이름이 바뀌거나 지워지는 것이 정확히 이 검사가
+    #   잡아야 할 드리프트다.
+    def _documented(name):
+        return _re.search(r"(?<![A-Z0-9_])%s(?![A-Z0-9_])" % _re.escape(name), doc) is not None
+
+    missing = sorted("%s (%s)" % (k, ", ".join(sorted(v))) for k, v in read.items()
+                     if not _documented(k))
+    check("★ 코드가 읽는 환경변수가 전부 문서에 있다", missing, [])
+    if missing:
+        print("      문서에 없으면 운영자가 설정하지 않고 배포한다:")
+        for m in missing:
+            print("        " + m)
+    print("    코드가 읽는 환경변수 %d개" % len(read))
+
+    # ★ 검출기 자체 검증 — 규칙이 직접/간접 호출을 모두 잡는지, 아무 대문자나 잡지는 않는지.
+    sample = ('x = os.getenv("QA_DIRECT_ONE")\n'
+              'y = os.environ["QA_BRACKET_TWO"]\n'
+              'z = _env_flag("QA_HELPER_THREE", True)\n'
+              'w = SOME_CONSTANT + "NOT_AN_ENV_VAR_JUST_TEXT"\n')
+    got = set()
+    for rx in (DIRECT, BRACKET, HELPER):
+        got |= set(rx.findall(sample))
+    check("검출기 자체 검증: 직접 호출을 잡는다", "QA_DIRECT_ONE" in got, True)
+    check("검출기 자체 검증: 대괄호 접근을 잡는다", "QA_BRACKET_TWO" in got, True)
+    check("검출기 자체 검증: 간접(_env_flag) 호출을 잡는다", "QA_HELPER_THREE" in got, True)
+    check("검출기 자체 검증: 그냥 상수/문자열은 잡지 않는다",
+          ("SOME_CONSTANT" in got or "NOT_AN_ENV_VAR_JUST_TEXT" in got), False)
+
+    # ★ 문서 대조가 **부분 문자열로 속지 않는지**도 못박는다(변이 M3 가 그렇게 빠져나갔다).
+    _sample_doc = "`RATE_LIMIT_TRUST_FORWARDEDX` 는 다른 이름이다"
+    def _documented_in(name, text):
+        return _re.search(r"(?<![A-Z0-9_])%s(?![A-Z0-9_])" % _re.escape(name), text) is not None
+    check("검출기 자체 검증: 더 긴 이름에 묻힌 것을 '문서에 있다'로 읽지 않는다",
+          _documented_in("RATE_LIMIT_TRUST_FORWARDED", _sample_doc), False)
+    check("검출기 자체 검증: 정확히 같은 이름은 찾는다",
+          _documented_in("RATE_LIMIT_TRUST_FORWARDED",
+                         "`RATE_LIMIT_TRUST_FORWARDED` 설명"), True)
+
+
 def run():
     print("=" * 60)
     print("fresh clone 부트스트랩 검증 (Sprint 99)")
@@ -720,6 +823,7 @@ def run():
     test_claude_md_bootstrap_claims_are_true()
     test_bootstrap_is_idempotent()
     test_db_path_does_not_depend_on_cwd()
+    test_every_env_var_the_code_reads_is_documented()
 
     print("\n" + "=" * 60)
     if failures:

@@ -101,13 +101,25 @@ def is_time_up() -> bool:
 
 ### A. 지금 당장 필요 — 없으면 기능이 막힌다
 
-| 변수 | 상태 | 없을 때 증상 |
+> **★ 아래 "상태" 칸은 머신마다 다르다 (2026-08-26 정정, `docs/BUGS.md` #232).**
+> `.env` 는 git 이 추적하지 않으므로 이 표의 ✅/❌ 는 **어느 한 머신의 한 시점 스냅샷**이다.
+> 다른 머신에서 그대로 믿으면 안 된다 — BUGS #222 가 `P0A-VERDICT` 에서 정리한 것과
+> 같은 부류다. **머신과 무관한 것은 "없을 때 증상" 칸뿐이고, 그쪽이 이 표의 본체다.**
+> 지금 이 머신의 상태를 직접 재려면 `python audit_auth_health.py` (읽기 전용).
+
+| 변수 | 상태(데스크탑3, 2026-08-26 실측) | 없을 때 증상 |
 |---|---|---|
-| `SUPABASE_JWT_SECRET` | ❌ 미설정(2026-08-11 재확인) | HS256 레거시 검증 경로만 비활성 — 실사용자 토큰은 ES256/JWKS로 검증되어 영향 없음(`docs/BUGS.md` #27) |
-| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 설정됨 | 로그인/회원가입 불가 |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 설정됨 | 로그인/회원가입 불가 |
-| `ADMIN_API_KEY` | ✅ 설정됨(2026-08-11 Sprint 57 실제 요청으로 재확인 — 이전 "미설정" 기록은 stale) | — |
-| `SUPER_ADMIN_API_KEY` | ✅ 설정됨(2026-08-11 Sprint 57 재확인, `ADMIN_API_KEY`와 다른 값이라 등급 분리 정상 동작) | — |
+| `SUPABASE_JWT_SECRET` | ✅ 설정됨 (len 88) — *2026-08-11 판의 "❌ 미설정"은 stale이었다* | HS256 레거시 검증 경로만 비활성 — 실사용자 토큰은 ES256/JWKS로 검증되어 영향 없음(`docs/BUGS.md` #27) |
+| `SUPABASE_URL` | ⚠️ **이름은 있는데 값이 비어 있다** | ES256 JWKS 조회가 `.env.local` 의 `NEXT_PUBLIC_SUPABASE_URL` 폴백으로 넘어간다. **백엔드만 배포하며 그 파일을 빠뜨리면 로그인 사용자 전원 401**(`docs/BUGS.md` #205/#206). 부팅 로그에 INFO 한 줄이 뜬다 |
+| `SUPABASE_ANON_KEY` | ⚠️ **이름은 있는데 값이 비어 있다** | 없음 — 백엔드는 이 이름을 **읽지 않는다**(위 §발견 2). 프런트는 `.env.local` 의 `NEXT_PUBLIC_SUPABASE_ANON_KEY` 를 쓴다 |
+| `NEXT_PUBLIC_SUPABASE_URL` | ✅ 설정됨(`.env.local`) | 로그인/회원가입 불가 |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ 설정됨(`.env.local`) | 로그인/회원가입 불가 |
+| `ADMIN_API_KEY` | ✅ 설정됨 (len 75) | Admin 라우트 전체 사용 불가 |
+| `SUPER_ADMIN_API_KEY` | ✅ 설정됨 (len 74, `ADMIN_API_KEY`와 다른 값이라 등급 분리 정상) | SUPER 전용 라우트 사용 불가 |
+
+★ **"이름은 있는데 값이 비어 있다"** 를 "없음"과 따로 적는 이유: `.env` 에 이름이 보이면
+운영자는 설정됐다고 읽는다. 실제로는 빈 문자열이라 코드가 폴백 경로로 넘어가고,
+그 폴백이 다른 파일(`.env.local`)에 의존한다는 사실이 가려진다 — 이것이 #206 의 기제다.
 
 ### B. 론칭 직전 필요 — 결제/모니터링 개시 시점
 

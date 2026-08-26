@@ -83,6 +83,38 @@ def _area_of(row, key):
         return None
 
 
+# 면적 컬럼 이름은 여기 한 곳에만 적는다 — 필터/검사/로그가 따로 적으면 하나가
+# 어긋났을 때 방어가 조용히 빗나간다.
+AREA_COLUMNS = ("building_area", "land_area")
+
+
+def _any_not_none(*values) -> bool:
+    return any(v is not None for v in values)
+
+
+def _area_columns_available(conn) -> bool:
+    """이 DB 의 `auction_item` 에 면적 컬럼이 있는가 (= migration 025 적용 여부).
+
+    비용은 **실측**이다 (2026-08-26, 이 머신 auction.db, 2,000회):
+
+        중앙값 0.128ms / 평균 0.141ms / p95 0.228ms
+        (대조) 같은 커넥션의 단건 COUNT 쿼리 중앙값 0.073ms
+
+    ★ 처음에 주석에 "0.01ms 미만"이라고 적었다가 재 보고 고쳤다 — 실제로는 그 13배이고
+      가장 싼 실제 쿼리보다도 비싸다. `PRAGMA` 가 파싱된 스키마를 돌려주니 공짜일
+      것이라고 **짐작한 값**이었다. 짐작한 숫자를 주석에 남기지 않는다.
+
+    그래도 쓸 만하다. 면적 검색 실측이 12.4ms 이므로 1% 수준이고, **면적 조건이 실제로
+    들어온 요청에서만** 부르므로 평범한 검색은 이 비용조차 지지 않는다.
+
+    캐시하지 않는 이유: 서버가 떠 있는 동안 migration 을 적용하는 일이 실제로 있고
+    (`run_daily.bat` 가 매일 새벽 러너를 부른다, #219), 캐시하면 그 뒤로도 계속
+    "컬럼 없음"이라고 답해 **고쳐졌는데도 빈 결과**를 주게 된다.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)").fetchall()}
+    return all(c in cols for c in AREA_COLUMNS)
+
+
 def row_to_item(row, favorited_ids=frozenset(), thumbnails=None) -> dict:
     """검색 결과 1건.
 
@@ -413,6 +445,29 @@ def search(
         #   즉 면적을 모르는 물건(차량/선박 등 16행)은 면적 조건을 주는 순간 결과에서 빠진다.
         #   그것이 옳다: "건물 30㎡ 이상"을 찾는 사람에게 면적 미상 물건을 섞어 주면
         #   조건이 지켜지지 않은 결과를 조건대로라고 보여 주는 셈이다.
+        #
+        # ★★ migration 025 미적용 DB 방어 (2026-08-26, `docs/BUGS.md` #220).
+        #   위 `_area_of()` 는 **응답 쪽**을 이미 그렇게 방어해 뒀는데(컬럼이 없으면 그
+        #   필드만 null) **필터 쪽**은 그러지 않아, 면적을 하나라도 주면
+        #   `no such column: building_area` 가 그대로 올라와 검색 전체가 500 이 됐다.
+        #   같은 기능의 두 반쪽이 반대로 행동하던 것이다.
+        #
+        #   여기서의 올바른 답은 위 NULL 규약이 이미 정해 두었다 — 면적을 모르는 행은
+        #   면적 조건에서 빠진다. 컬럼 자체가 없으면 **모든 행이 면적 미상**이므로
+        #   결과는 빈 집합이다. 조건을 조용히 버려 "조건에 맞지 않는 행"을 섞어 주지
+        #   않는다(그쪽이 훨씬 나쁜 거짓말이다).
+        #
+        #   근본 원인(스키마 드리프트)은 `test_bootstrap` / `test_schema_hygiene` 가
+        #   따로 잡는다 — `auction_image` 결손을 다루는 #177 과 같은 분담이다.
+        if _any_not_none(min_building_area, max_building_area,
+                         min_land_area, max_land_area) \
+                and not _area_columns_available(conn):
+            logger.warning(
+                "auction_item 에 면적 컬럼이 없다(migration 025 미적용) - "
+                "면적 조건을 만족하는 행이 없는 것으로 응답한다"
+            )
+            return {"total": 0, "page": page, "size": size,
+                    "total_pages": 0, "items": []}
         if min_building_area is not None:
             conditions.append("building_area >= ?")
             params.append(min_building_area)

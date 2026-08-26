@@ -165,6 +165,41 @@ def test_monthly_reset_and_plan_limit():
             "SELECT COUNT(*) FROM registry_usage WHERE user_id=? AND is_free=1", (pro,)).fetchone()[0]
         check("lifetime total (old logic would use this)", lifetime, 5)
         check("month_start is 1st of month", get_month_start()[8:10], "01")
+
+        # ★ 2026-08-26 (BUGS #227 과 같은 부류) — 이 월 경계 판정은 `used_at` 을
+        #   **문자열로** 비교한다(`used_at >= month_start`). ISO 8601 은 사전순 == 시간순이라
+        #   맞는데, 그것은 **모든 쓰기가 `datetime.now().isoformat()` 형식일 때만** 참이다.
+        #
+        #   위험을 실제로 재 둔다: SQLite 의 `CURRENT_TIMESTAMP` 처럼 'T' 대신 **공백**을
+        #   쓰면 어떻게 되는가.
+        #
+        #   ★ 처음에는 "오늘"로 넣어 보고 아무 일도 안 일어나 검사를 잘못 썼다고 알았다.
+        #     구분자는 **날짜 부분이 같을 때만** 비교에 닿는다 — 즉 위험한 날은
+        #     **매월 1일**뿐이다(그날 사용은 월초 자정과 날짜가 같다).
+        #     좁지만 실재하고, 하필 조용하다: 그날 쓴 무료 열람이 한 건도 세어지지 않아
+        #     한도가 그만큼 더 열린다.
+        first_space = datetime.now().replace(day=1, hour=12, minute=0, second=0,
+                                             microsecond=0).isoformat(sep=" ")
+        conn.execute("INSERT INTO registry_usage (user_id,item_id,is_free,charged_amount,used_at)"
+                     " VALUES (?,?,?,?,?)", ("t-fmt-user", item_id, 1, 0, first_space))
+        check_true("★ 1일에 공백 구분으로 쓰면 이번 달 사용으로 세어지지 않는다(형식이 계약인 이유)",
+                   get_free_count(conn, "t-fmt-user") == 0,
+                   "-> %r vs 월초 %r" % (first_space, get_month_start()))
+        # 같은 시각을 규정 형식('T')으로 쓰면 정상적으로 세어진다 — 차이가 구분자 하나임을 못박는다.
+        conn.execute("INSERT INTO registry_usage (user_id,item_id,is_free,charged_amount,used_at)"
+                     " VALUES (?,?,?,?,?)",
+                     ("t-fmt-ok", item_id, 1, 0, first_space.replace(" ", "T")))
+        check("같은 시각을 'T' 형식으로 쓰면 세어진다", get_free_count(conn, "t-fmt-ok"), 1)
+
+        #   그래서 **쓰는 곳이 하나이고 그 형식인지**를 소스로 고정한다.
+        reg_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "api", "v1", "registry.py"), encoding="utf-8-sig").read()
+        inserts = [ln for ln in reg_src.splitlines()
+                   if "INSERT INTO registry_usage" in ln and not ln.strip().startswith("#")]
+        check("registry_usage 를 쓰는 곳은 한 곳이다", len(inserts), 1)
+        check_true("그 한 곳이 datetime.now().isoformat() 형식을 쓴다",
+                   "now = datetime.now().isoformat()" in reg_src,
+                   "-> 다른 형식으로 쓰기 시작하면 월 경계 판정이 조용히 틀린다")
     finally:
         conn.rollback()
         conn.close()
@@ -818,6 +853,145 @@ def test_every_plan_prices_every_billing_cycle():
     print("    조합 %d개 전부 가격 있음" % (len(VALID_PLANS) * len(VALID_BILLING_CYCLES)))
 
 
+
+# ---------------------------------------------------------------------------
+# 가격표가 **조용히 틀린 금액을 만들 수 있는가** (2026-08-26, `docs/BUGS.md` #227)
+# ---------------------------------------------------------------------------
+def test_plan_catalog_rejects_silent_money_errors():
+    """`PLAN_CATALOG` 는 프로그래머가 아닌 사람이 고치는 것을 전제로 한 표다.
+
+    위 `PLAN_CATALOG` 주석이 그 의도를 직접 적고 있다 —
+    *"향후 할인 이벤트를 붙일 때 이 카탈로그의 값만 바꾸면 되고 결제/검증 로직은
+    손대지 않아도 된다."* 그렇다면 **그 표에 잘못 적힌 값이 조용히 금액을 바꾸면 안 된다.**
+
+    ## 무엇이 틀려 있었나
+
+    할인 기간 판정이 날짜를 **문자열로 비교**했다(`today < start`). `YYYY-MM-DD` 로
+    영점을 채웠을 때만 맞는 방식이라, 월을 한 자리로 적으면 두 방향 모두 조용히 틀렸다.
+
+        discount_end   "2026-9-1"  + 오늘 2026-10-05 -> 할인이 **끝나지 않는다**
+                                                        (274,800 받을 것을 198,000 만 받는다)
+        discount_start "2026-9-1"  + 오늘 2026-09-15 -> 할인이 **시작되지 않는다**
+
+    오류도 로그도 없이 금액만 달라진다. 지금 카탈로그에는 기간이 걸린 항목이 없어
+    드러나지 않았을 뿐, 이벤트를 하나 붙이는 순간 성립한다.
+
+    ## 이 검사가 잠그는 것
+
+    날짜 형식만 보지 않는다. 같은 표에 있는 다른 값들도 어긋나면 똑같이 조용히
+    금액을 바꾸므로 함께 못박는다(할인가가 정상가보다 비싼 경우 등).
+    """
+    print("\n--- 4-b. 가격표의 조용한 금액 오류 (BUGS #227) ---")
+    import ast as _ast
+    import copy as _copy
+    import io as _io
+    import os as _os
+    from api.v1.payments import validate_plan_catalog, _is_discount_active
+
+    # (0) 전제 — 지금 쓰는 진짜 카탈로그는 통과해야 한다.
+    #     이게 없으면 아래 "거부한다" 검사들이 전부 참이어도 아무 의미가 없다.
+    try:
+        validate_plan_catalog(PLAN_CATALOG)
+        ok, why = True, ""
+    except ValueError as exc:
+        ok, why = False, str(exc)
+    check_true("전제: 실제 PLAN_CATALOG 는 검증을 통과한다", ok, why)
+
+    def rejects(label, mutate):
+        """카탈로그 사본을 망가뜨려 검증이 **거부하는지** 본다(원본은 건드리지 않는다)."""
+        cat = _copy.deepcopy(PLAN_CATALOG)
+        mutate(cat)
+        try:
+            validate_plan_catalog(cat)
+            check_true("거부한다: %s" % label, False, "-> 통과해 버렸다")
+        except ValueError as exc:
+            check_true("거부한다: %s" % label, True, str(exc)[:70])
+
+    def price_of(cat, plan="BASIC", cycle=None):
+        return cat[plan]["prices"][cycle or BILLING_MONTHLY]
+
+    # (1) ★ 실제로 겪은 결함 — 월/일을 한 자리로 적은 날짜
+    rejects("discount_end 의 월이 한 자리('2026-9-1')",
+            lambda c: price_of(c).update({"discount_end": "2026-9-1"}))
+    rejects("discount_start 의 월이 한 자리('2026-9-1')",
+            lambda c: price_of(c).update({"discount_start": "2026-9-1"}))
+    rejects("일이 한 자리('2026-09-1')",
+            lambda c: price_of(c).update({"discount_end": "2026-09-1"}))
+    rejects("슬래시 표기('2026/09/01')",
+            lambda c: price_of(c).update({"discount_start": "2026/09/01"}))
+    rejects("날짜가 아닌 값",
+            lambda c: price_of(c).update({"discount_end": "곧 종료"}))
+    # ★ 파이썬 3.11+ 의 `date.fromisoformat` 은 대시 없는 기본 형식도 받아들인다.
+    #   그 값은 **날짜로는 유효한데 사전순 비교와 시간순 비교가 갈린다**
+    #   ("2026-09-15" < "20260901" 이 참이다). 문서가 약속한 형식만 받게 못박는다.
+    rejects("대시 없는 기본 형식('20260901')",
+            lambda c: price_of(c).update({"discount_start": "20260901"}))
+    rejects("날짜에 시각이 붙은 값('2026-09-01T00:00:00')",
+            lambda c: price_of(c).update({"discount_end": "2026-09-01T00:00:00"}))
+    rejects("날짜가 문자열이 아니다",
+            lambda c: price_of(c).update({"discount_end": 20260901}))
+
+    # (2) 뒤집힌 기간 — 할인이 영원히 적용되지 않는다(조용한 실패)
+    rejects("시작일이 종료일보다 늦다",
+            lambda c: price_of(c).update({"discount_start": "2026-10-01",
+                                          "discount_end": "2026-09-01"}))
+
+    # (3) 금액 자체가 어긋나는 경우
+    rejects("sale_price 가 list_price 보다 비싸다(할인이라며 더 받는다)",
+            lambda c: price_of(c).update({"sale_price": 99000}))
+    rejects("sale_price 가 0 이하",
+            lambda c: price_of(c).update({"sale_price": 0}))
+    rejects("list_price 가 0 이하",
+            lambda c: price_of(c).update({"list_price": 0}))
+    rejects("discount_percent 가 100 이상(금액이 0 이하가 된다)",
+            lambda c: price_of(c).update({"discount_percent": 100}))
+    rejects("discount_percent 가 0 이하",
+            lambda c: price_of(c).update({"discount_percent": 0}))
+
+    # (4) 정상 값은 **거부하지 않는다** — 과잉 방어면 이벤트를 못 건다.
+    for label, patch in [
+        ("기간이 없는 상시 할인", {"sale_price": 9900}),
+        ("정상 표기 기간", {"sale_price": 9900,
+                        "discount_start": "2026-09-01", "discount_end": "2026-09-30"}),
+        ("시작만 지정", {"sale_price": 9900, "discount_start": "2026-09-01"}),
+        ("종료만 지정", {"sale_price": 9900, "discount_end": "2026-09-30"}),
+        ("정률 할인", {"discount_percent": 20}),
+    ]:
+        cat = _copy.deepcopy(PLAN_CATALOG)
+        entry = price_of(cat)
+        entry.pop("sale_price", None)
+        entry.update(patch)
+        try:
+            validate_plan_catalog(cat)
+            check_true("정상 값은 통과한다: %s" % label, True)
+        except ValueError as exc:
+            check_true("정상 값은 통과한다: %s" % label, False, str(exc)[:70])
+
+    # (5) 경계 — 시작일/종료일 **당일은 포함**한다(기존 규약을 그대로 유지한다)
+    check("종료일 당일은 할인 적용",
+          _is_discount_active({"discount_end": "2026-09-30"}, datetime(2026, 9, 30)), True)
+    check("종료일 다음 날은 정상가",
+          _is_discount_active({"discount_end": "2026-09-30"}, datetime(2026, 10, 1)), False)
+    check("시작일 당일은 할인 적용",
+          _is_discount_active({"discount_start": "2026-09-01"}, datetime(2026, 9, 1)), True)
+    check("시작일 전날은 정상가",
+          _is_discount_active({"discount_start": "2026-09-01"}, datetime(2026, 8, 31)), False)
+
+    # (6) ★ 가드가 **실제로 불리는가** — 정의만 해 두면 아무것도 지키지 못한다.
+    #     문자열 grep 이 아니라 구문 트리로 본다(주석에 이름이 나오는 것은 호출이 아니다).
+    src = _io.open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                 "api", "v1", "payments.py"), encoding="utf-8-sig").read()
+    tree = _ast.parse(src)
+    called_at_import = any(
+        isinstance(node, _ast.Expr) and isinstance(node.value, _ast.Call)
+        and getattr(node.value.func, "id", None) == "validate_plan_catalog"
+        for node in tree.body        # 모듈 최상단에서 부르는 것만 센다
+    )
+    check_true("★ 모듈 최상단에서 validate_plan_catalog() 를 실제로 부른다",
+               called_at_import,
+               "-> 정의만 있고 호출이 없으면 잘못된 표가 그대로 배포된다")
+
+
 def run():
     test_row_to_subscription_shapes_agree()
     test_plan_prices()
@@ -825,6 +999,7 @@ def run():
     test_invalid_combinations()
     test_every_plan_prices_every_billing_cycle()
     test_discount_structure()
+    test_plan_catalog_rejects_silent_money_errors()
     test_monthly_reset_and_plan_limit()
     test_auction_case_composite_key()
     test_auction_identity_keys()

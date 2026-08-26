@@ -80,7 +80,16 @@ def get_item_image(item_id: int, seq: int, request: Request):
     # 마이그레이션이 넣은 값이 항상 얌전하다고 가정하지 않는다).
     real_root = os.path.realpath(DOCUMENT_ROOT)
     real_path = os.path.realpath(file_path)
-    if os.path.commonpath([real_root, real_path]) != real_root:
+    # ★ 2026-08-26 (`docs/BUGS.md` #229): `commonpath` 는 두 경로의 **드라이브가 다르면
+    #   ValueError 를 던진다**(Windows). `storage_path` 가 "D:/..." 처럼 절대경로면
+    #   `os.path.join` 이 베이스를 통째로 갈아치우므로 정확히 그 상황이 된다.
+    #   막아야 할 입력에서 **가드 자신이 죽어** 404 대신 500 이 나갔다.
+    #   비교할 수 없는 경로는 "밖"으로 본다 — `api/v1/admin.py` 가 이미 쓰던 방식이다.
+    try:
+        outside = os.path.commonpath([real_root, real_path]) != real_root
+    except ValueError:
+        outside = True
+    if outside:
         logger.warning("사진 경로가 documents/ 밖을 가리킨다 (item=%s, seq=%s): %s",
                        item_id, seq, row["storage_path"])
         raise HTTPException(status_code=404, detail="사진을 찾을 수 없습니다")

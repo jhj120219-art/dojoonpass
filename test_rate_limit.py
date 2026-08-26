@@ -104,6 +104,29 @@ check_true("★ 그러나 **한 자리뿐**이다(고정 창이면 여기서 또
            lim2.check("b", 3, now=161.1)[0] is False,
            "-> 여기서 True 면 창 전체를 비우는 구현이다. 경계에서 상한의 2배가 통과한다")
 
+# ★ 2026-08-26 — 창의 **정확한 경계**를 못박는다.
+#
+#   경계 변이(`bucket[0] <= cutoff` -> `<`)가 **살아남는 것**을 확인하고 추가했다.
+#   위 검사들은 159.0 / 161.0 / 161.1 만 보므로 `now - 60.0` 과 **정확히 같은** 시각이
+#   만료로 처리되는지는 한 번도 지나지 않는다.
+#
+#   `_WINDOW_SECONDS = 60` 이고 판정이 `bucket[0] <= now - 60` 이므로,
+#   100.0 에 넣은 요청은 now=160.0 에서 **정확히 만료**여야 한다(포함 경계).
+#   `<` 로 바뀌면 그 한 건이 창에 남아 자리가 나지 않는다.
+lim2b = rl.SlidingWindowLimiter()
+for t in (100.0, 130.0, 150.0):
+    lim2b.check("edge", 3, now=t)
+check_true("★ cutoff 와 **정확히 같은** 시각의 요청은 만료로 본다(포함 경계)",
+           lim2b.check("edge", 3, now=160.0)[0] is True,
+           "-> 100.0 == 160.0-60.0 이다. False 면 경계가 배타적(`<`)으로 바뀐 것")
+# 바로 직전(159.999)은 아직 만료가 아니어야 한다 — 경계가 한쪽으로만 열려 있는지 함께 본다.
+lim2c = rl.SlidingWindowLimiter()
+for t in (100.0, 130.0, 150.0):
+    lim2c.check("edge2", 3, now=t)
+check_true("★ cutoff 직전은 아직 만료가 아니다(경계가 한 방향으로만 열린다)",
+           lim2c.check("edge2", 3, now=159.999)[0] is False,
+           "-> 여기서 True 면 만료 판정이 너무 이르다")
+
 lim3 = rl.SlidingWindowLimiter()
 ok, retry = lim3.check("c", 1, now=100.0)
 ok2, retry2 = lim3.check("c", 1, now=110.0)

@@ -461,6 +461,38 @@ def test_calc_priority():
     check("7일 뒤 -> 2순위", dbmod.calc_priority(after(7)), 2)
     check("10일 뒤 -> 3순위", dbmod.calc_priority(after(10)), 3)
     check("지난 기일도 최우선(1)", dbmod.calc_priority(after(-5)), 1)
+
+    # ★★ 2026-08-26 (`docs/BUGS.md` #237) — **위 검사들은 경계에 닿지 않는다.**
+    #
+    #   경계 변이(`days_left <= 3` -> `< 3`, `<= 7` -> `< 7`)를 넣었더니 **둘 다
+    #   살아남았다.** 이유는 이름과 실제 값이 다르기 때문이다.
+    #
+    #       calc_priority 는 `strptime(auction_date, "%Y-%m-%d")` 로 **자정**을 만들고
+    #       `(target - datetime.now()).days` 를 쓴다. now 에는 시각이 붙어 있으므로
+    #       timedelta 가 잘려 **days_left = (달력 일수) - 1** 이 된다.
+    #
+    #   실측(2026-08-26 18:21 기준):
+    #
+    #       after(3) -> days_left=2   after(7) -> days_left=6    <- 경계가 아니다
+    #       after(4) -> days_left=3   after(8) -> days_left=7    <- **여기가 경계다**
+    #
+    #   즉 "3일 뒤 -> 1" 이라는 이름의 검사는 실제로는 days_left=2 를 보고 있어서,
+    #   경계를 한 칸 옮겨도 통과한다. 이름과 검증 내용이 어긋난 자리다.
+    #
+    #   ★ 제품 동작은 그대로 둔다. `days_left` 의 정의를 바꾸면 큐 정렬이 통째로
+    #     달라지는 **정책 변경**이고, 지금 코드가 스스로 일관되지 않다는 근거는 없다.
+    #     여기서 할 일은 **경계가 어디인지 정확히 못박는 것**이다.
+    check("★ 경계: days_left=3 (달력 4일 뒤) -> 최우선(1)", dbmod.calc_priority(after(4)), 1)
+    check("★ 경계 바로 밖: days_left=4 (달력 5일 뒤) -> 2순위", dbmod.calc_priority(after(5)), 2)
+    check("★ 경계: days_left=7 (달력 8일 뒤) -> 2순위", dbmod.calc_priority(after(8)), 2)
+    check("★ 경계 바로 밖: days_left=8 (달력 9일 뒤) -> 3순위", dbmod.calc_priority(after(9)), 3)
+
+    # 이름이 다시 어긋나지 않도록 **오프셋 자체를 고정한다**.
+    # 이 관계가 깨지면(예: 자정 대신 now 기준으로 바뀌면) 위 경계 검사도 함께 옮겨야 한다.
+    from datetime import datetime as _dt2
+    _target = _dt2.strptime(after(4), "%Y-%m-%d")
+    check("★ days_left = 달력일수 - 1 이라는 전제가 유지된다",
+          (_target - _dt2.now()).days, 3)
     # 값이 없거나 형식이 깨져도 죽지 않고 가장 낮은 우선순위로 떨어져야 한다
     check("빈 값 -> 3", dbmod.calc_priority(""), 3)
     check("None -> 3", dbmod.calc_priority(None), 3)

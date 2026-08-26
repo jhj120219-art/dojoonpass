@@ -83,7 +83,15 @@ def get_document(item_id: int, doc_type: str, request: Request):
     # 경로 탐색 방지: 계산된 경로가 DOCUMENT_ROOT 밖으로 벗어나면 차단
     real_document_root = os.path.realpath(DOCUMENT_ROOT)
     real_file_path = os.path.realpath(file_path)
-    if os.path.commonpath([real_document_root, real_file_path]) != real_document_root:
+    # ★ 2026-08-26 (`docs/BUGS.md` #229): 드라이브가 다르면 `commonpath` 가 ValueError 를
+    #   낸다(Windows). `court_name` 이 "D:" 같은 값이면 `os.path.join` 이 베이스를 갈아치워
+    #   실제로 그 상황이 된다(`get_doc_dir("D:", ...)` -> "D:2024타경1\\1" 실측).
+    #   막아야 할 입력에서 가드가 죽으면 404 가 아니라 500 이 나간다.
+    try:
+        outside = os.path.commonpath([real_document_root, real_file_path]) != real_document_root
+    except ValueError:
+        outside = True
+    if outside:
         raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
 
     # ★ "있다"의 기준을 **크롤러와 같게** 맞춘다 (2026-08-13 Sprint 98).

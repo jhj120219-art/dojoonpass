@@ -339,6 +339,12 @@ export default function PropertyDetailPage() {
       // 이전 물건에서 즐겨찾기 요청이 아직 끝나지 않은 채로 넘어온 경우, 그 요청은 위 idRef
       // 가드로 무시되므로 favBusy가 절대 풀리지 않는다 — 새 물건에서는 항상 false로 시작한다.
       setFavBusy(false)
+      // 2026-08-26 (BUGS #225): 등기부 쪽 busy 도 여기서 함께 내린다.
+      // 여태 `favBusy` 만 여기 있었고 `registryBusy` 는 각 핸들러의 finally 가 **가드 없이**
+      // 내려 주는 것에 기대고 있었다. 아래에서 그 finally 에 idRef 가드를 붙이는 순간
+      // (붙이지 않으면 늦게 온 응답이 새 물건 화면을 덮는다) 이 줄이 없으면 물건을 넘긴 뒤
+      // 버튼이 "처리 중..." 에서 영원히 돌아오지 않는다. 두 상태를 대칭으로 맞춘다.
+      setRegistryBusy(false)
       // handleToggleFavorite와 동일한 idRef 가드: 이 요청이 시작된 뒤 다른 물건으로
       // 넘어가 있으면(idRef.current !== requestId) 늦게 도착한 응답은 화면에 반영하지 않는다.
       const requestId = id
@@ -398,10 +404,18 @@ export default function PropertyDetailPage() {
   // 등기부 신청 실제 호출 — busy 관리 없이 로직만 담당한다. handleSubscribe가 구독 성공 직후
   // 이미 registryBusy를 쥔 채로 이어서 호출해야 하므로(자기 자신의 가드에 막히면 안 됨),
   // 가드/busy 관리는 각 공개 핸들러(아래 handleRegistryRequest, handleSubscribe)가 맡는다.
-  async function performRegistryRequest() {
+  // `requestId` = 이 요청을 시작한 시점의 물건 id. 호출부가 잡아서 넘긴다
+  // (handleSubscribe 가 구독 성공 직후 이어서 부르는 경로에서도 **같은 물건**이어야 한다).
+  async function performRegistryRequest(requestId: string) {
     const token = await requireToken()
     if (!token) return
-    const result = await postJSON<RegistryRequestSummary>('/api/v1/registry-requests', { item_id: Number(id) }, token)
+    const result = await postJSON<RegistryRequestSummary>('/api/v1/registry-requests', { item_id: Number(requestId) }, token)
+    // ★ 2026-08-26 (BUGS #225) — handleToggleFavorite 와 동일한 idRef 가드.
+    //   이 응답이 오기 전에 사용자가 다른 물건으로 넘어갔다면 화면에 반영하지 않는다.
+    //   여기서 반영하면 `registryRequest` 가 **이전 물건의 신청 건**으로 채워지는데,
+    //   그 값은 문구가 아니라 **다운로드 URL(`/registry-requests/{id}/download`)과
+    //   결제 금액**을 만든다 — 다른 물건 화면에서 이전 물건의 등기부를 받게 된다.
+    if (idRef.current !== requestId) return
     if (!result.success || !result.data) {
       const code = result.error ?? null
       setRegistryErrorCode(code)
@@ -421,15 +435,19 @@ export default function PropertyDetailPage() {
     // 아직 false라 가드를 그냥 통과해버린다(백엔드는 #19로 이미 안전하지만, 불필요한 중복
     // 요청 자체를 프론트에서부터 막는 게 맞다. 2026-08-09 Sprint 39).
     if (registryBusy) return
+    const requestId = id
     setRegistryBusy(true)
     setRegistryMessage(null)
     setRegistryErrorCode(null)
     try {
-      await performRegistryRequest()
+      await performRegistryRequest(requestId)
     } catch {
+      if (idRef.current !== requestId) return
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
-      setRegistryBusy(false)
+      // 넘어간 뒤라면 새 물건의 busy 를 대신 내려 주지 않는다(그 물건이 자기 요청을
+      // 진행 중일 수 있다). 넘어간 물건 쪽 busy 는 [id] 효과가 내린다.
+      if (idRef.current === requestId) setRegistryBusy(false)
     }
   }
 
@@ -442,6 +460,7 @@ export default function PropertyDetailPage() {
     // (아래) 가드가 있는 handleRegistryRequest가 아니라 performRegistryRequest를 직접 부른다 —
     // 그렇지 않으면 handleRegistryRequest 자신의 가드에 막혀 재시도가 조용히 무시된다.
     if (registryBusy) return
+    const requestId = id
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
@@ -449,6 +468,7 @@ export default function PropertyDetailPage() {
       if (!token) return
       const planOption = planOptions.find((p) => p.plan === plan)
       if (!planOption || !planOption.prices[cycle]) {
+        if (idRef.current !== requestId) return
         setRegistryMessage('요금제 정보를 불러오지 못했습니다. 잠시 후 다시 시도해주세요')
         return
       }
@@ -462,15 +482,19 @@ export default function PropertyDetailPage() {
         },
         token
       )
+      if (idRef.current !== requestId) return
       if (!result.success) {
         setRegistryMessage(result.message ?? '구독 처리에 실패했습니다')
         return
       }
-      await performRegistryRequest()
+      // 같은 물건일 때만 이어서 신청한다. 물건을 넘겼다면 그 신청은 **새 물건에 대한
+      // 것이 되어 버리므로** 이어가지 않는다(구독 자체는 이미 성공했고 물건과 무관하다).
+      await performRegistryRequest(requestId)
     } catch {
+      if (idRef.current !== requestId) return
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
-      setRegistryBusy(false)
+      if (idRef.current === requestId) setRegistryBusy(false)
     }
   }
 
@@ -481,6 +505,7 @@ export default function PropertyDetailPage() {
     // 2026-08-09 Sprint 39 — 나머지 등기부/구독 핸들러와 동일하게 busy를 await 이전에
     // 동기적으로 세운다.
     if (registryBusy) return
+    const requestId = id
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
@@ -491,6 +516,9 @@ export default function PropertyDetailPage() {
         { payment_type: 'OVERAGE_USAGE', amount: registryRequest.charged_amount ?? overageFee },
         token
       )
+      // ★ BUGS #225 — 결제 응답이 늦게 오는 사이 물건을 넘겼으면 반영하지 않는다.
+      //   여기서 반영하면 새 물건 화면이 **이전 물건의 결제 결과**를 자기 것으로 보여 준다.
+      if (idRef.current !== requestId) return
       if (!result.success || !result.data) {
         setRegistryMessage(result.message ?? '결제에 실패했습니다')
         return
@@ -499,9 +527,10 @@ export default function PropertyDetailPage() {
         setRegistryRequest(result.data.registry_request)
       }
     } catch {
+      if (idRef.current !== requestId) return
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
-      setRegistryBusy(false)
+      if (idRef.current === requestId) setRegistryBusy(false)
     }
   }
 
@@ -512,6 +541,7 @@ export default function PropertyDetailPage() {
     // 2026-08-09 Sprint 39 — 나머지 등기부/구독 핸들러와 동일하게 busy를 await 이전에
     // 동기적으로 세운다.
     if (registryBusy) return
+    const requestId = id
     setRegistryBusy(true)
     setRegistryMessage(null)
     try {
@@ -521,6 +551,9 @@ export default function PropertyDetailPage() {
       const contentType = res.headers.get('content-type') ?? ''
       if (!res.ok || contentType.includes('application/json')) {
         const body = await res.json().catch(() => null)
+        // 파일 저장 자체는 사용자가 그 물건에서 직접 누른 행동이라 물건을 넘겨도 그대로
+        // 진행한다. 화면에 남기는 **문구**만 가드한다 — 그것이 새 물건 것으로 읽히면 안 된다.
+        if (idRef.current !== requestId) return
         setRegistryMessage(body?.message ?? '다운로드에 실패했습니다')
         return
       }
@@ -537,9 +570,10 @@ export default function PropertyDetailPage() {
       link.remove()
       URL.revokeObjectURL(objectUrl)
     } catch {
+      if (idRef.current !== requestId) return
       setRegistryMessage('일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요')
     } finally {
-      setRegistryBusy(false)
+      if (idRef.current === requestId) setRegistryBusy(false)
     }
   }
 
