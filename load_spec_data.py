@@ -18,7 +18,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pdfplumber
-from storage.database import get_connection
+from storage.database import get_connection, chunked_for_sql
 from api.v1.documents import get_doc_dir
 
 # 헤더 셀 텍스트 -> 필드명 매칭 규칙.
@@ -202,11 +202,15 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     if not missing_file_item_ids:
         return 0
 
-    placeholders = ",".join("?" * len(missing_file_item_ids))
-    removed = conn.execute(
-        "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)" % placeholders,
-        missing_file_item_ids,
-    ).rowcount
+    # ★ 한 문장에 몰아넣지 않는다 (2026-08-27, `docs/BUGS.md` #243).
+    #   위 `load_rights_data.py` 와 같은 이유·같은 규칙이다.
+    removed = 0
+    for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
+        placeholders = ",".join("?" * len(chunk))
+        removed += conn.execute(
+            "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)" % placeholders,
+            chunk,
+        ).rowcount
     conn.commit()
     return removed
 

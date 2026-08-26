@@ -1101,6 +1101,59 @@ QUEUE_CLAIMABLE_STATUSES = (QUEUE_STATUS_PENDING, QUEUE_STATUS_REFRESH)
 # (`api/v1/payments.py`의 `IN (%s)`와 같은 패턴)이고, 어휘가 늘어도 자동으로 따라간다.
 QUEUE_CLAIMABLE_PLACEHOLDERS = ", ".join("?" * len(QUEUE_CLAIMABLE_STATUSES))
 
+
+# ---------------------------------------------------------------------------
+# `IN (...)` 을 만들 때의 **바인딩 변수 상한** (2026-08-27, `docs/BUGS.md` #243)
+#
+# SQLite 는 한 문장에 넣을 수 있는 `?` 개수에 상한이 있다
+# (`SQLITE_LIMIT_VARIABLE_NUMBER`, 이 환경 실측 **32,766**). 넘으면 실행 자체가
+# `OperationalError: too many SQL variables` 로 죽는다 — 느려지는 것이 아니라 **멈춘다.**
+#
+# 이것이 실제로 매일 크롤링을 통째로 죽일 수 있는 자리였다. `migrate_execute.py` 가
+# `(court_code, case_no)` 쌍을 한 문장에 몰아넣어 조회했는데, 쌍당 변수가 2개라
+# **유니크 사건 16,384건째부터 파이프라인 전체가 실패**한다(실측: 16,383 정상 /
+# 16,384 파손). 60개 법원을 매일 도는 구조라 수집 범위가 넓어지면 닿는 수다.
+#
+# 그래서 "얼마나 큰 입력이 와도 문장 하나에 다 넣지 않는다"를 **한 곳에서** 정한다.
+# 값을 SQL 텍스트로 넣는 우회(인젝션 위험)로 풀지 않는다 — 나누기만 한다.
+# 이 환경 실측은 32,766 이지만 **그 숫자를 믿고 박아 두지 않는다.** SQLite 3.31 이하의
+# 기본값은 999 라, 상한을 상수로 가정하면 낮은 빌드에서 **500건대부터** 같은 사고가 난다.
+# 그래서 실제 커넥션에 물어보고, 못 물어보면 가장 낮은 쪽(999)으로 보수적으로 잡는다.
+SQLITE_MAX_VARIABLES_FALLBACK = 999
+
+
+def sql_variable_limit(conn=None) -> int:
+    """이 커넥션이 실제로 허용하는 `?` 개수. 모르면 보수적인 하한을 돌려준다."""
+    if conn is not None:
+        try:
+            return int(conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        except Exception:      # noqa: BLE001 - getlimit 은 Python 3.11+ 에만 있다
+            pass
+    return SQLITE_MAX_VARIABLES_FALLBACK
+
+
+def chunked_for_sql(items, vars_per_item: int = 1, headroom: int = 64, conn=None):
+    """`IN (...)` 한 문장이 변수 상한을 넘지 않도록 `items` 를 나눠 내보낸다.
+
+    `vars_per_item` 은 항목 하나가 쓰는 `?` 개수다(단일 값이면 1,
+    `(?,?)` 같은 행-값 쌍이면 2). `headroom` 은 같은 문장의 다른 바인딩
+    (예: `WHERE user_id=? AND item_id IN (...)`) 을 위한 여유분이다.
+    `conn` 을 주면 **그 커넥션의 실제 상한**을 쓴다 — 주지 않으면 보수적인 하한을 쓴다.
+
+    빈 입력에서는 아무것도 내보내지 않는다 — 빈 `IN ()` 은 SQL 구문 오류라
+    호출부가 그 경우를 따로 다루지 않아도 되게 한다.
+    """
+    limit = sql_variable_limit(conn)
+    per_chunk = max(1, (limit - headroom) // max(1, vars_per_item))
+    buf = []
+    for it in items:
+        buf.append(it)
+        if len(buf) >= per_chunk:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
 # 집어갈 때: 대기 상태 -> 진행 상태
 QUEUE_CLAIM_STATUS = {
     QUEUE_STATUS_PENDING: QUEUE_STATUS_IN_PROGRESS,

@@ -1,6 +1,6 @@
 ﻿import sys, os, re
 sys.path.insert(0, os.getcwd())
-from storage.database import get_connection, requeue_changed_documents
+from storage.database import get_connection, requeue_changed_documents, chunked_for_sql
 # 면적은 주소 원문에서 뽑는다. 추출 규칙의 **정본은 normalizer 한 곳**이다
 # (백필 스크립트도 같은 함수를 쓴다 — 규칙이 두 벌이 되면 갈라진다, BUGS #204).
 from normalizer.normalizer import extract_areas
@@ -14,7 +14,7 @@ logging.basicConfig(
         logging.StreamHandler(),
     ]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # migrate_execute 가 만드는 document_status 행의 종류.
 #
@@ -106,11 +106,31 @@ def execute():
         # 1,574건 = case_map과 우연히 같지만 항상 같다는 보장은 없다) 전체를 긁는 대신,
         # SQLite의 row-value IN(3.15+, 이 환경 3.50)으로 지금 필요한 키만 한 번에 읽는다 —
         # 결과는 기존 개별 조회와 동일하다(같은 UNIQUE(court_code, case_no) 제약을 그대로 사용).
+        #
+        # ★★ 그 "한 번에"에는 **상한이 있다** (2026-08-27, `docs/BUGS.md` #243).
+        #
+        #   쌍 하나가 `?` 를 2개 쓰므로 SQLite 의 바인딩 변수 상한
+        #   (`SQLITE_LIMIT_VARIABLE_NUMBER`, 이 환경 32,766)에 **유니크 사건 16,384건째**
+        #   에서 닿는다. 넘으면 느려지는 것이 아니라
+        #   `OperationalError: too many SQL variables` 로 **실행이 죽는다.**
+        #
+        #   실측(사본 DB, 합성 사건):  16,383건 정상 / 16,384건 파손
+        #   파손 시 결과: rollback 은 깨끗하지만(부분 커밋 0) auction_case/item/
+        #   document_status 가 **전부 0건** — 그날 크롤이 통째로 버려진다.
+        #
+        #   지금 운영 DB 는 유니크 사건 1,882건(상한의 11%)이라 아직 닿지 않는다.
+        #   그러나 이 스크립트는 **60개 법원을 매일 전수**로 도는 구조라 수집 범위가
+        #   넓어지면 닿는 수이고, 닿는 날 조용히가 아니라 **전면 중단**된다.
+        #
+        #   값을 SQL 텍스트로 밀어 넣는 우회(인젝션 위험)로 풀지 않는다 — **나누기만** 한다.
+        #   나눠도 결과는 동일하다: 각 청크가 서로소인 키 집합을 조회해 같은 dict 에 담는다.
         case_keys = list(case_map.keys())
         case_id_by_key = {}
-        if case_keys:
-            placeholders = ",".join(["(?,?)"] * len(case_keys))
-            params = [v for pair in case_keys for v in pair]
+        #   상한은 **이 커넥션에 직접 물어본다** — 상수로 박으면 SQLite 3.31 이하
+        #   (기본값 999)에서 500건대부터 같은 사고가 난다.
+        for key_chunk in chunked_for_sql(case_keys, vars_per_item=2, conn=conn):
+            placeholders = ",".join(["(?,?)"] * len(key_chunk))
+            params = [v for pair in key_chunk for v in pair]
             for cc_row in conn.execute(
                 f"SELECT id, court_code, case_no FROM auction_case "
                 f"WHERE (court_code, case_no) IN ({placeholders})",

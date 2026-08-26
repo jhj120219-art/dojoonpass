@@ -439,12 +439,43 @@ def search(
         if max_fail_count is not None:
             conditions.append("fail_count <= ?")
             params.append(max_fail_count)
-        # 면적 범위 (2026-08-26 신설).
+        # 면적 범위 (2026-08-26 신설, 2026-08-26 결합 규칙 수정 — `docs/BUGS.md` #239).
         #
         # ★ NULL 은 자연히 걸러진다 — SQLite 에서 `NULL >= 3` 은 참이 아니라 **NULL**(거짓 취급)이다.
-        #   즉 면적을 모르는 물건(차량/선박 등 16행)은 면적 조건을 주는 순간 결과에서 빠진다.
+        #   즉 면적을 모르는 행은 그 면적 조건을 주는 순간 결과에서 빠진다.
         #   그것이 옳다: "건물 30㎡ 이상"을 찾는 사람에게 면적 미상 물건을 섞어 주면
         #   조건이 지켜지지 않은 결과를 조건대로라고 보여 주는 셈이다.
+        #
+        # ★★★ 그런데 "면적 미상"은 **16행짜리 예외가 아니다.** (2026-08-26 실측, 전수)
+        #
+        #     건물면적만 보유  1,535 (60.0%)      토지면적만 보유  1,006 (39.3%)
+        #     ★ 둘 다 보유         0 (0.0%)       둘 다 없음          17 (0.7%)
+        #
+        #   `extract_areas()` 는 주소 원문의 대괄호 구획 **머리말**을 보고 건물이면
+        #   building_area 를, 토지면 land_area 를 채운다. 실데이터에서 한 물건은 둘 중
+        #   **하나만** 갖는다 — 두 컬럼은 독립 속성이 아니라 **판별 합집합(union)** 이다.
+        #   그래서 버려지는 행은 차량/선박이 아니라 **반대 유형의 정상 부동산 전부**다:
+        #   건물면적 조건 -> 전답·임야 등 1,023행(40.0%)이 빠지고,
+        #   토지면적 조건 -> 아파트·오피스텔·다세대 등 1,552행(60.7%)이 빠진다.
+        #
+        #   앞서 이 자리에 적혀 있던 "16행"은 `backfill_area.py` 의 **'둘 다 없음' 17행**
+        #   (= 커버리지 99.3% 의 여집합)을 가져다 쓴 것이다. 그 숫자는 "면적을 하나라도
+        #   가진 행의 비율"이지 "네가 거는 그 컬럼을 가진 행의 비율"이 아니다.
+        #
+        # ★★★★ 두 면적을 **AND** 로 묶으면 만족할 수 있는 행이 구조적으로 0이다.
+        #   둘 다 보유한 행이 0이므로 `building AND land` 는 어떤 값 조합에서도 공집합이다.
+        #   UI 는 두 입력을 같은 '면적 조건' 패널에 나란히 두므로 둘 다 채우는 것이 가장
+        #   자연스러운 조작인데, 그때 결과는 **항상 0건**이었다(드롭다운 13x12=156 조합
+        #   전수 실측, 156/156 이 0건. 종결물건 포함에서도 0건).
+        #
+        #   그래서 결합 규칙을 하나로 통일한다:
+        #
+        #       면적 조건 = **주어진 면적 계열들의 OR**,  계열 안의 min/max 는 AND
+        #
+        #   - 한 계열만 주면 OR 의 항이 하나이므로 **기존 동작과 완전히 같다**(NULL 규약 유지).
+        #   - 두 계열을 주면 "건물이 이 범위이거나, 토지가 이 범위인 물건"이 된다 —
+        #     판별 합집합인 데이터에서 사용자가 둘을 채웠을 때 뜻이 통하는 유일한 읽기다.
+        #   이는 바로 위 property_type 다중선택을 OR 로 묶는 것과 같은 원칙이다.
         #
         # ★★ migration 025 미적용 DB 방어 (2026-08-26, `docs/BUGS.md` #220).
         #   위 `_area_of()` 는 **응답 쪽**을 이미 그렇게 방어해 뒀는데(컬럼이 없으면 그
@@ -468,18 +499,34 @@ def search(
             )
             return {"total": 0, "page": page, "size": size,
                     "total_pages": 0, "items": []}
-        if min_building_area is not None:
-            conditions.append("building_area >= ?")
-            params.append(min_building_area)
-        if max_building_area is not None:
-            conditions.append("building_area <= ?")
-            params.append(max_building_area)
-        if min_land_area is not None:
-            conditions.append("land_area >= ?")
-            params.append(min_land_area)
-        if max_land_area is not None:
-            conditions.append("land_area <= ?")
-            params.append(max_land_area)
+        # ★ SQL 조각은 **전부 소스 리터럴**이다 — 컬럼명을 f-string 으로 조립하지 않는다.
+        #   `test_schema_hygiene` 의 "WHERE 조각이 전부 상수" 검사가 그것을 요구한다
+        #   (SPRINT107 SQL Injection Audit). 조립하면 값이 SQL 텍스트가 될 수 있는 형태를
+        #   정적으로 구별할 수 없어진다. 여기서 가변인 것은 **조각의 개수**뿐이고,
+        #   면적 값은 언제나 `?` 바인딩으로만 들어간다.
+        area_families = []
+        for lo_sql, hi_sql, lo, hi in (
+                ("building_area >= ?", "building_area <= ?",
+                 min_building_area, max_building_area),
+                ("land_area >= ?", "land_area <= ?",
+                 min_land_area, max_land_area)):
+            clauses, values = [], []
+            if lo is not None:
+                clauses.append(lo_sql)
+                values.append(lo)
+            if hi is not None:
+                clauses.append(hi_sql)
+                values.append(hi)
+            if clauses:
+                area_families.append((clauses, values))
+        if area_families:
+            # 계열 안은 AND(범위), 계열끼리는 OR(합집합). 계열이 하나면 항이 하나라
+            # 괄호만 늘고 의미는 기존과 같다. params 는 절이 나오는 순서 그대로 넣는다.
+            area_clause = " OR ".join(
+                "(" + " AND ".join(c) + ")" for c, _ in area_families)
+            conditions.append(f"({area_clause})")
+            for _, values in area_families:
+                params.extend(values)
 
         where = " AND ".join(conditions)
         total = conn.execute(

@@ -18,6 +18,7 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
+import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
 
 describe('검색 실행이 현재 pathname을 유지한다 (MASTER_SPEC §8.2) — 소스 계약', () => {
   test('검색 Form이 /search로 하드코딩 push하지 않는다', () => {
@@ -315,13 +316,12 @@ describe('검색 파라미터 계약: 프런트가 보내는 것과 백엔드가
   // 빼도록 강제한다.
   // 2026-08-26: 면적 4종(min/max_building_area, min/max_land_area)을 **구현했다** —
   //   migration 025 가 컬럼을, normalizer.extract_areas() 가 추출을,
-  //   api/v1/search.py 가 WHERE 절을 맡는다(실데이터 커버리지 99.3%).
-  //   그래서 목록에서 뺐다. 남은 것은 special_conditions 하나다 —
-  //   이쪽은 auction_item 은 물론 rights_summary 에도 대응 데이터가 없어
-  //   **뽑아낼 원천 자체가 없다**(면적과 다른 점이다).
-  const KNOWN_UNSUPPORTED = new Set([
-    'special_conditions',
-  ])
+  //   api/v1/search.py 가 WHERE 절을 맡는다.
+  //   그래서 목록에서 뺐다. 남은 것은 special_conditions 하나다.
+  //
+  // ★ 목록 자체는 `tests/_search_param_contract.mjs` **한 곳**에만 둔다.
+  //   같은 목록이 이 파일과 frontend-contract.test.mjs 에 두 벌 생겼다가, 한쪽에서만
+  //   빼면 다른 쪽이 계속 눈감아 주는 구조가 됐다(BUGS #204 가 경계하는 그것).
 
   async function read(file) {
     const { promises: fs } = await import('node:fs')
@@ -1053,5 +1053,74 @@ describe('상세 화면의 늦은 응답 방어 (BUGS #210) — 소스 계약', 
       .filter((h) => !h.guarded && !GUARD_EXEMPT[h.name])
     assert.ok(missing.length > 0,
       'requestId 선언을 전부 지웠는데도 탐지되지 않습니다 — 이 검사는 아무것도 지키지 못합니다')
+  })
+})
+
+describe('면적 조건 — 두 컬럼은 판별 합집합이다 (BUGS #239) — 소스 계약', () => {
+  // 이 검사가 지키는 것은 "숫자가 맞는가"가 아니라 **틀린 전제가 되살아나지 않는가**이다.
+  //
+  // 2026-08-26 실측(auction_item 2,558행 전수):
+  //   건물면적만 1,535(60.0%) / 토지면적만 1,006(39.3%) / 둘 다 보유 0 / 둘 다 없음 17
+  // 한 물건은 두 면적 중 하나만 갖는다. 그런데 세 파일이 backfill_area.py 의
+  // "둘 다 없음 16행(=커버리지 99.3% 의 여집합)"을 **각 컬럼의 미보유 행 수**로 잘못
+  // 옮겨 적고("면적 미상 = 차량/선박 16건"), 그 전제 위에서 두 면적을 AND 로 묶었다.
+  // 결과는 UI 드롭다운 156개 조합이 **전부 0건**인 죽은 검색 경로였다.
+  const FILES = ['src/app/search/SearchForm.tsx', 'api/v1/search.py']
+
+  test('면적 미상을 "차량/선박 16건"으로 단정하는 서술이 남아있지 않다', async () => {
+    const { promises: fs } = await import('node:fs')
+    for (const file of FILES) {
+      const src = await fs.readFile(file, 'utf8')
+      // "16건/16행" 과 "차량/선박" 이 같은 줄에 함께 오는 형태만 잡는다.
+      // (17행이라는 사실 자체를 적는 것은 정당하므로 문구 전체를 금지하지 않는다)
+      for (const line of src.split('\n')) {
+        assert.ok(
+          !(/차량\/선박/.test(line) && /16\s*(건|행)/.test(line)),
+          `${file}: 면적 미상을 '차량/선박 16건'으로 단정하는 서술이 되살아났습니다 -> ${line.trim()}`
+        )
+      }
+    }
+  })
+
+  test('검색 백엔드가 두 면적 계열을 OR 로 묶는다 (AND 회귀 방지)', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile('api/v1/search.py', 'utf8')
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n')
+    assert.ok(
+      /area_families/.test(code),
+      'api/v1/search.py 에 면적 계열 묶음(area_families)이 없습니다'
+    )
+    // ★ 여기서 그냥 `" OR ".join` 을 찾으면 안 된다 — 바로 위 property_type 다중선택이
+    //   같은 표현을 쓰고 있어서, 면적 쪽을 AND 로 되돌려도 초록으로 남는다.
+    //   (이 검사를 처음 쓸 때 실제로 그렇게 써서 변이 N1 이 생존했다.)
+    //   면적 계열을 묶는 **그 식 자체**가 OR 인지를 본다.
+    //
+    // ★★ 줄 단위로 보면 안 된다 — 두 번째 실수. `area_clause = " OR ".join(` 와
+    //   `for c, _ in area_families)` 가 서로 다른 줄로 갈리는 순간(줄바꿈 하나로)
+    //   검사가 붉어졌다. 공백을 뭉개서 **식 단위**로 본다.
+    const flat = code.replace(/\s+/g, ' ')
+    assert.ok(
+      /area_clause\s*=/.test(flat),
+      '면적 계열을 묶는 area_clause 를 찾지 못했습니다'
+    )
+    const areaExpr = flat.slice(flat.indexOf('area_clause ='))
+    assert.ok(
+      /^area_clause = " OR "\.join\(/.test(areaExpr),
+      `면적 계열을 OR 로 묶는 코드가 사라졌습니다 — AND 로 되돌아가면 항상 0건입니다 -> ${areaExpr.slice(0, 120)}`
+    )
+    assert.ok(
+      /area_families/.test(areaExpr.slice(0, 200)),
+      `area_clause 가 area_families 로부터 만들어지지 않습니다 -> ${areaExpr.slice(0, 120)}`
+    )
+    // 계열별 조건을 개별 conditions 로 바로 붙이던 옛 형태가 되살아나지 않았는지 본다.
+    for (const dead of [
+      'conditions.append("building_area >= ?")',
+      'conditions.append("land_area >= ?")',
+    ]) {
+      assert.ok(
+        !code.includes(dead),
+        `면적 조건을 개별 AND 로 붙이던 옛 코드가 되살아났습니다: ${dead}`
+      )
+    }
   })
 })

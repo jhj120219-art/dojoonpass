@@ -249,6 +249,43 @@ def db_state():
             (today,)).fetchone()
         st["queue_pending_total"] = row[0] or 0
         st["queue_pending_moot"] = row[1] or 0
+
+        # ★ 2026-08-27 추가 - **파이프라인 마지막 단계가 배선돼 있는가** (BUGS #245).
+        #
+        #   doc_worker 가 문서를 받아 `doc_raw` 에 넣는 것까지는 예약 작업이 한다.
+        #   그런데 그 문서를 **권리분석 데이터로 바꾸는** `load_rights_data.py` /
+        #   `load_spec_data.py` 는 어떤 .bat 에도, 어떤 예약 작업에도 없다(전수 grep).
+        #   즉 사람이 손으로 돌린 날만 채워진다. 실측(2026-08-27):
+        #
+        #       2026-08-25 수집 161건 / 파싱 161건 (100%)   <- 손으로 돌린 날
+        #       2026-08-26 수집  16건 / 파싱   0건 (  0%)   <- doc_worker 만 돈 날
+        #
+        #   이 축이 없으면 그 사실이 어디에도 안 보인다 - 큐는 done 이고 문서도 있으니
+        #   다른 모든 지표가 초록이다. **수집일별 파싱률**을 그대로 보여 준다.
+        try:
+            st["parse_by_day"] = [
+                (r[0], r[1], r[2]) for r in con.execute(
+                    "SELECT substr(dr.created_at,1,10) AS d, COUNT(*),"
+                    " SUM(CASE WHEN EXISTS(SELECT 1 FROM rights_summary rs"
+                    "                      WHERE rs.item_id=dr.item_id) THEN 1 ELSE 0 END)"
+                    " FROM doc_raw dr WHERE dr.doc_type='STATUS'"
+                    " GROUP BY 1 ORDER BY 1 DESC LIMIT 7")
+            ]
+            st["status_ready_unparsed"] = con.execute(
+                "SELECT COUNT(*) FROM document_status ds"
+                " WHERE ds.doc_type='STATUS' AND ds.status='READY'"
+                " AND NOT EXISTS (SELECT 1 FROM rights_summary rs WHERE rs.item_id=ds.item_id)"
+            ).fetchone()[0]
+            st["status_ready_unparsed_visible"] = con.execute(
+                "SELECT COUNT(*) FROM document_status ds"
+                " JOIN auction_item ai ON ai.id=ds.item_id"
+                " WHERE ds.doc_type='STATUS' AND ds.status='READY' AND ai.auction_date >= ?"
+                " AND NOT EXISTS (SELECT 1 FROM rights_summary rs WHERE rs.item_id=ds.item_id)",
+                (today,)).fetchone()[0]
+        except sqlite3.Error:
+            st["parse_by_day"] = None
+            st["status_ready_unparsed"] = None
+            st["status_ready_unparsed_visible"] = None
         return st
     finally:
         con.close()
@@ -342,6 +379,30 @@ def queue_stall_signal(db):
         out.append("pending %d건 중 %d건(%.0f%%)은 기일이 이미 지나 이제 수집해도"
                     " 의미가 없다 - 정체가 길어질수록 이 비율만 늘어난다"
                     % (total, moot, 100.0 * moot / total))
+    return out
+
+
+def parse_axis_lines(db):
+    """[6] 축의 출력 줄. **순수 함수** — selftest 가 직접 태울 수 있게 분리했다.
+
+    이 축이 보는 것: doc_worker 가 받아 둔 문서가 실제로 권리분석 데이터로
+    바뀌었는가. `load_rights_data.py` / `load_spec_data.py` 가 어떤 .bat 에도
+    예약 작업에도 없어서(2026-08-27 전수 grep) **손으로 돌린 날만** 채워진다.
+    이 축이 없으면 그 사실이 어디에도 안 보인다 — 큐는 done 이고 문서 파일도
+    있으니 다른 모든 지표가 초록이기 때문이다. `docs/BUGS.md` #245.
+    """
+    if db is None or db.get("parse_by_day") is None:
+        return ["      판정할 재료가 없다(DB 없음 또는 관련 테이블 부재)"]
+    out = []
+    for d, got, parsed in db["parse_by_day"]:
+        rate = (parsed * 100.0 / got) if got else 0.0
+        mark = "   <- ★ 파싱이 안 돌았다" if got and parsed == 0 else ""
+        out.append("      %s  수집 %4d건 / 파싱 %4d건 (%3.0f%%)%s"
+                   % (d, got, parsed, rate, mark))
+    out.append("      STATUS=READY 인데 권리분석 없음 : %s건 (그중 기일 남은 물건 %s건)"
+               % (db.get("status_ready_unparsed"), db.get("status_ready_unparsed_visible")))
+    out.append("      ※ `load_rights_data.py` / `load_spec_data.py` 는 어떤 .bat/예약 작업에도")
+    out.append("        없다. 손으로 돌린 날만 채워진다 - docs/BUGS.md #245")
     return out
 
 
@@ -447,6 +508,11 @@ def run_report():
             print("      남은 물건 %d건, 마지막 기일 %s"
                   % (db["future_items"], db["last_auction_date"]))
             print("      그 다음 날부터 기본 검색 결과가 0건이 된다.")
+
+    print()
+    print("[6] 파이프라인 마지막 단계 - 받은 문서가 권리분석으로 바뀌었는가")
+    for line in parse_axis_lines(db):
+        print(line)
 
     print()
     print("=" * 70)
@@ -556,6 +622,41 @@ def selftest():
                                   "queue_last_attempt_max": None})), 1)
     check("둘 다 없으면 판정하지 않는다(재료 없음)",
           len(queue_stall_signal({})), 0)
+
+    # --- [6] 파이프라인 마지막 단계 축 (2026-08-27, BUGS #245) -----------------
+    #     이 축이 조용히 사라지면 "문서는 받았는데 아무도 파싱하지 않는다"가
+    #     다시 안 보이게 된다. 그 자리를 순수 함수로 뽑아 두고 여기서 태운다.
+    print("--- selftest: [6] 파싱 축 ---")
+    _lines = parse_axis_lines({
+        "parse_by_day": [("2026-08-26", 16, 0), ("2026-08-25", 161, 161)],
+        "status_ready_unparsed": 16,
+        "status_ready_unparsed_visible": 0,
+    })
+    _blob = "\n".join(_lines)
+    check("파싱 0%인 날을 지목한다", "★ 파싱이 안 돌았다" in _blob, True)
+    check("100%인 날은 지목하지 않는다",
+          any("2026-08-25" in l and "★" not in l for l in _lines), True)
+    check("두 날짜가 모두 보고된다",
+          ("2026-08-26" in _blob) and ("2026-08-25" in _blob), True)
+    # ★ 여기서 그냥 "16건" 을 찾으면 안 된다 - 바로 위 일자별 줄이
+    #   "수집   16건 / 파싱    0건" 이라 **요약 줄을 통째로 지워도 통과한다**
+    #   (2026-08-27 변이 F4 로 확인한 사각지대). 요약 줄 자체를 지목한다.
+    _summary = [l for l in _lines if "STATUS=READY 인데 권리분석 없음" in l]
+    check("미파싱 요약 줄이 있다", len(_summary), 1)
+    check("요약이 미파싱 건수와 그중 가시 건수를 함께 말한다",
+          bool(_summary) and ("16건" in _summary[0]) and ("0건" in _summary[0]), True)
+    check("배선되지 않은 스크립트 이름을 지목한다",
+          ("load_rights_data.py" in _blob) and ("load_spec_data.py" in _blob), True)
+    # 대조군 - 전부 파싱된 날만 있으면 ★ 를 찍지 않는다(과잉 경보 방지)
+    _clean = "\n".join(parse_axis_lines({
+        "parse_by_day": [("2026-08-25", 161, 161)],
+        "status_ready_unparsed": 0, "status_ready_unparsed_visible": 0,
+    }))
+    check("전부 파싱된 상태에서는 ★ 를 찍지 않는다", "★ 파싱이 안 돌았다" in _clean, False)
+    # 재료가 없으면 판정하지 않는다
+    check("재료가 없으면 판정하지 않는다",
+          "판정할 재료가 없다" in "\n".join(parse_axis_lines(None)), True)
+    print()
 
     print()
     if fails:

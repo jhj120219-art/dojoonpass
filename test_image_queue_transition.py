@@ -97,8 +97,13 @@ def _fresh_db(tmp):
     (`test_worker_batching.py:_fresh_db` 와 같은 이유·같은 순서다. 반쪽 스키마로
      돌리면 종결이 예외로 떨어져 "수집 실패"처럼 보인다.)
     """
+    # ★ 경로 전환 수단은 `db.DB_PATH` 대입 **하나뿐**이다 (2026-08-26 확인).
+    #   예전에는 여기서 `os.environ["AUCTION_DB_PATH"]` 도 함께 세웠는데,
+    #   그 이름을 **읽는 코드가 저장소에 하나도 없다**(전수 grep). 즉 아무 효과가 없으면서
+    #   "환경변수가 DB 를 돌린다"고 오해하게 만드는 죽은 설정이었다 —
+    #   그렇게 믿고 아래 대입을 지우면 테스트가 **운영 DB 에 쓴다.**
+    #   (그 사고 자체는 `run_python_tests.py` 의 운영 DB 지문 감시가 따로 잡는다.)
     path = os.path.join(tmp, "auction.db")
-    os.environ["AUCTION_DB_PATH"] = path
     import storage.database as db
     import storage.migrate_v4_1 as mig
     import storage.migrations.run_migrations as runmig

@@ -91,7 +91,8 @@ const BID_RATE_OPTIONS = Array.from({ length: 10 }, (_, i) => String((i + 1) * 1
 // 면적(㎡) 구간. 2026-08-26 신설 — 백엔드 구현(migration 025)과 함께 열었다.
 //
 // 값은 임의로 고르지 않고 **실데이터 분위수**에서 잡았다
-// (auction_item 2,444행, 면적 보유 2,428행 실측):
+// (auction_item 2,444행. '면적 보유 2,428행(99.3%)' 은 **둘 중 하나라도 가진** 행 수이지
+//  각 컬럼의 보유율이 아니다 — 컬럼별로는 건물 60.0% / 토지 39.3% 다. `docs/BUGS.md` #239):
 //
 //   건물  p10 21 / p25 30 / p50 49 / p75 84 / p90 151 / p95 294 / p99 1,057
 //   토지  p10 151 / p25 330 / p50 870 / p75 2,766 / p90 8,382 / p95 18,540
@@ -364,8 +365,10 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
     if (Number(form.bidPriceMin) > 0) query.min_bid_price = Number(form.bidPriceMin)
     if (Number(form.bidPriceMax) > 0) query.max_bid_price = Number(form.bidPriceMax)
     // 2026-08-26 구현됨: auction_item.building_area / land_area (migration 025) +
-    // normalizer.extract_areas() 가 주소 원문에서 뽑는다. 실데이터 커버리지 99.3%.
-    // 면적을 못 뽑는 물건(차량/선박 등)은 NULL 이라 면적 조건을 주면 결과에서 빠진다.
+    // normalizer.extract_areas() 가 주소 원문에서 뽑는다.
+    // 한 물건은 건물면적 **또는** 토지면적 하나만 갖는다(둘 다 가진 행은 실데이터에 0건).
+    // 그래서 그 컬럼이 NULL 인 행 — 건물 조건이면 전답·임야, 토지 조건이면 아파트·오피스텔 —
+    // 은 결과에서 빠진다. 차량/선박(17행)만의 이야기가 아니다. `docs/BUGS.md` #239.
     if (form.buildingAreaMin) query.min_building_area = Number(form.buildingAreaMin)
     if (form.buildingAreaMax) query.max_building_area = Number(form.buildingAreaMax)
     if (form.landAreaMin) query.min_land_area = Number(form.landAreaMin)
@@ -680,8 +683,12 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           백엔드가 이제 이 파라미터를 실제로 읽는다 — migration 025 가 컬럼을,
           normalizer.extract_areas() 가 주소 원문에서 값을(실데이터 커버리지 99.3%),
           api/v1/search.py 가 WHERE 절을 맡는다.
-          면적을 뽑을 수 없는 물건(차량/선박/건설기계 16건)은 NULL 이라 면적 조건을
-          주면 결과에서 빠진다 — 조건을 지키지 않은 행을 섞어 주지 않는다. */}
+          한 물건은 두 면적 중 **하나만** 갖는다(둘 다 가진 행 0건, 2026-08-26 전수).
+          그래서 건물면적 조건은 토지형 1,023행(40.0%)을, 토지면적 조건은 건물형
+          1,552행(60.7%)을 뺀다 — 예전 주석은 '둘 다 없는' 17행(커버리지 99.3% 의
+          여집합)을 각 컬럼의 미보유 행 수로 잘못 옮겨 적은 것이었다.
+          두 면적을 함께 주면 백엔드가 **OR(합집합)** 로 읽는다 — AND 로 묶으면
+          만족 가능한 행이 구조적으로 0이라 항상 빈 결과였다(`docs/BUGS.md` #239). */}
       <SearchAccordionSection title="면적 조건" defaultOpen={false}>
         <RangeSelect
           label="건물면적"

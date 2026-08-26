@@ -12,7 +12,7 @@ from api.v1.thumbnails import image_url as _image_url
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter()
 
 def _area_of(row, key):
     """`row` 에서 면적 컬럼을 꺼낸다. 컬럼이 없는 DB 도 견딘다.
@@ -288,19 +288,41 @@ def _document_entry(item_id: int, row, doc_raw_by_type, item_row=None) -> dict:
     effective_status = "COLLECTING" if (measured and served_size is None) else status
     ready = effective_status == "READY"
 
+    # ★ 서빙 대상이 아닌 종류(IMAGE)에는 문서 URL 을 **주지 않는다**
+    #   (2026-08-26, `docs/BUGS.md` #241).
+    #
+    #   바로 아래 주석이 이미 규칙을 적어 두었는데 — *"열 수 없는 주소를 건네고 프런트가
+    #   404를 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다"* —
+    #   그 규칙이 `ready` 에만 걸려 있어서 **IMAGE 에는 적용되지 않았다.**
+    #
+    #   `document_status` 에는 `doc_type='IMAGE'` 행이 있고 그것이 READY 가 되므로,
+    #   응답은 `available:true` + `/api/v1/item/{id}/documents/IMAGE` 를 광고했다.
+    #   그런데 그 주소는 **400 "지원하지 않는 문서 종류입니다"** 다 — 사진은 문서가
+    #   아니라 `images[]` / `representative_image` 로 나간다(0~N장이라 단일 파일이 없다).
+    #   실측(2026-08-26): 사진을 가진 17물건 전부가 그 상태였고,
+    #   `audit_asset_integrity.py` [9] 가 "열리지 않음 17개"로 계속 붉었다.
+    #
+    #   프런트는 이 목록에서 IMAGE 를 걸러 내며 버티고 있었지만(`page.tsx` 의
+    #   `.filter(doc_type !== 'IMAGE')`), 그것은 **소비자 한 곳의 우회**일 뿐
+    #   API 계약은 여전히 거짓이었다. 서빙 계층(`DOC_TYPE_FILES`)을 진실의 원천으로
+    #   삼아 여기서 막는다 — 위 `servable` 이 이미 그 판정을 갖고 있다.
+    openable = ready and servable
+
     return {
         "doc_type": doc_type,
         "status": effective_status,
         # 화면이 "열람 가능"으로 다룰 수 있는가. 상태 문자열 비교를 프런트마다 따로
         # 하지 않도록 서버가 한 번만 판단한다.
-        "available": ready,
+        # ★ "열 수 있다"는 곧 아래 URL 을 줄 수 있다는 뜻이다 — 둘은 같은 주장이므로
+        #   같은 조건을 쓴다. (수집 상태 자체는 `status` 가 그대로 전한다.)
+        "available": openable,
         "page_count": raw["page_count"] if raw else None,
         "file_size": served_size,
         "doc_version": raw["doc_version"] if raw else None,
         # READY가 아니면 URL을 주지 않는다. 열 수 없는 주소를 건네고 프런트가 404를
         # 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다.
-        "viewer_url": _document_url(item_id, doc_type) if ready else None,
-        "download_url": _document_url(item_id, doc_type) if ready else None,
+        "viewer_url": _document_url(item_id, doc_type) if openable else None,
+        "download_url": _document_url(item_id, doc_type) if openable else None,
     }
 
 

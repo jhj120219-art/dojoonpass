@@ -103,12 +103,25 @@ export function parseArea(fullAddress: string | null): ParsedArea | null {
   //   파싱을 잃은 행 0개.
   const landRightsAt = inside.search(/대지권|토지의\s*표시|대지의\s*표시/)
   const areaScope = landRightsAt >= 0 ? inside.slice(0, landRightsAt) : inside
-  const areaRe = /([0-9]+(?:\.[0-9]+)?)\s*(?:㎡|m2|m²)/g
+  // ★ 2026-08-26 — 천단위 쉼표를 받는다 (`docs/BUGS.md` #240).
+  //
+  //   예전 정규식은 `[0-9]+` 라 쉼표에서 끊겼고, **쉼표 뒤부터** 매치됐다:
+  //
+  //       "1층 3,005.35㎡"   ->    5.35㎡   (562배 축소)
+  //       "1층 1,000㎡"      ->       0㎡   ★ 면적이 0 으로 보인다
+  //       "1층 12,345.67㎡"  ->  345.67㎡
+  //
+  //   실데이터 id=443(평택 공장)이 그랬다 — 지1층 3,005.35 + 1층 6,110.75 +
+  //   2층 5,322.75 = 14,438.85㎡ 인 건물이 카드에 **438.85㎡** 로 찍혔다.
+  //   백엔드(`normalizer.extract_areas`)는 처음부터 `[0-9][0-9,]*` 로 옳게 읽고
+  //   있었다 — **같은 규칙의 두 구현이 갈라져 있었다**(BUGS #204 가 경계하는 그것).
+  //   여기서 백엔드 정규식과 같은 모양으로 맞춘다.
+  const areaRe = /([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:㎡|m2|m²)/g
   let total = 0
   let count = 0
   let m: RegExpExecArray | null
   while ((m = areaRe.exec(areaScope)) !== null) {
-    total += Number(m[1])
+    total += Number(m[1].replace(/,/g, ''))
     count += 1
   }
   if (count === 0) return null

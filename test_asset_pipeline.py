@@ -2749,6 +2749,106 @@ def test_ready_document_without_served_file_is_not_advertised():
     finally:
         env.close()
 
+
+def test_every_advertised_document_url_actually_opens():
+    """상세가 광고한 문서 URL 은 **전부 실제로 열려야 한다** (2026-08-26, docs/BUGS.md #241).
+
+    ## 무엇이 틀려 있었나
+
+    `document_status` 에는 `doc_type='IMAGE'` 행이 있고 사진을 받으면 READY 가 된다.
+    그런데 사진은 **문서가 아니다** — 0~N장이라 단일 서빙 파일이 없고,
+    `api/v1/documents.py:DOC_TYPE_FILES` 에도 IMAGE 가 없다. 그래서 응답은
+
+        {"doc_type":"IMAGE","status":"READY","available":true,
+         "viewer_url":"/api/v1/item/1450/documents/IMAGE"}
+
+    라고 광고했는데 그 주소는 **400 "지원하지 않는 문서 종류입니다"** 였다.
+    실측(2026-08-26 운영 DB): 사진을 가진 **17물건 전부**가 그 상태.
+
+    바로 그 자리 주석이 규칙을 이미 적어 두었다 — *"열 수 없는 주소를 건네고 프런트가
+    404를 받아 보게 하는 것보다, 없다는 사실을 응답에 담는 편이 정직하다."*
+    그 규칙이 `ready` 에만 걸려 있어 **서빙 불가 종류에는 적용되지 않았다.**
+
+    ## 왜 프런트가 멀쩡했는데도 결함인가
+
+    `page.tsx` 가 `.filter(doc_type !== 'IMAGE')` 로 걸러 내며 버티고 있었다. 그러나
+    그것은 **소비자 한 곳의 우회**이고 API 계약은 여전히 거짓이었다 —
+    `audit_asset_integrity.py` [9] 는 그 우회를 모르므로 "열리지 않음 17개"로 계속 붉었다.
+
+    ## 이 검사가 고정하는 것
+
+    종류 이름을 손으로 적지 않는다. **광고된 URL 을 전부 실제로 호출해** 200 인지 본다.
+    새 doc_type 이 늘어도 규칙이 그대로 적용된다.
+    """
+    print("\n--- 17c. 광고한 문서 URL 이 전부 열리는가 (BUGS #241) ---")
+    from fastapi.testclient import TestClient
+    import crawler.doc_paths as _dp
+    from api.v1.documents import DOC_TYPE_FILES
+    env = Env()
+    try:
+        court, case_no, item_no = env.seed_item(item_id=1)
+        from api_server import app
+        client = TestClient(app)
+
+        # 서빙 가능한 문서 3종은 **실물 파일까지** 만들어 READY 로 둔다.
+        d1 = _dp.get_doc_dir(court, case_no, item_no)
+        os.makedirs(d1, exist_ok=True)
+        c = env.conn()
+        for dt, (fname, _mime) in DOC_TYPE_FILES.items():
+            with open(os.path.join(d1, fname), "wb") as fh:
+                fh.write(b"x" * 2048)
+            c.execute("INSERT INTO document_status (item_id,doc_type,status)"
+                      " VALUES (1,?, 'READY')", (dt,))
+        # 사진: 문서가 아니지만 document_status 에는 READY 로 들어온다(실데이터 그대로).
+        c.execute("INSERT INTO document_status (item_id,doc_type,status)"
+                  " VALUES (1,'IMAGE','READY')")
+        c.commit()
+        c.close()
+
+        body = client.get("/api/v1/item/1").json()
+        docs = body["documents"]
+        by_type = {d["doc_type"]: d for d in docs}
+
+        # 전제 - 검사가 공허하지 않다(광고된 URL 이 실제로 몇 개는 있어야 한다).
+        advertised = [d for d in docs if d["viewer_url"] or d["download_url"]]
+        check_true("전제: 광고된 문서 URL 이 하나 이상이다 (%d개)" % len(advertised),
+                   len(advertised) >= len(DOC_TYPE_FILES),
+                   [d["doc_type"] for d in advertised])
+
+        # ★ 핵심 - 광고한 URL 은 전부 열린다.
+        for d in advertised:
+            for field in ("viewer_url", "download_url"):
+                url = d[field]
+                if not url:
+                    continue
+                r = client.get(url)
+                check("★ %s 의 %s 가 실제로 200 이다" % (d["doc_type"], field),
+                      r.status_code, 200)
+
+        # ★ IMAGE 는 서빙 대상이 아니므로 URL 을 주지 않는다.
+        img = by_type.get("IMAGE")
+        check_true("IMAGE 행이 응답에 있다", img is not None)
+        if img is not None:
+            check("★ IMAGE 는 viewer_url 을 주지 않는다", img["viewer_url"], None)
+            check("★ IMAGE 는 download_url 을 주지 않는다", img["download_url"], None)
+            check("★ IMAGE 는 available=False (열 수 있다고 말하지 않는다)",
+                  img["available"], False)
+            # 수집 상태 자체는 그대로 전한다 - 없애 버리면 화면이 상태를 못 읽는다.
+            check("IMAGE 의 수집 상태(READY)는 그대로 남는다", img["status"], "READY")
+
+        # 대조군 - 그 주소가 정말 열리지 않는다는 것을 확인한다.
+        # (이것이 없으면 "URL 을 안 준다"가 과잉 방어인지 알 수 없다.)
+        r = client.get("/api/v1/item/1/documents/IMAGE")
+        check_true("대조군: /documents/IMAGE 는 실제로 200 이 아니다 (%d)" % r.status_code,
+                   r.status_code != 200, r.status_code)
+
+        # 사진은 사진 경로로 나간다 - 기능이 사라진 것이 아니다.
+        check_true("사진은 images[] 로 여전히 나간다",
+                   isinstance(body.get("images"), list))
+    finally:
+        env.close()
+
+
 def test_oversized_ids_are_404_not_500():
     """SQLite INTEGER 범위를 벗어난 id에 **인증 없이 500을 만들 수 있었다.**
 
@@ -5359,6 +5459,7 @@ if __name__ == "__main__":
     test_file_size_describes_what_download_url_serves()
     test_stored_resolution_is_never_lower_than_the_source()
     test_ready_document_without_served_file_is_not_advertised()
+    test_every_advertised_document_url_actually_opens()
 
     print("\n" + "=" * 55)
     if failures:

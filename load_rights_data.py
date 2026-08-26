@@ -14,7 +14,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage.database import get_connection
+from storage.database import get_connection, chunked_for_sql
 from api.v1.documents import get_doc_dir
 
 
@@ -147,15 +147,21 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     if not missing_file_item_ids:
         return 0
 
-    placeholders = ",".join("?" * len(missing_file_item_ids))
-    removed = conn.execute(
-        "DELETE FROM rights_summary WHERE item_id IN (%s)" % placeholders,
-        missing_file_item_ids,
-    ).rowcount
-    removed += conn.execute(
-        "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)" % placeholders,
-        missing_file_item_ids,
-    ).rowcount
+    # ★ 한 문장에 몰아넣지 않는다 (2026-08-27, `docs/BUGS.md` #243).
+    #   `missing_file_item_ids` 는 상한이 없다 — documents/ 가 부분적으로 유실되면
+    #   물건 수만큼 커진다. SQLite 의 바인딩 변수 상한을 넘으면 정리 자체가
+    #   `too many SQL variables` 로 죽는다. 상한은 이 커넥션에 직접 물어본다.
+    removed = 0
+    for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
+        placeholders = ",".join("?" * len(chunk))
+        removed += conn.execute(
+            "DELETE FROM rights_summary WHERE item_id IN (%s)" % placeholders,
+            chunk,
+        ).rowcount
+        removed += conn.execute(
+            "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)" % placeholders,
+            chunk,
+        ).rowcount
     conn.commit()
     return removed
 

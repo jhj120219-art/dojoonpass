@@ -13,6 +13,8 @@ import한다. 두 부분으로 나뉜다:
 """
 import sys
 import os
+import contextlib
+import io
 import shutil
 import tempfile
 
@@ -686,6 +688,183 @@ def test_migrate_reports_actual_changes():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_migrate_survives_more_cases_than_sql_variable_limit():
+    """유니크 사건이 SQLite 바인딩 변수 상한을 넘어도 매일 크롤이 죽지 않는다
+    (2026-08-27, `docs/BUGS.md` #243).
+
+    ## 무엇이 틀려 있었나
+
+    Sprint 129 가 N+1 을 없애며 `(court_code, case_no)` 쌍 **전부**를 한 문장의
+    `IN ((?,?),(?,?),...)` 에 넣었다. 쌍당 `?` 가 2개라 SQLite 의
+    `SQLITE_LIMIT_VARIABLE_NUMBER`(이 환경 32,766)에 **유니크 사건 16,384건째**로 닿는다.
+
+        실측(사본, 합성 사건)   16,383건 -> 정상
+                                16,384건 -> OperationalError: too many SQL variables
+
+    넘으면 느려지는 것이 아니라 **실행이 죽는다.** rollback 자체는 깨끗해서
+    부분 커밋은 없지만(auction_case/item/document_status 전부 0건),
+    **그날 크롤 결과가 통째로 버려지고** `run_daily.bat` 은 `[FAILED]` 만 남긴다.
+
+    ## 왜 16,384행을 만들어 검사하지 않는가
+
+    그 규모의 씨앗을 매 실행마다 만들면 테스트가 수십 초씩 걸린다. 대신
+    **상한 자체를 낮춘다** — `sqlite3.Connection.setlimit()` 으로
+    `SQLITE_LIMIT_VARIABLE_NUMBER` 를 작게 만들면 적은 행으로 **같은 경계**를 넘는다.
+    이것은 흉내가 아니라 진짜 같은 제약이다(넘으면 같은 `OperationalError` 가 난다).
+
+    ## 대조군을 함께 둔다
+
+    상한을 낮춘 상태에서 **수정 전 코드였다면 반드시 죽는** 규모를 쓴다.
+    그리고 나눠서 조회해도 결과가 같은지(사건/물건/문서 건수)를 함께 못박는다 —
+    "죽지 않는다"만 보면 조각을 잃어버리는 구현도 통과한다.
+    """
+    print("\n--- 10. SQL 변수 상한을 넘는 사건 수 (BUGS #243) ---")
+    import sqlite3
+    import migrate_execute
+
+    real_path = dbmod.DB_PATH
+    tmp_dir = tempfile.mkdtemp(prefix="kokchal_varlimit_")
+    tmp_db = os.path.join(tmp_dir, "scratch.db")
+    shutil.copy2(real_path, tmp_db)
+    dbmod.DB_PATH = tmp_db
+
+    # 이 검사 동안만 커넥션의 변수 상한을 낮춘다. `get_connection()` 을 감싼다.
+    # ★ 상한을 **너무** 낮추면 안 된다 (2026-08-27 변이로 확인).
+    #   처음엔 40 으로 잡았는데, 그러면 청크 크기가 `max(1, (40-64)//n)` 의 클램프에
+    #   걸려 **n 이 뭐든 1** 이 된다. 그래서 `vars_per_item` 을 1 로 잘못 세는 변이(D3)가
+    #   그대로 통과했다 — 낮춘 상한 자체가 검사를 무디게 만든 것이다.
+    #   여유분(64)보다 넉넉히 큰 값으로 잡아 청크 산식이 실제로 계산되게 한다.
+    LOWERED = 200                     # (200-64)//2 = 쌍 68개씩 -> 136변수, 상한 안
+    N_CASES = 200                     # 쌍 200개 = 400변수 -> 수정 전이면 확실히 죽는다
+    orig_get_conn = dbmod.get_connection
+
+    def lowered_get_connection(*a, **kw):
+        c = orig_get_conn(*a, **kw)
+        c.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, LOWERED)
+        return c
+
+    try:
+        # 전제 1: 상한 축소가 실제로 먹는가 (안 먹으면 이 검사는 공허하다)
+        probe = lowered_get_connection()
+        try:
+            hit = False
+            try:
+                probe.execute("SELECT 1 WHERE 1 IN (%s)" % ",".join("?" * (LOWERED + 1)),
+                              [1] * (LOWERED + 1))
+            except sqlite3.OperationalError:
+                hit = True
+            _check_true("전제: 상한 축소가 실제로 적용된다(%d개 초과에서 거부)" % LOWERED, hit)
+        finally:
+            probe.close()
+
+        # ── 헬퍼 자체의 계약 (여기서만 fallback 경로를 태울 수 있다) ──────────
+        #   위 시나리오는 항상 `conn` 을 넘기므로, `conn` 이 없을 때의 보수적 하한은
+        #   그 경로로는 한 번도 실행되지 않는다. 변이 D6(하한을 32766 으로 키움)이
+        #   그래서 생존했다 — 직접 못박는다.
+        from storage.database import (chunked_for_sql, sql_variable_limit,
+                                      SQLITE_MAX_VARIABLES_FALLBACK)
+        _check_true("헬퍼: conn 없이는 보수적 하한(999)을 쓴다",
+                    sql_variable_limit(None) == 999
+                    and SQLITE_MAX_VARIABLES_FALLBACK == 999,
+                    (sql_variable_limit(None), SQLITE_MAX_VARIABLES_FALLBACK))
+        _probe = lowered_get_connection()
+        try:
+            _check_true("헬퍼: conn 을 주면 그 커넥션의 실제 상한을 쓴다",
+                        sql_variable_limit(_probe) == LOWERED, sql_variable_limit(_probe))
+            # 어떤 vars_per_item 이든 청크가 상한을 넘지 않아야 한다.
+            for _vpi in (1, 2, 3):
+                _sizes = [len(c) for c in chunked_for_sql(range(500), vars_per_item=_vpi,
+                                                          conn=_probe)]
+                _worst = max(_sizes) * _vpi
+                _check_true("헬퍼: vars_per_item=%d 청크가 상한을 넘지 않는다 (최대 %d변수 <= %d)"
+                            % (_vpi, _worst, LOWERED), _worst <= LOWERED, (_sizes[:3], _worst))
+                _check_true("헬퍼: vars_per_item=%d 에서 항목을 잃지 않는다" % _vpi,
+                            sum(_sizes) == 500, sum(_sizes))
+        finally:
+            _probe.close()
+
+        # 씨앗: 유니크 사건 N_CASES 개 (사건당 물건 1개)
+        dbmod.upsert_batch([
+            {"court_code": "QA-VL-%02d" % (i % 7), "court_name": "QA법원",
+             "case_no": "QA-VARLIMIT-%05d" % i, "item_no": "1",
+             "full_address": "서울 강남구 역삼동 %d [집합건물 50㎡]" % i}
+            for i in range(N_CASES)
+        ])
+
+        conn = orig_get_conn()
+        try:
+            seeded = conn.execute(
+                "SELECT COUNT(DISTINCT court_code || '|' || case_no) FROM auction"
+                " WHERE case_no LIKE 'QA-VARLIMIT-%'").fetchone()[0]
+        finally:
+            conn.close()
+        _check_true("전제: 유니크 사건 %d건이 씨앗으로 들어갔다 (실제 %d)" % (N_CASES, seeded),
+                    seeded == N_CASES, seeded)
+        _check_true("전제: 그 수가 낮춘 상한을 실제로 넘는다 (%d쌍 x 2 > %d)"
+                    % (seeded, LOWERED), seeded * 2 > LOWERED)
+
+        # ★ 본 검사 — 상한을 낮춘 채로 execute() 가 끝까지 간다
+        dbmod.get_connection = lowered_get_connection
+        migrate_execute.get_connection = lowered_get_connection
+        err = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                migrate_execute.execute()
+        except Exception as exc:      # noqa: BLE001
+            err = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+        finally:
+            dbmod.get_connection = orig_get_conn
+            migrate_execute.get_connection = orig_get_conn
+
+        _check_true("★ 상한을 넘는 사건 수에서도 죽지 않는다", err is None, err)
+
+        # ★ 죽지 않는 것만으로는 부족하다 — 조각을 잃지 않았는가
+        conn = orig_get_conn()
+        try:
+            got_case = conn.execute(
+                "SELECT COUNT(*) FROM auction_case WHERE case_no LIKE 'QA-VARLIMIT-%'"
+            ).fetchone()[0]
+            got_item = conn.execute(
+                "SELECT COUNT(*) FROM auction_item WHERE case_no LIKE 'QA-VARLIMIT-%'"
+            ).fetchone()[0]
+            got_ds = conn.execute(
+                "SELECT COUNT(*) FROM document_status ds"
+                " JOIN auction_item ai ON ds.item_id = ai.id"
+                " WHERE ai.case_no LIKE 'QA-VARLIMIT-%'").fetchone()[0]
+        finally:
+            conn.close()
+        check("★ 사건이 전부 만들어졌다(청크 경계에서 잃지 않는다)", got_case, N_CASES)
+        check("★ 물건이 전부 만들어졌다", got_item, N_CASES)
+        check("★ 문서 상태 3종이 전부 만들어졌다", got_ds, N_CASES * 3)
+
+        # 재실행 멱등성 — 나눠 조회해도 중복이 생기지 않는다
+        dbmod.get_connection = lowered_get_connection
+        migrate_execute.get_connection = lowered_get_connection
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                migrate_execute.execute()
+        finally:
+            dbmod.get_connection = orig_get_conn
+            migrate_execute.get_connection = orig_get_conn
+        conn = orig_get_conn()
+        try:
+            again_case = conn.execute(
+                "SELECT COUNT(*) FROM auction_case WHERE case_no LIKE 'QA-VARLIMIT-%'"
+            ).fetchone()[0]
+            again_item = conn.execute(
+                "SELECT COUNT(*) FROM auction_item WHERE case_no LIKE 'QA-VARLIMIT-%'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        check("재실행해도 사건이 늘지 않는다(멱등)", again_case, N_CASES)
+        check("재실행해도 물건이 늘지 않는다(멱등)", again_item, N_CASES)
+    finally:
+        dbmod.get_connection = orig_get_conn
+        migrate_execute.get_connection = orig_get_conn
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def run():
     test_real_db_integrity_invariants()
     test_document_queue_writes_are_court_scoped()
@@ -696,6 +875,7 @@ def run():
     test_migrate_exit_code_contract()
     test_dryrun_predicts_what_execute_does()
     test_migrate_reports_actual_changes()
+    test_migrate_survives_more_cases_than_sql_variable_limit()
 
     print("\n" + "=" * 55)
     if failures:

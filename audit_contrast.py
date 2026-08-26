@@ -111,7 +111,25 @@ function effOpacity(el){
   return o;
 }
 
-var out = [], seen = 0;
+// ★ 컬러 이모지는 **CSS `color` 로 판정할 수 없다** (2026-08-26, docs/BUGS.md #242).
+//
+//   이모지 표현(emoji presentation)을 가진 문자는 폰트가 **자체 색 글리프**로 그린다 —
+//   `getComputedStyle(el).color` 는 그 픽셀과 아무 상관이 없다. 그런데 이 도구는
+//   그 값을 전경색으로 믿고 배경과 비교했다. 실제로 `🤍`(즐겨찾기 안 됨)가
+//   상속된 `rgb(237,237,237)` 로 읽혀 **1.17:1 위반 40곳**으로 집계됐다.
+//   그 숫자는 측정이 아니라 잡음이고, 잡음이 섞이면 나머지 진짜 부채까지 못 믿게 된다.
+//
+//   그렇다고 **조용히 버리지도 않는다** — `🤍` 를 흰 카드 위에 두는 것이 잘 보이느냐는
+//   실제로 남아 있는 질문이다(WCAG 1.4.3 텍스트가 아니라 1.4.11 비텍스트 대비 쪽 논점).
+//   그래서 위반이 아니라 **'판정 불가(emoji)'** 로 따로 세어 보고한다 —
+//   `run_python_tests.py` 가 SKIPPED 와 PASSED 를 절대 합치지 않는 것과 같은 이유다.
+//   범위(\u2600-\u27BF 같은)로 자르면 `✓`(U+2713)·`▼` 처럼 **텍스트 표현**이
+//   기본인 기호까지 빨려 들어가 측정에서 빠진다. 그건 반대 방향의 오류다.
+//   그래서 유니코드 속성으로 정확히 고른다 - `Emoji_Presentation`(기본이 이모지)
+//   또는 `U+FE0F`(이모지 표현을 강제하는 변이 선택자)가 붙은 것만.
+var EMOJI_RE = /\p{Emoji_Presentation}|\uFE0F/u;
+
+var out = [], seen = 0, emoji = [];
 var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
 var node;
 while ((node = walker.nextNode())){
@@ -127,6 +145,14 @@ while ((node = walker.nextNode())){
   // sr-only 등 화면에서 안 보이는 것은 제외
   if (r.width <= 2 && r.height <= 2) continue;
   seen++;
+
+  // 이모지가 섞인 노드는 CSS color 로 판정하지 않는다(위 주석). 따로 센다.
+  if (EMOJI_RE.test(txt)){
+    emoji.push({ text: txt.slice(0, 34), tag: el.tagName,
+                 cls: (el.className || '').toString().slice(0, 52),
+                 size: parseFloat(cs.fontSize) });
+    continue;
+  }
 
   var fg = parse(cs.color); if (!fg) continue;
   var bg = bgOf(el);
@@ -150,7 +176,7 @@ while ((node = walker.nextNode())){
     });
   }
 }
-return { seen: seen, bad: out, probe: {
+return { seen: seen, bad: out, emoji: emoji, probe: {
      'lab':   parse('lab(54.1736 13.3368 -74.6839)'),
      'oklch': parse('oklch(0.623 0.214 259.815)'),
      'hex':   parse('#767676'),
@@ -372,6 +398,7 @@ def main():
         return 2
     total_seen = 0
     all_bad = []
+    all_emoji = []
     per_screen = []      # (경로, 잰 텍스트 노드 수) - 재지 못한 화면을 구분하기 위해 (#193)
     try:
         AV.set_viewport(drv, WIDTH, 1000)
@@ -427,8 +454,12 @@ def main():
             for b in r["bad"]:
                 b["path"] = path.split("?")[0]
             all_bad.extend(r["bad"])
-            print("  %-10s 텍스트 노드 %4d개 검사 / 기준 미달 %d개"
-                  % (path.split("?")[0], r["seen"], len(r["bad"])))
+            for e in r.get("emoji", []):
+                e["path"] = path.split("?")[0]
+            all_emoji.extend(r.get("emoji", []))
+            print("  %-10s 텍스트 노드 %4d개 검사 / 기준 미달 %d개 / 판정 불가(emoji) %d개"
+                  % (path.split("?")[0], r["seen"], len(r["bad"]),
+                     len(r.get("emoji", []))))
     finally:
         try:
             drv.quit()
@@ -436,7 +467,26 @@ def main():
             pass
 
     print()
-    print("  합계: 텍스트 노드 %d개 / 기준 미달 %d개" % (total_seen, len(all_bad)))
+    print("  합계: 텍스트 노드 %d개 / 기준 미달 %d개 / 판정 불가(emoji) %d개"
+          % (total_seen, len(all_bad), len(all_emoji)))
+
+    # ★ 판정 불가를 **통과로도 위반으로도 세지 않는다** (2026-08-26, docs/BUGS.md #242).
+    #   컬러 이모지는 폰트가 자체 색으로 그리므로 CSS `color` 로 명암비를 낼 수 없다.
+    #   예전에는 상속된 color 를 전경색으로 믿고 `🤍` 를 1.17:1 위반 40곳으로 셌다 —
+    #   측정이 아니라 잡음이었다. 그렇다고 지우지도 않는다: 흰 하트를 흰 카드에 두는 것이
+    #   보이느냐는 남아 있는 질문이고(WCAG 1.4.11 비텍스트 대비), 눈으로 볼 사람이
+    #   있어야 판단할 수 있다. 그래서 **여기 남긴다.**
+    if all_emoji:
+        eg = defaultdict(list)
+        for e in all_emoji:
+            eg[(e["text"], round(e.get("size") or 0, 1))].append(e)
+        print()
+        print("  판정 불가 - 컬러 이모지 (CSS color 로 명암비를 낼 수 없다. 눈으로 볼 것)")
+        print("  " + "-" * 88)
+        for (txt, size), items in sorted(eg.items(), key=lambda kv: -len(kv[1])):
+            print(console_safe("    %-6s %gpx  %d곳   예: %s  %s"
+                               % (txt, size, len(items), items[0]["path"],
+                                  items[0]["cls"][:44])))
 
     code, why = contrast_verdict(per_screen, all_bad)
     if code == 2:

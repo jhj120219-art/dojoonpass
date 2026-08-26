@@ -141,6 +141,49 @@ def test_corrupted_file_does_not_crash_get():
     check_true("get() on corrupted file does not raise", not raised)
     check("get() on corrupted file returns None (treated as no checkpoint)", result, None)
 
+    # ★ 죽지 않는 것만으로는 부족하다 — **보이는가** (2026-08-27, docs/BUGS.md #244).
+    #
+    #   이 폴백은 "60개 법원을 전부 처음부터 다시 긁는다"는 뜻이다. 그런데 예전에는
+    #   `except Exception: return {}` 이라 **로그가 한 줄도 남지 않았다**(실측: 빈 문자열).
+    #   운영자는 밤새 돈 재크롤을 보고도 원인을 알 수 없었다. 위 테스트는 "크래시하지
+    #   않는다"만 봤기 때문에 그 침묵을 통과시켰다.
+    import logging as _logging
+    import io as _io
+    _buf = _io.StringIO()
+    _h = _logging.StreamHandler(_buf)
+    _cp_logger = _logging.getLogger("storage.checkpoint")
+    _prev_level, _prev_prop = _cp_logger.level, _cp_logger.propagate
+    _cp_logger.addHandler(_h)
+    _cp_logger.setLevel(_logging.DEBUG)
+    try:
+        with open(QA_PATH, "w", encoding="utf-8") as f:
+            f.write('{"법원A": {"last_case_no": "2026타')      # 반쯤 잘린 JSON
+        _buf.truncate(0); _buf.seek(0)
+        again = CheckpointManager(path=QA_PATH)._load_all()
+        logged = _buf.getvalue()
+        check("손상 파일은 여전히 빈 dict 로 폴백한다(동작 무변경)", again, {})
+        check_true("★ 손상을 읽지 못했다는 사실이 로그에 남는다", bool(logged.strip()),
+                   repr(logged))
+        check_true("★ 로그가 '전부 다시 수집한다'는 결과를 말한다",
+                   "다시 수집" in logged, repr(logged[:160]))
+        check_true("★ 로그에 경로가 들어 있다(어느 파일인지 알 수 있다)",
+                   QA_PATH in logged or os.path.basename(QA_PATH) in logged,
+                   repr(logged[:160]))
+
+        # 대조군 — **파일이 없는 정상 첫 실행은 조용해야 한다.**
+        #   매일 남는 소음은 진짜 신호를 묻는다.
+        if os.path.exists(QA_PATH):
+            os.remove(QA_PATH)
+        _buf.truncate(0); _buf.seek(0)
+        empty = CheckpointManager(path=QA_PATH)._load_all()
+        check("파일이 없으면 빈 dict", empty, {})
+        check_true("★ 파일이 없는 것은 사고가 아니므로 로그를 남기지 않는다",
+                   _buf.getvalue().strip() == "", repr(_buf.getvalue()))
+    finally:
+        _cp_logger.removeHandler(_h)
+        _cp_logger.setLevel(_prev_level)
+        _cp_logger.propagate = _prev_prop
+
 
 def test_write_failure_does_not_stop_the_crawl():
     """저장 실패가 **크롤을 멈추지 않는가** (2026-08-13 Sprint 85 신설).

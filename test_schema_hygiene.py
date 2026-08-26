@@ -1858,6 +1858,156 @@ def _sql_text_interpolations(root):
     return fstr, pct, cat
 
 
+def _names_bound_only_to_str_literals(tree):
+    """이 모듈에서 **문자열 리터럴로만** 묶이는 지역 이름들.
+
+    `for lo_sql, hi_sql, lo, hi in (("building_area >= ?", ...), ...)` 처럼
+    리터럴 튜플을 풀어 담는 형태를 인정하기 위한 것이다. 같은 이름이 한 번이라도
+    리터럴이 아닌 것에 묶이면 **후보에서 뺀다**(의심스러우면 통과시키지 않는다).
+    """
+    import ast
+    ok, bad = set(), set()
+
+    def note(target, value):
+        if isinstance(target, ast.Name):
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                ok.add(target.id)
+            else:
+                bad.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            vals = value.elts if isinstance(value, (ast.Tuple, ast.List)) else None
+            for i, el in enumerate(target.elts):
+                note(el, vals[i] if vals is not None and i < len(vals) else None)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                note(t, node.value)
+        elif isinstance(node, ast.For):
+            # 리터럴 튜플들의 튜플/리스트를 순회하는 경우만 인정한다.
+            it = node.iter
+            rows = it.elts if isinstance(it, (ast.Tuple, ast.List)) else []
+            if not rows:
+                for n2 in ast.walk(node.target):
+                    if isinstance(n2, ast.Name):
+                        bad.add(n2.id)
+                continue
+            for row in rows:
+                note(node.target, row)
+    return ok - bad
+
+
+# ---------------------------------------------------------------------------
+# `IN (...)` 을 만드는 지점마다 **변수 상한**을 넘지 않는가 (2026-08-27, BUGS #243)
+#
+# SQLite 는 한 문장의 `?` 개수에 상한이 있다(`SQLITE_LIMIT_VARIABLE_NUMBER`,
+# 이 환경 32,766 / 3.31 이하 기본값 999). 넘으면 느려지는 것이 아니라
+# `OperationalError: too many SQL variables` 로 **실행이 죽는다.**
+#
+# 실제로 그것이 매일 크롤을 통째로 죽일 수 있는 자리였다 — `migrate_execute.py` 가
+# `(court_code, case_no)` 쌍 전부를 한 문장에 몰아넣어, 유니크 사건 16,384건째부터
+# 파이프라인 전체가 실패했다(실측: 16,383 정상 / 16,384 파손, 결과는 전 테이블 0건).
+#
+# 그래서 **새 지점이 생기면 사람이 한 번 판단하게** 만든다. 각 지점은 둘 중 하나여야 한다:
+#   (a) 입력 크기가 구조적으로 작다 (모듈 상수, 페이지 크기 상한 등)  -> 근거를 적는다
+#   (b) `chunked_for_sql()` 로 나눈다                                  -> `len(chunk)` 가 보인다
+#
+# 목록을 손으로 관리하는 대신 **AST 로 전수 추출**하고 인벤토리와 대조한다 —
+# 이 파일의 다른 SQL 감사(`ALLOWED_SQL_*`)와 같은 방식이다.
+# ---------------------------------------------------------------------------
+SQL_PLACEHOLDER_SITES = {
+    # (파일, len() 인자 소스) -> 왜 안전한가
+    ("api/v1/payments.py", "len(log_ids)"):
+        "한 결제의 payment_logs 행. 결제 1건당 로그 수는 작다(상태 전이 횟수).",
+    ("api/v1/search.py", "len(ids)"):
+        "한 페이지의 결과 id. `size` 가 Query(le=100) 로 막혀 있어 최대 100.",
+    ("api/v1/search.py", "len(patterns)"):
+        "물건종류 별칭 패턴. PROPERTY_TYPE_ALIASES 기반 모듈 상수에서 파생, 수십 개.",
+    ("api/v1/thumbnails.py", "len(ids)"):
+        "호출부가 넘기는 한 페이지의 물건 id. search 와 같은 상한(<=100).",
+    ("load_rights_data.py", "len(chunk)"):
+        "chunked_for_sql() 로 나눈 조각 (BUGS #243).",
+    ("load_spec_data.py", "len(chunk)"):
+        "chunked_for_sql() 로 나눈 조각 (BUGS #243).",
+    ("migrate_execute.py", "len(MIGRATED_DOC_TYPES)"):
+        "모듈 상수 튜플(3개).",
+    ("migrate_execute.py", "len(key_chunk)"):
+        "chunked_for_sql(vars_per_item=2) 로 나눈 조각 (BUGS #243).",
+    ("step11_setup.py", "len(TARGET_COURTS)"):
+        "일회성 조사 스크립트의 모듈 상수.",
+    ("storage/database.py", "len(QUEUE_CLAIMABLE_STATUSES)"):
+        "모듈 상수 튜플(2개).",
+    ("storage/database.py", "len(saved_seqs)"):
+        "한 물건의 사진 순번. 법원 캐러셀 장수라 수십 장 규모.",
+}
+
+
+def _placeholder_len_arg(node):
+    """`"?" * len(X)` / `["(?,?)"] * len(X)` 이면 `len(X)` 의 소스를 돌려준다."""
+    import ast
+    if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Mult):
+        return None
+    for a, b in ((node.left, node.right), (node.right, node.left)):
+        lit = None
+        if isinstance(a, ast.Constant) and isinstance(a.value, str) and "?" in a.value:
+            lit = a
+        elif (isinstance(a, ast.List) and a.elts
+              and isinstance(a.elts[0], ast.Constant)
+              and isinstance(a.elts[0].value, str) and "?" in a.elts[0].value):
+            lit = a
+        if lit is not None:
+            return ast.unparse(b)
+    return None
+
+
+def test_sql_placeholder_sites_are_bounded_or_chunked():
+    print("\n--- `IN (...)` 변수 상한 인벤토리 (BUGS #243) ---")
+    import ast
+    root = os.path.dirname(os.path.abspath(__file__))
+    skip_dirs = {"node_modules", ".git", "__pycache__", ".next", ".claude"}
+    found = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in skip_dirs]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            rel = os.path.relpath(os.path.join(dp, f), root).replace("\\", "/")
+            # 테스트 파일은 제품 경로가 아니다.
+            if rel.startswith("test_") or "/test_" in rel or rel.startswith("tests/"):
+                continue
+            try:
+                with open(os.path.join(dp, f), "rb") as fh:
+                    tree = ast.parse(fh.read().decode("utf-8-sig"))
+            except Exception:      # noqa: BLE001 - 파싱 못 하는 파일은 다른 검사가 잡는다
+                continue
+            for node in ast.walk(tree):
+                arg = _placeholder_len_arg(node)
+                if arg:
+                    found.setdefault((rel, arg), []).append(node.lineno)
+
+    print("    발견한 지점 %d개" % len(found))
+    check_true("검사가 공허하지 않다 - 지점을 실제로 찾았다", len(found) >= 8, len(found))
+
+    unknown = sorted(k for k in found if k not in SQL_PLACEHOLDER_SITES)
+    check_true(
+        "새 `IN (...)` 지점이 인벤토리에 등록돼 있다", not unknown,
+        "등록되지 않은 지점: %s -- 입력 크기가 작다는 근거를 적거나 "
+        "chunked_for_sql() 로 나누십시오 (BUGS #243)" % (unknown,))
+
+    dead = sorted(k for k in SQL_PLACEHOLDER_SITES if k not in found)
+    check_true("인벤토리에 죽은 항목이 없다", not dead,
+               "코드에서 사라진 항목: %s" % (dead,))
+
+    # chunked 라고 적어 둔 곳은 **실제로** chunked_for_sql 을 쓰는가 (이름만 믿지 않는다)
+    for (rel, arg), why in sorted(SQL_PLACEHOLDER_SITES.items()):
+        if "chunked_for_sql" not in why:
+            continue
+        with open(os.path.join(root, rel), "rb") as fh:
+            src = fh.read().decode("utf-8-sig")
+        check_true("%s: 근거대로 chunked_for_sql 을 실제로 쓴다" % rel,
+                   "chunked_for_sql(" in src, rel)
+
+
 def test_no_new_sql_text_interpolation():
     print("\n--- SQL 텍스트 보간 지점 고정 ---")
     root = os.path.dirname(os.path.abspath(__file__))
@@ -1917,18 +2067,56 @@ def test_no_new_sql_text_interpolation():
                 continue
             if isinstance(arg, ast.Name) and arg.id in ("addr_sql",):
                 continue          # _address_condition() 이 돌려주는 상수 조각
-            # `f"({or_clause})"` 만 예외. 따옴표 종류에 흔들리지 않게 **구조로** 본다.
+            # `f"({or_clause})"` / `f"({area_clause})"` 만 예외.
+            # 따옴표 종류에 흔들리지 않게 **구조로** 본다.
             # (`or_clause` 는 `["property_type LIKE ?"] * len(...)` ― 길이만 가변이다.)
+            # (`area_clause` 는 면적 계열 OR ― 조각이 전부 소스 리터럴이고 개수만 가변이다.
+            #  2026-08-26 `docs/BUGS.md` #239. 아래 CONSTANT_CLAUSE_SOURCES 가
+            #  "정말 리터럴만 들어가는가"를 따로 못박는다 — 이름만 믿지 않는다.)
             if isinstance(arg, ast.JoinedStr):
                 names = [ast.unparse(v.value) for v in arg.values
                          if isinstance(v, ast.FormattedValue)]
                 lits = "".join(v.value for v in arg.values
                                if isinstance(v, ast.Constant) and isinstance(v.value, str))
-                if names == ["or_clause"] and lits == "()":
+                if names in (["or_clause"], ["area_clause"]) and lits == "()":
                     continue
             bad.append("%s:%d %s" % (rel, node.lineno, ast.unparse(arg) if arg else "?"))
     check_true("WHERE 조각이 전부 상수", not bad,
                "상수가 아닌 조각은 값이 SQL 텍스트가 된다: %s" % bad)
+
+    # ── 위 예외가 **이름만 믿는 것**이 되지 않게 한다 (2026-08-26, `docs/BUGS.md` #239)
+    #
+    # `f"({or_clause})"` / `f"({area_clause})"` 를 통과시켰으니, 그 변수에 실제로 무엇이
+    # 들어가는지도 봐야 한다. 안 그러면 누군가 `area_clause` 라는 이름만 유지한 채
+    # 컬럼명을 f-string 으로 조립해도 이 검사가 초록으로 남는다 — 예외가 곧 구멍이 된다.
+    #
+    # 규칙: 그 두 변수의 재료를 모으는 리스트(`clauses`)에 append 되는 값은 **문자열 리터럴**
+    #       이어야 한다. 가변인 것은 조각의 **개수**뿐이어야 한다.
+    CONSTANT_CLAUSE_SOURCES = {"api/v1/search.py": ("clauses",)}
+    nonliteral = []
+    for rel, listnames in CONSTANT_CLAUSE_SOURCES.items():
+        with open(os.path.join(root, rel), "rb") as f:
+            tree = ast.parse(f.read().decode("utf-8-sig"))
+        seen = 0
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "append"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in listnames):
+                continue
+            seen += 1
+            a = node.args[0] if node.args else None
+            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                continue
+            # 리터럴을 담아 둔 지역 이름(예: lo_sql/hi_sql)도 허용하되, 그 이름이
+            # 리터럴 튜플에서만 왔는지 확인한다.
+            if isinstance(a, ast.Name) and a.id in _names_bound_only_to_str_literals(tree):
+                continue
+            nonliteral.append("%s:%d %s" % (rel, node.lineno,
+                                            ast.unparse(a) if a else "?"))
+        check_true("%s 의 조각 수집 지점을 실제로 찾았다" % rel, seen > 0, seen)
+    check_true("면적/물건종류 OR 조각의 재료가 전부 문자열 리터럴", not nonliteral,
+               "조립된 조각이 섞이면 예외가 구멍이 된다: %s" % nonliteral)
 
 
 # ---------------------------------------------------------------------------
@@ -4101,6 +4289,7 @@ def run():
     test_list_gets_never_return_success_false()
     test_no_confusable_column_misuse()
     test_no_new_sql_text_interpolation()
+    test_sql_placeholder_sites_are_bounded_or_chunked()
     test_init_db_failure_is_loud()
     test_known_dependency_cves_are_tracked()
     test_no_duplicate_config_constants()

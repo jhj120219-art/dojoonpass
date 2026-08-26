@@ -282,3 +282,54 @@ describe('formatArea — 화면에 찍히는 문자열', () => {
     assert.equal(formatArea({ label: '토지', sqm: SQM_PER_PYEONG }), '토지 3.31㎡ (1.00평)')
   })
 })
+
+describe('parseArea — 천단위 쉼표 (BUGS #240)', () => {
+  // 예전 정규식 `[0-9]+` 는 쉼표에서 끊겨 **쉼표 뒤부터** 매치됐다.
+  // 화면에는 오류도 빈칸도 아닌 **그럴듯한 작은 숫자**가 찍혀서 알아챌 방법이 없었다.
+  test('★ 쉼표가 있어도 앞자리를 잃지 않는다', () => {
+    assert.deepEqual(parseArea('서울 x [건물 1층 3,005.35㎡]'), { label: '건물', sqm: 3005.35 })
+    assert.deepEqual(parseArea('서울 x [건물 1층 12,345.67㎡]'), { label: '건물', sqm: 12345.67 })
+    assert.deepEqual(parseArea('서울 x [토지 대 1,048㎡]'), { label: '토지', sqm: 1048 })
+  })
+
+  test('★ 쉼표 뒤가 0 뿐이어도 0㎡ 가 되지 않는다', () => {
+    // `1,000㎡` -> 0 이 나오던 자리. 면적이 **0 으로 보이는** 최악의 표시였다.
+    assert.deepEqual(parseArea('서울 x [건물 1층 1,000㎡]'), { label: '건물', sqm: 1000 })
+    assert.deepEqual(parseArea('서울 x [건물 1층 2,000.00㎡]'), { label: '건물', sqm: 2000 })
+  })
+
+  test('★ 쉼표가 섞인 다층 합산이 맞는다 (실데이터 id=443)', () => {
+    // 지1층 3,005.35 + 1층 6,110.75 + 2층 5,322.75 = 14,438.85
+    const addr =
+      '경기도 평택시 청북읍 드림산단2로 80 (제넨코어센터피동) [건물 일반철골구조 ' +
+      '(철근)콘크리트지붕 공장 지1층 3,005.35㎡ 1층 6,110.75㎡ 2층 5,322.75㎡ ' +
+      '공장 및 광업재단 저당법 제6조 목록 제2022-66호, 제2022-112호]'
+    assert.deepEqual(parseArea(addr), { label: '건물', sqm: 14438.85 })
+  })
+
+  test('쉼표가 없는 기존 표기는 그대로다 (회귀 없음)', () => {
+    assert.deepEqual(parseArea('서울 x [건물 999.5㎡]'), { label: '건물', sqm: 999.5 })
+    assert.deepEqual(parseArea('서울 x [집합건물 17.08㎡]'), { label: '건물', sqm: 17.08 })
+    assert.equal(parseArea('서울 x [카니발 2016년식 승용차]'), null)
+  })
+
+  test('★ 백엔드(normalizer.extract_areas)와 같은 숫자를 낸다', () => {
+    // 같은 규칙의 두 구현이 갈라져 있던 것이 결함의 정체다(BUGS #204/#240).
+    // 파이썬을 여기서 부를 수는 없으므로, **파이썬이 내는 값을 기대값으로 못박는다.**
+    // (그 값은 `test_normalizer.py` 가 파이썬 쪽에서 같은 입력으로 고정한다 —
+    //  한쪽만 고치면 다른 쪽이 붉어진다.)
+    const pairs = [
+      ['서울 x [건물 1층 3,005.35㎡ 2층 1,000㎡]', 4005.35],
+      ['서울 x [토지 대 1,048㎡]', 1048],
+      ['서울 x [건물 1층 75.6㎡ 2층 70.2㎡]', 145.8],
+    ]
+    for (const [addr, expected] of pairs) {
+      const got = parseArea(addr)
+      assert.ok(got, `면적을 못 뽑았습니다: ${addr}`)
+      assert.equal(
+        Number(got.sqm.toFixed(4)), expected,
+        `백엔드와 다른 값입니다: ${addr}`
+      )
+    }
+  })
+})

@@ -583,21 +583,27 @@ def check_declared_filters_actually_filter():
 
     # 2026-08-21 실측: 프런트는 보내지만 백엔드가 받지 않는 것들.
     #
-    # ★ 목록을 여기서 **새로 적지 않는다.** `tests/source-contract.test.mjs` 의
-    #   `KNOWN_UNSUPPORTED` 를 읽어 온다. 두 벌로 두면 한쪽만 갱신되는 날이 오고,
-    #   그때 두 검사가 서로를 눈감아 준다 - 이 저장소가 "규칙이 두 벌"에서 반복해
-    #   겪은 사고다(BUGS #107/#112/#136/#161).
+    # ★ 목록을 여기서 **새로 적지 않는다.** 정본은 `tests/_search_param_contract.mjs`
+    #   하나뿐이고, 여기와 node 검사 두 개가 **모두 그 파일을 읽는다.**
+    #   두 벌로 두면 한쪽만 갱신되는 날이 오고, 그때 검사들이 서로를 눈감아 준다 -
+    #   이 저장소가 "규칙이 두 벌"에서 반복해 겪은 사고다(BUGS #107/#112/#136/#161/#204).
     #
     #   실제로 그 구멍을 mutation 으로 확인했다(2026-08-21): 파라미터를 선언만 하고
-    #   source-contract 목록에서 빼면 소스 검사 36건이 전부 통과하는데 필터는
-    #   여전히 아무것도 거르지 않았다. 아래 동기화 검사가 그 편집을 잡는다.
+    #   목록에서 빼면 소스 검사 36건이 전부 통과하는데 필터는 여전히 아무것도 거르지
+    #   않았다. 아래 동기화 검사가 그 편집을 잡는다.
+    #
+    #   2026-08-26: 목록이 `source-contract.test.mjs` 안에 있었는데, node 쪽에 검사가
+    #   하나 더 늘면서 **두 벌이 됐다.** 그래서 목록만 전용 모듈로 빼고 셋이 함께 읽는다.
+    #   (그 이동 때 이 검사가 곧바로 붉어져 세 번째 소비자가 있다는 것을 알려 줬다 —
+    #    단일 정본 규칙이 실제로 작동한 사례다.)
     sc = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "tests", "source-contract.test.mjs"),
+                               "tests", "_search_param_contract.mjs"),
                   encoding="utf-8").read()
-    m = re.search(r"const KNOWN_UNSUPPORTED = new Set\(\[(.*?)\]\)", sc, re.S)
-    check("source-contract 의 미지원 목록을 읽었다(검사가 공허하지 않다)", bool(m), None)
+    m = re.search(r"export const KNOWN_UNSUPPORTED = new Set\(\[(.*?)\]\)", sc, re.S)
+    check("미지원 목록 정본(_search_param_contract.mjs)을 읽었다(검사가 공허하지 않다)",
+          bool(m), None)
     KNOWN_UNSUPPORTED = set(re.findall(r"['\"](\w+)['\"]", m.group(1))) if m else set()
-    print("    source-contract 가 선언한 미지원 목록: %s" % sorted(KNOWN_UNSUPPORTED))
+    print("    정본이 선언한 미지원 목록: %s" % sorted(KNOWN_UNSUPPORTED))
 
     tmp = tempfile.mkdtemp(prefix="qa_filter_")
     try:
@@ -1485,6 +1491,7 @@ def run():
     check_authed_screens_get_the_same_address()
     check_sort_and_injection_are_bounded()
     check_area_filter_survives_missing_migration_025()
+    check_area_families_are_a_union_not_a_pair()
 
     print()
     if FAILURES:
@@ -1705,6 +1712,116 @@ def check_area_filter_survives_missing_migration_025():
     finally:
         dbmod.DB_PATH = orig_db
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 건물면적 / 토지면적은 **판별 합집합**이다 — 두 조건을 AND 로 묶으면 항상 0건이었다
+# (2026-08-26, `docs/BUGS.md` #239)
+#
+# 왜 기존 검사가 이것을 못 잡았나
+# ---------------------------------------------------------------------------
+# `check_area_filter_survives_missing_migration_025()` 의 씨앗은 4행 전부
+# `property_type='아파트'` 이고 1~3번이 **건물·토지 면적을 둘 다** 갖고 있다.
+# 실데이터에는 그런 행이 **한 행도 없다**(2026-08-26 전수: 둘 다 보유 0행).
+# 즉 그 fixture 는 존재하지 않는 데이터 모양을 전제하고 있어서, 통과해도
+# "두 조건을 함께 주면 공집합"이라는 실제 결함을 드러낼 수 없었다.
+# 여기서는 **실측된 모양 그대로** 씨앗을 만든다 — 한 물건은 둘 중 하나만 갖는다.
+def check_area_families_are_a_union_not_a_pair():
+    import contextlib, io as _io, shutil, tempfile
+    from fastapi.testclient import TestClient
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    orig_db = dbmod.DB_PATH
+    workdir = tempfile.mkdtemp(prefix="qa_area_union_")
+    try:
+        # 스키마는 실제 부트스트랩 3단계 그대로 만든다(위 검사와 같은 이유).
+        dbmod.DB_PATH = os.path.join(workdir, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        import api_server
+        client = TestClient(api_server.app)
+
+        # 실데이터 모양: 건물형 물건은 building_area 만, 토지형 물건은 land_area 만.
+        rows = [
+            (1, "2024타경801", "아파트",   85.0, None),
+            (2, "2024타경802", "오피스텔", 40.0, None),
+            (3, "2024타경803", "전답",     None, 900.0),
+            (4, "2024타경804", "임야",     None, 5000.0),
+            (5, "2024타경805", "자동차",   None, None),
+        ]
+        c = dbmod.get_connection()
+        try:
+            for item_id, case_no, ptype, b, l in rows:
+                case_id = c.execute(
+                    "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                    ("서울중앙지방법원", case_no)).lastrowid
+                c.execute(
+                    "INSERT INTO auction_item"
+                    " (id, case_id, case_no, item_no, court_name, property_type,"
+                    "  sido, sigungu, full_address, auction_date,"
+                    "  building_area, land_area)"
+                    " VALUES (?,?,?,'1','서울중앙지방법원',?,'서울','강남구',"
+                    "         '서울 강남구 역삼동 1', '2099-01-01', ?, ?)",
+                    (item_id, case_id, case_no, ptype, b, l))
+            c.commit()
+        finally:
+            c.close()
+
+        def ids(**params):
+            r = client.get("/api/v1/search", params={"size": 100, **params})
+            assert r.status_code == 200, (r.status_code, r.text[:200])
+            return sorted(i["id"] for i in r.json()["items"])
+
+        # -- 전제: 실데이터와 같은 모양인가 (이게 깨지면 아래 판정이 무의미하다) --
+        conn = dbmod.get_connection()
+        try:
+            both = conn.execute(
+                "SELECT COUNT(*) FROM auction_item"
+                " WHERE building_area IS NOT NULL AND land_area IS NOT NULL").fetchone()[0]
+        finally:
+            conn.close()
+        check("전제: 씨앗에 두 면적을 동시에 가진 행이 없다(실데이터와 같은 모양)",
+              both == 0, both)
+        check("전제: 씨앗 5건이 기본 검색에 보인다", ids() == [1, 2, 3, 4, 5], ids())
+
+        # -- 한 계열만 줄 때: 기존 NULL 규약 그대로 (동작 변경 없음) --
+        check("★ 건물면적만 주면 토지형·면적미상은 빠진다(NULL 규약 유지)",
+              ids(min_building_area=50) == [1], ids(min_building_area=50))
+        check("★ 토지면적만 주면 건물형·면적미상은 빠진다(NULL 규약 유지)",
+              ids(min_land_area=1000) == [4], ids(min_land_area=1000))
+        check("★ 한 계열 안의 min/max 는 AND 다(범위가 좁혀진다)",
+              ids(min_building_area=50, max_building_area=100) == [1],
+              ids(min_building_area=50, max_building_area=100))
+        check("★ 한 계열 안에서 범위가 뒤집히면 0건이다",
+              ids(min_building_area=100, max_building_area=50) == [],
+              ids(min_building_area=100, max_building_area=50))
+
+        # -- 두 계열을 함께 줄 때: OR (여기가 결함이었다 — 예전에는 항상 []) --
+        got = ids(min_building_area=50, min_land_area=1000)
+        check("★★★ 두 면적을 함께 주면 공집합이 아니다(합집합으로 읽는다)",
+              got == [1, 4], got)
+        check("★★★ 두 계열 OR 는 각 계열 결과의 정확한 합집합이다",
+              sorted(set(ids(min_building_area=50)) | set(ids(min_land_area=1000))) == got,
+              got)
+        check("★★ 두 계열을 줘도 어느 쪽에도 안 맞는 행은 들어오지 않는다"
+              " (면적미상 5번이 섞이지 않는다)",
+              5 not in got and 2 not in got and 3 not in got, got)
+        got2 = ids(min_building_area=30, max_building_area=50,
+                   min_land_area=800, max_land_area=1000)
+        check("★★ 계열 안 AND · 계열 간 OR 가 함께 성립한다",
+              got2 == [2, 3], got2)
+        check("★★ 두 계열 다 아무것도 못 맞히면 0건이다(과잉 확장이 아니다)",
+              ids(min_building_area=10000, min_land_area=99999) == [],
+              ids(min_building_area=10000, min_land_area=99999))
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 
 if __name__ == "__main__":

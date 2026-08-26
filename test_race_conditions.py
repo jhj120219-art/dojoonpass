@@ -1369,10 +1369,10 @@ def _scratch_db():
     import storage.migrations.run_migrations as runmig
 
     tmp = tempfile.mkdtemp(prefix="qa_race_sync_")
+    # 경로 전환 수단은 `dbmod.DB_PATH` 대입 하나뿐이다 — `AUCTION_DB_PATH` 는 읽는 곳이
+    # 없어 지웠다(2026-08-26, `test_image_queue_transition._fresh_db` 주석 참고).
     path = os.path.join(tmp, "auction.db")
-    prev_env = os.environ.get("AUCTION_DB_PATH")
     prev_path = dbmod.DB_PATH
-    os.environ["AUCTION_DB_PATH"] = path
     dbmod.DB_PATH = path
     with contextlib.redirect_stdout(_io.StringIO()):
         dbmod.init_db()
@@ -1382,10 +1382,6 @@ def _scratch_db():
     def restore():
         import shutil
         dbmod.DB_PATH = prev_path
-        if prev_env is None:
-            os.environ.pop("AUCTION_DB_PATH", None)
-        else:
-            os.environ["AUCTION_DB_PATH"] = prev_env
         shutil.rmtree(tmp, ignore_errors=True)
 
     return dbmod, restore

@@ -73,12 +73,38 @@ class CheckpointManager:
                 logger.error("checkpoint clear failed: %s", str(e))
 
     def _load_all(self) -> Dict:
+        """저장된 진행 상황. 파일이 없거나 읽을 수 없으면 빈 dict.
+
+        ## 읽지 못했다는 사실을 **로그에 남긴다** (2026-08-27, `docs/BUGS.md` #244)
+
+        예전에는 `except Exception: return {}` 로 조용히 삼켰다. 그런데 이 반환값이
+        비면 크롤러는 **60개 법원을 전부 처음부터 다시 긁는다** — 바로 위
+        `_write_atomic()` 의 docstring 이 경계한 그 상황이다. 그 일이 벌어져도
+        로그에 한 줄도 남지 않아, 운영자는 밤새 돈 재크롤을 보고도 원인을 알 수 없었다.
+        실측(2026-08-27): 법원 2곳의 진행 상황을 저장한 뒤 파일을 반쯤 자르니
+        `_load_all()` 이 `{}` 를 돌려주고 **로그 출력은 빈 문자열**이었다.
+
+        **동작은 그대로 둔다** — 여기서 예외를 올리면 체크포인트 하나 때문에 크롤
+        자체가 죽는다. 처음부터 다시 긁는 것이 옳은 선택이다. 바꾸는 것은
+        *"그 선택을 했다는 사실이 보이는가"* 뿐이다.
+
+        '파일이 없다'(정상 첫 실행)와 '파일이 있는데 못 읽었다'(사고)를 구별한다 —
+        전자는 로그를 남기지 않는다. 매일 남는 소음은 진짜 신호를 묻는다.
+        """
         if not os.path.exists(self.path):
             return {}
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:      # noqa: BLE001 - 어떤 이유로든 못 읽으면 처음부터 간다
+            try:
+                size = os.path.getsize(self.path)
+            except OSError:
+                size = -1
+            logger.error(
+                "체크포인트를 읽지 못했다 - **모든 법원을 처음부터 다시 수집한다**. "
+                "경로=%s 크기=%dB 사유=%s: %s",
+                self.path, size, type(e).__name__, e)
             return {}
 
 

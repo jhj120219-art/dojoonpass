@@ -30,6 +30,7 @@
 
 import { test, describe, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
 
 const BASE = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
 
@@ -856,5 +857,105 @@ describe('예상치 못한 오류/404가 Next 기본 화면이 아니다 (2026-0
     const errorSrc = fs.readFileSync(path.join(root, 'src/app/error.tsx'), 'utf8')
     assert.ok(errorSrc.startsWith("'use client'"), 'error.tsx는 Client Component여야 한다(Next.js 규약)')
     assert.ok(/reset\s*\(\s*\)/.test(errorSrc), 'error.tsx가 reset()을 호출하지 않습니다(다시 시도 불가)')
+  })
+})
+
+// ================================================================
+// 검색 파라미터 계약 — 프런트가 보내는 것을 백엔드가 **실제로 읽는가**
+// (2026-08-26 신설, `docs/BUGS.md` #239)
+//
+// 이 저장소가 같은 함정을 두 번 밟았다.
+//
+//   BUGS #123  면적 4종을 프런트가 보내는데 백엔드가 읽지 않았다 —
+//              "사용자가 면적을 좁혀도 결과가 그대로였다. 오류도 안내도 없다."
+//   BUGS #239  면적이 구현된 뒤에도 결합 규칙이 틀려 두 조건을 함께 주면 항상 0건이었다.
+//
+// FastAPI 는 **모르는 쿼리 파라미터를 조용히 무시한다.** 그래서 프런트가 오타를 내거나
+// 아직 없는 필터를 보내도 200 이 돌아오고, 사용자에게는 "그런 물건이 없다"로 보인다.
+// 이 검사는 그 침묵을 깨는 것이 목적이다 — OpenAPI 를 진실의 원천으로 삼아
+// **프런트가 보내는 이름 전부**가 백엔드에 실재하는지 본다.
+//
+// 목록을 손으로 적지 않는다(그러면 목록이 코드보다 뒤처진다). 양쪽 다 유도한다:
+//   보내는 쪽 = SearchForm.tsx 의 `query.<name> =` 전수
+//   받는 쪽   = /openapi.json 의 /api/v1/search 파라미터 전수
+// ================================================================
+describe('검색 파라미터 계약 — 보내는 것과 읽는 것이 일치한다 (BUGS #239)', () => {
+  // 목록은 `tests/_search_param_contract.mjs` 한 곳에만 있다 — source-contract 와 공유한다.
+  // (두 벌로 두면 한쪽에서만 빼도 다른 쪽이 계속 눈감아 준다. BUGS #204)
+  // 특수조건 UI 를 여는 날 그 목록에서 빼야 하고, 빼지 않으면 아래 "죽은 예외" 검사가 붉어진다.
+
+  async function sentParams() {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile('src/app/search/SearchForm.tsx', 'utf8')
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+    const names = new Set()
+    // 점 표기와 대괄호 표기를 **둘 다** 본다. 점만 보면 `query['min_x'] = ...` 로 바꾸는
+    // 순간 검사가 조용히 눈이 먼다(2026-08-26 변이 P4 로 확인한 사각지대).
+    for (const m of code.matchAll(/query\.([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) names.add(m[1])
+    for (const m of code.matchAll(/query\[\s*['"`]([A-Za-z_][A-Za-z0-9_]*)['"`]\s*\]\s*=/g)) {
+      names.add(m[1])
+    }
+    return names
+  }
+
+  async function acceptedParams() {
+    const res = await fetch(`${API_BASE}/openapi.json`, { cache: 'no-store' })
+    assert.equal(res.status, 200, `openapi.json 을 못 받았습니다 (${res.status})`)
+    const spec = await res.json()
+    const params = spec.paths?.['/api/v1/search']?.get?.parameters ?? []
+    return new Set(params.map((p) => p.name))
+  }
+
+  test('검사가 공허하지 않다 — 양쪽 목록을 실제로 얻었다', async () => {
+    const sent = await sentParams()
+    const accepted = await acceptedParams()
+    assert.ok(sent.size >= 15, `보내는 파라미터를 제대로 못 뽑았습니다 (${sent.size}개)`)
+    assert.ok(accepted.size >= 15, `OpenAPI 파라미터를 제대로 못 뽑았습니다 (${accepted.size}개)`)
+    // 알려진 대표값이 양쪽에 있어야 추출 방식이 살아 있다고 말할 수 있다.
+    for (const n of ['min_building_area', 'max_land_area', 'property_type', 'case_no']) {
+      assert.ok(sent.has(n), `프런트 추출이 ${n} 를 놓쳤습니다 — 정규식이 낡았습니다`)
+      assert.ok(accepted.has(n), `OpenAPI 에 ${n} 가 없습니다`)
+    }
+  })
+
+  test('★ 프런트가 보내는 파라미터를 백엔드가 전부 받는다 (조용히 무시되는 필터가 없다)', async () => {
+    const sent = await sentParams()
+    const accepted = await acceptedParams()
+    const ignored = [...sent].filter((n) => !accepted.has(n) && !KNOWN_UNSUPPORTED.has(n)).sort()
+    assert.deepEqual(
+      ignored,
+      [],
+      `백엔드가 읽지 않는 파라미터를 프런트가 보내고 있습니다 — 사용자는 조건을 좁혔는데 ` +
+        `결과가 그대로입니다(BUGS #123 과 같은 형태): ${ignored.join(', ')}`
+    )
+  })
+
+  test('★ 예외 목록이 코드보다 앞서 나가지 않는다 (죽은 예외 금지)', async () => {
+    const sent = await sentParams()
+    const accepted = await acceptedParams()
+    const stale = [...KNOWN_UNSUPPORTED]
+      .filter((n) => accepted.has(n) || !sent.has(n))
+      .sort()
+    assert.deepEqual(
+      stale,
+      [],
+      `KNOWN_UNSUPPORTED 에 죽은 항목이 있습니다(백엔드가 이미 받거나, 프런트가 더 이상 ` +
+        `보내지 않습니다). 예외를 남겨 두면 진짜 결함을 가립니다: ${stale.join(', ')}`
+    )
+  })
+
+  test('★ 지원하지 않는 파라미터는 실제로 결과를 바꾸지 않는다 (무시됨을 실측)', async () => {
+    // "무시된다"를 소스가 아니라 **응답**으로 확인한다.
+    const base = await (await fetch(`${API_BASE}/api/v1/search?size=1`, { cache: 'no-store' })).json()
+    for (const n of KNOWN_UNSUPPORTED) {
+      const res = await fetch(`${API_BASE}/api/v1/search?size=1&${n}=xyz`, { cache: 'no-store' })
+      assert.equal(res.status, 200, `${n} 를 붙였더니 200 이 아닙니다 (${res.status})`)
+      const got = await res.json()
+      assert.equal(
+        got.total,
+        base.total,
+        `${n} 가 결과를 바꿨습니다 — 이미 구현된 것이라면 KNOWN_UNSUPPORTED 에서 빼야 합니다`
+      )
+    }
   })
 })

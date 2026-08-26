@@ -80,8 +80,9 @@ def _fresh_db(tmp):
       (이 검사를 쓰다가 실제로 그렇게 됐다. 아래 자체 검증이 그 재발을 막는다.)
     """
     import contextlib
+    # 경로 전환 수단은 `db.DB_PATH` 대입 하나뿐이다 — `AUCTION_DB_PATH` 는 읽는 곳이
+    # 없어 지웠다(2026-08-26, `test_image_queue_transition._fresh_db` 주석 참고).
     path = os.path.join(tmp, "auction.db")
-    os.environ["AUCTION_DB_PATH"] = path
     import storage.database as db
     import storage.migrate_v4_1 as mig
     import storage.migrations.run_migrations as runmig
