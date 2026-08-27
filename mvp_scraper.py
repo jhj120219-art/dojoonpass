@@ -87,6 +87,23 @@ def attach_file_log():
 # 예약 작업끼리는 기본 MultipleInstances=IgnoreNew 로 안 겹치지만, **운영자의 수동
 # 실행이 스케줄 실행과 겹치는 경우**는 막지 못한다 — doc_worker 가 락을 둔 것과 같은 이유다.
 LOCK_PATH = os.path.join(_HERE, "logs", "mvp_scraper.lock")
+
+# CSV 백업이 떨어질 폴더. 기본값은 **이 파일이 있는 곳**(저장소 루트)이고 cwd 가 아니다
+# (Sprint 252, 아래 `save_csv_backup()` 참고).
+#
+# ★ 모듈 변수로 둔 이유는 성능도 설정도 아니라 **회귀 테스트가 운영 산출물을 파괴하지
+#   않게 하기 위해서다** (2026-08-27, BUGS #250).
+#
+#   `test_crawl_orchestration.py` 는 "CSV 가 cwd 를 따라가지 않는가"를 정적 검사로는
+#   잡을 수 없어(인자가 pandas `to_csv` 의 조립된 변수다) **다른 cwd 에서 실제로**
+#   `save_csv_backup()` 을 돌린다. 그런데 파일명이 `auction_<오늘>.csv` 로 고정이라
+#   그 실행이 **그날 진짜 백업을 QA 데이터로 덮어썼고**, 검사가 끝나며 지웠다.
+#   실측(2026-08-27): 세션 시작 시 있던 `auction_20260827.csv` 가 검사 1회 실행 뒤
+#   사라졌다. CSV 는 `.gitignore` 대상이라 **git 도 알려 주지 않는다** — 조용한 소실이다.
+#
+#   `storage.database.DB_PATH` 를 스크래치로 갈아끼우는 것과 **정확히 같은 방식**이다.
+#   그 격리를 이 산출물만 갖고 있지 않았다.
+CSV_BACKUP_DIR = _HERE
 # 전체 크롤 실측 3.1시간(Sprint 190)보다 넉넉하게. 이 시간이 지난 락은 죽은 실행으로 보고
 # 회수한다 — 비정상 종료가 다음 날 실행을 영원히 막으면 안 된다.
 LOCK_STALE_HOURS = 6
@@ -106,6 +123,17 @@ def save_csv_backup(rows: list) -> str:
       `doc_worker.py` 의 LOCK_PATH, 운영 도구 8개) **이 한 곳만 남아 있었다.**
       이 모듈 자신도 로그/락은 이미 `_HERE` 기준인데 CSV 만 아니었다.
 
+      ★ 2026-08-27 정정 (BUGS #263) — 위 *"이 한 곳만 남아 있었다"* 는 **사실이 아니었다.**
+        그때의 감사가 (A) 모듈 최상위 상수와 (B) 경로 호출의 리터럴만 봤기 때문에,
+        **함수 기본 인자값**에 숨은 세 곳을 통째로 놓치고 있었다:
+
+            storage/checkpoint.py    CheckpointManager(path="logs/checkpoint.json")
+            validator/validation_engine.py  ValidationEngine(log_path="logs/validation.jsonl")
+            revalidate.py            ValidationEngine(log_path="logs/revalidation.jsonl")
+
+        그중 체크포인트는 **재개를 조용히 무력화**하는 자리였다. 감사에 갈래 C/D 를
+        추가해 셋 다 잡아 고쳤다. 목록을 세는 주석은 그 목록을 만든 도구만큼만 정확하다.
+
       `.bat` 은 `cd /d %~dp0` 로 보호되므로 예약 실행에서는 드러나지 않는다. 드러나는 것은
       수동 실행/서비스 등록처럼 cwd 가 다른 경우이고, 그때 백업이 엉뚱한 폴더에 흩어진다 —
       "백업이 있다"고 믿는데 저장소에는 없는 상태가 된다.
@@ -115,10 +143,13 @@ def save_csv_backup(rows: list) -> str:
       본다. 여기는 pandas 의 `to_csv` 이고 인자도 조립된 변수라 두 조건 다 비껴간다.
       그래서 정적 검사 대신 **다른 cwd 에서 실제로 돌려 보는** 회귀를 따로 뒀다
       (`test_crawl_orchestration.py`).
+      ★ 2026-08-27 BUGS #250 — 목적지 폴더를 `CSV_BACKUP_DIR` 로 뺐다(기본값은 그대로
+        `_HERE`). 경로 규칙은 **아무것도 바뀌지 않는다.** 바뀐 것은 회귀 테스트가
+        운영 백업을 덮어쓰지 않고도 이 규칙을 검증할 수 있다는 것뿐이다.
     """
     df = pd.DataFrame(rows)
     filename = "auction_" + datetime.today().strftime("%Y%m%d") + ".csv"
-    path = os.path.join(_HERE, filename)
+    path = os.path.join(CSV_BACKUP_DIR or _HERE, filename)
     df.to_csv(path, index=False, encoding="utf-8-sig")
     logger.info("CSV 백업 저장: %s (%d건)", path, len(rows))
     return path
@@ -188,8 +219,27 @@ def run_courts(courts: List[CourtInfo], outcome: CrawlOutcome = None) -> list:
     print_validation_summary(engine, all_items)
 
     # 2. 정규화
+    #
+    # ★ 떨어져 나간 건수를 **반드시 남긴다** (2026-08-27, docs/BUGS.md #261).
+    #
+    #   `normalize_batch()` 는 기형 행 하나가 배치를 죽이지 않도록 그 행만 버린다
+    #   (Sprint 78 — 옳은 격리다). 문제는 **버렸다는 사실이 여기서 사라졌다**는 것이다.
+    #   예전 이 자리는 `"정규화 완료: %d건"` 만 찍었다. 2,608건을 받아 2,600건을 찍어도
+    #   그 줄만 봐서는 8건이 없어진 것을 알 수 없다 - 앞줄과 손으로 빼 봐야 안다.
+    #
+    #   전부 떨어지면 `persisted == 0` 으로 잡히지만(#47), **부분 손실은 어디에서도
+    #   잡히지 않았다.** 크롤은 성공, 저장도 성공, 종료코드 0 - 그런데 법원에서 받아 온
+    #   자료 일부가 DB 에 없다.
+    before_normalize = len(all_items)
     rows = normalize_batch(all_items)
-    logger.info("정규화 완료: %d건", len(rows))
+    outcome.normalize_dropped = before_normalize - len(rows)
+    if outcome.normalize_dropped:
+        logger.error(
+            "정규화에서 %d건이 떨어졌다 (%d -> %d건). 크롤은 받아 왔는데 DB 에 닿지 "
+            "못한 건수다 - 위쪽 'normalize_item failed' 경고에 사건번호가 있다",
+            outcome.normalize_dropped, before_normalize, len(rows))
+    logger.info("정규화 완료: %d건 (입력 %d건, 탈락 %d건)",
+                len(rows), before_normalize, outcome.normalize_dropped)
 
     # 3. SQLite UPSERT
     result = upsert_batch(rows)
@@ -255,17 +305,24 @@ def main() -> int:
 
         # 부분 실패는 성공으로 두되 **반드시 눈에 띄게** 남긴다. 이 줄이 없으면
         # "일부 법원이 계속 실패 중"인 상태가 조용히 굳어진다.
-        if outcome.failed:
-            logger.warning("일부 법원 수집 실패: %d/%d곳 -> %s",
-                           len(outcome.failed), outcome.courts, outcome.failed)
+        #
+        # ★ 어휘를 여기서 복제하지 않는다 (2026-08-27, docs/BUGS.md #261).
+        #   "치명적이지는 않지만 눈에 띄어야 하는 것"의 목록은 `CrawlOutcome.warnings()`
+        #   하나가 들고 있다. 예전에는 법원 실패만 여기 인라인으로 적혀 있어서,
+        #   같은 성격의 **정규화 탈락**이 생겼을 때 붙일 자리가 없었다.
+        for warn in outcome.warnings():
+            logger.warning("%s", warn)
 
         reason = outcome.failure_reason()
         if reason:
             logger.error("===== 사건 수집 실패: %s =====", reason)
         else:
-            logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d/변화없음 %d) =====",
+            logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d/변화없음 %d)"
+                        "%s =====",
                         outcome.persisted, outcome.inserted, outcome.updated,
-                        outcome.unchanged)
+                        outcome.unchanged,
+                        (", 정규화 탈락 %d건" % outcome.normalize_dropped)
+                        if outcome.normalize_dropped else "")
         return outcome.exit_code()
     finally:
         lock.release()

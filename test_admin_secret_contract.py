@@ -281,21 +281,56 @@ def test_boot_warns_when_admin_keys_are_missing():
             check_true("경고에 결과가 적혀 있다(무엇이 깨지는지)",
                        "500" in msgs[0], msgs[0][:120])
 
-        # (2) 키가 하나라도 있으면 조용하다 + 값이 새지 않는다
+        # (2) ★ **한쪽만** 없어도 경고한다 (2026-08-25 BUGS #205)
+        #
+        #   예전 이 자리는 "키가 하나라도 있으면 조용하다" 를 고정하고 있었다.
+        #   그 계약은 뒤집혔고, 이 검사는 **뒤집힌 것을 따라오지 못한 채 남아** 있었다.
+        #   `warn_if_admin_keys_missing()` 의 docstring 이 이유를 실측으로 적어 둔다:
+        #
+        #       둘 다 없음      전부 500    -> 어차피 즉시 드러난다
+        #       SUPER 만 없음   SUPER 전용 라우트가 **403**   <- 조용하다
+        #       ADMIN 만 없음   ADMIN 등급 키가 **403**       <- 조용하다
+        #
+        #   403 은 "권한 부족"과 구별되지 않으므로 운영자는 설정 누락을 등급 문제로
+        #   읽는다. **시끄러운 쪽이 아니라 조용한 쪽에 경고가 필요하다.**
         secret = "qa-boot-warn-not-a-real-key-000"
         os.environ["ADMIN_API_KEY"] = secret
         grab.records = []
         warned2 = admin_mod.warn_if_admin_keys_missing()
-        check("★ 키가 하나라도 있으면 경고하지 않는다", warned2, False)
-        check("그때 로그도 남기지 않는다(잡음 방지)", len(grab.records), 0)
+        check("★ SUPER 만 없어도 경고한다(403 이 조용히 묻히는 쪽)", warned2, True)
+        msgs2 = [r.getMessage() for r in grab.records if r.levelno >= logging.WARNING]
+        check("그때 경고가 정확히 한 줄 나간다", len(msgs2), 1)
+        if msgs2:
+            check_true("어느 키인지 적혀 있다(SUPER)",
+                       "SUPER_ADMIN_API_KEY" in msgs2[0], msgs2[0][:120])
+            check_true("무엇이 깨지는지 적혀 있다(403)",
+                       "403" in msgs2[0], msgs2[0][:120])
+            check_true("★ 경고에 키 **값**이 들어 있지 않다",
+                       secret not in msgs2[0], msgs2[0][:120])
 
-        # (3) 값 자체가 로그에 절대 들어가지 않는다 - 두 키를 다시 비우고 재확인
+        # (3) 반대쪽도 같다 - ADMIN 만 없을 때
         del os.environ["ADMIN_API_KEY"]
         os.environ["SUPER_ADMIN_API_KEY"] = secret
         grab.records = []
-        admin_mod.warn_if_admin_keys_missing()
-        check("SUPER 키만 있어도 조용하다", len(grab.records), 0)
+        warned3 = admin_mod.warn_if_admin_keys_missing()
+        check("★ ADMIN 만 없어도 경고한다", warned3, True)
+        msgs3 = [r.getMessage() for r in grab.records if r.levelno >= logging.WARNING]
+        check("그때도 경고는 한 줄이다", len(msgs3), 1)
+        if msgs3:
+            check_true("어느 키인지 적혀 있다(ADMIN)",
+                       "ADMIN_API_KEY" in msgs3[0], msgs3[0][:120])
+            check_true("★ 경고에 키 **값**이 들어 있지 않다",
+                       secret not in msgs3[0], msgs3[0][:120])
 
+        # (4) 대조군 - **둘 다 있을 때만** 조용하다. 이게 없으면 위 검사들은
+        #     "항상 경고한다" 는 고장난 구현도 통과시킨다.
+        os.environ["ADMIN_API_KEY"] = secret
+        grab.records = []
+        warned4 = admin_mod.warn_if_admin_keys_missing()
+        check("★ 두 키가 모두 있으면 경고하지 않는다", warned4, False)
+        check("그때 로그도 남기지 않는다(잡음 방지)", len(grab.records), 0)
+
+        os.environ.pop("ADMIN_API_KEY", None)
         os.environ.pop("SUPER_ADMIN_API_KEY", None)
     finally:
         lg.removeHandler(grab)
@@ -334,7 +369,10 @@ def test_boot_warns_when_admin_keys_are_missing():
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "warning"):
                 warn_calls.append(node)
-    check("검사가 공허하지 않다(경고 호출을 찾았다)", len(warn_calls), 1)
+    # 경고 갈래는 셋이다(둘 다 없음 / SUPER 만 없음 / ADMIN 만 없음, BUGS #205).
+    # 숫자를 고정하는 이유는 "몇 개인지"가 아니라 **하나라도 찾았는지**와
+    # 갈래가 조용히 사라지지 않았는지를 함께 보기 위해서다.
+    check("검사가 공허하지 않다(경고 호출을 찾았다)", len(warn_calls), 3)
 
     reads_value = []
     for call in warn_calls:

@@ -26,8 +26,55 @@ def case_no_matches_list_entry(target_case_no: str, list_entry_case_no: str) -> 
     (실 DB 실측: "2024타경1009"가 "2024타경100920"의 부분 문자열, 서로 다른 진짜
     사건). validator/validation_engine.py 상단 주석이 남긴 것과 같은 교훈 —
     "같은 판정을 하는 함수가 두 벌이면 한쪽만 고쳐질 수 있다" — 이라 한 곳으로 합친다.
+
+    ## ★ 2026-08-28 (docs/BUGS.md #265) — **한쪽만 쪼개고 있었다**
+
+    Sprint 121 판본은 **목록 쪽만** `" / "` 로 쪼갰다:
+
+        return target_case_no in [c.strip() for c in list_entry_case_no.split(" / ")]
+
+    그래서 **찾는 쪽이 병합 사건번호이면 자기 자신과도 일치하지 않는다.**
+
+        m("2023타경300780",                      "2023타경300780 / 2023타경302427")  -> True
+        m("2023타경300780 / 2023타경302427",     "2023타경300780 / 2023타경302427")  -> **False**  <- 같은 문자열인데
+        m("2023타경300780 / 2023타경302427",     "2023타경300780")                   -> **False**
+        m("2023타경302427 / 2023타경300780",     "2023타경300780 / 2023타경302427")  -> **False**  <- 순서만 달라도
+
+    큐/`auction` 에는 병합 사건번호가 그대로 **저장된다**(한 물건에 사건번호가 여럿인
+    경우 `base_crawler` 가 `" / ".join(case_nos)` 로 만든 값이 그대로 흘러온다).
+    즉 찾는 쪽이 병합인 경우가 예외가 아니라 **일상**이다. 실측(2026-08-28 운영 DB):
+
+        document_queue 병합 사건번호 행   1,507
+          그중 pending 222 / failed 105 / refresh 4 = **331행이 현재 진행형**
+        auction 병합 사건번호 행            602
+
+    그 331행은 **매일 밤 반드시 매칭에 실패한다.** 실패 한 번이 상세페이지 이동
+    1회(실측 중앙값 10.9초)를 태우고 재시도 예산을 깎는다. 2026-08-28 워커 로그에서
+    `사건 매칭 실패` 경고가 67건 났고 그날 `failed` 가 95 -> 205 로 늘었다.
+
+    ## 고친 방법 — **양쪽을 쪼개고 구성요소가 겹치는지** 본다
+
+    한 물건의 사건번호 묶음은 시점에 따라 표기가 달라질 수 있다(병합이 생기거나
+    풀리거나, 순서가 바뀌거나). 어느 쪽이든 **구성요소를 하나라도 공유하면 같은 물건**이다 —
+    사건번호는 법원 안에서 유일하고, 병합 표기는 같은 경매를 가리키기 때문이다.
+
+    ★ Sprint 121 이 막은 것(부분 문자열 포함)은 **그대로 막힌다.** 비교는 여전히
+      구성요소끼리의 **정확 일치**다 — `"2024타경1009"` 는 `"2024타경100920"` 과
+      다른 문자열이므로 겹치지 않는다.
+
+    ★ 빈 문자열은 **아무것도 일치시키지 않는다.** 예전 판본은 `m("", "")` 가 True 였다
+      (`"" in [""]`). 사건번호가 비었다는 것은 "모른다"는 뜻이지 "아무거나 맞다"가
+      아니다 — 그 상태로 첫 항목에 진입하면 **엉뚱한 물건의 자산을 저장**할 수 있고,
+      그것이 `go_to_case_detail()` 이 `require_exact_item` 으로 막으려는 바로 그 사고다.
     """
-    return target_case_no in [c.strip() for c in list_entry_case_no.split(" / ")]
+    target = _case_no_parts(target_case_no)
+    entry = _case_no_parts(list_entry_case_no)
+    return bool(target & entry)
+
+
+def _case_no_parts(case_no: str) -> set:
+    """`"A / B"` -> `{"A", "B"}`. 비어 있으면 빈 집합(= 아무것도 일치하지 않는다)."""
+    return {part.strip() for part in (case_no or "").split(" / ") if part.strip()}
 
 
 def resume_start_idx(list_items: List[dict], resume_from: Optional[str]) -> int:

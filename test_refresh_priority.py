@@ -73,7 +73,10 @@ def run():
 
     tmp = tempfile.mkdtemp(prefix="refreshprio_")
     scratch = os.path.join(tmp, "auction.db")
-    shutil.copy2(src, scratch)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    db.snapshot_live_db(scratch)
     saved = db.DB_PATH
     db.DB_PATH = scratch
 

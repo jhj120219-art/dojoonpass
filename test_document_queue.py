@@ -612,6 +612,9 @@ def test_relisted_auction_date_is_refreshed():
             ("2024타경505", "1", "status", "SKIPPED_EXPIRED", 3, old_date, 0, None),
             ("2024타경505", "1", "appraisal", "SKIPPED_EXPIRED", 3, old_date, 0, None),
             ("2024타경505", "1", "image", "SKIPPED_EXPIRED", 3, old_date, 0, None),
+            # 대조군 — 이쪽은 되살리면 안 된다(#254). 시간이 지나도 성공할 수 없는 항목이
+            # 매일 되살아나던 것이 `mark_queue_unsupported()` 가 없앤 문제다.
+            ("2024타경777", "1", "spec", "SKIPPED_UNSUPPORTED", 3, old_date, 0, None),
         ])
         conn.close()
         dbmod.DB_PATH = os.path.join(d, "t.db")
@@ -623,6 +626,8 @@ def test_relisted_auction_date_is_refreshed():
             {"court_code": "B000210", "case_no": "2024타경502", "item_no": "1",
              "auction_date": new_date},
             {"court_code": "B000210", "case_no": "2024타경505", "item_no": "1",
+             "auction_date": new_date},
+            {"court_code": "B000210", "case_no": "2024타경777", "item_no": "1",
              "auction_date": new_date},
         ])
 
@@ -649,21 +654,35 @@ def test_relisted_auction_date_is_refreshed():
                    row("2024타경1533")["priority"] != 3,
                    "계산값이 시드와 같으면 이 검사는 갱신 누락을 잡지 못한다")
 
-        # 상태는 손대지 않는다 - 재수집 여부는 정책 결정이라 이 수정의 범위가 아니다.
+        # 상태는 대부분 손대지 않는다 - 재수집 여부는 정책 결정이라 이 수정의 범위가 아니다.
         check("pending은 pending 그대로", row("2024타경1533")["status"], "pending")
         check("done은 되살리지 않는다", row("2024타경502")["status"], "done")
-        check("SKIPPED_EXPIRED도 되살리지 않는다",
-              row("2024타경505")["status"], "SKIPPED_EXPIRED")
+        # ★ 예외는 SKIPPED_EXPIRED 하나다 (2026-08-27, BUGS #254).
+        #   그 상태는 "기일이 지나 대상이 아님"이라는 **주장**인데, 새 기일이 미래로
+        #   잡힌 지금 그 주장은 사실이 아니다. done/failed 되살리기(=재수집)와 달리
+        #   이 행들은 **한 번도 받은 적이 없어** 되살리는 것이 첫 수집이다.
+        check("★ SKIPPED_EXPIRED는 되살린다(기일이 다시 잡혔으므로)",
+              row("2024타경505")["status"], "pending")
+        check("되살릴 때 재시도 예산도 새로 준다",
+              row("2024타경505")["retry_count"], 0)
+        check("SKIPPED_UNSUPPORTED는 되살리지 않는다(시간이 지나도 성공할 수 없다)",
+              row("2024타경777")["status"], "SKIPPED_UNSUPPORTED")
         # 다만 기록된 기일 자체는 사실과 맞아야 한다(운영 조회/통계가 이 값을 본다).
         check("done 행의 기일도 사실과 맞춘다", row("2024타경502")["auction_date"], new_date)
-        check("SKIPPED_EXPIRED 행의 기일도 사실과 맞춘다",
+        check("되살린 행의 기일도 새 기일이다",
               row("2024타경505")["auction_date"], new_date)
+        check("되살린 행의 우선순위도 새 기일 기준이다",
+              row("2024타경505")["priority"], dbmod.calc_priority(new_date))
 
         # 갱신 건수를 호출부가 알 수 있어야 한다(로그로 추적 가능해야 조용한 실패가 안 된다).
         check_true("반환값에 갱신 건수가 있다", "refreshed" in result, result)
-        # 사건 3건 x 문서종류 4개 = 12행이 전부 갱신 대상이다(Sprint 144에 image 추가).
-        check("갱신 건수", result.get("refreshed"), 12)
-        check("신규 적재는 0건", result["added"], 0)
+        # 1533(4행) + 502(4행) + 777 의 spec(1행) = 9행이 '기일 갱신'이다.
+        # 505 의 4행은 '기일 갱신'이 아니라 **되살리기**로 세어진다(#254) — 두 사건을
+        # 한 칸에 합치면 로그가 다시 사실이 아닌 것을 말하게 된다(#47 과 같은 부류).
+        check("갱신 건수", result.get("refreshed"), 9)
+        check("되살린 건수", result.get("revived_expired"), 4)
+        # 777 은 spec 만 시드했으므로 나머지 3종이 새로 들어간다.
+        check("신규 적재", result["added"], 3)
 
         # ★ 결과 확인: 이제 doc_worker의 2차 방어선이 이 행을 죽이지 않는다.
         claimed = dbmod.claim_next_queue_item()
@@ -675,6 +694,83 @@ def test_relisted_auction_date_is_refreshed():
                    % (claimed["auction_date"], today))
 
         c.close()
+    finally:
+        dbmod.DB_PATH = real_path
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 12-C. 기일이 **이미 최신인데도** SKIPPED_EXPIRED 로 굳은 행 (2026-08-27, BUGS #254)
+#
+# Sprint 74 의 되살리기는 "기일이 **바뀌었을 때**"만 돌았다. 그런데 운영에서 실제로
+# 쌓인 모양은 그게 아니었다 — 날짜는 이미 오늘로 맞춰져 있고 상태만 SKIPPED_EXPIRED 다.
+#
+#     실측 (2026-08-27 운영 DB)
+#       36행: status=SKIPPED_EXPIRED / auction_date=2026-08-27(오늘) / 전부 appraisal
+#       같은 물건의 spec/status/image 는 pending — 오늘 함께 수집될 예정
+#       document_status 기록 없음 / doc_raw 0행  -> 한 번도 받은 적이 없다
+#
+# 즉 **오늘 매각이 진행되는 물건의 감정평가서만** 조용히 빠진다. 그리고 날짜가 이미
+# 최신이라 "바뀌었을 때만 고친다"로는 **영원히 안 고쳐진다.**
+#
+# `test_pipeline_integrity.py` 가 상한 1로 잡아 두었고 1 -> 36 으로 늘어 붉어졌다.
+# ---------------------------------------------------------------------------
+def test_expired_row_with_current_date_is_revived():
+    print("\n--- 12-C. 날짜가 이미 최신인 SKIPPED_EXPIRED 도 되살린다 (BUGS #254) ---")
+    import storage.database as dbmod
+
+    d, conn = make_db()
+    real_path = dbmod.DB_PATH
+    try:
+        # ★ 핵심: 큐 행의 기일이 **이미 오늘**이다. 바뀔 것이 없다.
+        today = datetime.now().strftime("%Y-%m-%d")
+        _seed_queue(conn, [
+            ("2024타경9001", "1", "spec", "pending", 3, today, 0, None),
+            ("2024타경9001", "1", "status", "pending", 3, today, 0, None),
+            ("2024타경9001", "1", "image", "pending", 3, today, 0, None),
+            # 운영에서 실제로 남아 있던 모양 그대로 — 형제는 pending, 이것만 종결됐다.
+            ("2024타경9001", "1", "appraisal", "SKIPPED_EXPIRED", 3, today, 0,
+             "'2026-08-26T07:01:23'"),   # 마지막 칸은 **원시 SQL**이다(_seed_queue 참고)
+        ])
+        conn.close()
+        dbmod.DB_PATH = os.path.join(d, "t.db")
+
+        result = dbmod.enqueue_documents([
+            {"court_code": "B000210", "case_no": "2024타경9001", "item_no": "1",
+             "auction_date": today},
+        ])
+
+        c = sqlite3.connect(dbmod.DB_PATH)
+        c.row_factory = sqlite3.Row
+        appr = c.execute("SELECT * FROM document_queue WHERE case_no='2024타경9001'"
+                         " AND doc_type='appraisal'").fetchone()
+
+        check("★ 날짜가 안 바뀌어도 되살린다", appr["status"], "pending")
+        check("되살린 건수를 호출부가 알 수 있다", result.get("revived_expired"), 1)
+        check("새로 넣은 행은 없다(되살리기지 중복 적재가 아니다)", result["added"], 0)
+        check("날짜가 같으므로 '기일 갱신'으로는 세지 않는다", result.get("refreshed"), 0)
+        check("행 수는 그대로 4행", c.execute(
+            "SELECT COUNT(*) FROM document_queue WHERE case_no='2024타경9001'"
+        ).fetchone()[0], 4)
+
+        # ★ 되살린 행을 워커가 실제로 집어 가는가 — 상태만 바꾸고 못 집으면 헛일이다.
+        picked = []
+        for _ in range(6):
+            got = dbmod.claim_next_queue_item()
+            if not got:
+                break
+            picked.append(got["doc_type"])
+        check_true("★ 되살린 appraisal 행을 워커가 집어 간다",
+                   "appraisal" in picked, "-> 집어 온 것: %s" % picked)
+
+        # 두 번 돌려도 같은 결과여야 한다(멱등) — 이미 pending 이므로 되살릴 것이 없다.
+        c.close()
+        result2 = dbmod.enqueue_documents([
+            {"court_code": "B000210", "case_no": "2024타경9001", "item_no": "1",
+             "auction_date": today},
+        ])
+        check("두 번째 실행에서는 되살릴 것이 없다(멱등)",
+              result2.get("revived_expired"), 0)
     finally:
         dbmod.DB_PATH = real_path
         shutil.rmtree(d, ignore_errors=True)
@@ -1460,6 +1556,7 @@ def run():
     test_calc_priority()
     test_refresh_queue_priority()
     test_relisted_auction_date_is_refreshed()
+    test_expired_row_with_current_date_is_revived()
     test_expired_items_are_not_enqueued()
     test_relist_does_not_touch_unrelated_rows()
     test_get_doc_button_id_contract()

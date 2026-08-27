@@ -59,10 +59,27 @@ def check_true(name, cond, detail=""):
 _TMP = []
 
 
+# 운영 DB 경로를 **한 번만** 붙잡아 둔다 (2026-08-27, BUGS #257).
+#
+# ★ 예전에는 `scratch_db()` 가 그때그때의 `dbmod.DB_PATH` 에서 스냅샷을 떴다. 그런데
+#   이 함수는 마지막 줄에서 `dbmod.DB_PATH` 를 **방금 만든 스크래치로 바꾼다.** 즉
+#   두 번째 호출부터는 실 DB 가 아니라 **직전 스크래치의 사본**을 뜨고 있었다.
+#
+#   행은 지우므로 데이터는 안 넘어온다 — 그래서 지금까지 아무도 몰랐다. 넘어오는 것은
+#   **스키마 객체**다. 6-B 가 유도를 깨뜨리려고 심은 트리거가 6-C/6-D 까지 따라가
+#   집계를 흔들었다(실측: 6-D 의 `inserted` 가 1 이 아니라 2 로 나왔다. 그 검사만
+#   단독으로 돌리면 1 이다).
+#
+#   검사끼리 조용히 오염되는 모양이고, 이 세션에 고친 #251(찢어진 DB 사본)과 같은
+#   부류다 — **격리한 줄 알았는데 아니었다.**
+_LIVE_DB_PATH = dbmod.DB_PATH
+
+
 def scratch_db():
     d = tempfile.mkdtemp(prefix="upsert_cd_")
     _TMP.append(d)
     path = os.path.join(d, "scratch.db")
+    dbmod.DB_PATH = _LIVE_DB_PATH      # 항상 **실 DB** 에서 뜬다 (직전 스크래치가 아니라)
     dbmod.snapshot_live_db(path)
     c = sqlite3.connect(path)
     try:
@@ -261,6 +278,190 @@ def test_all_unchanged_day_is_success():
     check("실패 사유 없음", oc.failure_reason(), None)
 
 
+# ---------------------------------------------------------------------------
+# 6. 한 문장 upsert 로 바뀐 뒤 **집계의 전제**가 지켜지는가 (2026-08-27, BUGS #256)
+#
+# 이제 신규/갱신/무변화를 행마다 묻지 않는다. 배치 앞뒤로 두 번만 세서 유도한다:
+#
+#     inserted  = 행 수 증가분
+#     written   = total_changes 증가분
+#     updated   = written - inserted
+#     unchanged = 처리한 행 - written
+#
+# 이 유도는 **한 upsert 가 정확히 0 또는 1행만 바꾼다**는 전제 위에 있다.
+# `auction` 에 트리거나 이 테이블을 참조하는 외래키가 생기면 그 전제가 깨진다.
+# 아래 검사들은 (a) 전제가 지금 성립하고 (b) 깨졌을 때 **조용하지 않은지**를 본다.
+# ---------------------------------------------------------------------------
+def test_no_triggers_or_referencing_fks_on_auction():
+    print("\n--- 6-A. 집계 유도의 전제 (트리거/참조 외래키 없음) ---")
+    path = scratch_db()
+    c = sqlite3.connect(path)
+    try:
+        trig = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='auction'"
+        ).fetchall()
+        check("auction 에 트리거가 없다", [t[0] for t in trig], [])
+
+        refs = []
+        for (t,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"
+                              " AND name NOT LIKE 'sqlite_%'").fetchall():
+            for fk in c.execute('PRAGMA foreign_key_list("%s")' % t).fetchall():
+                if fk[2] == "auction":
+                    refs.append("%s -> auction(%s)" % (t, fk[4]))
+        check("auction 을 참조하는 외래키가 없다", refs, [])
+        if trig or refs:
+            print("      -> 생겼다면 upsert_batch 의 집계 유도를 다시 봐야 한다."
+                  " total_changes 가 한 행보다 많이 세게 된다.")
+    finally:
+        c.close()
+
+
+def test_broken_derivation_is_loud_not_silent():
+    """전제가 깨지면 **틀린 숫자를 조용히 내보내지 않는다.**
+
+    트리거를 실제로 심어 유도를 깨뜨린다. 이 검사가 없으면 위 자기 검사는 장식이다.
+    """
+    print("\n--- 6-B. 전제가 깨지면 시끄럽게 운다 ---")
+    path = scratch_db()
+    dbmod.upsert_batch([row(case_no="2026타경000001")])
+
+    # auction 이 갱신될 때마다 **다른 행도** 만드는 트리거 - total_changes 가 부풀어
+    # 유도가 깨진다. 실제로 이런 트리거를 심어 두는 것이 아니라, "전제가 깨진 상태"를
+    # 재현해 경보가 울리는지만 본다.
+    c = sqlite3.connect(path)
+    try:
+        c.execute("CREATE TRIGGER qa_break_derivation AFTER UPDATE ON auction "
+                  "BEGIN "
+                  "  INSERT INTO auction(court_code, case_no, item_no) "
+                  "    VALUES('QA-TRIG', 'QA-'||NEW.id||'-'||NEW.updated_at, '9'); "
+                  "END")
+        c.commit()
+    finally:
+        c.close()
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            logging.Handler.__init__(self)
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    logging.disable(logging.NOTSET)          # 이 파일은 위에서 로깅을 꺼 두었다
+    grab = Grab()
+    lg = logging.getLogger(dbmod.__name__)
+    lg.addHandler(grab)
+    prev = lg.level
+    lg.setLevel(logging.ERROR)
+    try:
+        res = dbmod.upsert_batch([row(case_no="2026타경000001", status="유찰 1회")])
+    finally:
+        lg.removeHandler(grab)
+        lg.setLevel(prev)
+        logging.disable(logging.CRITICAL)
+
+    # 이 검사가 만든 트리거는 이 검사가 치운다 - 위 `scratch_db()` 격리와 두 겹으로 막는다.
+    c = sqlite3.connect(path)
+    try:
+        c.execute("DROP TRIGGER IF EXISTS qa_break_derivation")
+        c.commit()
+    finally:
+        c.close()
+
+    errs = [r.getMessage() for r in grab.records if r.levelno >= logging.ERROR]
+    check_true("검사가 공허하지 않다(트리거가 실제로 유도를 깨뜨렸다)",
+               min(res["inserted"], res["updated"], res["unchanged"]) < 0,
+               "-> %s (깨지지 않았다면 이 검사를 고쳐라)" % res)
+    check_true("★ 유도가 깨지면 ERROR 로그가 나간다", len(errs) >= 1,
+               "-> 결과=%s / 로그=%s" % (res, errs))
+    if errs:
+        check_true("로그가 원인을 짚어 준다(트리거/외래키)",
+                   "트리거" in errs[0] or "외래키" in errs[0], errs[0][:160])
+
+
+def test_created_at_and_doc_flags_survive_update():
+    """갱신이 `created_at` 과 `has_*` 를 덮지 않는다 (SET 목록에 없어야 한다).
+
+    한 문장 upsert 로 옮기면서 SET 목록을 새로 조립했다. 거기에 이 컬럼들이 끼면
+    **문서 수집 결과가 매일 크롤에 지워진다** - 조용하고 되돌리기 어려운 손실이다.
+    """
+    print("\n--- 6-C. 갱신이 created_at / has_* 를 보존한다 ---")
+    path = scratch_db()
+    dbmod.upsert_batch([row(case_no="2026타경000001")])
+    c = sqlite3.connect(path)
+    try:
+        c.execute("UPDATE auction SET created_at='2020-01-01T00:00:00',"
+                  " has_spec_pdf=1, has_status_doc=1, has_appraisal_pdf=1")
+        c.commit()
+    finally:
+        c.close()
+
+    res = dbmod.upsert_batch([row(case_no="2026타경000001", status="유찰 1회")])
+    check("실제로 갱신됐다(검사가 공허하지 않다)", res["updated"], 1)
+    check("created_at 이 보존된다", one(path, "SELECT created_at FROM auction"),
+          "2020-01-01T00:00:00")
+    check("has_spec_pdf 가 보존된다", one(path, "SELECT has_spec_pdf FROM auction"), 1)
+    check("has_status_doc 가 보존된다", one(path, "SELECT has_status_doc FROM auction"), 1)
+    check("has_appraisal_pdf 가 보존된다",
+          one(path, "SELECT has_appraisal_pdf FROM auction"), 1)
+    check_true("updated_at 은 갱신된다",
+               one(path, "SELECT updated_at FROM auction") != "2020-01-01T00:00:00")
+
+
+def test_duplicate_key_inside_one_batch():
+    """같은 배치에 같은 키가 두 번 와도 행이 두 벌 생기지 않고 계수도 맞는다."""
+    print("\n--- 6-D. 한 배치 안의 중복 키 ---")
+    path = scratch_db()
+    r = row(case_no="2026타경000001")
+    res = dbmod.upsert_batch([r, dict(r)])
+    check("행은 하나만 생긴다", one(path, "SELECT COUNT(*) FROM auction"), 1)
+    check("신규 1", res["inserted"], 1)
+    check("둘째는 무변화", res["unchanged"], 1)
+    check_true("합계가 입력 수와 같다", sum(res.values()) == 2, res)
+
+    # 같은 배치 안에서 **값이 다른** 중복 - 뒤엣것이 이기고 갱신으로 센다.
+    res2 = dbmod.upsert_batch([row(case_no="2026타경000002"),
+                               row(case_no="2026타경000002", status="유찰 1회")])
+    check("값이 다른 중복: 신규 1 + 갱신 1", (res2["inserted"], res2["updated"]), (1, 1))
+    check("마지막 값이 남는다",
+          one(path, "SELECT status FROM auction WHERE case_no='2026타경000002'"), "유찰 1회")
+    check("행은 여전히 하나", one(
+        path, "SELECT COUNT(*) FROM auction WHERE case_no='2026타경000002'"), 1)
+
+
+def test_statement_count_is_one_per_row():
+    """★ 행마다 **한 문장**인가 (#256 의 본론).
+
+    숫자를 고정하는 것이 목적이 아니라, 예전의 `SELECT + INSERT/UPDATE` 두 문장이
+    다시 돌아오는 것을 막는 것이 목적이다.
+    """
+    print("\n--- 6-E. 행마다 한 문장 ---")
+    scratch_db()
+    seen = []
+    real_connect = sqlite3.connect
+
+    def traced(*a, **kw):
+        c = real_connect(*a, **kw)
+        c.set_trace_callback(
+            lambda s: seen.append((s.strip().split(None, 1) or ["?"])[0].upper()))
+        return c
+
+    sqlite3.connect = traced
+    try:
+        n = 50
+        dbmod.upsert_batch([row(case_no="2026타경%06d" % i) for i in range(n)])
+    finally:
+        sqlite3.connect = real_connect
+
+    body = [s for s in seen if s in ("SELECT", "INSERT", "UPDATE")]
+    check_true("검사가 공허하지 않다(문장을 실제로 관찰했다)", len(body) > 0, seen[:5])
+    check("행마다 INSERT(upsert) 한 문장", body.count("INSERT"), n)
+    check("행마다 SELECT 를 보내지 않는다(배치당 2번뿐)", body.count("SELECT"), 2)
+    check("별도 UPDATE 문장은 없다", body.count("UPDATE"), 0)
+    check_true("총 문장 수가 행 수 + 상수다(2N 이 아니다)",
+               len(body) <= n + 4, "-> %d문장 / %d행" % (len(body), n))
+
+
 if __name__ == "__main__":
     try:
         test_unchanged_is_not_written()
@@ -268,6 +469,11 @@ if __name__ == "__main__":
         test_null_columns_are_detected()
         test_mixed_batch_counts()
         test_all_unchanged_day_is_success()
+        test_no_triggers_or_referencing_fks_on_auction()
+        test_broken_derivation_is_loud_not_silent()
+        test_created_at_and_doc_flags_survive_update()
+        test_duplicate_key_inside_one_batch()
+        test_statement_count_is_one_per_row()
     finally:
         for d in _TMP:
             shutil.rmtree(d, ignore_errors=True)

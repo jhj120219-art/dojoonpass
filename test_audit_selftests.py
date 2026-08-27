@@ -63,6 +63,13 @@ TOOLS = [
     "audit_asset_integrity.py",
     "audit_schedule_health.py",
     "audit_auth_health.py",
+    # 2026-08-27 추가 (BUGS #258) - 이 도구는 "다른 검사가 공허하지 않은가"를 재면서
+    #   **정작 자기 자신은 아무도 재지 않았다.** 그리고 이 도구가 틀렸을 때 나오는 것은
+    #   오류가 아니라 **그럴듯한 숫자**라 조용히 틀린다:
+    #     - 저장소 경로가 다른 PC 것으로 박혀 있어 한 줄도 돌지 않았다(#252)
+    #     - coverage 출력이 비면 이유 없이 None 으로 사라졌다(#258)
+    #   둘 다 selftest 를 붙이면서 드러났다.
+    "audit_test_reality.py",
 ]
 
 

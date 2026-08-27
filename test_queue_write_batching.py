@@ -66,11 +66,22 @@ def check_true(name, cond, detail=""):
 _TMP = []
 
 
+# 운영 DB 경로를 **한 번만** 붙잡아 둔다 (2026-08-27, BUGS #257).
+#
+# ★ `scratch_db()` 는 마지막에 `dbmod.DB_PATH` 를 스크래치로 갈아끼운다. 그래서
+#   그때그때의 `dbmod.DB_PATH` 에서 스냅샷을 뜨면, 두 번째 호출부터는 실 DB 가 아니라
+#   **직전 스크래치의 사본**을 뜬다. 행은 지우므로 데이터는 안 넘어오지만 **스키마
+#   객체(트리거/인덱스/뷰)는 넘어간다** — 검사끼리 조용히 오염된다.
+#   `test_upsert_change_detection.py` 에서 실제로 트리거가 새어 나가 집계를 흔들었다.
+_LIVE_DB_PATH = dbmod.DB_PATH
+
+
 def scratch_db():
     """운영 DB 의 스키마 그대로인 빈 DB."""
     d = tempfile.mkdtemp(prefix="qwb_")
     _TMP.append(d)
     path = os.path.join(d, "scratch.db")
+    dbmod.DB_PATH = _LIVE_DB_PATH   # 항상 **실 DB** 에서 뜬다
     dbmod.snapshot_live_db(path)
     c = sqlite3.connect(path)
     try:
@@ -221,6 +232,13 @@ def test_enqueue_refreshes_changed_auction_date():
 #
 #    `INSERT OR IGNORE` 의 원래 성질이다. 선조회 방식으로 바꾸면서 이게 바뀌면
 #    doc_worker 가 수집을 끝낸 done 행이 매일 pending 으로 되돌아가 영원히 재수집된다.
+#
+#    ★ 2026-08-27 (BUGS #254) — 예외가 딱 하나 생겼다: `SKIPPED_EXPIRED`.
+#      그 상태는 "기일이 지나 대상이 아님"이라는 **주장**인데, 새 기일이 아직 안 지난
+#      행에 붙어 있으면 그 주장은 사실이 아니고 아무도 그 행을 다시 보지 않는다.
+#      `done` / `failed` 되살리기(=재수집)와 다르다 — 그 행들은 한 번도 받은 적이 없다.
+#      운영에서 36행이 그렇게 굳어 있었다(전부 감정평가서, 전부 매각기일이 그날).
+#      여기서는 **되살리는 쪽과 안 되살리는 쪽을 같은 검사에서 대비**해 둔다.
 # ---------------------------------------------------------------------------
 def test_enqueue_preserves_existing_status():
     print("\n--- 3. enqueue_documents: 기존 status 보존 ---")
@@ -239,8 +257,10 @@ def test_enqueue_preserves_existing_status():
     got = {x["doc_type"]: (x["status"], x["retry_count"])
            for x in rows_of(path, "SELECT doc_type, status, retry_count FROM document_queue")}
     check("done 은 done 으로 남는다", got["spec"][0], "done")
-    check("SKIPPED_EXPIRED 도 그대로", got["image"][0], "SKIPPED_EXPIRED")
-    check("retry_count 도 그대로", got["status"][1], 2)
+    check("★ SKIPPED_EXPIRED 는 되살린다(기일이 안 지났으므로, #254)",
+          got["image"][0], "pending")
+    check("되살릴 때 재시도 예산도 새로 준다", got["image"][1], 0)
+    check("되살리지 않은 행의 retry_count 는 그대로", got["status"][1], 2)
 
     # 기일이 바뀌어 refresh 가 나가도 status/retry_count 는 안 건드린다
     dbmod.enqueue_documents([row(1, auction_date=days_ahead(50))])
@@ -248,6 +268,9 @@ def test_enqueue_preserves_existing_status():
             for x in rows_of(path, "SELECT doc_type, status, retry_count FROM document_queue")}
     check("기일 갱신 후에도 done 유지", got2["spec"][0], "done")
     check("기일 갱신 후에도 retry_count 유지", got2["status"][1], 2)
+    # 되살리기는 **한 번**이면 끝이다 - 이미 pending 이므로 두 번째부터는 할 일이 없다.
+    r3 = dbmod.enqueue_documents([row(1, auction_date=days_ahead(50))])
+    check("이미 되살린 뒤에는 되살릴 것이 없다(멱등)", r3.get("revived_expired"), 0)
 
 
 # ---------------------------------------------------------------------------

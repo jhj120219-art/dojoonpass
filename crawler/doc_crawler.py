@@ -38,6 +38,43 @@ from crawler.resume import case_no_matches_list_entry
 
 KAPANET_BASE = "https://ca.kapanet.or.kr"
 OVERLAY_TIMEOUT = 15
+
+
+def _pdf_iframe_src(driver):
+    """지금 프레임 안에서 **src 가 `.pdf` 로 끝나는 iframe** 의 src. 없으면 None.
+
+    ## 왜 따로 뺐나 (2026-08-28, docs/BUGS.md #267)
+
+    `WebDriverWait(...).until()` 의 **조건 자체**로 쓰기 위해서다. 예전에는
+    "iframe 이 하나라도 생겼는가"를 기다린 뒤 src 를 **한 번만** 훑었는데, 뷰어는
+    iframe 을 먼저 붙이고 src 를 나중에 채우므로 그 한 번이 대개 너무 일렀다.
+    `until()` 은 None/False 를 받으면 계속 폴링하므로, 이 함수를 그대로 조건으로
+    쓰면 **필요한 것이 생길 때까지** 기다린다.
+
+    함수로 뺀 두 번째 이유는 **브라우저 없이 검증할 수 있게** 하려는 것이다.
+    이 저장소가 `crawler/resume.py` / `crawler/doc_paths.py` 에서 쓴 방법과 같다 —
+    순수한 판단만 떼어 내면 가짜 드라이버로 회귀를 걸 수 있다
+    (`test_doc_pdf_iframe.py`).
+
+    ★ 판정 규칙은 예전과 **글자 그대로 같다**(`src.lower().endswith(".pdf")`).
+      이번에 고친 것은 *언제 보는가*이지 *무엇을 보는가*가 아니다. 쿼리스트링이
+      붙은 src(`....pdf?token=…`)를 어떻게 볼지는 실 사이트 확인이 필요해
+      건드리지 않았다(docs/BUGS.md #267 의 "남긴 것" 참고).
+
+    ★ id 로 찾지 않는다 — 내부 iframe 의 id 는 매번 랜덤이다.
+    """
+    try:
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+    except Exception:               # noqa: BLE001 - 폴링 중 DOM 교체는 정상이다
+        return None
+    for frame in frames:
+        try:
+            src = frame.get_attribute("src") or ""
+        except Exception:           # noqa: BLE001 - stale element 는 다음 폴링에서 다시 본다
+            continue
+        if src.lower().endswith(".pdf"):
+            return src
+    return None
 NEW_WINDOW_TIMEOUT = 15
 
 # 형제 물건의 사건 단위 문서를 재사용할 수 있는 최대 나이(초). 기본 6시간.
@@ -850,15 +887,31 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
         driver.switch_to.frame(outer_iframe)
 
         # 2단계: 그 안에서 src가 .pdf로 끝나는 iframe 탐색 (id는 매번 랜덤이므로 사용 금지)
-        inner_iframes = WebDriverWait(driver, OVERLAY_TIMEOUT).until(
-            lambda d: d.find_elements(By.TAG_NAME, "iframe") or False
-        )
-        pdf_src = None
-        for f in inner_iframes:
-            src = f.get_attribute("src") or ""
-            if src.lower().endswith(".pdf"):
-                pdf_src = src
-                break
+        #
+        # ★ 2026-08-28 (docs/BUGS.md #267) — **기다리는 대상이 틀려 있었다.**
+        #
+        #   예전 판본:
+        #       inner_iframes = WebDriverWait(...).until(
+        #           lambda d: d.find_elements(By.TAG_NAME, "iframe") or False)
+        #       for f in inner_iframes:            # <- 여기서 src 를 **딱 한 번** 본다
+        #
+        #   즉 기다린 것은 "iframe 이 **하나라도** 생겼는가"인데, 정작 필요한 것은
+        #   "src 가 .pdf 인 iframe 이 생겼는가"다. 뷰어는 iframe 을 먼저 붙이고
+        #   **src 를 나중에 채운다.** 그래서 껍데기 iframe 이 붙는 순간 대기가 풀리고,
+        #   그 찰나에 한 번 훑어 못 찾으면 그대로 실패한다 — 15초 예산을 두고도
+        #   **사실상 기다리지 않는다.**
+        #
+        #   2026-08-28 워커 로그에서 이 경고가 **106건**으로 단일 실패 사유 1위였다
+        #   (그날 failed 95 -> 205). 한 건이 실패하면 재시도 3회가 각각
+        #   상세페이지 이동(중앙값 10.9초) + 오버레이 대기를 다시 태운다.
+        #
+        #   고친 방법: **기다리는 조건 자체를 필요한 것으로 바꾼다.** 새 예산을 만들지
+        #   않고 이미 있던 `OVERLAY_TIMEOUT` 을 그대로 쓴다. 성공 경로의 동작은 같고,
+        #   경합일 때만 실제로 기다린다.
+        try:
+            pdf_src = WebDriverWait(driver, OVERLAY_TIMEOUT).until(_pdf_iframe_src)
+        except Exception:
+            pdf_src = None
 
         if not pdf_src:
             logger.warning("[%s-%s] appraisal 내부 PDF iframe을 찾지 못함", case_no, item_no)

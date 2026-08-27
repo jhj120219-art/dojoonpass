@@ -57,7 +57,9 @@ def check_true(name, cond, detail=""):
 #
 # 이 테스트가 검증하는 것은 `CheckpointManager`의 **순수 로직**(임시파일 + os.replace)이지
 # 저장소의 `logs/` 디렉터리가 아니다. 동기화 폴더를 벗어나면 그 무관한 실패 요인이 사라진다.
-# (제품 코드는 그대로 `logs/checkpoint.json`을 쓴다 — 테스트 경로만 바꾼 것이다.)
+# (제품 코드는 그대로 저장소의 `logs/checkpoint.json`을 쓴다 — 테스트 경로만 바꾼 것이다.
+#  2026-08-27 BUGS #263 이후 그 기본값은 **모듈 파일 기준 절대경로**다. 아래
+#  `test_default_path_does_not_follow_cwd()` 가 그것을 고정한다.)
 QA_DIR = tempfile.mkdtemp(prefix="dojoonpass-qa-checkpoint-")
 QA_PATH = os.path.join(QA_DIR, "qa-checkpoint-" + uuid.uuid4().hex[:8] + ".json")
 
@@ -680,8 +682,77 @@ def test_runlock_backs_off_when_the_filesystem_is_weird():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_default_path_does_not_follow_cwd():
+    """★ 기본 체크포인트 경로가 **cwd 를 따라가지 않는가** (2026-08-27, BUGS #263).
+
+    ## 무엇이 문제였나
+
+    예전 기본값은 `"logs/checkpoint.json"` 이라 **cwd 기준**이었다. 저장소가 아닌 곳에서
+    크롤러를 띄우면 그 폴더에 `logs/checkpoint.json` 이 새로 생기고:
+
+        저장소의 진짜 체크포인트를 **못 찾는다** -> resume_from=None -> **처음부터 다시 긁는다**
+        진행 상황은 엉뚱한 폴더에 쌓인다        -> 다음 실행도 못 찾는다
+
+    즉 **재개가 조용히 무력화된다.** 오류도 경고도 없다 — 어제 다 한 법원을 오늘
+    처음부터 다시 돈다(상세페이지 이동 실측 중앙값 10.9초/건).
+
+    Sprint 245/246/252 가 같은 계열을 네 곳에서 고쳤는데(`api/auth.py` 의 load_dotenv,
+    `storage/database.py` 의 DB_PATH, `doc_worker.py` 의 LOCK_PATH, `mvp_scraper.py` 의
+    CSV) **여기만 남아 있었다.**
+
+    ## 정적 검사가 왜 못 잡았나
+
+    `test_schema_hygiene.py` 의 cwd 감사는 (A) 모듈 최상위 상수 할당과 (B) 경로 호출의
+    문자열 리터럴을 봤다. 여기는 **함수 기본 인자값**이라 둘 다 비껴갔다.
+    그 감사도 함께 고쳤지만(갈래 C/D 추가), 정적 검사만 믿지 않는다 —
+    **다른 cwd 에서 실제로 만들어 본다.**
+    """
+    print("\n--- 기본 경로가 cwd 를 따라가지 않는가 (BUGS #263) ---")
+    import subprocess
+    import shutil as _shutil
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    probe = tempfile.mkdtemp(prefix="cp-cwd-probe-")
+    code = (
+        "import sys, os, json;"
+        " sys.path.insert(0, r'%s');"
+        " from storage.checkpoint import CheckpointManager;"
+        " cm = CheckpointManager();"
+        " print(json.dumps({'path': os.path.abspath(cm.path), 'cwd': os.getcwd()}))"
+    ) % root
+    try:
+        r = subprocess.run([sys.executable, "-c", code], cwd=probe,
+                           capture_output=True, timeout=120,
+                           env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        out = (r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+        payload = None
+        for line in reversed(out):
+            if line.startswith("{"):
+                payload = json.loads(line)
+                break
+        check_true("다른 cwd 에서 CheckpointManager 를 실제로 만들었다", payload is not None,
+                   "-> stdout=%r stderr=%r" % (out[-3:], (r.stderr or b"")[-300:]))
+        if payload:
+            check_true("전제: 정말 다른 cwd 에서 돌았다",
+                       os.path.normcase(payload["cwd"]) != os.path.normcase(root),
+                       payload["cwd"])
+            check_true("★ 기본 경로가 저장소 안을 가리킨다(cwd 가 아니라)",
+                       os.path.normcase(os.path.dirname(payload["path"]))
+                       == os.path.normcase(os.path.join(root, "logs")),
+                       "-> %s" % payload["path"])
+        # cwd 에 logs/ 가 새로 생기지 않았는지도 본다 - 경로만 맞고 부수효과가 남으면 반쪽이다.
+        check("★ 실행 폴더에 logs/ 가 생기지 않는다",
+              sorted(os.listdir(probe)), [])
+    finally:
+        _shutil.rmtree(probe, ignore_errors=True)
+
+    # 명시 경로를 넘기던 기존 계약은 그대로다(이 파일의 다른 검사 전부가 그것을 쓴다).
+    check("명시 경로는 그대로 쓰인다", CheckpointManager(path="X/y.json").path, "X/y.json")
+
+
 def run():
     try:
+        test_default_path_does_not_follow_cwd()
         test_save_get_clear_roundtrip()
         test_atomic_write_survives_simulated_crash()
         test_corrupted_file_does_not_crash_get()

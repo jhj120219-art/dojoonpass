@@ -60,6 +60,20 @@ venv/
 htmlcov/
 coverage.xml
 
+# ★ `audit_test_reality.py` 가 만드는 파일별 커버리지 DB (2026-08-27, docs/BUGS.md #264)
+#
+#   그 도구는 검사 파일마다 `COVERAGE_FILE=.cov_<파일명>` 로 따로 측정한다. 즉 이름이
+#   `.coverage*` 가 아니라 **`.cov_*`** 라, 위 두 줄이 잡지 못한다.
+#
+#   그 누락은 이미 사고가 됐다 — `.cov_test_audit_selftests-DESKTOP-DVRJEGP_py` 가
+#   **git 에 추적된 채로 커밋돼 있고**, `test_schema_hygiene.py` 의 "추적된 SQLite DB"
+#   검사가 그것을 붉게 잡고 있었다(BUGS #253). 이 규칙이 처음부터 있었으면
+#   애초에 커밋될 수 없었다.
+#
+#   바로 위 주석이 적어 둔 것과 **정확히 같은 부류의 누락**이다 — 확장자도 접두어도
+#   기존 규칙과 살짝 어긋난 산출물.
+.cov_*
+
 # 크롤링 데이터 / 결과물 (코드 아님, 용량 크고 계속 바뀜)
 *.db
 # DB 백업 스냅숏 — `*.db`는 `auction.db.backup_20260728_103355`처럼 확장자가 뒤에 없는

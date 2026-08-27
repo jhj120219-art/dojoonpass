@@ -77,6 +77,14 @@ def _item(ms, case_no, item_no="1", court="QA법원"):
     )
 
 
+def _csv_state(path):
+    """(존재, 크기, mtime). 없으면 (False, None, None)."""
+    if not os.path.exists(path):
+        return (False, None, None)
+    st = os.stat(path)
+    return (True, st.st_size, st.st_mtime)
+
+
 def run():
     import storage.database as db
 
@@ -85,9 +93,41 @@ def run():
         check_true("원본 DB 가 있다", False, real_db)
         return 1
 
+    # ★ 그날 CSV 의 **처음 상태**를 기록해 둔다 (2026-08-28, docs/BUGS.md #266).
+    #
+    #   예전에는 검사 끝에 `not os.path.exists(오늘_CSV)` 를 단언했다. 즉
+    #   **"그 파일이 아예 없어야 한다"** 였는데, 그 파일은 매일 04:53 크롤이
+    #   정상적으로 만드는 **운영 산출물**이다. 그래서 이 검사는 **크롤이 실제로 돈
+    #   날이면 반드시 붉어졌다.**
+    #
+    #   지금까지 안 드러난 이유가 고약하다 — 어제까지는 이 검사 자신이 그 CSV 를
+    #   **지우고 있었다**(#250). 그 결함을 고치자마자 이 단언이 드러났다.
+    #   실측(2026-08-28): 04:53 크롤이 만든 `auction_20260828.csv`(84KB, 실제 컬럼)
+    #   때문에 실패.
+    #
+    #   #250 과 같은 부류다 — **"내가 만들었나"와 "존재하나"를 구별하지 못한다.**
+    #   그래서 존재 여부가 아니라 **앞뒤 상태 변화**를 본다.
+    _today_csv = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "auction_%s.csv" % datetime.date.today().strftime("%Y%m%d"))
+    _csv_before = _csv_state(_today_csv)
+
     tmp = tempfile.mkdtemp(prefix="crawlorch_")
     scratch = os.path.join(tmp, "auction.db")
-    shutil.copy2(real_db, scratch)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 (2026-08-27, BUGS #251).
+    #
+    #   SQLite 파일을 OS 파일 복사로 뜨면 **다른 프로세스가 쓰는 중일 때 찢어진 사본**이
+    #   나온다. `snapshot_live_db()` 의 docstring 이 그 이유와 실측을 갖고 있고,
+    #   이 저장소의 다른 검사 10곳은 이미 그 함수를 쓴다. **이 파일만 남아 있었다.**
+    #
+    #   `test_db_snapshot.py` 의 정적 감사가 왜 못 잡았는지도 남긴다: 그 정규식은
+    #   `copy2(...)` 의 인자에 `DB_PATH` 라는 **글자**가 있는지를 본다. 여기는
+    #   `real_db = db.DB_PATH` 로 한 번 받아 둔 뒤 `copy2(real_db, ...)` 였다 —
+    #   같은 것을 가리키지만 글자로는 다르다. 그 감사도 함께 고쳤다(별칭을 따라간다).
+    #
+    #   실측 근거: 2026-08-27 전체 스위트 2회 중 1회에서 이 파일만 12건 실패했고
+    #   단독 실행 12/12 는 통과했다 — 다른 프로세스가 실 DB 를 만지던 동안이었다.
+    db.snapshot_live_db(scratch)
     db.DB_PATH = scratch
 
     try:
@@ -243,6 +283,69 @@ def run():
         check("★ main() 이 document_queue 적재를 호출한다", enqueued["calls"], 1)
         check("main() 이 넘긴 행 수", enqueued["rows"], 2)
 
+        # ── 5-b. ★ 정규화에서 떨어진 건수가 **눈에 보이는가** (2026-08-27, BUGS #261)
+        #
+        #   `normalize_batch()` 는 기형 행 하나가 배치를 죽이지 않도록 그 행만 버린다
+        #   (Sprint 78 — 옳은 격리다. `test_normalizer.py` 가 그 격리를 고정한다).
+        #   문제는 **버렸다는 사실이 파이프라인에서 사라졌다**는 것이었다. 예전 이 경로는
+        #   `"정규화 완료: N건"` 만 찍어서, 2,608건을 받아 2,600건을 찍어도 그 줄만으로는
+        #   8건이 없어진 것을 알 수 없었다.
+        #
+        #       수집 2,608 -> 정규화 2,600 -> 저장 2,600 -> 종료코드 0
+        #       법원에서 받아 온 8건이 DB 에 닿지 못했는데 아무도 모른다.
+        #
+        #   **전부** 떨어지면 `persisted == 0` 으로 잡힌다(#47). 부분 손실만 어디에서도
+        #   잡히지 않았다 — 이 저장소가 반복해서 고쳐 온 "조용한 손실"이다.
+        import logging as _logging
+
+        class _Grab(_logging.Handler):
+            def __init__(self):
+                _logging.Handler.__init__(self)
+                self.msgs = []
+
+            def emit(self, record):
+                self.msgs.append(record.getMessage())
+
+        broken = _item(ms, "2099타경4001")
+        broken.address = None          # normalize_address 안에서 예외가 난다
+        ms.crawl_court = lambda court: [_item(ms, "2099타경4002"), broken,
+                                        _item(ms, "2099타경4003")]
+        grab = _Grab()
+        lg = _logging.getLogger(ms.__name__)
+        lg.addHandler(grab)
+        prev_level = lg.level
+        lg.setLevel(_logging.WARNING)
+        drop_oc = CrawlOutcome()
+        try:
+            drop_rows = ms.run_courts([_Court("QA1")], drop_oc)
+        finally:
+            lg.removeHandler(grab)
+            lg.setLevel(prev_level)
+
+        check("검사가 공허하지 않다(정상 행이 실제로 통과했다)", len(drop_rows), 2)
+        check("크롤이 가져온 건수는 3건 그대로", drop_oc.collected, 3)
+        check("★ 정규화 탈락 건수가 CrawlOutcome 에 남는다", drop_oc.normalize_dropped, 1)
+        warns = drop_oc.warnings()
+        check_true("★ warnings() 가 탈락을 보고한다",
+                   any("정규화" in w for w in warns), warns)
+        check_true("★ 로그로도 실제로 나간다(반환값만 바꾼 게 아니다)",
+                   any("정규화" in m for m in grab.msgs), grab.msgs[:4])
+        # 부분 손실은 **치명적 실패가 아니다** — 임계값을 임의로 정하면 그 자체가
+        # 새 정책이 되고, 멀쩡한 실행이 매일 실패로 보고되면 경보가 무시당한다.
+        check("부분 탈락은 종료 코드를 붉게 만들지 않는다", drop_oc.exit_code(), 0)
+        check_true("그래도 나머지는 실제로 저장됐다", drop_oc.persisted >= 2,
+                   drop_oc.persisted)
+
+        # 대조군 — 기형 행이 없으면 조용하다. 이게 없으면 위 검사들은
+        # "항상 경고한다"는 고장난 구현도 통과시킨다.
+        ms.crawl_court = lambda court: [_item(ms, "2099타경4004"),
+                                        _item(ms, "2099타경4005")]
+        clean_oc = CrawlOutcome()
+        ms.run_courts([_Court("QA1")], clean_oc)
+        check("★ 기형 행이 없으면 탈락 0건", clean_oc.normalize_dropped, 0)
+        check("그때는 정규화 경고도 없다",
+              [w for w in clean_oc.warnings() if "정규화" in w], [])
+
         # ── 6. main() 실패 경로: 전 법원 실패 -> 종료 코드 1 ──────────────
         ms.ALL_COURTS = [_Court("QA1"), _Court("QA2")]
         ms.crawl_court = boom
@@ -292,10 +395,15 @@ def run():
             qa_lines = sum(1 for line in fh if "2099타경" in line)
     check("★ 운영 logs/validation.jsonl 에 QA 기록이 새지 않았다", qa_lines, 0)
 
-    today_csv = os.path.join(root, "auction_%s.csv" % datetime.date.today().strftime("%Y%m%d"))
-    check_true("★ 저장소 루트에 QA CSV 백업이 생기지 않았다",
-               not os.path.exists(today_csv),
-               "-> %s 가 생겼다(save_csv_backup 격리 실패)" % os.path.basename(today_csv))
+    # ★ 존재 여부가 아니라 **변화**를 본다 (#266 — 위 `_csv_before` 주석 참고).
+    #   그날 CSV 는 매일 04:53 크롤이 정상적으로 만드는 운영 산출물이므로,
+    #   "없어야 한다"로 단언하면 크롤이 돈 날마다 붉어진다.
+    _csv_after = _csv_state(_today_csv)
+    check("★ 이 검사가 그날 운영 CSV 백업을 만들거나 건드리지 않았다",
+          _csv_after, _csv_before)
+    if _csv_before[0]:
+        print("      (그날 CSV 는 검사 시작 전부터 있었다 - 크롤이 만든 것이다: %d바이트)"
+              % _csv_before[1])
 
     # ── CSV 백업이 **cwd 를 따라가지 않는가** (2026-08-24 Sprint 252) ──────
     #
@@ -309,15 +417,44 @@ def run():
     # Sprint 246 이 쓴 방법(별도 프로세스 + cwd 만 바꿔 재현) 그대로다.
     import subprocess
 
-    probe_dir = tempfile.mkdtemp(prefix="cwdprobe_")
+    # ★ 2026-08-27 BUGS #250 — 예전 이 검사는 **그날 진짜 백업을 파괴했다.**
+    #
+    #   `save_csv_backup()` 의 파일명은 `auction_<오늘>.csv` 로 고정이고 목적지는
+    #   저장소 루트였다. 즉 이 검사가 QA 한 줄로 **그날 크롤 백업을 덮어썼고**,
+    #   `finally` 가 "이 검사가 만든 CSV" 라며 그것을 지웠다. 실측(2026-08-27):
+    #   세션 시작 시 있던 `auction_20260827.csv` 가 이 검사 1회 실행 뒤 사라졌다.
+    #   CSV 는 `.gitignore` 대상이라 **git 이 알려 주지도 않는다.**
+    #
+    #   이 파일 위쪽은 이미 DB 를 스크래치로 갈아끼워 격리하고 있었다
+    #   (`db.DB_PATH = scratch`). 그 격리를 이 산출물만 갖고 있지 않았다.
+    #   그래서 제품에 `CSV_BACKUP_DIR` 를 두고 여기서 스크래치로 돌린다.
+    #
+    #   ★ 검사의 목적은 그대로다 — **cwd 를 따라가지 않는가.** 목적지를 갈아끼워도
+    #     그 성질은 그대로 확인된다: cwd(probe_dir) 와 목적지(out_dir) 를 **서로 다른
+    #     폴더**로 두고, 결과가 cwd 가 아니라 목적지에 떨어지는지 본다.
+    #     기본값이 저장소 루트라는 것은 아래에서 따로 못 박는다.
     root = os.path.dirname(os.path.abspath(__file__))
+
+    import mvp_scraper as _ms_default
+    check_true("★ CSV_BACKUP_DIR 의 기본값이 저장소(모듈 위치)다",
+               os.path.abspath(_ms_default.CSV_BACKUP_DIR) == root,
+               "-> %s" % _ms_default.CSV_BACKUP_DIR)
+
+    probe_dir = tempfile.mkdtemp(prefix="cwdprobe_")
+    out_dir = tempfile.mkdtemp(prefix="cwdout_")
+    # 검사가 운영 산출물을 건드리지 않는다는 것 자체를 증거로 남긴다.
+    prod_csv = os.path.join(root, "auction_" +
+                            __import__("datetime").datetime.today().strftime("%Y%m%d") + ".csv")
+    prod_before = (os.path.exists(prod_csv),
+                   os.path.getmtime(prod_csv) if os.path.exists(prod_csv) else None)
     code = (
         "import sys, os, json;"
         " sys.path.insert(0, r'%s');"
         " import mvp_scraper as ms;"
+        " ms.CSV_BACKUP_DIR = r'%s';"
         " rows=[{'case_no':'2099타경9001','court_name':'QA','item_no':'1'}];"
         " print(json.dumps({'ret': ms.save_csv_backup(rows), 'cwd': os.getcwd()}))"
-    ) % root
+    ) % (root, out_dir)
     written = None
     try:
         r = subprocess.run([sys.executable, "-c", code], cwd=probe_dir,
@@ -335,14 +472,16 @@ def run():
             written = payload["ret"]
             stray = [f for f in os.listdir(probe_dir) if f.endswith(".csv")]
             check("★ CSV 백업이 실행 폴더(cwd)에 떨어지지 않는다", stray, [])
-            check_true("★ CSV 백업이 저장소(모듈 위치) 안에 생긴다",
-                       os.path.dirname(os.path.abspath(written)) == root,
+            check_true("★ CSV 백업이 지정된 폴더에 생긴다(cwd 가 아니라)",
+                       os.path.dirname(os.path.abspath(written)) == out_dir,
                        "-> %s" % written)
+        # ★ 이 검사 자체가 운영 백업을 건드리지 않았는가 (#250 의 회귀)
+        prod_after = (os.path.exists(prod_csv),
+                      os.path.getmtime(prod_csv) if os.path.exists(prod_csv) else None)
+        check("★ 이 검사가 그날 운영 CSV 백업을 건드리지 않는다", prod_after, prod_before)
     finally:
-        # 이 검사가 만든 CSV 는 이 검사가 치운다(운영 산출물을 남기지 않는다).
-        if written and os.path.exists(written):
-            os.remove(written)
         shutil.rmtree(probe_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     print("\n" + "=" * 55)
     if failures:

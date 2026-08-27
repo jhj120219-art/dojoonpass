@@ -98,7 +98,23 @@ PER_FILE_TIMEOUT = 900
 # 돌릴 때마다 운영 DB 파일의 지문을 재고, 달라지면 그 파일을 지목하고 게이트를
 # 붉게 만든다. 허용목록은 새 파일을 놓치지만 이건 놓치지 않는다.
 #
-# 비용: 5MB 파일 md5 가 파일당 ~10ms (전체 ~0.6s). 무시할 수 있다.
+# 비용 (2026-08-28 재측정 — 이 줄은 원래 "5MB md5 가 파일당 ~10ms, 전체 ~0.6s" 였다):
+#
+#     감시 대상 합계   15.59 MB   (auction.db 7.04 + 로그 5개 8.55)
+#     지문 1회         19.6 ms
+#     스위트 1회       72파일 x 2(전/후) = **2.8초 / 2.19 GB 해싱**
+#
+# 여전히 스위트(약 116초)의 2~3% 라 감수할 만하다. 다만 **이 비용은 로그를 따라
+# 자란다** — 이 저장소에는 **로그 로테이션이 한 군데도 없다**(전수 확인:
+# RotatingFileHandler/maxBytes/backupCount 참조 0건). 증가 속도 실측:
+#
+#     logs/scraper.log     약 1,000줄/일 (~85KB/일)   현재 4.05 MB
+#     logs/daily_run.log   약 1,000줄/일             현재 3.01 MB
+#     logs/doc_run.log     약 2,400~3,300줄/일       현재 1.31 MB  <- 워커가 매일 돌기 시작
+#
+# 1년이면 감시 대상이 약 40MB, 스위트당 약 7초 / 5.6GB 가 된다. 그때는 이 방식을
+# 다시 봐야 한다(크기+mtime 선비교 등). **로테이션 도입은 옛 로그를 지우는 일이라
+# 승인 영역**이므로 여기서는 숫자만 정직하게 남긴다 — docs/BUGS.md #269.
 # ---------------------------------------------------------------------------
 def live_db_path():
     """감시 대상 = 제품이 실제로 여는 경로. 이름으로 고르지 않는다 —
@@ -163,11 +179,59 @@ def db_fingerprint(path):
         return None
 
 
-def discover(pattern=None):
+# OneDrive 충돌 사본 — **제품 검사가 아니다** (2026-08-27, docs/BUGS.md #253/#258)
+#
+# `<이름>-DESKTOP-XXXX.py` 는 OneDrive 가 두 대에서 같은 파일이 바뀐 것을 보고 만든
+# 사본이고, 실수로 커밋되어 8개가 추적되고 있다. 내용은 제품 파일의 **옛 판본**이다.
+#
+# 이것들을 같이 돌리면 게이트가 세 가지로 망가진다(2026-08-27 실측):
+#
+#     test_crawl_orchestration-DESKTOP-DVRJEGP.py   FAILED (KeyError: 'unchanged')
+#                                                   -> upsert 계약이 생기기 전 판본이다
+#     test_audit_selftests-DESKTOP-DVRJEGP.py       FAILED, **605초**(파일당 상한에 걸림)
+#                                                   -> 스위트 전체가 2분에서 12분이 된다
+#     그리고 이 둘은 **고칠 수 없다** — 충돌 사본 정리는 사람이 어느 쪽이 최신인지
+#     골라야 하는 일이라 자동으로 손대지 않는다.
+#
+# 영구히 붉은 게이트에서는 **새 회귀와 이미 아는 부채를 구별할 수 없다.** 그것이
+# 애초에 이 실행기를 만든 이유(통과와 무판정을 합치지 않는다)와 정확히 같은 문제다.
+#
+# ★ 그래서 숨기지 않고 **따로 센다.** 실행하지 않되 요약에 전용 칸으로 남기고,
+#   `--include-conflicts` 로 언제든 돌려 볼 수 있다. 개수는
+#   `test_schema_hygiene.py` 가 따로 감시해 **늘어나면 붉어진다.**
+CONFLICT_COPY_RE = re.compile(r"-DESKTOP-[A-Z0-9]+(?:[.][A-Za-z0-9]+)?$")
+
+
+def is_conflict_copy(name):
+    return bool(CONFLICT_COPY_RE.search(name))
+
+
+def discover(pattern=None, include_conflicts=False):
+    """실행할 테스트 파일 **목록**을 돌려준다.
+
+    ★ 반환값은 예나 지금이나 **리스트 하나**다. 충돌 사본 목록이 필요해졌을 때
+      튜플로 바꿀 뻔했는데, `test_runner_contract.py` 가 `set(R.discover())` 로
+      이 계약을 붙잡고 있었다(그리고 곧바로 붉어졌다). 계약을 바꾸는 대신
+      `conflict_copies()` 를 따로 뒀다 — 그 검사가 하려던 일이 정확히 이것이다.
+    """
     names = sorted(
         f for f in os.listdir(ROOT)
         if f.startswith("test_") and f.endswith(".py")
         and os.path.isfile(os.path.join(ROOT, f))
+    )
+    if pattern:
+        names = [f for f in names if pattern.lower() in f.lower()]
+    if not include_conflicts:
+        names = [f for f in names if not is_conflict_copy(f)]
+    return names
+
+
+def conflict_copies(pattern=None):
+    """실행 대상에서 뺀 OneDrive 충돌 사본 목록(요약에만 쓴다)."""
+    names = sorted(
+        f for f in os.listdir(ROOT)
+        if f.startswith("test_") and f.endswith(".py")
+        and os.path.isfile(os.path.join(ROOT, f)) and is_conflict_copy(f)
     )
     if pattern:
         names = [f for f in names if pattern.lower() in f.lower()]
@@ -234,9 +298,14 @@ def main():
                     help="파일명 부분 일치 필터")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="실패한 파일의 출력을 함께 보여 준다")
+    ap.add_argument("--include-conflicts", action="store_true",
+                    help="OneDrive 충돌 사본(-DESKTOP-*.py)도 함께 실행한다"
+                         " (기본값: 실행하지 않고 요약에만 남긴다, BUGS #253)")
     args = ap.parse_args()
 
-    files = discover(args.pattern)
+    files = discover(args.pattern, args.include_conflicts)
+    skipped_conflicts = ([] if args.include_conflicts
+                         else conflict_copies(args.pattern))
     if not files:
         emit("대상 파일이 없습니다.")
         return 0
@@ -308,6 +377,15 @@ def main():
             emit("\n%s (%d):" % (label, len(buckets[key])))
             for n in buckets[key]:
                 emit("   - %s" % n)
+
+    if skipped_conflicts:
+        emit("")
+        emit("OneDrive 충돌 사본 %d개 - **실행하지 않았다**(제품 검사가 아니다, BUGS #253):"
+             % len(skipped_conflicts))
+        for n in skipped_conflicts:
+            emit("   - %s" % n)
+        emit("   정리는 사람이 한다(어느 쪽이 최신인지 골라야 한다)."
+             " 돌려 보려면 --include-conflicts.")
 
     if touched:
         emit("")

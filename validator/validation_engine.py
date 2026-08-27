@@ -1,8 +1,9 @@
 ﻿import re
 import json
 import logging
+import os
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 from models.auction_item import AuctionItem
 # 시도(sido) 데이터 중복 제거 이력 — 2026-08-17 Sprint 167에 import까지 정리했다.
 #
@@ -76,9 +77,24 @@ from normalizer.normalizer import normalize_price as parse_price  # noqa: E402  
 def is_adjacent(sido_a: str, sido_b: str) -> bool:
     return frozenset([sido_a, sido_b]) in ADJACENT_SIDO_PAIRS
 
+# ★ 기본 검증 로그 경로는 **이 파일 기준**이다 (2026-08-27, docs/BUGS.md #263).
+#
+#   예전 기본값은 `"logs/validation.jsonl"` 이라 **cwd 기준**이었다. 저장소가 아닌 곳에서
+#   돌리면 그 폴더에 `logs/` 가 새로 생기고 검증 로그가 흩어진다 - "검증 기록이 있다"고
+#   믿는데 저장소에는 없는 상태가 된다.
+#
+#   `mvp_scraper.py` 는 이미 `os.path.join(_HERE, ...)` 를 넘기고 있어 운영 경로는
+#   무사했지만, **기본값에 기대는 호출부가 하나라도 생기면 그때 조용히 어긋난다.**
+#   실제로 `revalidate.py` 가 상대경로 리터럴을 그대로 넘기고 있었다(함께 고쳤다).
+#
+#   `storage/checkpoint.py` 의 `DEFAULT_CHECKPOINT_PATH` 와 같은 규칙이다.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_VALIDATION_LOG_PATH = os.path.join(_PROJECT_ROOT, "logs", "validation.jsonl")
+
+
 class ValidationEngine:
-    def __init__(self, log_path: str = "logs/validation.jsonl"):
-        self.log_path = log_path
+    def __init__(self, log_path: Optional[str] = None):
+        self.log_path = log_path or DEFAULT_VALIDATION_LOG_PATH
 
     def validate(self, item: AuctionItem) -> AuctionItem:
         reasons: List[str] = []

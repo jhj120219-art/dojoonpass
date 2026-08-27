@@ -18,6 +18,7 @@ import sys
 import codecs
 import ast
 import os
+import re
 import sqlite3
 import subprocess
 
@@ -718,6 +719,41 @@ def test_tracked_sources_do_not_import_untracked():
 # `test_pipeline_integrity.py`에서 쓰는 "상한을 두고 증가만 차단" 방식과 같다).
 # 새로 추가되면 즉시 실패하고, 나중에 정리해서 줄어들면 그대로 통과한다.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# OneDrive 충돌 사본 — **제품이 아니다.** 따로 센다 (2026-08-27, BUGS #253)
+# ---------------------------------------------------------------------------
+#
+# 이 저장소에는 `<이름>-DESKTOP-DVRJEGP.<확장자>` 꼴의 파일이 8개 **추적되어** 있다.
+# OneDrive 가 두 대에서 같은 파일이 바뀐 것을 보고 만든 사본이고, 실수로 커밋됐다.
+# 내용은 제품 파일의 **옛 판본**이다(예: `test_crawl_orchestration-DESKTOP-DVRJEGP.py`
+# 는 `upsert_batch` 의 `unchanged` 계약이 생기기 전 판본이라 KeyError 로 죽는다).
+#
+# 그래서 이 감사가 붉어져 있었다:
+#
+#     ★ 새로 추적된 SQLite DB   -> .cov_test_audit_selftests-DESKTOP-DVRJEGP_py
+#     ★ 드라이버를 직접 만드는 파일 -> audit_viewport-DESKTOP-DVRJEGP.py:313
+#
+# 둘 다 **제품의 결함이 아니라 충돌 사본의 결함**이다. 그런데 이 사본들은 지금
+# 손대지 않기로 되어 있다(정리는 사람이 판단할 일이다 — 어느 쪽이 최신인지 골라야 한다).
+# 그러면 게이트가 **영원히 붉은 채**로 남고, 그 상태에서는 새로 생긴 회귀와
+# 이미 아는 부채를 구별할 수 없다. `run_python_tests.py` 가 "통과와 무판정을 절대
+# 합치지 않는다"고 적어 둔 것과 같은 문제다.
+#
+# ★ 그래서 **숨기지 않고 분리한다.** 제품 검사에서는 빼되, 아래 전용 검사가 목록을
+#   그대로 찍고 **개수가 늘어나면 붉어진다.** 부채는 계속 보이고, 늘어나면 잡힌다.
+ONEDRIVE_CONFLICT_RE = re.compile(r"-DESKTOP-[A-Z0-9]+(?:\.[A-Za-z0-9]+)?$|"
+                                  r"-DESKTOP-[A-Z0-9]+_[A-Za-z0-9]+$")
+
+
+def is_onedrive_conflict(rel):
+    """`<이름>-DESKTOP-XXXX.py` / `.cov_..-DESKTOP-XXXX_py` 같은 충돌 사본인가."""
+    return bool(ONEDRIVE_CONFLICT_RE.search(os.path.basename(rel)))
+
+
+# 지금 알고 있는 충돌 사본 수. 늘어나면 붉어진다(줄어드는 것은 정리이므로 통과다).
+KNOWN_ONEDRIVE_CONFLICTS = 8
+
+
 KNOWN_TRACKED_BUT_IGNORED = {
     "CEO/00 CEO.txt",
     "auction.db.backup_20260728_103355",
@@ -729,6 +765,18 @@ KNOWN_TRACKED_BUT_IGNORED = {
     "auction.db.backup_before_court_code_20260806_173734",
     "auction.db.backup_before_migration_recovery_20260808_153510",
     "auction.db.backup_before_soft_delete_20260808_160908",
+    # ★ 2026-08-27 (docs/BUGS.md #264) — 이 파일이 여기 온 경위를 남긴다.
+    #
+    #   `audit_test_reality.py` 가 만드는 파일별 커버리지 DB(`.cov_*`)가
+    #   `.gitignore` 에 없어서 **실수로 커밋됐다.** 이번에 `.cov_*` 규칙을 넣어
+    #   재발은 막았는데, 그 순간 이미 추적 중이던 이 파일이 "무시 대상인데 추적 중"이
+    #   되어 여기 검사가 (정확하게) 잡았다.
+    #
+    #   추적을 푸는 것(`git rm --cached`)은 **하지 않았다** — 커밋을 전제로 하고,
+    #   이 파일은 OneDrive 충돌 사본 정리(#253)와 함께 사람이 판단할 일이다.
+    #   목록에 적어 두는 것은 "괜찮다"는 뜻이 아니라 **"알고 있고, 늘어나면 잡힌다"**
+    #   는 뜻이다(위 백업 파일들과 같은 취급).
+    ".cov_test_audit_selftests-DESKTOP-DVRJEGP_py",
 }
 
 
@@ -1750,6 +1798,14 @@ ALLOWED_SQL_CONCAT_OPERANDS = {
     #   `placeholders` 는 `", ".join("?" * len(saved_seqs))` 로 **`?` 반복만**
     #   담는다. seq 값 자체는 SQL 문자열에 들어가지 않고 전부 바인딩된다.
     ("storage/database.py", "placeholders"),
+    # 2026-08-27 BUGS #256: `upsert_batch()` 가 한 문장 upsert 로 바뀌면서 생겼다.
+    #   둘 다 **모듈 상수 `UPSERT_COMPARE_COLUMNS`(리터럴 튜플)로만** 조립된다:
+    #       _UPSERT_SET   = ", ".join("%s=excluded.%s" % (c, c) for c in ...)
+    #       _UPSERT_WHERE = " OR ".join("auction.%s IS NOT excluded.%s" % (c, c) for c in ...)
+    #   값은 하나도 들어가지 않는다(전부 `?` 바인딩). 컬럼 이름을 세 곳에 손으로 적지
+    #   않으려고 한 곳에서 만든 것이라, 오히려 SET/WHERE 가 갈라지는 결함을 막는다.
+    ("storage/database.py", "_UPSERT_SET"),
+    ("storage/database.py", "_UPSERT_WHERE"),
     # `filter/` 는 어디에도 배선되지 않은 죽은 코드지만(docs/CLAUDE.md), 조각은 상수다.
     ("filter/filter_engine.py", "where"),
     ("filter/filter_engine.py", "' AND '.join(conditions)"),
@@ -3076,6 +3132,27 @@ def test_no_cwd_relative_paths_in_product_code():
                 names = [t.id for t in node.targets if isinstance(t, ast.Name)]
                 if v and names:
                     hits.append((node.lineno, "할당:" + names[0], v))
+        for node in ast.walk(tree):                  # (C) 함수 **기본 인자값**
+            # ★ 2026-08-27 (BUGS #263) - 이 갈래가 없어서 통째로 놓친 것이 있다:
+            #
+            #       class CheckpointManager:
+            #           def __init__(self, path: str = "logs/checkpoint.json"):
+            #
+            #   (A) 최상위 상수 할당도 아니고 (B) 경로 호출의 인자도 아니라 둘 다
+            #   비껴갔다. 그런데 **결과는 같다** - 다른 cwd 에서 띄우면 그 폴더에
+            #   체크포인트가 생기고, 저장소의 진짜 체크포인트를 못 찾아
+            #   **재개가 조용히 무력화된다**(어제 다 한 법원을 오늘 처음부터 다시 돈다).
+            #
+            #   기본 인자값은 그 자체가 "아무도 안 주면 이 경로를 쓴다"는 선언이라
+            #   (A) 의 모듈 상수와 성격이 완전히 같다.
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            _a = node.args
+            for _d in list(_a.defaults) + [x for x in _a.kw_defaults if x is not None]:
+                v = relative_literal(_d)
+                if v:
+                    hits.append((getattr(_d, "lineno", node.lineno),
+                                 "기본인자:" + node.name, v))
         for node in ast.walk(tree):                  # (B) 경로 인자를 받는 호출
             if not isinstance(node, ast.Call) or not node.args:
                 continue
@@ -3092,6 +3169,31 @@ def test_no_cwd_relative_paths_in_product_code():
                     path_context=(name in ("makedirs", "mkdir", "join")))
                 if v:
                     hits.append((node.lineno, name, v))
+
+        # (D) **경로임을 이름으로 밝힌 키워드 인자** (2026-08-27, BUGS #263)
+        #
+        #   `ValidationEngine(log_path="logs/revalidation.jsonl")` 를 (B) 가 놓쳤다 —
+        #   `ValidationEngine` 은 `PATH_CALLS` 에 없는 이름이기 때문이다. 그런데 인자
+        #   이름이 `log_path` 라고 **스스로 경로라고 말하고 있다.** 호출 대상이 무엇이든
+        #   그 자리에 상대경로 리터럴이 들어가면 cwd 를 따라간다.
+        #
+        #   이름을 보는 것이라 오탐이 적다: 값이 **문자열 리터럴일 때만** 잡는다.
+        #   변수/상수를 넘기는 정상 호출(`log_path=QA_LOG_PATH`)은 걸리지 않는다.
+        #   ★ `dest` 는 **일부러 뺐다.** argparse 의 `add_argument(..., dest="pattern")`
+        #     은 경로가 아니라 **저장할 속성 이름**이다(`run_python_tests.py:281` 을
+        #     실제로 오탐했다). 이름이 경로를 확실히 가리키는 것만 남긴다 —
+        #     목록을 넓히려다 오탐을 늘리면 이 검사 전체가 무시당한다.
+        PATH_KWARGS = {"path", "log_path", "db_path", "file_path", "dest_path",
+                       "filename", "out_path", "lock_path",
+                       "checkpoint_path", "storage_path"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg in PATH_KWARGS:
+                    v = relative_literal(kw.value, path_context=True)
+                    if v:
+                        hits.append((node.lineno, "인자:" + kw.arg, v))
         return hits
 
     # --- 자기 검증: 알려진 결함 모양을 실제로 잡는가 -------------------------
@@ -3103,6 +3205,11 @@ def test_no_cwd_relative_paths_in_product_code():
         'LOCK_PATH = os.path.join("logs", "doc_worker.lock")\n'
         'with open("logs/errors.jsonl", "a") as f:\n'
         '    pass\n'
+        # (C) 기본 인자값 - BUGS #263 이 실제로 이 모양이었다.
+        'def make(path="logs/checkpoint.json"):\n'
+        '    return path\n'
+        # (D) 경로임을 이름으로 밝힌 키워드 인자 - 역시 #263 의 실제 모양이다.
+        'e = Engine(log_path="logs/revalidation.jsonl")\n'
     )
     KNOWN_GOOD = (
         'import os\n'
@@ -3113,11 +3220,28 @@ def test_no_cwd_relative_paths_in_product_code():
         # URL 라우트 템플릿 - 맨 앞이 "/"라 파일시스템 경로처럼 보이지만 cwd 와 무관하다
         # (2026-08-21 실측: api/v1/thumbnails.py의 IMAGE_URL_TEMPLATE 을 오탐했었다).
         'IMAGE_URL_TEMPLATE = "/api/v1/item/%d/images/%d"\n'
+        # 고쳐진 기본 인자값 모양 - 오탐하면 안 된다.
+        'def make(path=None):\n'
+        '    return path or os.path.join(_HERE, "logs", "cp.json")\n'
+        # 경로가 아닌 짧은 기본값(상태 어휘 등)도 오탐하면 안 된다.
+        'def role(kind="pending"):\n'
+        '    return kind\n'
+        # 경로 키워드에 **변수**를 넘기는 정상 호출 - 오탐하면 안 된다.
+        'e = Engine(log_path=QA_LOG_PATH)\n'
+        'f = Engine(log_path=os.path.join(_HERE, "logs", "v.jsonl"))\n'
     )
     bad_hits = scan(KNOWN_BAD)
-    check_true("자기 검증: 알려진 결함 3종을 전부 잡는다",
-               bad_hits is not None and len(bad_hits) == 3,
+    check_true("자기 검증: 알려진 결함 5종을 전부 잡는다",
+               bad_hits is not None and len(bad_hits) == 5,
                "-> %r. 못 잡으면 아래 '0건'은 아무 의미가 없다" % (bad_hits,))
+    check_true("자기 검증: 그중 **기본 인자값**도 잡는다 (BUGS #263 의 모양)",
+               bad_hits is not None
+               and any(k.startswith("기본인자:") for _, k, _ in bad_hits),
+               "-> %r" % (bad_hits,))
+    check_true("자기 검증: **경로 키워드 인자**도 잡는다 (BUGS #263 의 모양)",
+               bad_hits is not None
+               and any(k.startswith("인자:") for _, k, _ in bad_hits),
+               "-> %r" % (bad_hits,))
     good_hits = scan(KNOWN_GOOD)
     check_true("자기 검증: 고쳐진 모양과 SQL 문자열을 오탐하지 않는다",
                good_hits == [], "-> %r" % (good_hits,))
@@ -3784,7 +3908,9 @@ def test_no_new_tracked_sqlite_databases():
     # ★ 목록을 복제하지 않는다 - 6-2 가 이미 들고 있는 것을 그대로 쓴다.
     check_true("검사가 공허하지 않다(6-2 의 allowlist 를 읽었다)",
                len(KNOWN_TRACKED_BUT_IGNORED) > 0, KNOWN_TRACKED_BUT_IGNORED)
-    new = sorted(found - KNOWN_TRACKED_BUT_IGNORED)
+    # OneDrive 충돌 사본은 제품이 아니다 — 전용 검사가 따로 센다(#253).
+    new = sorted(r for r in (found - KNOWN_TRACKED_BUT_IGNORED)
+                 if not is_onedrive_conflict(r))
     check("★ 새로 추적된 SQLite DB(6-2 목록 밖)", new, [])
     if new:
         print("      -> 이름이 무시 규칙에 안 걸려도 데이터베이스는 데이터베이스다."
@@ -4159,6 +4285,8 @@ def test_pipeline_resolves_chrome_driver_through_one_place():
     for rel in tracked:
         if rel in CHROME_DRIVER_FALLBACK_OWNERS:
             continue
+        if is_onedrive_conflict(rel):
+            continue          # 제품이 아니다 — 전용 검사가 따로 센다(#253)
         full = os.path.join(root, rel.replace("/", os.sep))
         try:
             tree = ast.parse(open(full, encoding="utf-8-sig").read())
@@ -4348,6 +4476,8 @@ def run():
     test_no_python_syntax_warnings()
     test_declared_indexes_survive_bootstrap()
     test_secret_comparisons_are_constant_time()
+    test_onedrive_conflict_copies_do_not_grow()
+    test_product_module_names_are_not_shadowed_by_stale_copies()
 
     print("\n" + "=" * 55)
     if failures:
@@ -4634,6 +4764,135 @@ def test_secret_comparisons_are_constant_time():
     check_true("자기 검증: 합성 `==` 대조를 잡는다",
                not _uses_compare_digest(pfn) and _naive_equality_on(pfn, {"k"}),
                "-> 탐지기가 동작하지 않는다")
+
+
+
+def test_onedrive_conflict_copies_do_not_grow():
+    """OneDrive 충돌 사본을 **따로 세어** 눈에 띄게 남긴다 (2026-08-27, BUGS #253).
+
+    위 제품 검사들에서 뺀 것을 여기서 갚는다 — 숨기는 것이 아니라 옮기는 것이다.
+    """
+    print("\n--- OneDrive 충돌 사본 (제품 아님 / 사람이 정리할 부채) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        ls = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if ls.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+    paths = [p.decode("utf-8", "replace") for p in ls.stdout.split(b"\x00") if p]
+    conflicts = sorted(p for p in paths if is_onedrive_conflict(p))
+
+    # 검사가 공허하지 않다 — 판별기가 실제로 무언가를 구별하는가.
+    check_true("자기 검증: 충돌 사본 이름을 잡는다",
+               is_onedrive_conflict("test_x-DESKTOP-DVRJEGP.py"))
+    check_true("자기 검증: 커버리지 산출물 이름도 잡는다",
+               is_onedrive_conflict(".cov_test_x-DESKTOP-DVRJEGP_py"))
+    check_true("자기 검증: 평범한 제품 파일은 안 잡는다",
+               not is_onedrive_conflict("storage/database.py"))
+
+    for c in conflicts:
+        print("      (부채) %s" % c)
+    check_true("★ OneDrive 충돌 사본이 늘지 않았다 (현재 %d개, 상한 %d개)"
+               % (len(conflicts), KNOWN_ONEDRIVE_CONFLICTS),
+               len(conflicts) <= KNOWN_ONEDRIVE_CONFLICTS,
+               "-> %s" % conflicts)
+    if conflicts:
+        print("      -> 정리는 사람이 한다: 각 쌍에서 어느 쪽이 최신인지 고른 뒤"
+              " `git rm --cached` 로 추적에서 뺀다. 자동으로 지우지 않는다.")
+
+
+# ---------------------------------------------------------------------------
+# 제품 모듈 이름을 **가리는 낡은 사본**이 있는가 (2026-08-27, docs/BUGS.md #262)
+#
+# 실측: `logs/` 안에 2026-08-04 자 사본 세 개가 있다.
+#
+#     logs/mvp_scraper.py       130줄   (제품은 321줄)
+#     logs/doc_worker.py
+#     logs/refresh_priority.py
+#
+# 추적되지 않고(`.gitignore`) 3주 넘게 방치된 초기 판본이다. 왜 위험한가:
+#
+#   [1] 이 저장소의 진단 스크립트 다수가 `sys.path.insert(0, os.getcwd())` 를 쓴다.
+#       `logs/` 에서 그런 스크립트를 돌리면 **3주 전 mvp_scraper 를 import 한다.**
+#       그리고 그 판본에는 이 세션이 고친 것들이 하나도 없다.
+#   [2] 더 흔한 피해는 사람이다 — 장애를 쫓다 `logs/mvp_scraper.py` 를 열고
+#       "제품이 이렇게 돼 있네" 라고 읽는다. 그 파일은 제품이 아니다.
+#
+# `-DESKTOP-*` 충돌 사본(#253)과 **같은 부류**다: 제품 파일의 옛 판본이 제품 이름으로
+# 남아 있다. 그래서 처리도 같게 한다 — **지우지 않고**(파일 삭제는 승인 영역,
+# docs/CLAUDE.md) 목록을 찍고 **늘어나면 붉어지게** 한다.
+#
+# ★ `__pycache__` 는 세지 않는다 - 파이썬이 만드는 것이고 이름이 가려지지도 않는다.
+# ---------------------------------------------------------------------------
+# 제품 모듈 이름이 나타나면 안 되는 폴더. 전부 산출물 폴더다(코드가 살 자리가 아니다).
+SHADOW_SCAN_DIRS = ("logs", "downloads", "documents", "documents_quarantine",
+                    "registry_documents", "public")
+
+# 지금 알고 있는 그림자 사본 수. 늘어나면 붉어진다(줄어드는 것은 정리이므로 통과다).
+KNOWN_SHADOW_COPIES = 3
+
+
+def test_product_module_names_are_not_shadowed_by_stale_copies():
+    print("\n--- 산출물 폴더에 제품 모듈 이름의 낡은 사본이 있는가 (BUGS #262) ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    # 제품 모듈 이름 = 저장소 루트의 추적된 .py + 제품 패키지 폴더 이름
+    try:
+        ls = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if ls.returncode != 0:
+        print("[SKIP] git 저장소가 아니다")
+        return
+    tracked = [p.decode("utf-8", "replace")
+               for p in ls.stdout.split(b"\x00") if p]
+    product_names = set()
+    for rel in tracked:
+        if rel.endswith(".py") and "/" not in rel and not rel.startswith("test_"):
+            product_names.add(os.path.basename(rel))
+    check_true("검사가 공허하지 않다(제품 모듈 이름을 실제로 모았다)",
+               len(product_names) > 5, sorted(product_names)[:8])
+    check_true("검사가 공허하지 않다(대표 모듈이 목록에 있다)",
+               "mvp_scraper.py" in product_names and "doc_worker.py" in product_names,
+               sorted(product_names)[:8])
+
+    shadows = []
+    scanned = 0
+    for d in SHADOW_SCAN_DIRS:
+        base = os.path.join(root, d)
+        if not os.path.isdir(base):
+            continue
+        for dp, dn, fn in os.walk(base):
+            dn[:] = [x for x in dn if x != "__pycache__"]
+            scanned += 1
+            for f in fn:
+                if f in product_names:
+                    rel = os.path.relpath(os.path.join(dp, f), root)
+                    shadows.append(rel.replace(os.sep, "/"))
+    check_true("검사가 공허하지 않다(산출물 폴더를 실제로 훑었다)", scanned > 0, scanned)
+
+    import io as _io
+    for sfile in sorted(shadows):
+        full = os.path.join(root, sfile.replace("/", os.sep))
+        try:
+            lines = sum(1 for _ in _io.open(full, encoding="utf-8", errors="replace"))
+        except OSError:
+            lines = -1
+        print("      (부채) %-40s %d줄" % (sfile, lines))
+    check_true("★ 제품 이름을 가리는 사본이 늘지 않았다 (현재 %d개, 상한 %d개)"
+               % (len(shadows), KNOWN_SHADOW_COPIES),
+               len(shadows) <= KNOWN_SHADOW_COPIES, "-> %s" % sorted(shadows))
+    if shadows:
+        print("      -> 정리는 사람이 한다(파일 삭제는 승인 영역). 위험한 이유는"
+              " 진단 스크립트 다수가 sys.path 에 cwd 를 넣기 때문이다 -"
+              " 그 폴더에서 실행하면 낡은 판본을 import 한다.")
+
 
 if __name__ == "__main__":
     sys.exit(run())

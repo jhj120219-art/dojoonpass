@@ -18,6 +18,20 @@ class CrawlOutcome:
     skipped: List[str] = field(default_factory=list)  # 기일이 없어 건너뛴 법원 (정상)
     failed: List[str] = field(default_factory=list)   # 예외로 실패한 법원
     collected: int = 0                       # 크롤로 얻은 사건 수
+    # ★ 크롤에는 성공했지만 **정규화에서 떨어져 나간** 건수 (2026-08-27, docs/BUGS.md #261)
+    #
+    #   `normalize_batch()` 는 행 하나가 기형이어도 나머지를 살리려고 그 행만 버린다
+    #   (Sprint 78, 옳은 격리다). 그런데 **버렸다는 사실이 아무 데도 남지 않았다** —
+    #   경고 한 줄이 로그로 나갈 뿐, 배치 요약도 `CrawlOutcome` 도 그 수를 몰랐다.
+    #
+    #   그래서 이런 날이 조용히 지나간다:
+    #       수집 2,608건 -> 정규화 2,600건 -> 저장 2,600건 -> 종료코드 0
+    #       법원에서 받아 온 8건이 DB 에 닿지 못했는데 아무도 모른다.
+    #
+    #   **전부** 떨어지면 `persisted == 0` 으로 잡히지만(그건 이미 있다), 부분 손실은
+    #   지금까지 잡히는 곳이 한 곳도 없었다. 이 저장소가 #47 에서 고친
+    #   "배치 로그가 사실이 아닌 것을 말한다"와 같은 계열이다.
+    normalize_dropped: int = 0
     inserted: int = 0                        # DB 신규
     updated: int = 0                         # DB 갱신 (값이 실제로 바뀌어 쓴 것)
     unchanged: int = 0                       # DB에 이미 올바르게 있던 것 (쓸 필요가 없었다)
@@ -62,6 +76,26 @@ class CrawlOutcome:
         if self.persisted == 0:
             return "DB 저장 0건 (수집 %d건, 저장 실패 %d건)" % (self.collected, self.upsert_failed)
         return None
+
+    def warnings(self) -> List[str]:
+        """치명적이지는 않지만 **반드시 눈에 띄어야 하는** 것들 (2026-08-27, BUGS #261).
+
+        치명적 실패로 만들지 않는 이유는 위 `failure_reason()` 의 판단과 같다 —
+        임계값을 임의로 정하면 그 자체가 새 정책이 되고, 멀쩡한 실행이 매일 실패로
+        보고되면 경보가 무시당한다. 대신 **숫자를 사실대로 내놓는다.**
+        """
+        out = []
+        if self.normalize_dropped:
+            out.append(
+                "정규화에서 %d건이 떨어졌다 (수집 %d건 -> 저장 대상 %d건). "
+                "크롤은 받아 왔는데 DB 에 닿지 못한 건수다 - logs/scraper.log 의 "
+                "'normalize_item failed' 를 보라"
+                % (self.normalize_dropped, self.collected,
+                   self.collected - self.normalize_dropped))
+        if self.failed:
+            out.append("수집 실패 법원 %d곳: %s"
+                       % (len(self.failed), ", ".join(self.failed[:10])))
+        return out
 
     def exit_code(self) -> int:
         """배치가 읽을 종료 코드. 0=성공, 1=치명적 실패."""

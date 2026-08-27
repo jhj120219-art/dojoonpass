@@ -58,6 +58,56 @@ def test_case_no_matches_list_entry_is_exact_not_substring():
           case_no_matches_list_entry("2024타경100920", "2024타경1009"), False)
 
 
+def test_a_merged_case_no_matches_on_the_target_side_too():
+    """★ **찾는 쪽**이 병합 사건번호여도 일치해야 한다 (2026-08-28, docs/BUGS.md #265).
+
+    ## 무엇이 문제였나
+
+    Sprint 121 판본은 **목록 쪽만** `" / "` 로 쪼갰다. 그래서 찾는 쪽이 병합이면
+    **자기 자신과도 일치하지 않았다.** 그런데 큐/`auction` 에는 병합 사건번호가
+    그대로 저장되므로(한 물건에 사건번호가 여럿인 경우), 찾는 쪽이 병합인 것은
+    예외가 아니라 **일상**이다.
+
+    실측 (2026-08-28 운영 DB / 워커 로그):
+
+        document_queue 병합 사건번호 행  1,507  (pending 222 / failed 105 / refresh 4)
+        auction 병합 사건번호 행           602
+        그날 워커 로그 `사건 매칭 실패` 경고  67건
+        그날 failed 95 -> 205
+
+    그 331행(pending+failed+refresh)은 **매일 밤 반드시 매칭에 실패**하고,
+    실패 한 번이 상세페이지 이동 1회(중앙값 10.9초)를 태운다.
+    """
+    print("\n--- 0-b. 병합 사건번호가 **찾는 쪽**에 와도 일치한다 (BUGS #265) ---")
+    M = case_no_matches_list_entry
+    A, B = "2023타경300780", "2023타경302427"
+
+    # 이 넷이 예전에 전부 False 였다.
+    check("★ 병합 <-> 같은 병합 (같은 문자열인데 예전엔 False 였다)",
+          M(A + " / " + B, A + " / " + B), True)
+    check("★ 병합 <-> 단일 (목록이 나중에 분리된 경우)", M(A + " / " + B, A), True)
+    check("★ 병합 <-> 순서만 다른 병합", M(B + " / " + A, A + " / " + B), True)
+    check("★ 병합 <-> 다른 구성요소 하나만 겹침", M(A + " / " + B, B + " / 2024타경9"), True)
+
+    # 기존 계약은 그대로다.
+    check("단일 <-> 병합 (예전에도 True)", M(A, A + " / " + B), True)
+    check("겹치는 구성요소가 없으면 일치하지 않는다",
+          M(A + " / " + B, "2024타경1 / 2024타경2"), False)
+
+    # ★ Sprint 121 이 막은 것(부분 문자열)은 **여전히 막힌다** - 이게 없으면
+    #   이번 완화가 그 결함을 되살렸는지 알 수 없다.
+    check("Sprint 121 유지: 병합 안에서도 부분 문자열은 안 걸린다",
+          M("2024타경1009", "2024타경100920 / 2024타경7"), False)
+
+    # 빈 값은 아무것도 일치시키지 않는다(예전엔 M("","") 가 True 였다).
+    # 사건번호가 비었다는 것은 "모른다"이지 "아무거나 맞다"가 아니다 -
+    # 그 상태로 첫 항목에 진입하면 **엉뚱한 물건의 자산**을 저장할 수 있다.
+    check("빈 값 <-> 빈 값 은 일치하지 않는다", M("", ""), False)
+    check("빈 target 은 아무것도 못 찾는다", M("", A), False)
+    check("빈 목록 항목에는 아무것도 안 걸린다", M(A, ""), False)
+    check("공백만 있는 값도 마찬가지", M("   ", "   "), False)
+
+
 def test_no_checkpoint_starts_at_zero():
     print("\n--- 1. no checkpoint -> start at 0 ---")
     check("resume_from=None", resume_start_idx(LIST_ITEMS, None), 0)
@@ -155,6 +205,7 @@ def test_empty_list_items_returns_zero():
 
 def run():
     test_case_no_matches_list_entry_is_exact_not_substring()
+    test_a_merged_case_no_matches_on_the_target_side_too()
     test_no_checkpoint_starts_at_zero()
     test_checkpoint_match_resumes_after_the_completed_item()
     test_checkpoint_matches_either_case_no_in_a_joined_entry()

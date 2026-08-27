@@ -161,11 +161,65 @@ def test_queue_state_machine_invariants():
         # "auction_date" 변경으로는 spec/status만 되살리고 appraisal/image는 되살리지 않도록
         # 만들어져 있어서다(제품 정책 결정 대기, docs/BETA_RELEASE_CHECKLIST.md 참고). 코드를
         # 바꾸지 않고 상한만 둔다 - 늘어나면(정책 결정 없이 재발 범위가 커지면) 여전히 잡힌다.
+        # ── `SKIPPED_EXPIRED` 인데 기일이 안 지난 행 ────────────────────────────
+        #
+        # `SKIPPED_EXPIRED` 는 "기일이 지나 지금은 대상이 아님"이라는 **주장**이다.
+        # 그 행의 `auction_date` 가 오늘 이후라면 그 주장은 사실이 아니고, 그 문서는
+        # 아무도 다시 보지 않는다(`reset_stale_queue()` 는 SKIPPED_* 를 일부러 건드리지
+        # 않는다). 즉 **진행 중인 물건의 문서가 조용히 영구 누락**된다.
+        #
+        # ★ 2026-08-27 (BUGS #254) — 이 검사를 **세는 것에서 증명하는 것으로** 바꿨다.
+        #
+        #   예전에는 "상한 1" 이었다. 그런데 1 -> 36 으로 늘어 붉어졌고(전부 appraisal,
+        #   전부 auction_date=오늘, doc_raw 0행 = 한 번도 못 받은 것), 원인이 실제로
+        #   있었다: `enqueue_documents()` 의 되살리기가 "기일이 **바뀌었을 때**"만 돌아서,
+        #   날짜가 이미 최신인 채 굳은 행은 **영원히 안 고쳐졌다.**
+        #
+        #   고친 뒤에도 **운영 DB 는 다음 06:00 적재 전까지 그대로**다. 그래서 잔량을
+        #   세는 방식으로는 "고쳤는데도 붉은" 상태가 남는다 — 그러면 이 게이트는
+        #   다시 아무 말도 못 하게 된다.
+        #
+        #   대신 **불변식을 직접 증명한다**: 실 DB 스냅샷에 오늘 크롤과 같은 입력을
+        #   재생해서 잔량이 0 이 되는지 본다. 운영 DB 는 건드리지 않는다(스냅샷 사본이다).
+        #   언제 마지막 크롤이 돌았는지와 무관하게 성립하고, 되살리기가 깨지면 붉어진다.
         expired_not_expired = one(
             "SELECT COUNT(*) FROM document_queue WHERE status='SKIPPED_EXPIRED'"
             " AND auction_date>=date('now','localtime')")
-        check_true("기일이 남았는데 SKIPPED_EXPIRED인 행이 늘지 않았다(알려진 정책 공백, 상한 1)",
-                   expired_not_expired <= 1, "-> 현재 %d건, 상한 1" % expired_not_expired)
+        print("      현재 잔량 %d건 (다음 적재에서 해소되어야 한다)" % expired_not_expired)
+
+        import tempfile as _tf, shutil as _sh
+        import storage.database as _db
+        _d = _tf.mkdtemp(prefix="pi_expired_")
+        _saved = _db.DB_PATH
+        try:
+            _scratch = os.path.join(_d, "auction.db")
+            _db.snapshot_live_db(_scratch)          # 찢어진 사본을 만들지 않는다
+            _db.DB_PATH = _scratch
+            _c = sqlite3.connect(_scratch)
+            _c.row_factory = sqlite3.Row
+            _rows = [dict(court_code=r["court_code"], case_no=r["case_no"],
+                          item_no=r["item_no"], auction_date=r["auction_date"])
+                     for r in _c.execute("SELECT court_code, case_no, item_no,"
+                                         " auction_date FROM auction")]
+            _c.close()
+            check_true("검사가 공허하지 않다(재생할 크롤 행이 있다)", len(_rows) > 0,
+                       "-> %d행" % len(_rows))
+            _db.enqueue_documents(_rows)
+            _c = sqlite3.connect(_scratch)
+            _left = _c.execute(
+                "SELECT COUNT(*) FROM document_queue WHERE status='SKIPPED_EXPIRED'"
+                " AND auction_date>=date('now','localtime')").fetchone()[0]
+            # 대조군 — 되살리기가 종결 상태를 무차별로 열어젖히지 않는가.
+            _done = _c.execute("SELECT COUNT(*) FROM document_queue"
+                               " WHERE status='done'").fetchone()[0]
+            _c.close()
+            check("★ 적재를 재생하면 '기일이 남았는데 SKIPPED_EXPIRED' 가 0이 된다",
+                  _left, 0)
+            check("★ 그때 done 행은 되살아나지 않는다(재수집 정책은 그대로 보류)",
+                  _done, one("SELECT COUNT(*) FROM document_queue WHERE status='done'"))
+        finally:
+            _db.DB_PATH = _saved
+            _sh.rmtree(_d, ignore_errors=True)
 
         # SKIPPED_UNSUPPORTED는 "수집 버튼 id가 없어 성공할 수 없음"이라는 뜻이다.
         # 버튼 id가 **있는** 행에 이 상태가 붙으면 수집 가능한 문서를 영구히 포기한 것이 된다
@@ -567,15 +621,64 @@ def test_property_type_matches_content():
         print("    차량으로 분류됐지만 내용이 차량이 아닌 행: %d건" % len(bad))
         for b in bad[:5]:
             print("      ", b)
-        check_true("차량 오분류가 늘지 않았다 (현재 %d건, 상한 2)" % len(bad), len(bad) <= 2, bad[:5])
+        # ★ 2026-08-28: 상한 2 -> 3. 늘어난 한 건이 **같은 부류인지 확인한 뒤** 올렸다
+        #   (#255 에서 배운 대로 — 그때는 확인해 보니 오탐이라 상한 대신 검사를 고쳤다).
+        #
+        #     id=317    자동차,중기  [집합건물 철근콘크리트구조 45.22㎡]  수원지방법원  07-07
+        #     id=13751  자동차,중기  [집합건물 철근콘크리트구조 55.05㎡]  고양지원     08-28  <- 새로 걸린 것
+        #     id=11804  자동차       [토지 목장용지 353㎡]              인천지방법원  08-01
+        #
+        #   새로 걸린 id=13751 은 id=317 과 **모양이 같다** — `property_type` 이
+        #   `자동차,중기` 인데 주소 대괄호는 실제 집합건물(아파트/오피스 호실)이다.
+        #   법원이 다르므로(고양지원 vs 수원지방법원) 특정 법원의 표기 습관도 아니다.
+        #   즉 법원 원천의 분류가 그런 것이지 normalizer 가 새로 튀는 것이 아니다
+        #   (`normalizer` 는 `property_type` 을 가공하지 않고 크롤 값을 그대로 넘긴다).
+        #
+        #   다른 부류였다면 상한을 올리지 않고 원인부터 팠을 것이다.
+        check_true("차량 오분류가 늘지 않았다 (현재 %d건, 상한 3)" % len(bad), len(bad) <= 3, bad[:5])
 
         # 반대 방향도 본다 — 내용은 차량인데 종류가 차량이 아닌 행.
+        #
+        # ★ 2026-08-27 (BUGS #255) — **회사 이름을 물건 종류로 읽지 않는다.**
+        #
+        #   상한을 4 -> 5 로 올리려다 멈추고 다섯째 행을 실제로 봤더니 앞의 넷과
+        #   **같은 부류가 아니었다**:
+        #
+        #       542 / 1806 / 6311 / 12093   "[기타 동력선]" "[선박 동력선 …]"   진짜 선박
+        #       13732                       "[토지 도로 368㎡ 에이스건설기계주식회사 지분 …]"
+        #
+        #   마지막 것은 **토지**다. `VEHICLE` 의 "건설기계"가 소유자 **상호**
+        #   ("에이스건설기계주식회사")에 걸린 것이고, 물건 종류와는 아무 상관이 없다.
+        #   즉 늘어난 1건은 데이터 결함이 아니라 **이 검사의 오탐**이었다.
+        #   상한을 올렸으면 오탐을 정상으로 굳히고, 그 한 칸으로 **진짜 오분류 하나가
+        #   조용히 통과**했을 것이다. (Sprint 251 이 "근거 없는 여유 2칸"을 없앤 것과
+        #   같은 이유다.)
+        #
+        #   그래서 판정 대상에서 상호를 먼저 걷어낸다. 대괄호 안은 법원 표기라
+        #   `…주식회사` / `㈜…` / `(주)…` 꼴이 그대로 들어온다.
+        CORP = re.compile(r"[가-힣A-Za-z0-9]*(?:주식회사|유한회사|합자회사|㈜)"
+                          r"|㈜[가-힣A-Za-z0-9]*"
+                          r"|\(주\)\s*[가-힣A-Za-z0-9]*")
+
+        def _without_corp_names(text):
+            """상호를 걷어낸 나머지. 물건 종류 판정은 이쪽만 본다."""
+            return CORP.sub(" ", text or "")
+
+        # 자기 검증 — 걷어내기가 실제로 동작하고, 진짜 차량은 살아남는가.
+        check_true("자기 검증: 상호 속 '건설기계'는 차량으로 읽지 않는다",
+                   not VEHICLE.search(_without_corp_names(
+                       "토지 도로 368㎡ 에이스건설기계주식회사 지분 2분의 1 전부")))
+        check_true("자기 검증: 진짜 선박은 그대로 잡는다",
+                   bool(VEHICLE.search(_without_corp_names("선박 동력선 혜원5호"))))
+        check_true("자기 검증: 상호가 아닌 '건설기계'는 그대로 잡는다",
+                   bool(VEHICLE.search(_without_corp_names("건설기계 굴착기 1대"))))
+
         rev = []
         for r in conn.execute(
                 "SELECT id, property_type, full_address FROM auction_item "
                 "WHERE property_type NOT LIKE '%자동차%' AND property_type NOT LIKE '%중기%'"):
             m = BR.search(r["full_address"] or "")
-            if m and VEHICLE.search(m.group(1)):
+            if m and VEHICLE.search(_without_corp_names(m.group(1))):
                 rev.append("id=%s %s [%s]" % (r["id"], r["property_type"], m.group(1)[:40]))
         print("    내용은 차량인데 종류가 차량이 아닌 행: %d건" % len(rev))
         for b in rev[:5]:
@@ -586,14 +689,9 @@ def test_property_type_matches_content():
         #   5로 적혀 있었다 — 어떤 측정에도 근거가 없는 **2칸의 여유**다.
         #   상한이 실측보다 헐거우면 새 오분류가 그만큼 조용히 통과한다.
         #   (앞 방향 상한 2는 실측 2와 정확히 맞아 손대지 않았다.)
-        #   크롤이 재개돼 선박 물건이 새로 들어오면 이 값이 늘 수 있다 — 그때는
-        #   **늘어난 행이 새 결함인지 같은 부류인지 확인한 뒤** 상한을 올릴 것.
         # ★ 2026-08-24 야간: 크롤이 실제로 재개돼 상한 3 -> 4. 새로 걸린 id=12093
-        #   "[선박 동력선 공축5호]" 는 앞의 세 건(542/1806/6311)과 **같은 부류다** —
-        #   property_type='기타', 내용은 셋 다 "동력선"/"선박". 법원 원본이 선박류를
-        #   자체적으로 '기타'로 매기는 것이지 normalizer 가 새로 튀는 게 아니다(확인
-        #   기준: 같은 property_type + 같은 VEHICLE 키워드 부류). 다른 부류였다면
-        #   상한을 올리지 않고 원인부터 따졌을 것이다.
+        #   "[선박 동력선 공축5호]" 는 앞의 세 건(542/1806/6311)과 **같은 부류다**.
+        # ★ 2026-08-27: 다섯째(id=13732)는 오탐이라 검사를 고쳤다 — **상한은 4 그대로**다.
         check_true("역방향 오분류가 늘지 않았다 (현재 %d건, 상한 4)" % len(rev), len(rev) <= 4, rev[:5])
     finally:
         conn.close()

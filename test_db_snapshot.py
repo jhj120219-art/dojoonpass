@@ -225,6 +225,42 @@ _BAD = re.compile(
     r"(DB_PATH|db_path\(\)|[\"']auction\.db[\"'])",
     re.S,
 )
+# BEGIN-ALIAS
+_ALIAS_ASSIGN = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z_0-9]*)\s*=\s*[^=\n]*"
+    r"(?:DB_PATH|db_path\(\)|[\"']auction\.db[\"'])",
+    re.M,
+)
+
+
+def _copies_db_via_alias(code):
+    """`x = ...DB_PATH...` 로 묶인 이름이 `shutil.copy2(x, ...)` 에 쓰이면 그 이름 목록.
+
+    ★ 왜 필요한가 (2026-08-27, BUGS #251)
+
+    위 `_BAD` 정규식은 `copy2(...)` 의 인자에 `DB_PATH` 라는 **글자**가 있는지만 본다.
+    그래서 이 모양을 통째로 놓쳤다 — `test_crawl_orchestration.py` 가 실제로 그랬다:
+
+        real_db = db.DB_PATH             # 한 번 받아 두고
+        shutil.copy2(real_db, scratch)   # 글자로는 DB_PATH 가 없다
+
+    같은 파일을 가리키는데 검사만 다른 것을 봤다. 그리고 그 파일은 실제로 **흔들렸다**
+    (2026-08-27 전체 스위트 2회 중 1회에서 그 파일만 12건 실패 / 단독 12/12 통과).
+    이 감사가 막으려던 바로 그 증상이다. 감사가 있는데 증상이 났다면 감사가 부족한 것이다.
+
+    한 파일 범위의 아주 얕은 추적이다(정확한 데이터플로가 아니다). 그래도 이 저장소에서
+    실제로 난 모양을 덮고, 오탐은 아래 자기 검증이 고정한다.
+    """
+    aliases = set(_ALIAS_ASSIGN.findall(code))
+    if not aliases:
+        return []
+    hit = []
+    for name in sorted(aliases):
+        if re.search(r"shutil\.copy2?\s*\(\s*" + re.escape(name) + r"\s*[,)]", code):
+            hit.append(name)
+    return hit
+# END-ALIAS
+
 # 이 두 파일은 예외다:
 #   storage/database.py  - snapshot_live_db 정의 자리(설명 주석에 이름이 나온다)
 #   run_python_tests.py  - 실패 안내문에 옛 관례를 **문자열로** 찍는다(코드가 아니다)
@@ -249,6 +285,11 @@ for _dp, _dn, _fn in os.walk(REPO):
         _scanned += 1
         if _BAD.search(_code):
             _offenders.append(_rel)
+        else:
+            # 별칭을 거친 옛 방식도 같은 위반이다(#251).
+            _alias_hit = _copies_db_via_alias(_code)
+            if _alias_hit:
+                _offenders.append("%s (별칭 %s)" % (_rel, ",".join(_alias_hit)))
 
 check_true("검사 대상 파일을 실제로 훑었다(공허하지 않다)", _scanned > 50, "-> %d개" % _scanned)
 check("★ shutil.copy 로 실 DB 사본을 뜨는 곳 없음", sorted(_offenders), [])
@@ -261,6 +302,19 @@ check_true("자기 검증: 옛 방식 코드를 넣으면 잡는다",
            bool(_BAD.search("shutil.copy2(dbmod.DB_PATH, tmp)")))
 check_true("자기 검증: 무관한 복사는 안 잡는다",
            not _BAD.search("shutil.copy2(src_pdf, dest_pdf)"))
+# 자기 검증: 별칭 추적이 실제로 동작하는가 — 이게 없으면 위 else 가지는 공허하다.
+check("자기 검증: 별칭을 거친 옛 방식도 잡는다",
+      _copies_db_via_alias(
+          "real_db = db.DB_PATH\nshutil.copy2(real_db, scratch)"),
+      ["real_db"])
+check("자기 검증: 별칭 추적이 무관한 복사를 잡지 않는다",
+      _copies_db_via_alias(
+          "src_pdf = os.path.join(d, 'a.pdf')\nshutil.copy2(src_pdf, dest_pdf)"),
+      [])
+check("자기 검증: DB 를 가리켜도 복사에 안 쓰이면 잡지 않는다",
+      _copies_db_via_alias(
+          "real_db = db.DB_PATH\nassert os.path.exists(real_db)"),
+      [])
 
 # 실제로 검사들이 그 함수를 쓰고 있는지도 본다(대조군 - 아무도 안 쓰면 위 검사는 공허하다).
 _users = []

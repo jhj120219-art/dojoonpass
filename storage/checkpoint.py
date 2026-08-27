@@ -21,9 +21,36 @@ from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
+# ★ 기본 체크포인트 경로는 **이 파일 기준**이다 (2026-08-27, docs/BUGS.md #263).
+#
+#   예전 기본값은 `"logs/checkpoint.json"` 이라 **cwd 기준**이었다. 저장소가 아닌 곳에서
+#   크롤러를 띄우면 그 폴더에 `logs/checkpoint.json` 이 새로 생기고:
+#
+#       저장소의 진짜 체크포인트를 **못 찾는다**  -> resume_from=None -> **처음부터 다시 긁는다**
+#       진행 상황은 엉뚱한 폴더에 쌓인다          -> 다음 실행도 못 찾는다
+#
+#   즉 **재개가 조용히 무력화된다.** 오류도 경고도 없다 — 그냥 어제 다 한 법원을
+#   오늘 처음부터 다시 돈다(법원 한 곳 실측 중앙값 10.9초/건).
+#   실측(2026-08-27, cwd 만 바꿔 `CheckpointManager()` 를 만들어 저장):
+#       cwd = 저장소 루트  -> 저장소 logs/checkpoint.json 에 쓴다
+#       cwd = 다른 폴더    -> **그 폴더에** logs/checkpoint.json 이 새로 생긴다
+#
+#   이 저장소가 Sprint 245/246/252 에 네 곳(`api/auth.py` 의 load_dotenv,
+#   `storage/database.py` 의 DB_PATH, `doc_worker.py` 의 LOCK_PATH, `mvp_scraper.py` 의
+#   CSV)에서 고친 것과 **같은 계열**이고, 여기만 남아 있었다.
+#
+#   `test_schema_hygiene.py` 의 cwd 감사가 왜 못 잡았는지도 남긴다: 그 검사는
+#   (A) 모듈 최상위 상수 할당과 (B) 경로 호출의 문자열 리터럴을 본다. 여기는
+#   **함수 기본 인자값**이라 둘 다 비껴갔다. 그 감사도 함께 고쳤다(기본 인자값을 본다).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CHECKPOINT_PATH = os.path.join(_PROJECT_ROOT, "logs", "checkpoint.json")
+
+
 class CheckpointManager:
-    def __init__(self, path: str = "logs/checkpoint.json"):
-        self.path = path
+    def __init__(self, path: Optional[str] = None):
+        # ★ 기본값을 인자 자리에 두지 않는다 - 거기 두면 다시 상대경로가 박히기 쉽고,
+        #   테스트가 모듈 변수를 갈아끼워 검증하는 이 저장소의 방식과도 어긋난다.
+        self.path = path or DEFAULT_CHECKPOINT_PATH
 
     def _write_atomic(self, data: Dict) -> None:
         """임시 파일에 다 쓴 뒤 os.replace()로 한 번에 바꾼다.

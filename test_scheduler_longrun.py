@@ -34,12 +34,14 @@
     python test_scheduler_longrun.py
 """
 import contextlib
+import gc
 import io
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -566,6 +568,244 @@ def test_expired_backlog_does_not_starve_live_work():
         env.close()
 
 
+# ---------------------------------------------------------------------------
+# 6. **프로세스 자원**이 바퀴마다 쌓이는가 (2026-08-27 신설, docs/BUGS.md #259)
+#
+# 위 1~5 는 전부 **DB 안의 누적**을 본다(큐 행, 재시도 예산, 상태 정합). 촘촘하다.
+# 비어 있던 것은 **프로세스 밖의 누적**이다:
+#
+#     sqlite 커넥션이 닫히지 않고 쌓인다      -> 결국 "database is locked"
+#     파일 핸들이 쌓인다                       -> 결국 열기 실패
+#     파이썬 객체가 쌓인다                     -> 밤새 돌면 메모리가 따라 오른다
+#     바퀴마다 조금씩 느려진다                 -> "처음엔 정상인데 아침에 안 끝나 있다"
+#
+# 이 저장소의 DB 함수는 전부 `try/finally: conn.close()` 를 쓴다. **그 규약이 지켜지고
+# 있는지 아무도 확인하지 않았다** — 한 함수에서 `finally` 를 빠뜨려도 하루치 검사는
+# 전부 통과한다. 드러나는 것은 밤새 돌린 다음 날 아침이다.
+#
+# ## 어떻게 재는가 — 의견이 아니라 측정
+#
+#     살아 있는 sqlite3.Connection 객체 수   gc 로 직접 센다(close 누락이 곧 증가다)
+#     프로세스 핸들 수                       Windows GetProcessHandleCount
+#     파이썬 힙                              tracemalloc
+#     바퀴당 소요 시간                       마지막 바퀴가 첫 바퀴보다 크게 느린가
+#
+# 절대값이 아니라 **기울기**를 본다. 첫 바퀴는 캐시/임포트가 데워지느라 원래 다르다.
+# 그래서 워밍업 바퀴를 버리고 그 뒤 구간에서만 증가를 판정한다.
+#
+# 실측 (2026-08-27, 이 검사를 만들며 20바퀴):
+#     핸들 128 -> 128 (무변화) / 파이썬 힙 0.38MB 고정 / DB 행수 전 테이블 무변화
+#     RSS 28.8 -> 33.9MB (초반 5MB 오른 뒤 평평 - SQLite 페이지 캐시가 데워진 것)
+# ---------------------------------------------------------------------------
+class _ConnLeakWatch(object):
+    """이 구간에서 **연 커넥션이 전부 명시적으로 닫혔는가**를 센다.
+
+    ## ★ 여기까지 오는 데 판본을 두 번 버렸다 (2026-08-27, 둘 다 변이로 확인)
+
+    변이는 하나다 — `refresh_queue_priority()` 의 `finally: conn.close()` 를 지운다.
+
+        1판: `gc.get_objects()` 로 살아 있는 Connection 개수를 셌다
+             -> 변이가 **그대로 통과**. CPython 참조 카운팅이 함수가 끝나는 순간
+                지역 변수를 회수해 버리므로, 닫는 것을 잊어도 개수가 안 오른다.
+                "누수가 없다"가 아니라 **"측정할 수 없다"** 를 통과로 읽고 있었다.
+
+        2판: `conn.close` 를 파이썬 함수로 갈아끼워 호출을 셌다
+             -> 변이가 **그대로 통과**. `sqlite3.Connection` 은 C 타입이라
+                **속성을 붙일 수 없다**(AttributeError). 그리고 그 예외를 잡는 갈래가
+                "감쌀 수 없으면 닫힌 것으로 친다"였다 — 즉 **실패를 통과로 바꾸는
+                폴백**이었다. 이 저장소가 반복해서 잡아 온 바로 그 모양이다.
+
+        3판(지금): `factory=` 로 **Connection 을 상속**한다. 이것이 파이썬이 공식으로
+             지원하는 자리고, 상속 인스턴스는 `__dict__` 가 있어 중복 close 도 가른다.
+             폴백은 두지 않는다 — 감쌀 수 없으면 **잡아서 알린다.**
+
+    ★ 규약을 지키는 것이 왜 중요한가(참조 카운팅이 어차피 치워 주는데도):
+
+        예외가 나면 트레이스백이 프레임을 붙잡아 지역 변수가 **살아남는다.**
+        그때는 정말로 새고, 하필 그때가 밤새 실행 중 문제가 생긴 순간이다.
+        Windows 에서 열린 커넥션은 파일 잠금을 쥐고 있어 다른 프로세스를 막는다.
+        (실제로 이 변이는 파일 핸들이 바퀴마다 정확히 1개씩 늘어 그쪽 축에도 잡혔다.)
+    """
+
+    def __init__(self):
+        self.opened = 0
+        self.closed = 0
+        self.untrackable = 0
+        self._real = sqlite3.connect
+
+    def _factory_for(self, base):
+        watch = self
+
+        class _Tracked(base):
+            def close(self):
+                if not getattr(self, "_watch_closed", False):
+                    self._watch_closed = True
+                    watch.closed += 1
+                return base.close(self)
+
+        return _Tracked
+
+    def __enter__(self):
+        watch = self
+
+        def traced(*a, **kw):
+            base = kw.pop("factory", sqlite3.Connection)
+            try:
+                kw["factory"] = watch._factory_for(base)
+            except Exception:          # noqa: BLE001
+                watch.untrackable += 1
+                kw["factory"] = base
+            conn = watch._real(*a, **kw)
+            watch.opened += 1
+            return conn
+
+        sqlite3.connect = traced
+        return self
+
+    def __exit__(self, *exc):
+        sqlite3.connect = self._real
+        return False
+
+    @property
+    def leaked(self):
+        return self.opened - self.closed
+
+
+def _process_handles():
+    """Windows 프로세스 핸들 수. 잴 수 없으면 None(그때는 이 축을 판정하지 않는다)."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.GetProcessHandleCount.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(ctypes.c_ulong)]
+        k32.GetProcessHandleCount.restype = ctypes.c_int
+        n = ctypes.c_ulong(0)
+        if k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(n)):
+            return n.value
+    except Exception:                      # noqa: BLE001 - 못 재면 판정하지 않는다
+        pass
+    return None
+
+
+def _py_heap_bytes():
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+        tracemalloc.start()
+    return tracemalloc.get_traced_memory()[0]
+
+
+def _table_counts(env):
+    c = env.conn()
+    try:
+        out = {}
+        for (t,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"
+                              " AND name NOT LIKE 'sqlite_%'").fetchall():
+            try:
+                out[t] = c.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
+            except sqlite3.Error:
+                pass
+        return out
+    finally:
+        c.close()
+
+
+def test_repeated_cycles_do_not_accumulate_process_resources():
+    print("\n--- 6. 반복 실행이 프로세스 자원을 쌓지 않는가 (자원 누수) ---")
+    CYCLES = 10
+    WARMUP = 3                 # 캐시/임포트가 데워지는 구간은 기울기 판정에서 뺀다
+
+    env = Env()
+    try:
+        base_date = (datetime.now() + timedelta(days=20)).strftime("%Y-%m-%d")
+        rows = make_rows(0, 40, base_date)
+
+        # 1회차로 큐/물건을 만들어 둔다. 이후 바퀴는 **같은 입력을 다시** 흘린다 —
+        # 그것이 "매일 같은 자료가 다시 들어오는" 실제 운영 모양이다.
+        env.dbmod.upsert_batch(rows)
+        env.dbmod.enqueue_documents(rows)
+        sync_to_auction_item()
+
+        samples = []
+        counts0 = _table_counts(env)      # 반복 **전** 기준선
+        with _ConnLeakWatch() as watch:
+            for i in range(CYCLES):
+                t0 = time.time()
+                env.dbmod.upsert_batch(rows)
+                env.dbmod.enqueue_documents(rows)
+                env.dbmod.refresh_queue_priority()
+                env.dbmod.reset_stale_queue()
+                picked = 0
+                for _ in range(8):
+                    got = env.dbmod.claim_next_item_rows()
+                    if not got:
+                        break
+                    picked += len(got)
+                    env.dbmod.release_queue_rows([g["id"] for g in got])
+                elapsed = time.time() - t0
+                samples.append({
+                    "handles": _process_handles(),
+                    "heap": _py_heap_bytes(),
+                    "secs": elapsed,
+                    "picked": picked,
+                })
+            opened, leaked = watch.opened, watch.leaked
+            untrackable = watch.untrackable
+        # 행수는 감시 밖에서 센다 - 이 조회는 제품 경로가 아니다.
+        for i, srec in enumerate(samples):
+            srec["counts"] = _table_counts(env) if i == len(samples) - 1 else None
+        counts_last = samples[-1]["counts"]
+
+        # --- 검사가 공허하지 않은가 --------------------------------------
+        check_true("검사가 공허하지 않다(바퀴마다 실제로 일을 했다)",
+                   sum(s["picked"] for s in samples) > 0,
+                   "-> 집은 행이 0이면 이 검사는 아무것도 태우지 않은 것이다")
+        check_true("검사가 공허하지 않다(큐가 실제로 쌓여 있다)",
+                   counts_last.get("document_queue", 0) > 0,
+                   counts_last.get("document_queue"))
+
+        # --- (a) 커넥션 규약 ---------------------------------------------
+        # `finally: conn.close()` 를 한 곳이라도 빠뜨리면 여기서 잡힌다.
+        # (객체 생존을 세던 첫 판본은 변이가 그대로 통과했다 - _ConnLeakWatch 참고.)
+        check_true("검사가 공허하지 않다(커넥션을 실제로 열었다)", opened > 0, opened)
+        check("추적할 수 없었던 커넥션 없음(폴백이 실패를 숨기지 않는다)", untrackable, 0)
+        check("★ 연 sqlite 커넥션이 전부 닫혔다 (%d개 열었다)" % opened, leaked, 0)
+
+        # --- (b) 파일 핸들 -----------------------------------------------
+        hs = [s["handles"] for s in samples if s["handles"] is not None]
+        if len(hs) == len(samples):
+            grew = hs[-1] - hs[WARMUP]
+            check_true("★ 파일 핸들이 바퀴를 따라 늘지 않는다 (%s)" % hs,
+                       grew <= 0, "-> %d개 증가 (%d -> %d)" % (grew, hs[WARMUP], hs[-1]))
+        else:
+            print("      (핸들 수를 잴 수 없는 환경 - 이 축은 판정하지 않는다)")
+
+        # --- (c) 파이썬 힙 -----------------------------------------------
+        # 절대값이 아니라 워밍업 이후의 증가를 본다. 여유는 두되 **비율로** 둔다.
+        h0, h1 = samples[WARMUP]["heap"], samples[-1]["heap"]
+        check_true("★ 파이썬 힙이 바퀴를 따라 늘지 않는다 (%.2fMB -> %.2fMB)"
+                   % (h0 / 1048576.0, h1 / 1048576.0),
+                   h1 <= max(h0 * 1.25, h0 + 2 * 1024 * 1024),
+                   "-> %d바퀴에 %.2fMB 증가" % (CYCLES - WARMUP, (h1 - h0) / 1048576.0))
+
+        # --- (d) DB 행이 바퀴를 따라 늘지 않는다 (멱등) --------------------
+        grew_tables = {t: (counts0[t], counts_last.get(t))
+                       for t in counts0 if counts_last.get(t, 0) != counts0[t]}
+        check("★ 같은 입력을 %d번 다시 흘려도 어떤 테이블도 늘지 않는다" % CYCLES,
+              grew_tables, {})
+
+        # --- (e) 바퀴마다 느려지지 않는다 ----------------------------------
+        # "처음엔 정상인데 아침에 안 끝나 있다" 를 잡는 축이다.
+        head = sum(s["secs"] for s in samples[WARMUP:WARMUP + 3]) / 3.0
+        tail = sum(s["secs"] for s in samples[-3:]) / 3.0
+        check_true("★ 마지막 바퀴가 초반 바퀴보다 크게 느려지지 않는다 "
+                   "(%.3fs -> %.3fs)" % (head, tail),
+                   tail <= max(head * 2.0, head + 0.5),
+                   "-> %.2f배 느려졌다. 누적이 비용에 붙고 있다" % (tail / max(head, 1e-9)))
+    finally:
+        env.close()
+
+
 def run():
     print("=" * 62)
     print(" Scheduler 장시간 무인 운전 시뮬레이션 (Sprint 230)")
@@ -575,6 +815,7 @@ def run():
     test_retry_budget_does_not_regenerate_forever()
     test_rerun_same_day_is_idempotent()
     test_expired_backlog_does_not_starve_live_work()
+    test_repeated_cycles_do_not_accumulate_process_resources()
 
     print("\n" + "=" * 62)
     if failures:

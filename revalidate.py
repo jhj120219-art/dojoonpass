@@ -11,7 +11,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 def main():
-    filename = "auction_20260703.csv"
+    # ★ 경로는 **이 파일 기준**이다 (2026-08-27, BUGS #263). 상대경로면
+    #   다른 폴더에서 돌렸을 때 그 CSV 를 못 찾는다.
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    filename = os.path.join(_HERE, "auction_20260703.csv")
     logger.info("CSV 로드: %s", filename)
     df = pd.read_csv(filename, encoding="utf-8-sig")
     logger.info("총 %d건 로드", len(df))
@@ -34,7 +37,9 @@ def main():
         )
         items.append(item)
 
-    engine = ValidationEngine(log_path="logs/revalidation.jsonl")
+    # ★ 같은 이유로 로그 경로도 이 파일 기준이다 (BUGS #263).
+    engine = ValidationEngine(
+        log_path=os.path.join(_HERE, "logs", "revalidation.jsonl"))
     items = engine.validate_batch(items)
     summary = engine.summary(items)
 

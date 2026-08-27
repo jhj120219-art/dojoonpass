@@ -241,6 +241,50 @@ def init_db() -> None:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# `upsert_batch()` 가 쓰는 **한 문장** (2026-08-27, docs/BUGS.md #256)
+#
+# 컬럼 목록을 세 번(SET / WHERE / VALUES) 손으로 적지 않는다 — 한 곳에서 만든다.
+# 예전 구현은 SET 14개와 WHERE 14개를 각각 적어 두었고, 그 둘이 갈라지면
+# **바뀐 값을 안 쓰는** 결함이 조용히 생긴다(정확히 그것을 막으려고
+# `test_upsert_change_detection.py` 가 필드를 하나씩 따로 바꿔 본다).
+#
+# `IS NOT` 를 쓴다 — `<>` 는 한쪽이 NULL 이면 NULL(=거짓)이라 NULL 이 든 열의 변경을
+# 놓친다. `IS NOT` 는 NULL 도 제대로 비교한다.
+UPSERT_COMPARE_COLUMNS = (
+    "court_name", "property_type", "sido", "sigungu", "dong", "lot_number",
+    "full_address", "appraisal_price", "minimum_bid_price", "auction_date",
+    "status", "validation_status", "validation_reasons", "crawl_date",
+)
+
+# `court_code` 는 식별키의 일부라 비교 대상이 아니지만(같지 않으면 애초에 다른 행이다)
+# SET 에는 넣어 둔다 — 기존 구현과 같은 동작을 유지한다.
+_UPSERT_SET = ", ".join(
+    "%s=excluded.%s" % (c, c) for c in ("court_code",) + UPSERT_COMPARE_COLUMNS
+) + ", updated_at=excluded.updated_at"
+
+_UPSERT_WHERE = " OR ".join(
+    "auction.%s IS NOT excluded.%s" % (c, c) for c in UPSERT_COMPARE_COLUMNS
+)
+
+# ★ `created_at` / `has_*` 는 SET 에 **없다.** 그래서 갱신에서 보존된다 —
+#   예전 구현이 UPDATE 문에 그 컬럼들을 안 넣어 둔 것과 같은 효과다.
+UPSERT_SQL = """
+    INSERT INTO auction (
+        court_code, court_name, case_no, item_no,
+        property_type, sido, sigungu, dong, lot_number,
+        full_address, appraisal_price, minimum_bid_price,
+        auction_date, status, validation_status,
+        validation_reasons, crawl_date,
+        has_spec_pdf, has_status_doc, has_appraisal_pdf,
+        created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?)
+    ON CONFLICT(court_code, case_no, item_no) DO UPDATE SET
+""" + _UPSERT_SET + """
+    WHERE """ + _UPSERT_WHERE + """
+"""
+
+
 def upsert_batch(rows: List[Dict]) -> Dict:
     """크롤 결과를 `auction` 에 반영한다.
 
@@ -267,131 +311,100 @@ def upsert_batch(rows: List[Dict]) -> Dict:
       안 바뀐 날에도 배치 로그가 *"업데이트: 1,876건"* 을 찍는다 — 이 저장소가 #47 에서
       고친 "배치 로그가 사실이 아닌 것을 말한다"와 정확히 같은 문제다.
       `refresh_queue_priority()` 도 같은 이유로 실제로 바뀐 행 수를 돌려준다.
+    
+
+    ## 행마다 두 문장에서 **한 문장**으로 (2026-08-27, docs/BUGS.md #256)
+
+    예전에는 행마다 `SELECT id` 로 존재를 확인하고 `INSERT` 또는 `UPDATE` 를 보냈다.
+    문장 수는 **행 수의 두 배**였고, 하루치 파이프라인 전체 문장의 **99%** 가 여기였다
+    (실측 2026-08-27, 운영 2,608행: upsert 5,219문장 / 나머지 경로 전부 합쳐 51문장).
+
+    이제 `INSERT ... ON CONFLICT DO UPDATE ... WHERE <바뀐 게 있나>` 한 문장이다.
+    변경 감지는 예전과 똑같이 **DB 가** 한다(그 계약은 그대로다).
+
+        2,608행   신규 32.0->29.8ms  변화없음 27.9->22.6ms  변경 41.3->35.7ms
+       10,000행   신규113.5->104.1ms 변화없음105.6->82.9ms  변경152.2->124.7ms
+       50,000행   신규580.7->529.7ms 변화없음536.4->414.4ms 변경782.3->674.6ms
+                  문장 2N+3 -> N+5   (모든 규모에서 결과값은 완전히 동일)
+
+    ### ★ `RETURNING` 은 쓰지 않는다 — 재 보고 버렸다
+
+    분류(신규/갱신/변화없음)를 `RETURNING created_at` + `fetchone()` 으로 하는 것이
+    가장 곧은 길이라 **그것을 먼저 만들었고, 그게 훨씬 느렸다.** 원인을 갈라 재 보니
+    upsert 가 아니라 **커서 물질화**였다(20,000행 신규):
+
+        plain INSERT                              99.4ms
+        SELECT + plain INSERT (예전 구현)         123.7ms
+        upsert, RETURNING 없음                    99.8ms   <- upsert 자체는 공짜다
+        upsert + RETURNING + fetchone            622.4ms   <- 6배
+
+    그래서 분류를 **행마다 묻지 않고** 배치 앞뒤로 두 번만 센다(아래 참고).
+    `#249` 때와 같은 교훈이다 — 재 보지 않았으면 문장 수만 줄이고 **더 느려진 채**
+    끝났을 것이다.
     """
     conn = get_connection()
-    inserted = 0
-    updated = 0
-    unchanged = 0
     failed = 0
+    processed = 0
     try:
+        # ★ 분류를 **행마다 묻지 않는다.** 배치 앞뒤로 두 번만 센다(#256).
+        #
+        #   inserted  = 행 수 증가분          (그 배치가 새로 만든 행)
+        #   written   = total_changes 증가분  (실제로 쓴 행: 신규 + 갱신)
+        #   updated   = written - inserted
+        #   unchanged = 처리한 행 - written   (값이 같아 아무것도 안 쓴 행)
+        #
+        #   `total_changes` 는 커넥션이 지금까지 바꾼 행 수라 **SQL 을 한 문장도 더
+        #   쓰지 않는다.** 이 유도가 성립하려면 한 upsert 가 정확히 0 또는 1행만
+        #   바꿔야 하는데, `auction` 에는 트리거가 없고 이 테이블을 참조하는 외래키도
+        #   없다(2026-08-27 전수 확인). 그 전제가 깨지면 아래 자기 검사가 시끄럽게 운다.
+        before_rows = conn.execute("SELECT COUNT(*) FROM auction").fetchone()[0]
+        before_changes = conn.total_changes
+
         for row in rows:
             try:
                 now = datetime.now().isoformat()
-                # 식별키는 (court_code, case_no, item_no)다 — 2026-08-07 Migration 012에서
-                # auction의 UNIQUE 제약을 여기에 맞춰 바꿨다(docs/BUGS.md #18).
-                # 예전에는 법원을 빼고 (case_no, item_no)로만 찾아 UPDATE했기 때문에,
-                # 서로 다른 법원이 같은 사건번호+물건번호를 쓰면 앞서 저장된 법원의 물건이
-                # 통째로 교체되어 사라졌다(병합이 아니라 소실). 이제 법원별로 각자의 행을 갖는다.
-                existing = conn.execute(
-                    "SELECT id FROM auction WHERE court_code=? AND case_no=? AND item_no=?",
-                    (row.get("court_code", ""), row.get("case_no", ""), row.get("item_no", ""))
-                ).fetchone()
-                if existing:
-                    # ★ 값이 이미 같으면 **행을 다시 쓰지 않는다.**
-                    #
-                    #   비교를 파이썬이 아니라 **UPDATE 의 WHERE** 로 한다. 처음에는
-                    #   15개 컬럼을 함께 SELECT 해 파이썬에서 튜플로 비교했는데,
-                    #   실측하니 **더 느렸다**(1,876행에서 41.6ms -> 63.4ms, 0.7배).
-                    #   넓은 SELECT 와 튜플 생성 비용이, 절약한 UPDATE 보다 컸다.
-                    #   여기서는 문장 수가 예전과 같고(SELECT 1 + UPDATE 1) 대신
-                    #   **실제 쓰기만 사라진다.** `rowcount` 가 곧 '정말 바뀌었나'다.
-                    #
-                    #   `IS NOT` 를 쓴다 — `<>` 는 한쪽이 NULL 이면 NULL(=거짓)이라
-                    #   NULL 이 든 열의 변경을 놓친다. `IS NOT` 는 NULL 도 제대로 비교한다.
-                    cur = conn.execute("""
-                        UPDATE auction SET
-                            court_code=?, court_name=?, property_type=?,
-                            sido=?, sigungu=?, dong=?, lot_number=?,
-                            full_address=?, appraisal_price=?,
-                            minimum_bid_price=?, auction_date=?,
-                            status=?, validation_status=?,
-                            validation_reasons=?, crawl_date=?,
-                            updated_at=?
-                        WHERE court_code=? AND case_no=? AND item_no=?
-                          AND (court_name IS NOT ? OR property_type IS NOT ?
-                            OR sido IS NOT ? OR sigungu IS NOT ? OR dong IS NOT ?
-                            OR lot_number IS NOT ? OR full_address IS NOT ?
-                            OR appraisal_price IS NOT ? OR minimum_bid_price IS NOT ?
-                            OR auction_date IS NOT ? OR status IS NOT ?
-                            OR validation_status IS NOT ? OR validation_reasons IS NOT ?
-                            OR crawl_date IS NOT ?)
-                    """, (
-                        row.get("court_code", ""),
-                        row.get("court_name", ""),
-                        row.get("property_type", ""),
-                        row.get("sido", ""),
-                        row.get("sigungu", ""),
-                        row.get("dong", ""),
-                        row.get("lot_number", ""),
-                        row.get("full_address", ""),
-                        int(row.get("appraisal_price", 0) or 0),
-                        int(row.get("minimum_bid_price", 0) or 0),
-                        row.get("auction_date", ""),
-                        row.get("status", ""),
-                        row.get("validation_status", ""),
-                        row.get("validation_reasons", ""),
-                        row.get("crawl_date", ""),
-                        now,
-                        row.get("court_code", ""),
-                        row.get("case_no", ""),
-                        row.get("item_no", ""),
-                        # 아래 14개는 WHERE 의 변경 감지용이다(SET 과 같은 값).
-                        row.get("court_name", ""),
-                        row.get("property_type", ""),
-                        row.get("sido", ""),
-                        row.get("sigungu", ""),
-                        row.get("dong", ""),
-                        row.get("lot_number", ""),
-                        row.get("full_address", ""),
-                        int(row.get("appraisal_price", 0) or 0),
-                        int(row.get("minimum_bid_price", 0) or 0),
-                        row.get("auction_date", ""),
-                        row.get("status", ""),
-                        row.get("validation_status", ""),
-                        row.get("validation_reasons", ""),
-                        row.get("crawl_date", ""),
-                    ))
-                    # rowcount 가 0 이면 값이 이미 같아 **아무것도 쓰지 않은 것**이다.
-                    if cur.rowcount:
-                        updated += 1
-                    else:
-                        unchanged += 1
-                else:
-                    conn.execute("""
-                        INSERT INTO auction (
-                            court_code, court_name, case_no, item_no,
-                            property_type, sido, sigungu, dong, lot_number,
-                            full_address, appraisal_price, minimum_bid_price,
-                            auction_date, status, validation_status,
-                            validation_reasons, crawl_date,
-                            has_spec_pdf, has_status_doc, has_appraisal_pdf,
-                            created_at, updated_at
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?)
-                    """, (
-                        row.get("court_code", ""),
-                        row.get("court_name", ""),
-                        row.get("case_no", ""),
-                        row.get("item_no", ""),
-                        row.get("property_type", ""),
-                        row.get("sido", ""),
-                        row.get("sigungu", ""),
-                        row.get("dong", ""),
-                        row.get("lot_number", ""),
-                        row.get("full_address", ""),
-                        int(row.get("appraisal_price", 0) or 0),
-                        int(row.get("minimum_bid_price", 0) or 0),
-                        row.get("auction_date", ""),
-                        row.get("status", ""),
-                        row.get("validation_status", ""),
-                        row.get("validation_reasons", ""),
-                        row.get("crawl_date", ""),
-                        now,
-                        now,
-                    ))
-                    inserted += 1
+                conn.execute(UPSERT_SQL, (
+                    row.get("court_code", ""),
+                    row.get("court_name", ""),
+                    row.get("case_no", ""),
+                    row.get("item_no", ""),
+                    row.get("property_type", ""),
+                    row.get("sido", ""),
+                    row.get("sigungu", ""),
+                    row.get("dong", ""),
+                    row.get("lot_number", ""),
+                    row.get("full_address", ""),
+                    int(row.get("appraisal_price", 0) or 0),
+                    int(row.get("minimum_bid_price", 0) or 0),
+                    row.get("auction_date", ""),
+                    row.get("status", ""),
+                    row.get("validation_status", ""),
+                    row.get("validation_reasons", ""),
+                    row.get("crawl_date", ""),
+                    now,
+                    now,
+                ))
+                processed += 1
             except Exception as e:
                 logger.warning("upsert 실패 [%s]: %s", row.get("case_no", ""), str(e))
                 failed += 1
+
+        after_rows = conn.execute("SELECT COUNT(*) FROM auction").fetchone()[0]
+        written = conn.total_changes - before_changes
+        inserted = after_rows - before_rows
+        updated = written - inserted
+        unchanged = processed - written
+
+        # ★ 유도가 깨졌으면 **조용히 틀린 숫자를 내보내지 않는다.**
+        #   이 값들은 `CrawlOutcome.persisted` 를 거쳐 크롤의 종료코드가 된다 —
+        #   틀린 채로 흘러가면 배치 로그가 사실이 아닌 것을 말하게 된다(#47).
+        if inserted < 0 or updated < 0 or unchanged < 0:
+            logger.error(
+                "upsert 집계 유도가 깨졌다 - 처리 %d행 / 행수 %d->%d / 쓴 행 %d "
+                "(신규 %d, 갱신 %d, 변화없음 %d). auction 에 트리거나 참조 외래키가 "
+                "생겼는지 확인하라 - 그러면 total_changes 가 한 행보다 많이 센다",
+                processed, before_rows, after_rows, written,
+                inserted, updated, unchanged)
 
         conn.commit()
         logger.info("DB UPSERT 완료 - 신규: %d, 갱신: %d, 변화없음: %d, 실패: %d",
@@ -521,6 +534,42 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
 
     UNIQUE 덕에 이미 대기 중인 항목도 조용히 무시된다 (중복 enqueue 방지).
 
+    ## 기일이 다시 잡히면 `SKIPPED_EXPIRED` 를 되살린다 (2026-08-27, docs/BUGS.md #254)
+
+    `SKIPPED_EXPIRED` 는 **"기일이 지나 지금은 대상이 아님"** 이라는 기록이다. 그런데
+    유찰 후 재매각으로 기일이 미래로 다시 잡히면 그 전제가 **사실이 아니게 된다.**
+    Sprint 74 가 이 함수에 `to_refresh` 를 넣어 `auction_date` 는 최신으로 맞췄지만
+    `status` 는 일부러 두었고, 그래서 이런 행이 남았다 — 실측(2026-08-27 운영 DB):
+
+        큐 36행: status=SKIPPED_EXPIRED / auction_date=2026-08-27(**오늘**)
+                 전부 doc_type=appraisal
+                 같은 물건의 spec/status/image 는 pending (같이 수집될 예정)
+                 document_status 기록 **없음** / doc_raw **0행** (한 번도 못 받았다)
+
+    즉 **오늘 매각이 진행되는 물건의 감정평가서만** 조용히 빠진다. 화면은 "수집중"에
+    머물고, 큐는 "대상 아님"이라고 말하며, 둘 다 사실이 아니다. 그리고 아무도 다시
+    보지 않는다 — `reset_stale_queue()` 는 SKIPPED_EXPIRED 를 일부러 건드리지 않고
+    (성공할 수 없는 항목이 매일 되살아나는 것을 막는 규칙이다), 이 함수는 날짜만 고쳤다.
+    `test_pipeline_integrity.py` 가 상한 1로 잡아 두었는데 **1 -> 36 으로 늘었다.**
+
+    ★ 이것은 보류된 "재수집 정책"이 아니다. 그 보류는 *이미 받아 둔 것을 또 받을지*
+      (`done`/`failed` 되살리기)에 대한 판단이다. 여기 36행은 **한 번도 받은 적이 없다**
+      (doc_raw 0행). 되살리는 것은 재수집이 아니라 **첫 수집**이고, 고치는 것은
+      "큐가 자기 필드에 사실과 다른 값을 들고 있는 것"뿐이다 — Sprint 74 와 같은 판단이다.
+
+    ★ `done` / `failed` / `SKIPPED_UNSUPPORTED` 는 **건드리지 않는다.** 되살리는 것은
+      전제가 반증된 `SKIPPED_EXPIRED` 하나뿐이다. 특히 `SKIPPED_UNSUPPORTED` 는
+      "지금 구조로는 성공할 수 없다"라서, 되살리면 `mark_queue_unsupported()` 가 없앤
+      "영원히 재시도하는 항목"이 그대로 돌아온다.
+
+    ★ `retry_count` 는 0 으로 되돌린다. 그 예산은 **지난 기일의 시도**에 대한 것이고,
+      지금은 새 기일이다. `reset_stale_queue()` 가 하루 지난 `failed` 를 되돌릴 때
+      쓰는 규칙과 같다(새 정책이 아니다). 되돌리지 않으면 예산이 소진된 행이
+      `pending` 으로 남아 "pending 인데 재시도가 소진된 행" 불변식을 깬다.
+
+    ★ 되살린 뒤에도 이미 실체가 있으면 수집기가 "이미 존재. 스킵"으로 곧바로 `done`
+      처리한다(`overwrite=False` 경로). 그래서 없던 파일을 덮어쓸 위험은 없다.
+
     1차 방어선(예방): auction_date가 이미 지난 사건은 큐에 넣지 않는다.
     Step 13/14 검증 결과, 매각기일이 지난 사건은 법원경매정보 사이트의
     "사건번호 직접검색"으로도 조회가 안 되어(취하/변경/매각완료 등 사유는
@@ -530,6 +579,7 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
     conn = get_connection()
     added = 0
     refreshed = 0
+    revived_expired = 0
     skipped_expired = 0
     try:
         now = datetime.now().isoformat()
@@ -561,21 +611,25 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                 seen_key.add(k)
                 wanted_keys.append(k)
 
-        existing_q = {}      # (court_code, case_no, item_no, doc_type) -> auction_date
+        # (court_code, case_no, item_no, doc_type) -> (auction_date, status)
+        # ★ `status` 를 함께 읽는다(#254). 컬럼 하나가 늘 뿐 **문장 수는 그대로**다 —
+        #   되살릴 대상을 고르려고 행마다 다시 물으면 위 #249 가 없앤 N+1 이 돌아온다.
+        existing_q = {}
         for key_chunk in chunked_for_sql(wanted_keys, vars_per_item=3, conn=conn):
             placeholders = ",".join(["(?,?,?)"] * len(key_chunk))
             params = [v for triple in key_chunk for v in triple]
             for q in conn.execute(
-                "SELECT court_code, case_no, item_no, doc_type, auction_date"
+                "SELECT court_code, case_no, item_no, doc_type, auction_date, status"
                 " FROM document_queue"
                 " WHERE (court_code, case_no, item_no) IN (" + placeholders + ")",
                 params,
             ):
                 existing_q[(q["court_code"], q["case_no"], q["item_no"],
-                            q["doc_type"])] = q["auction_date"]
+                            q["doc_type"])] = (q["auction_date"], q["status"])
 
         to_insert = []       # 새로 넣을 큐 행
         to_refresh = []      # 기일이 바뀌어 갱신할 큐 행
+        to_revive = []       # 기일이 다시 잡혀 되살릴 SKIPPED_EXPIRED 행 (#254)
 
         for row in rows:
             court_code = row.get("court_code", "")
@@ -599,9 +653,23 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                                       priority, auction_date, now))
                     # 같은 배치 안에 같은 키가 두 번 나와도 두 벌 넣지 않는다
                     # (auction 의 UNIQUE 제약상 없어야 하지만 가정에 기대지 않는다)
-                    existing_q[qkey] = auction_date
+                    existing_q[qkey] = (auction_date, QUEUE_STATUS_PENDING)
                     added += 1
-                elif auction_date and (existing_q[qkey] or "") != auction_date:
+                    continue
+
+                prev_date, prev_status = existing_q[qkey]
+                if prev_status == QUEUE_STATUS_SKIPPED_EXPIRED:
+                    # ★ 여기 닿았다는 것은 위 `auction_date < today` 를 통과했다는 뜻,
+                    #   즉 **기일이 아직 안 지났다**는 것이다. 그 행이 "기일이 지나 대상이
+                    #   아님"으로 닫혀 있으면 그 기록은 지금 사실이 아니다(#254).
+                    #   날짜가 바뀌었는지와 무관하게 되살린다 — 이미 최신 날짜를 들고
+                    #   `SKIPPED_EXPIRED` 로 굳은 행이 실제로 36개 있었고, "바뀔 때만"
+                    #   고치면 그것들은 영원히 안 고쳐진다.
+                    to_revive.append((auction_date or prev_date, priority,
+                                      court_code, case_no, item_no, doc_type))
+                    existing_q[qkey] = (auction_date or prev_date, QUEUE_STATUS_PENDING)
+                    revived_expired += 1
+                elif auction_date and (prev_date or "") != auction_date:
                     # 이미 있는 행 — 기일이 바뀌었으면 최신 값으로 맞춘다 (2026-08-13 Sprint 74).
                     #
                     # 유찰 후 재매각은 한국 경매에서 일상이고, 그때 같은
@@ -621,7 +689,7 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                     to_refresh.append((auction_date, priority,
                                        court_code, case_no, item_no, doc_type,
                                        auction_date))
-                    existing_q[qkey] = auction_date
+                    existing_q[qkey] = (auction_date, prev_status)
 
         # `INSERT OR IGNORE` / `IFNULL(...) <> ?` 가드를 **그대로** 둔다. 위 조회와
         # 여기 사이에 다른 실행이 같은 행을 넣었을 수 있다(운영에서 두 프로세스가 겹치는
@@ -642,10 +710,30 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                    AND IFNULL(auction_date, '') <> ?
             """, to_refresh)
             refreshed = len(to_refresh)
+        if to_revive:
+            # `AND status=?` 가드를 둔다 — 조회와 여기 사이에 워커가 그 행을 집어
+            # 다른 상태로 옮겼다면 우리 판단이 낡은 것이므로 건드리지 않는다.
+            # 그래서 `rowcount` 가 곧 "정말 되살린 행 수"다.
+            cur = conn.executemany("""
+                UPDATE document_queue
+                   SET status=?, retry_count=0, auction_date=?, priority=?
+                 WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
+                   AND status=?
+            """, [(QUEUE_STATUS_PENDING, d, pr, cc, cn, it, dt,
+                   QUEUE_STATUS_SKIPPED_EXPIRED)
+                  for (d, pr, cc, cn, it, dt) in to_revive])
+            revived_expired = cur.rowcount if cur.rowcount and cur.rowcount >= 0                 else len(to_revive)
         conn.commit()
-        logger.info("document_queue 적재: %d건 (기일 갱신: %d건, 기일경과로 사전제외: %d건)",
-                    added, refreshed, skipped_expired)
-        return {"added": added, "refreshed": refreshed, "skipped_expired": skipped_expired}
+        logger.info("document_queue 적재: %d건 (기일 갱신: %d건, 기일 재공고로 되살림: %d건, "
+                    "기일경과로 사전제외: %d건)",
+                    added, refreshed, revived_expired, skipped_expired)
+        if revived_expired:
+            logger.info("기일이 다시 잡혀 SKIPPED_EXPIRED 에서 되살린 %d행 - "
+                        "그 상태로 두면 진행 중인 물건의 문서가 영원히 수집되지 않는다",
+                        revived_expired)
+        return {"added": added, "refreshed": refreshed,
+                "revived_expired": revived_expired,
+                "skipped_expired": skipped_expired}
     finally:
         conn.close()
 
@@ -1246,6 +1334,18 @@ QUEUE_STATUS_PENDING = "pending"
 QUEUE_STATUS_REFRESH = "refresh"
 QUEUE_STATUS_IN_PROGRESS = "in_progress"
 QUEUE_STATUS_IN_PROGRESS_REFRESH = "in_progress_refresh"
+
+# 종결 상태 — 워커가 다시 집지 않는다.
+#
+#   SKIPPED_EXPIRED       기일이 지나 **지금은** 대상이 아니다
+#   SKIPPED_UNSUPPORTED   지금 구조로는 성공할 수 없다(수집 버튼 id 자체가 없다)
+#
+# ★ 둘의 성격이 다르다. `SKIPPED_UNSUPPORTED` 는 시간이 지나도 그대로지만,
+#   `SKIPPED_EXPIRED` 는 **기일이 다시 잡히면 전제가 반증된다.** 그래서
+#   `enqueue_documents()` 는 앞의 것만 되살린다(#254). 이름을 상수로 두는 이유가
+#   그것이다 — 되살리는 쪽과 되살리지 않는 쪽을 문자열로 구별하면 언젠가 어긋난다.
+QUEUE_STATUS_SKIPPED_EXPIRED = "SKIPPED_EXPIRED"
+QUEUE_STATUS_SKIPPED_UNSUPPORTED = "SKIPPED_UNSUPPORTED"
 
 # 워커가 집어갈 수 있는 상태. `claim_next_queue_item()`과 `refresh_queue_priority()`가
 # **같은 목록**을 봐야 한다 — 갈라지면 refresh 행이 우선순위 재계산에서 빠진다.

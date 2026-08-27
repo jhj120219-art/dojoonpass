@@ -122,7 +122,10 @@ def test_cross_court_upsert_safety():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_qa_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
     try:
         case_no = "QA-AUCTION-IDENTITY-TEST"
@@ -196,7 +199,10 @@ def test_cross_court_migrate_safety():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_mig_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
     try:
         CASE, ITEM = "QA-MIGRATE-COURT", "1"
@@ -267,7 +273,10 @@ def test_migrate_exit_code_contract():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_exit_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
     try:
         _check_true("정상 상태에서는 True(성공)를 돌려준다", migrate_execute.execute() is True)
@@ -372,7 +381,10 @@ def test_upsert_partial_failure_isolation():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_qa_upsert_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
     try:
         case = "QA-UPSERT-ISOLATION"
@@ -644,7 +656,10 @@ def test_migrate_reports_actual_changes():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_chg_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
     try:
         importlib.reload(migrate_execute)
@@ -728,7 +743,10 @@ def test_migrate_survives_more_cases_than_sql_variable_limit():
     real_path = dbmod.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="kokchal_varlimit_")
     tmp_db = os.path.join(tmp_dir, "scratch.db")
-    shutil.copy2(real_path, tmp_db)
+    # ★ `shutil.copy2()` 를 쓰지 않는다 — 다른 프로세스가 쓰는 중이면 찢어진 사본이
+    #   나온다(`snapshot_live_db()` docstring 의 실측). 2026-08-27 BUGS #251 에서
+    #   `test_db_snapshot.py` 의 감사가 **별칭을 따라가도록** 강화되며 드러났다.
+    dbmod.snapshot_live_db(tmp_db)
     dbmod.DB_PATH = tmp_db
 
     # 이 검사 동안만 커넥션의 변수 상한을 낮춘다. `get_connection()` 을 감싼다.

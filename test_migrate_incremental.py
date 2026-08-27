@@ -76,11 +76,22 @@ def check_true(name, cond, detail=""):
 _TMP = []
 
 
+# 운영 DB 경로를 **한 번만** 붙잡아 둔다 (2026-08-27, BUGS #257).
+#
+# ★ `scratch_db()` 는 마지막에 `dbmod.DB_PATH` 를 스크래치로 갈아끼운다. 그래서
+#   그때그때의 `dbmod.DB_PATH` 에서 스냅샷을 뜨면, 두 번째 호출부터는 실 DB 가 아니라
+#   **직전 스크래치의 사본**을 뜬다. 행은 지우므로 데이터는 안 넘어오지만 **스키마
+#   객체(트리거/인덱스/뷰)는 넘어간다** — 검사끼리 조용히 오염된다.
+#   `test_upsert_change_detection.py` 에서 실제로 트리거가 새어 나가 집계를 흔들었다.
+_LIVE_DB_PATH = dbmod.DB_PATH
+
+
 def scratch_db():
     """운영 DB 의 **스키마 그대로**인 빈 DB. 마이그레이션도 끝까지 적용한다."""
     d = tempfile.mkdtemp(prefix="mig_incr_")
     _TMP.append(d)
     path = os.path.join(d, "scratch.db")
+    dbmod.DB_PATH = _LIVE_DB_PATH   # 항상 **실 DB** 에서 뜬다
     dbmod.snapshot_live_db(path)
 
     c = sqlite3.connect(path)
