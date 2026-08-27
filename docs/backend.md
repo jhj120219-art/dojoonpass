@@ -270,7 +270,8 @@ JWT 없으면 기록 안 함 (에러 없음).
 ### Payment Flow Migration (2026-08-05)
 - `payments.py:create_payment_record()`가 이제 `provider.charge()` 대신 `provider.create_order()` → `provider.confirm_payment()` → `provider.verify_payment()` 순서로 호출한다 — 실제 PG 흐름(주문 생성→결제창→승인→서버 재검증)과 동일한 단계 구성
 - `MockProvider`는 사용자가 결제창에서 결제를 마치고 돌아오는 중간 단계가 없으므로 `confirm_payment()`를 `create_order()` 직후 곧바로 이어서 호출한다 — 실제 PG 연동 시 이 호출 지점만 클라이언트 콜백/리다이렉트 처리 뒤로 옮기면 되고, 반환값 형태(`ChargeResult`)는 그대로라 이후 로직(저장/구독/등기부 연결)은 안 바뀐다
-- `cancel_payment()`/`handle_webhook()` 2개는 여전히 `payments.py` 어디에서도 호출되지 않음(환불 엔드포인트, Webhook 엔드포인트가 아직 없음 — 이번 Sprint 범위 아님)
+- ~~`cancel_payment()`/`handle_webhook()` 2개는 여전히 `payments.py` 어디에서도 호출되지 않음(환불 엔드포인트, Webhook 엔드포인트가 아직 없음 — 이번 Sprint 범위 아님)~~
+  → **둘 다 호출된다** (2026-08-27 코드 대조로 정정). 환불은 `payments.py:621 refund_payment()` 가 `provider.cancel_payment()` 를 부르고(:678), 관리자 라우트 `POST /api/v1/admin/payments/{id}/refund`(`admin.py:975`) 가 그것을 연다. Webhook 수신은 `POST /api/v1/payments/webhook/{provider_name}`(`payments.py:735`) 이고, 재처리용 `POST /api/v1/admin/payments/webhooks/{id}/reprocess`(`admin.py:913`) 도 있다. 남은 것은 **KGInicis 판 구현체**뿐이다.
 - `create_payment_record()`의 반환 시그니처(`payment_id`, `status`)는 그대로라 호출부(`create_payment()` 라우터 핸들러의 구독 생성/등기부 연결 로직)는 전혀 수정하지 않음 — 회귀 없음
 
 ### 결제(Payment) → 구독(Subscription) → Premium → Registry (2026-08-05 완성, PG 미연동)
@@ -379,7 +380,7 @@ Task Scheduler (매일 06:00)
 - `payment_logs`: 결제 생명주기 단계별 append-only 기록. `payment_id`는 nullable(주문 생성
   실패도 남겨야 하므로). 민감정보는 저장 전 마스킹
 - `payment_webhooks`: PG 노티 원문. `event_id` UNIQUE로 멱등, `signature_verified` 별도 관리.
-  **수신 엔드포인트는 아직 없다**(구조만 준비)
+  ~~**수신 엔드포인트는 아직 없다**(구조만 준비)~~ → **있다** (2026-08-27 정정): `POST /api/v1/payments/webhook/{provider_name}`(`payments.py:735`).
 - `registry_credits`: 무료 횟수 **조정 원장**(GRANT/DEDUCT/RESET). 잔액 컬럼 없음 —
   유효 한도 = 플랜 월 한도 + 이번 달 조정 합계
 - `registry_credit_logs`: 무료 횟수가 움직인 **모든 사건**(지급/사용/회수/이벤트/환불).

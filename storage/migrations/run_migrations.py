@@ -10,19 +10,70 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from storage.database import get_connection
 import logging
 import re
+import sqlite3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _is_executable_sql(chunk: str) -> bool:
+    """주석과 공백만 남는 조각인가? (그런 조각을 execute 하면 예외가 된다)"""
+    body = "\n".join(
+        line for line in (chunk or "").splitlines()
+        if not line.strip().startswith("--")
+    )
+    return bool(body.strip(" \t\r\n;"))
+
+
+def split_sql_statements(script: str):
+    """마이그레이션 파일을 **문장 하나씩** 내놓는다.
+
+    왜 직접 쪼개는가 — `executescript()` 를 못 쓰기 때문이다(`run()` 주석 참고).
+    한 파일을 한 트랜잭션으로 묶으려면 문장을 `execute()` 로 하나씩 넣어야 하고,
+    그러려면 경계를 알아야 한다.
+
+    경계 판정은 **직접 하지 않는다.** `sqlite3.complete_statement()` 는 SQLite 자신의
+    토크나이저다 — 주석 안의 세미콜론(`-- 경계가 아니다;`)과 문자열 리터럴 안의
+    세미콜론(`DEFAULT 'a;b'`)을 정확히 건너뛴다. 정규식으로 `;` 를 쪼개면 이 저장소의
+    실제 파일에서 바로 깨진다(013/016/023 에 여러 줄 CREATE TABLE 이 있다).
+
+    파일 끝에 주석만 남는 꼬리는 버린다 — `013`/`021` 처럼 마지막 문장 뒤에 설명이
+    붙는 파일이 있고, 주석뿐인 문자열을 `execute()` 에 넣으면 예외가 난다.
+    """
+    buf = ""
+    for line in (script or "").splitlines(keepends=True):
+        buf += line
+        if _is_executable_sql(buf) and sqlite3.complete_statement(buf):
+            yield buf
+            buf = ""
+    if _is_executable_sql(buf):
+        yield buf
+
 def run():
+    """마이그레이션을 적용한다. 커넥션은 **어떤 경로로 끝나든** 닫는다.
+
+    닫기를 `finally` 로 옮긴 이유 (2026-08-27, 자원 누수 감사):
+    예전에는 마지막 줄에서만 `conn.close()` 했다. 그래서 마이그레이션이 실패해
+    예외가 올라가면 커넥션이 열린 채로 남았다. 운영에서는 프로세스가 곧 끝나 OS 가
+    회수하므로 드러나지 않지만, **같은 프로세스 안에서 러너를 여러 번 부르는
+    검사**(`test_bootstrap.py`, `test_schema_hygiene.py` §7)에서는 다르다 —
+    Windows 는 열린 핸들이 있는 파일을 지우지 못해 스크래치 DB 정리가 실패하고,
+    남은 잠금이 다음 검사에 엉뚱한 실패로 나타난다.
+    """
     # 마이그레이션은 FK 강제를 끈 커넥션으로 실행한다.
     # SQLite에서 UNIQUE 제약을 바꾸려면 "새 테이블 생성 → 이관 → DROP → RENAME" 패턴을 써야
     # 하는데, DROP 직후 RENAME 전까지 자식 행이 잠시 고아가 된다. FK를 켠 채로는 그 지점에서
     # 마이그레이션 자체가 실패한다. 런타임(API/크롤러)은 기본값대로 FK가 켜진 커넥션을 쓴다.
     conn = get_connection(enforce_foreign_keys=False)
+    try:
+        _apply_all(conn)
+    finally:
+        conn.close()
 
+
+def _apply_all(conn):
     # ── 선행 스키마 확인 (2026-08-13 Sprint 99 신설) ────────────────────────────
     #
     # 이 마이그레이션들은 **빈 DB에서 시작하지 않는다.** 008(검색 인덱스)부터
@@ -71,7 +122,7 @@ def run():
 
     missing = [t for t in sorted(referenced) if t not in existing]
     if missing:
-        conn.close()
+        # 닫기는 `run()` 의 finally 가 한다 — 여기서 또 닫으면 이중 close 다.
         raise SystemExit(
             "\n[중단] 선행 스키마가 없습니다: %s\n"
             "\n이 마이그레이션들은 기존 테이블을 변경하는 것이라 빈 DB에서는 돌 수 없습니다."
@@ -110,9 +161,45 @@ def run():
         path = os.path.join(MIGRATIONS_DIR, filename)
         sql = open(path, encoding="utf-8").read()
 
+        # ★ 한 파일 = 한 트랜잭션. 전부 적용되거나 전부 없던 일이 된다.
+        #   (2026-08-27, docs/BUGS.md — 크롤->DB 경로 감사)
+        #
+        #   예전에는 `conn.executescript(sql)` 이었다. 이 메서드는 **먼저 커밋하고
+        #   스크립트를 트랜잭션 밖에서** 돌린다. 파일에 BEGIN/COMMIT 이 없으면
+        #   (이 폴더의 파일 전부가 그렇다) 각 문장이 **즉시 확정**된다. 실측했다:
+        #
+        #     "ALTER ADD COLUMN a; SELECT 없는컬럼;"  -> 예외가 났는데 a 는 남는다
+        #     "INSERT ...; ALTER ...; SELECT 없는컬럼;" -> 둘 다 남는다(DML 이 있어도 같다)
+        #     "CREATE t_new; DROP t; RENAME; SELECT 없는컬럼;" -> **t 의 행이 사라진다**
+        #
+        #   결과가 두 갈래로 나쁘다.
+        #
+        #   (1) 되돌아오지 않는다. 실패한 파일은 `migration_history` 에 안 들어가므로
+        #       다음 실행이 **처음부터 다시** 적용한다. 그런데 앞부분은 이미 적용돼 있어
+        #       `ALTER TABLE ADD COLUMN` 이 `duplicate column name` 으로 죽는다.
+        #       SQLite 에는 ADD COLUMN 용 IF NOT EXISTS 가 없다(025 주석이 인정한다).
+        #       러너가 raise -> `run_daily.bat` 3단계 exit 1 -> **mvp_scraper.py 가
+        #       아예 실행되지 않는다.** 한 번의 사고가 매일 06:00 크롤을 영구 정지시킨다.
+        #
+        #   (2) 023/024 는 SQLite 의 제약 변경을 위해
+        #       `CREATE _new` -> `INSERT SELECT` -> `DROP 원본` -> `RENAME` 을 돈다.
+        #       DROP 과 RENAME **사이**에서 죽으면 원본 테이블이 사라진 채 확정되고
+        #       데이터는 `_new` 라는 엉뚱한 이름 밑에 남는다. 재실행은
+        #       `INSERT ... SELECT FROM 원본` 에서 `no such table` 로 죽는다.
+        #       대상이 `payment_webhooks` / `registry_credits` — 결제 테이블이다.
+        #
+        #   SQLite 는 MySQL/Oracle 과 달리 **DDL 도 트랜잭션에 참여한다.** 그래서
+        #   파일 하나와 history INSERT 를 한 트랜잭션으로 묶는 것만으로 둘 다 사라진다.
+        #   묶으려면 `executescript()` 를 버리고 문장을 직접 넣어야 한다
+        #   (`split_sql_statements()` 참고 — 경계 판정은 SQLite 토크나이저에 맡긴다).
+        #
+        #   `PRAGMA foreign_keys` 는 커넥션 직후(트랜잭션 밖)에 이미 꺼져 있다.
+        #   트랜잭션 안에서는 이 PRAGMA 가 무시되므로 순서가 이대로여야 한다.
         try:
-            conn.executescript(sql)
             from datetime import datetime
+            conn.execute("BEGIN")
+            for stmt in split_sql_statements(sql):
+                conn.execute(stmt)
             conn.execute(
                 "INSERT INTO migration_history (filename, applied_at) VALUES (?, ?)",
                 (filename, datetime.now().isoformat())
@@ -120,7 +207,21 @@ def run():
             conn.commit()
             logger.info("[OK] %s 적용 완료", filename)
         except Exception as e:
-            logger.error("[FAIL] %s: %s", filename, str(e))
+            # ★ 이 rollback 을 지워도 **검사는 통과한다** — `run()` 의 `finally: conn.close()`
+            #   가 열린 트랜잭션을 어차피 버리기 때문이다(실측: BEGIN -> ALTER -> close 만
+            #   해도 컬럼이 남지 않는다). 그래서 변이 테스트에서 이 줄만 지운 변종은
+            #   아무 검사도 잡지 못한다 — **동치 변이이고, 그게 맞다.**
+            #
+            #   그래도 남겨 둔다: 되돌리는 시점을 close 에 맡기면, 나중에 누가 커넥션을
+            #   재사용하도록 바꾸는 순간(그 자체는 자연스러운 변경이다) 열린 트랜잭션이
+            #   그대로 이어져 **다음 파일이 실패한 것과 한 덩어리로 커밋된다.**
+            #   여기서 명시적으로 끝내면 그 경우에도 파일 경계가 유지된다.
+            try:
+                conn.rollback()
+            except Exception:       # noqa: BLE001 - 롤백 실패가 원인을 가리면 안 된다
+                logger.exception("[FAIL] %s: 롤백도 실패", filename)
+            logger.error("[FAIL] %s: %s (이 파일은 적용되지 않았다 - 고친 뒤 그대로 재실행하면 된다)",
+                         filename, str(e))
             raise
 
     print("")
@@ -130,8 +231,6 @@ def run():
     ).fetchall()
     for h in history:
         print(f"  {h['filename']} | {h['applied_at']}")
-
-    conn.close()
 
 if __name__ == "__main__":
     run()

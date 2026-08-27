@@ -281,21 +281,60 @@ def test_boot_warns_when_admin_keys_are_missing():
             check_true("경고에 결과가 적혀 있다(무엇이 깨지는지)",
                        "500" in msgs[0], msgs[0][:120])
 
-        # (2) 키가 하나라도 있으면 조용하다 + 값이 새지 않는다
+        # (2) **한쪽만** 없어도 경고한다 (2026-08-25, BUGS #205)
+        #
+        #     예전에는 여기서 "키가 하나라도 있으면 경고하지 않는다"를 고정했다.
+        #     잡음을 줄이려는 판단이었는데, **한쪽만 사라졌을 때 무슨 일이 나는지를
+        #     재보지 않고** 내린 판단이었다. 실측하니 그쪽이 더 위험하다:
+        #
+        #         SUPER 만 없음 -> SUPER 전용 라우트가 **누구에게도 403**
+        #         ADMIN 만 없음 -> ADMIN 키로는 전부 403 (SUPER 키로만 통과)
+        #
+        #     403 은 "권한 부족"과 구별되지 않는다. 500 처럼 눈에 띄지 않으니
+        #     설정 누락이 등급 문제로 읽힌다 - 정확히 이 저장소가 계속 걷어내 온
+        #     **조용한 실패**다. 그리고 이 키들은 실제로 반복해서 사라졌다
+        #     (BETA_RELEASE_CHECKLIST P0-2 이력).
         secret = "qa-boot-warn-not-a-real-key-000"
         os.environ["ADMIN_API_KEY"] = secret
         grab.records = []
         warned2 = admin_mod.warn_if_admin_keys_missing()
-        check("★ 키가 하나라도 있으면 경고하지 않는다", warned2, False)
-        check("그때 로그도 남기지 않는다(잡음 방지)", len(grab.records), 0)
+        check("★ SUPER 키만 없어도 경고한다(403 은 권한부족과 구별되지 않는다)",
+              warned2, True)
+        msgs2 = [r.getMessage() for r in grab.records if r.levelno >= logging.WARNING]
+        check("경고가 실제로 로그로 나간다", len(msgs2), 1)
+        if msgs2:
+            check_true("어느 키가 없는지 지목한다", "SUPER_ADMIN_API_KEY" in msgs2[0],
+                       msgs2[0][:140])
+            check_true("무엇이 깨지는지 적혀 있다(403)", "403" in msgs2[0], msgs2[0][:140])
+            # ★ 부분 소실은 값 누출을 **행위로** 검사할 수 있는 유일한 자리다 -
+            #   경고가 나가는 순간 나머지 한쪽에는 실제 값이 들어 있다.
+            #   (둘 다 빈 경우엔 흘릴 값 자체가 없어 공허했다 - 아래 AST 검사 참고)
+            check_true("★ 그때 살아 있는 키의 **값**이 로그에 안 들어간다",
+                       secret not in msgs2[0], "-> 경고에 키 값이 섞였다")
 
-        # (3) 값 자체가 로그에 절대 들어가지 않는다 - 두 키를 다시 비우고 재확인
+        # (3) 반대쪽도 마찬가지다
         del os.environ["ADMIN_API_KEY"]
         os.environ["SUPER_ADMIN_API_KEY"] = secret
         grab.records = []
-        admin_mod.warn_if_admin_keys_missing()
-        check("SUPER 키만 있어도 조용하다", len(grab.records), 0)
+        warned3 = admin_mod.warn_if_admin_keys_missing()
+        check("★ ADMIN 키만 없어도 경고한다", warned3, True)
+        msgs3 = [r.getMessage() for r in grab.records if r.levelno >= logging.WARNING]
+        check("경고가 실제로 로그로 나간다", len(msgs3), 1)
+        if msgs3:
+            check_true("어느 키가 없는지 지목한다",
+                       "ADMIN_API_KEY" in msgs3[0] and "SUPER_ADMIN_API_KEY" not in msgs3[0],
+                       msgs3[0][:140])
+            check_true("★ 그때 살아 있는 키의 **값**이 로그에 안 들어간다",
+                       secret not in msgs3[0], "-> 경고에 키 값이 섞였다")
 
+        # (4) 둘 다 있으면 조용하다 - 잡음 방지는 여기서만 성립한다
+        os.environ["ADMIN_API_KEY"] = secret
+        grab.records = []
+        warned4 = admin_mod.warn_if_admin_keys_missing()
+        check("★ 둘 다 있으면 경고하지 않는다", warned4, False)
+        check("그때 로그도 남기지 않는다(잡음 방지)", len(grab.records), 0)
+
+        os.environ.pop("ADMIN_API_KEY", None)
         os.environ.pop("SUPER_ADMIN_API_KEY", None)
     finally:
         lg.removeHandler(grab)
@@ -307,10 +346,14 @@ def test_boot_warns_when_admin_keys_are_missing():
 
     # --- 키 값이 로그로 새지 않는가 ------------------------------------------
     #
-    # ★ 이건 **동작으로는 검사할 수 없다.** 이 함수는 두 키가 **모두 빌 때만** 경고하니,
-    #   경고가 나가는 순간에는 흘릴 값 자체가 존재하지 않는다. 처음엔 "로그에 키 값이
-    #   없다"를 런타임으로 확인하려 했는데, 그 시점엔 두 환경변수가 비어 있어 **무엇을
-    #   넣어도 통과하는 공허한 검사**였다(2026-08-21 mutation 으로 확인하고 걷어냈다).
+    # ★ 예전에는 이걸 **동작으로 검사할 수 없었다.** 이 함수가 두 키가 **모두 빌 때만**
+    #   경고했으므로, 경고가 나가는 순간 흘릴 값 자체가 존재하지 않았다. 런타임으로
+    #   "로그에 키 값이 없다"를 확인하려던 첫 시도는 **무엇을 넣어도 통과하는 공허한
+    #   검사**였다(2026-08-21 mutation 으로 확인하고 걷어냈다).
+    #
+    #   BUGS #205 이후로는 부분 소실 때도 경고하므로 위 (2)/(3) 에서 **행위로도** 본다.
+    #   그래도 AST 검사를 함께 남긴다 - 둘 다 빈 경로는 여전히 행위로 못 잡고,
+    #   그 경로에 값을 끼워 넣는 편집을 막는 것은 여기뿐이다.
     #
     #   그래서 소스를 AST 로 본다. 문자열 검색으로는 안 된다 - 경고 문구 자체가
     #   "ADMIN_API_KEY" 라는 **이름**을 정당하게 포함하기 때문이다. 이름이 아니라
@@ -334,7 +377,9 @@ def test_boot_warns_when_admin_keys_are_missing():
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "warning"):
                 warn_calls.append(node)
-    check("검사가 공허하지 않다(경고 호출을 찾았다)", len(warn_calls), 1)
+    # 경고 호출은 3개다 - 둘 다 없음 / SUPER 만 없음 / ADMIN 만 없음
+    # (BUGS #205 로 1 -> 3. 늘거나 줄면 여기도 같이 갱신하고 이유를 적으라)
+    check("검사가 공허하지 않다(경고 호출을 찾았다)", len(warn_calls), 3)
 
     reads_value = []
     for call in warn_calls:
@@ -348,12 +393,22 @@ def test_boot_warns_when_admin_keys_are_missing():
                "-> %s 를 경고에 끼워 넣었다. 로그 유출이 곧 관리자 권한 유출이 된다"
                % sorted(set(reads_value)))
 
-    # 부팅 경로가 실제로 이 함수를 부르는가 - 안 부르면 위 검사가 전부 무의미하다
-    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "api_server.py"), encoding="utf-8-sig").read()
-    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-    check_true("★ api_server.py 가 부팅 시 이 함수를 호출한다",
-               "warn_if_admin_keys_missing()" in code,
+    # 부팅 경로가 실제로 이 함수를 **호출**하는가 - 안 부르면 위 검사가 전부 무의미하다.
+    #
+    #   문자열 검색으로는 부족하다(2026-08-25, BUGS #205 의 mutation 이 뚫었다):
+    #   주석 줄만 걸러 내는 방식은 `pass  # warn_if_admin_keys_missing()` 같은 **꼬리 주석**을
+    #   호출로 오인한다. 실제로 배선을 지우는 mutation 이 통과했다.
+    #   그래서 AST 로 **모듈 최상위의 호출문**을 찾는다.
+    import ast as _ast
+
+    _boot = _ast.parse(io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "api_server.py"),
+                               encoding="utf-8-sig").read())
+    _called = any(isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Call)
+                  and isinstance(n.value.func, _ast.Name)
+                  and n.value.func.id == "warn_if_admin_keys_missing"
+                  for n in _boot.body)
+    check_true("★ api_server.py 가 부팅 시 이 함수를 호출한다", _called,
                "-> 함수만 있고 아무도 안 부르면 경고는 영원히 안 나온다")
 
 

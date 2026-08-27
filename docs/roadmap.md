@@ -767,13 +767,35 @@ Beta v1 출시 기준
 
 ## Beta 남은 작업
 
-1. `ADMIN_API_KEY`를 `.env`에 설정 (Admin MVP 자체는 완료, 이 값만 없으면 500)
-2. ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정**(플랜별 월 단위: 베이직 5회/프로 10회). 남은 것은 **코드 반영**(현재 `FREE_LIMIT=5` 평생 누적)
+> **2026-08-27 코드 대조 정정.** 아래 목록의 네 항목이 **코드와 어긋나 있었다** —
+> 전부 "아직 안 됐다"고 적혀 있는데 실제로는 되어 있었다. 문서만 읽고 다음 작업을
+> 고르면 이미 끝난 일을 다시 하게 된다. 근거를 각 항목에 파일:줄로 남긴다.
+> (번호가 `5.` 로 두 번 매겨져 있던 것도 함께 고친다.)
+
+1. ~~`ADMIN_API_KEY`를 `.env`에 설정~~ → **2026-08-25 해소**
+   (`docs/BETA_RELEASE_CHECKLIST.md` P0-2). 두 키 SET 확인, 키 없음 403 / ADMIN 키 200 /
+   SUPER 전용 라우트 등급 분리 동작까지 실측.
+2. ~~등기부 무료 한도 정책 확정~~ → **2026-08-06 확정**(플랜별 월 단위: 베이직 5회/프로 10회).
+   ~~남은 것은 코드 반영(현재 `FREE_LIMIT=5` 평생 누적)~~ → **코드 반영도 완료됐다**
+   (2026-08-27 대조). `api/v1/registry.py:38 get_free_count()` 가 `used_at >= get_month_start()`
+   로 **이번 달만** 세고, `get_plan_free_limit()`(:85)이 `get_registry_monthly_limit(plan)`
+   으로 **플랜별 한도**를 가져온다. `DEFAULT_FREE_LIMIT = 5`(:19)는 플랜을 해석할 수 없을
+   때의 폴백일 뿐 "평생 누적"이 아니다.
 3. ~~확정 구독 정책 코드 반영~~ → **2026-08-06 완료**(플랜명/가격/연 결제/등기부 월 리셋 전부 반영)
 4. ~~PG사 확정~~ → **2026-08-06 KG이니시스 확정**, ~~`KGInicisProvider` 신설~~ → **2026-08-07 완료**. 남은 것은 6개 메서드의 실제 API 호출 구현(외부 API Key/계약 필요, 승인 대기)
-5. 환불 엔드포인트(`cancel_payment` 호출부), Webhook 수신 엔드포인트(`handle_webhook` 호출부) 신규 구현 — 이 둘은 여전히 어디서도 호출되지 않음
-5. ~~구독 플랜 비교/선택 UI~~ (2026-08-06 완료, Sprint 14), Admin 역할(role) 구분(여전히 미착수)
-6. (Beta v2) 등기부등본 실제 발급기관 자동 연동 — 현재는 운영자 수동 배치
+5. ~~환불 엔드포인트(`cancel_payment` 호출부), Webhook 수신 엔드포인트(`handle_webhook` 호출부)
+   신규 구현 — 이 둘은 여전히 어디서도 호출되지 않음~~ → **둘 다 있다** (2026-08-27 대조).
+   - 환불: `api/v1/payments.py:621 refund_payment()` 가 `provider.cancel_payment()` 를
+     호출하고(:678), 관리자 라우트 `POST /api/v1/admin/payments/{id}/refund`
+     (`api/v1/admin.py:975`) 가 그 함수를 연다.
+   - Webhook: `POST /api/v1/payments/webhook/{provider_name}`(`api/v1/payments.py:735`).
+     재처리용 `POST /api/v1/admin/payments/webhooks/{id}/reprocess`(`admin.py:913`)도 있다.
+   - 남은 것은 **KGInicis 판 구현체**뿐이다(4번과 같은 승인 대기 항목).
+6. ~~구독 플랜 비교/선택 UI~~ (2026-08-06 완료, Sprint 14),
+   ~~Admin 역할(role) 구분(여전히 미착수)~~ → **구현돼 있다** (2026-08-27 대조).
+   `api/v1/admin.py:78~96` 에 `ROLE_ADMIN`/`ROLE_SUPER_ADMIN` 과 `ROLE_RANK` 포함관계가
+   있고, 어떤 키로 인증했는지로 등급이 정해진다.
+7. (Beta v2) 등기부등본 실제 발급기관 자동 연동 — 현재는 운영자 수동 배치
 
 ## Critical Path
 

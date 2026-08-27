@@ -100,7 +100,35 @@ def test_failure_cases():
 def test_persisted_arithmetic():
     print("\n--- 4. persisted 계산 ---")
     check("신규+갱신", CrawlOutcome(inserted=7, updated=5).persisted, 12)
-    check("둘 다 0", CrawlOutcome().persisted, 0)
+    check("셋 다 0", CrawlOutcome().persisted, 0)
+
+    # ── ★ unchanged 를 반드시 더한다 (2026-08-27, docs/BUGS.md #249) ──────────
+    #
+    # `upsert_batch()` 는 값이 이미 같은 행에 UPDATE 를 보내지 않고 `unchanged` 로 센다.
+    # 법원 자료가 하루 종일 그대로면 **그날 전체가 unchanged 다.**
+    #
+    # 그때 `persisted` 가 unchanged 를 빼먹으면:
+    #     persisted == 0  ->  "DB 저장 0건"  ->  exit 1  ->  run_daily.bat [FAILED]
+    #     ->  migrate_execute.py 가 **아예 실행되지 않는다**
+    #
+    # 즉 아무 문제 없는 날에 파이프라인이 통째로 멈춘다. 이 저장소가 #47 에서 고친
+    # "배치가 사실이 아닌 것을 말한다"의 정반대 방향 사고다. 여기서 못박는다.
+    check("변화없음만 있어도 저장된 것이다",
+          CrawlOutcome(inserted=0, updated=0, unchanged=1876).persisted, 1876)
+    check("★ 전부 변화없음인 날은 **성공**이다 (정상적인 날)",
+          CrawlOutcome(courts=60, collected=1876, inserted=0, updated=0,
+                       unchanged=1876).exit_code(), 0)
+    check("그때 실패 사유도 없다",
+          CrawlOutcome(courts=60, collected=1876, inserted=0, updated=0,
+                       unchanged=1876).failure_reason(), None)
+    check("셋을 다 더한다", CrawlOutcome(inserted=2, updated=3, unchanged=5).persisted, 10)
+
+    # 반대로 **진짜로** 아무것도 저장되지 않은 날은 여전히 실패여야 한다.
+    o = CrawlOutcome(courts=60, collected=1876, inserted=0, updated=0,
+                     unchanged=0, upsert_failed=1876)
+    check("전건 저장 실패는 여전히 실패", o.exit_code(), 1)
+    check_true("그 사유가 'DB 저장 0건' 이다", "DB 저장 0건" in (o.failure_reason() or ""),
+               o.failure_reason())
 
 
 def test_doc_worker_outcome():

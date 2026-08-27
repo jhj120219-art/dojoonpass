@@ -14746,3 +14746,489 @@ F5 재료 없음을 '정상'으로 보고       검출
 (2) 고친 뒤에도 F4 가 생존했다. `"16건" in _blob` 으로 봤는데 바로 위 일자별 줄이
     *"수집   16건 / 파싱    0건"* 이라 **요약 줄을 통째로 지워도 통과**했다.
     요약 줄 자체를 지목하도록 고쳐서 잡았다.
+
+--------
+
+#246
+
+마이그레이션이 **중간에 실패하면 되돌아오지 않는다** — 한 번의 사고가 매일 06:00
+크롤을 영구히 세우고, 023/024 는 결제 테이블을 사라진 채로 확정한다
+
+상태
+
+**해결 (2026-08-27). 한 파일 = 한 트랜잭션. 회귀 `test_migration_atomicity.py`(4묶음).**
+
+### 증상 — 되돌아오지 않는다
+
+`storage/migrations/run_migrations.py` 가 파일 하나를 `conn.executescript(sql)` 로
+통째로 실행했다. 이 메서드는 **먼저 커밋하고 스크립트를 트랜잭션 밖에서** 돌린다.
+파일 안에 BEGIN/COMMIT 이 없으면(이 폴더의 25개 전부가 그렇다) 각 문장이 **즉시 확정**된다.
+
+실측(2026-08-27, 세 가지 모양을 각각 재현):
+
+```
+A) "ALTER ADD COLUMN a;  SELECT 없는컬럼;"
+   -> 예외가 났는데 컬럼 a 는 남는다.  rollback() 해도 안 없어진다.
+
+B) "INSERT ...;  ALTER ...;  SELECT 없는컬럼;"
+   -> DML 이 섞여도 마찬가지. 행도 컬럼도 둘 다 남는다.
+
+C) "CREATE t_new;  DROP t;  RENAME;  SELECT 없는컬럼;"
+   -> t 의 행이 **사라진다**.
+```
+
+실패한 파일은 `migration_history` 에 안 들어가므로(INSERT 가 뒤에 있다) 다음 실행이
+**처음부터 다시** 적용한다. 그런데 앞부분은 이미 적용돼 있어:
+
+```
+duplicate column name: bench_a      <- 영원히 이 자리에서 죽는다
+```
+
+SQLite 에는 `ALTER TABLE ADD COLUMN` 용 `IF NOT EXISTS` 가 **없다.** 025 의 주석이
+그 사실을 인정하면서 *"정상 경로에서는 두 번 실행되지 않는다"* 에 기대고 있었는데,
+부분 적용이 바로 그 "비정상 경로"를 만든다.
+
+### 왜 치명적인가 — 크롤이 통째로 멈춘다
+
+`run_daily.bat` 3단계가 마이그레이션이고, 실패하면 `exit /b 1` 이다. 즉
+**`mvp_scraper.py` 가 아예 실행되지 않는다.** 사람이 손으로 DB 를 고치기 전에는
+회복 경로가 없다. 이 저장소가 이미 겪은 "9일간 크롤 중단을 몰랐다"와 같은 계열이고,
+이쪽은 자동 회복이 **구조적으로 불가능**하다는 점이 더 나쁘다.
+
+### 더 나쁜 형태 — 023/024 는 결제 테이블을 지운다
+
+두 파일은 SQLite 의 제약 변경을 위해
+`CREATE _new` -> `INSERT SELECT` -> `DROP 원본` -> `RENAME` 을 돈다.
+DROP 과 RENAME **사이**에서 죽으면:
+
+```
+실패 후 테이블: [... 'payment_webhooks_new' ...]   <- payment_webhooks 가 없다
+재실행:        no such table: payment_webhooks     <- 영구 정지
+```
+
+대상이 `payment_webhooks` / `registry_credits` / `registry_credit_logs` — 결제 테이블이다.
+
+### 왜 이제껏 안 터졌나
+
+Sprint 100 대의 판단은 *"18개 전부 정상 적용됐고, 실행 모델을 바꾸는 것이 더 위험하다"* 였다.
+그때는 옳았다. 그 뒤 **021~025 가 들어오면서 전제가 둘 다 깨졌다** —
+가드를 붙일 수 없는 `ADD COLUMN` 이 생겼고(025), DROP/RENAME 이 생겼다(023/024).
+
+### 수정
+
+SQLite 는 MySQL/Oracle 과 달리 **DDL 도 트랜잭션에 참여한다.** 파일 하나와
+`migration_history` INSERT 를 한 트랜잭션으로 묶는 것만으로 위 전부가 사라진다.
+묶으려면 `executescript()` 를 버리고 문장을 하나씩 넣어야 하는데, 경계 판정은
+**직접 하지 않는다** — `sqlite3.complete_statement()` 가 SQLite 자신의 토크나이저라
+주석 안의 세미콜론과 문자열 리터럴 안의 세미콜론을 정확히 건너뛴다.
+옛 판단이 걱정한 "SQL 안의 세미콜론 처리"가 정확히 이 지점이고, 정규식으로 쪼갰다면
+실제로 위험했다(013/016/023 에 여러 줄 CREATE TABLE 이 있다).
+
+```
+실제 .sql 25개 -> 143문장, 전부 complete_statement() 통과, 주석뿐인 조각 0개
+빈 DB 부트스트랩(init_db -> migrate_v4_1 -> 25개)   119ms, 26테이블, 미적용 0
+라이브 사본에 021~025 적용                            90ms 후 migrate_execute OK
+```
+
+### 검사도 반대로 뒤집었다
+
+`test_schema_hygiene.py` §7 은 **버그를 사실로 고정**하고 있었다 —
+*"실패해도 앞 문장은 남아 있다"*, *"코드는 바꾸지 않았다"*. 그 검사가 이제
+*"실패한 파일은 앞 문장까지 통째로 롤백된다"* 와 **"고친 뒤 재실행이 성공한다"** 를 지킨다.
+후자가 이 수정으로 얻은 실제 가치다.
+
+새 회귀 `test_migration_atomicity.py` 는 **고치기 전 코드에서 9건 실패**하는 것을
+확인한 뒤 도입했다(검출력 확인).
+
+★ 처음 쓴 2번 검사는 **실패 지점을 RENAME 뒤에 두어 옛 코드에서도 통과했다.**
+  INSERT SELECT 가 이미 데이터를 옮긴 뒤라 결과만 보면 멀쩡했기 때문이다.
+  방어가 아니라 *실패 지점을 안전한 곳으로 골라 준 것*이었다 — DROP 과 RENAME
+  **사이**로 옮겨서야 진짜 위험 구간을 재게 됐다.
+
+--------
+
+#247
+
+`migrate_execute.py` 가 매일 **누적 전체를 다시 쓴다** — 하루 1,900건이 바뀌는데
+비용은 누적 행수를 따라가고, 10만 행에서는 동시 writer 가 `database is locked` 로 죽는다
+
+상태
+
+**해결 (2026-08-27). 문장 5.5배 감소, 실행 5.4배 단축, 동시성 실패 제거. 변이 12/13 검출
+(1건은 동치 변이), 회귀 `test_migrate_incremental.py`(8묶음, 57검사).**
+
+### 증상 — 비용이 "그날 수집량"이 아니라 "누적"에 붙어 있다
+
+이 스크립트는 `SELECT * FROM auction` 으로 누적 전체를 읽어 **전부 다시 쓴다.**
+하루에 새로 들어오는 것은 1,900건 안팎인데:
+
+```
+누적       upsert   enqueue  migrate   합계      (하루치 실행 1회)
+ 2,000      46ms      89ms    208ms     0.34초
+ 5,000      81ms     148ms    508ms     0.74초
+10,000     246ms     652ms  3,902ms     4.80초
+25,000   1,377ms   1,653ms 10,322ms    13.35초
+50,000   2,478ms   2,718ms 15,942ms    21.14초
+```
+
+**25배 데이터에 62배 시간.** 명백한 초선형이다.
+
+### 원인 — 쿼리의 무게가 아니라 문장 **개수**
+
+N=25,000 프로파일:
+
+```
+INSERT/UPDATE auction_item          25,000회  1,625ms  (49.8%)  건당 65µs
+INSERT OR IGNORE document_status    75,000회    733ms  (22.5%)  건당 9.8µs
+SELECT * FROM auction_item          25,000회     83ms  ( 2.5%)
+```
+
+건당 비용 차이(65 vs 9.8 = 6.6배)는 **인덱스 개수**에 거의 정확히 비례한다
+(auction_item 15개 vs document_status 2개). 즉 진짜 비용은 **인덱스 쓰기 증폭**이다.
+행 단위 SELECT 는 2.5%뿐이라 **그쪽을 고쳐도 소용없다.**
+
+cProfile 로 보면 전체 4.87초 중 `sqlite3.Connection.execute` 가 2.54초(52%),
+호출이 **254,892회**였다. 1,900건이 바뀐 날에 25만 문장을 보내고 있었다.
+
+### 수정 — "빨리 보내기"가 아니라 **안 보내기**
+
+세 자리에서 no-op 문장을 없앴다.
+
+```
+1. auction_item UPDATE     쓰려는 값이 기존과 **전부** 같으면 건너뛴다
+2. auction_case INSERT     먼저 있는 것을 읽고 없는 것만 executemany
+                           (id 조회를 어차피 하고 있었다 - 순서만 앞으로 옮겼다)
+3. document_status INSERT  먼저 (item_id, doc_type) 집합을 읽고 없는 것만
+```
+
+같은 데이터 · 같은 조건 (하루 = 기존 변경 1,400 + 신규 500):
+
+```
+누적       migrate 전 -> 후        문장 수 전 -> 후        데이터 일치
+ 5,000        484ms ->    207ms     33,493 ->  9,893      OK (2.3배)
+10,000      3,510ms ->  1,339ms     63,493 -> 14,893      OK (2.6배)
+25,000      9,882ms ->  2,015ms    153,495 -> 29,894      OK (4.9배)
+50,000     17,250ms ->  3,178ms    303,499 -> 54,896      OK (5.4배)
+```
+
+**단축률이 누적과 함께 커진다** — 건너뛰는 비율이 커지기 때문이고, 이것이 옳은 모양이다.
+
+### ★ 속도만의 문제가 아니었다 — 10만 행에서 **동시 writer 가 죽는다**
+
+`execute()` 는 실행 전체를 트랜잭션 하나로 묶으므로 그동안 쓰기 락을 잡는다.
+Python sqlite3 의 기본 `busy_timeout` 은 **5초**다. migrate 가 도는 동안 다른
+커넥션이 짧은 UPDATE 를 계속 시도하게 하고 실측했다:
+
+```
+누적       판       migrate    동시 writer 성공  locked 실패  최대 대기
+ 50,000   전       7,230ms          7             0         6,787ms   <- 5초를 넘겼다
+ 50,000   후       1,549ms          8             0         1,074ms
+100,000   전      15,033ms         11             1 ★       7,284ms
+100,000   후       2,907ms         10             0         2,125ms
+```
+
+10만 행에서 **실제로 `database is locked` 가 났다.** 이 저장소는 02:00~04:00
+`doc_worker`, 06:00 `run_daily`, 상시 `api_server` 가 같은 파일을 쓰므로 가상의 상황이 아니다.
+
+### 함께 좋아진 것 — `updated_at` 이 드디어 의미를 갖는다
+
+지금까지는 전 행이 마지막 실행 시각이라 **아무 정보도 없었다**(실측: 1,876행 100%가
+같은 값). 이제 "이 행이 마지막으로 **실제로** 변한 시각"이다. 제품 코드에
+`auction_item.updated_at` 을 읽는 곳은 없고(전수 확인), 수집 신선도는
+`audit_schedule_health.py` 가 `MAX(auction_item.crawl_date)` 로 보는데 오늘 크롤된 행은
+crawl_date 가 달라져 그대로 UPDATE 되므로 그 판정은 바뀌지 않는다.
+
+### 메모리도 함께 줄었다 — 기각 사유의 일관성 확인
+
+선적재는 메모리를 이유로 기각했으므로, **실제로 넣은 것**이 같은 비용을 내지는 않는지
+직접 재야 했다(안 그러면 기각 사유가 일관되지 않다).
+
+```
+누적       수정 전 최대   수정 후 최대   변화
+25,000        67.5MB        58.6MB     -8.9MB  (-13.2%)
+50,000       133.8MB       115.7MB    -18.1MB  (-13.5%)
+```
+
+**늘지 않고 줄었다.** `existing_ds` 집합은 (int, 짧은 str) 쌍 15만 개인데, 그것을 만드는
+대신 없앤 것이 `conn.execute()` **151,500회**다 — 매 호출이 Cursor 와 파라미터 튜플을
+만든다. 그 할당 churn 이 집합보다 컸다.
+
+기각한 `auction_item` 선적재는 성격이 다르다. 그쪽은 **20컬럼짜리 행 전체**를 5만 개
+들고 있어야 해서 +56MB 이고, 없애는 문장은 5만 개뿐이다.
+
+### 하지 않은 것 — 행 단위 SELECT 선적재 (메모리로 재고 기각)
+
+남은 N+1 은 `SELECT * FROM auction_item WHERE case_id=? AND item_no=?` 하나다.
+dict 로 선적재하면 문장이 50,500 -> 1 이 되지만 **메모리를 쟀다**:
+
+```
+현재 최대            115.7 MB  (N=50,000)
+선적재 dict 추가      56.4 MB  (+49%)
+얻는 시간             약 8%
+```
+
+메모리 49%를 8%와 바꾸지 않는다. 오히려 **`SELECT * FROM auction` 의 fetchall 자체가
+장기 규모의 벽**이다(50,000행에 115MB -> 20만 행이면 약 460MB). 스트리밍으로 바꾸려면
+`rows` 를 세 번 순회하는 구조를 손봐야 해서 다음 스프린트로 남긴다.
+
+### 변이 13종 중 12종 검출
+
+살아남은 1종은 러너의 명시적 `conn.rollback()` 제거인데, `run()` 의
+`finally: conn.close()` 가 열린 트랜잭션을 어차피 버리므로(실측 확인) **동치 변이다.**
+그래도 그 줄은 남겼다 — 나중에 커넥션을 재사용하도록 바꾸는 순간 파일 경계가 무너지기 때문이고,
+그 사유를 코드 주석에 적었다.
+
+★ **검사가 두 번 스스로를 속였고 둘 다 변이가 잡았다.**
+
+1. **합성 주소로 면적을 쟀다.** `extract_areas()` 는 대괄호 안에서만 읽는데
+   괄호 없는 주소를 썼다 -> 면적이 늘 None 이라 **공허한 검사**였다.
+   상태값도 마찬가지다 — 실데이터는 `유찰 3회`(공백)인데 괄호를 넣어 써서
+   정규식에 안 걸려 fail_count 가 늘 1이었다. 실데이터 모양으로 바꿔서야 진짜를 재게 됐다.
+
+2. **파생 필드가 원본 필드의 결함을 가려 줬다.** `appraisal_price` / `full_address` /
+   `fail_count` 를 각각 "자기 자신과 비교"하도록 망가뜨려도 전부 통과했다 —
+   bid_rate·면적이 **같이** 바뀌어 어차피 UPDATE 가 나갔기 때문이다.
+   그 필드가 **혼자** 바뀌는 입력(최저가 0인 물건의 감정가만 변경 / 대괄호 면적은 그대로
+   두고 주소 앞부분만 정정 / 파생 컬럼을 **한 번에 하나씩만** 틀어 놓기)을 따로 만들어
+   셋 다 잡았다.
+
+--------
+
+#248
+
+`auction`(크롤 스테이징 테이블)의 인덱스 5개 중 **3개는 읽는 사람이 없다** —
+비용은 매일 크롤이 쓸 때마다 낸다
+
+상태
+
+**측정·검증 완료, 적용은 SKIP (2026-08-27). 마이그레이션은 만들지 않았다 — 아래 사유.**
+
+### 발견 — 누가 `auction` 을 읽는가 (전수)
+
+```
+storage/database.py:get_stats()   mvp_scraper 가 실행 끝에 1회. GROUP BY sido / auction_date
+storage/database.py:query()       ★ 제품 호출부 0건. test_db.py:70 만 부른다
+migrate_execute.py                SELECT * FROM auction  (전체 스캔, 인덱스 무관)
+storage/database.py:upsert_batch  (court_code, case_no, item_no) 식별키 조회
+                                  -> UNIQUE 자동 인덱스를 쓴다
+api/v1/*                          ★ 0건. API 는 auction_item 만 읽는다
+```
+
+즉 `idx_case_no` / `idx_court_name` / `idx_validation` 은 **죽은 함수와 임시 진단
+스크립트만** 쓴다. `idx_sido` / `idx_auction_date` 는 `get_stats()` 가 실제로 쓴다.
+
+### 비용 실측 (N=25,000, 3회 중앙값)
+
+```
+auction 인덱스        upsert 신규   upsert 갱신   get_stats   DB 크기
+현재(5개)               242ms        486ms        3.0ms      10.9MB
+죽은 3개 제거            200ms        360ms        2.6ms       9.4MB
+                       -17.4%       -26.0%      -14.4%      -13.8%
+```
+
+**읽기가 나빠지지 않는다** — `get_stats()` 는 오히려 빨라졌다(DB 가 작아져 스캔 페이지가 준다).
+
+### 읽기 안전성 — 쿼리 계획과 결과를 전수 대조
+
+migration 021 의 교훈("접두니까 중복"은 점 조회에서만 맞다)이 여기 그대로 적용되므로,
+지우기 전에 `auction` 을 읽는 **모든** 쿼리의 계획과 결과를 맞춰 봤다.
+
+```
+get_stats COUNT        결과 동일   COVERING idx_validation -> COVERING idx_sido
+get_stats by_sido      결과 동일   SAME
+get_stats by_date      결과 동일   SAME
+upsert 식별키 조회      결과 동일   SAME  (UNIQUE 자동 인덱스)
+migrate 전체 스캔       결과 동일   COVERING idx_validation -> COVERING idx_sido
+query() sido           결과 동일   SAME
+query() case_no        결과 동일   SEARCH idx_case_no -> SCAN
+query() court_name     ★ 집합 다름  SEARCH idx_court_name -> SCAN idx_auction_date
+query() validation     ★ 집합 다름  SEARCH idx_validation -> SCAN idx_auction_date
+```
+
+마지막 둘은 **인덱스 결함이 아니다.** 두 쿼리는
+`WHERE x=? ORDER BY auction_date DESC LIMIT 100` 인데, 같은 `auction_date` 끼리의
+순서를 정하지 않는다. 그래서 스캔 방식이 바뀌면 **동점 경계에서 어느 100건이 뽑히는지가
+달라진다** — 인덱스가 있든 없든 이 쿼리가 원래 갖고 있던 비결정성이다.
+그리고 그 함수(`query()`)는 제품에서 죽어 있다.
+
+★ 이 대조를 처음 돌렸을 때 **4개가 "다름"으로 나왔다.** `SELECT *` 에 딸려 온
+  `created_at` / `updated_at` 을 함께 비교했기 때문이다 — 두 사본을 각각 채웠으니
+  `datetime.now()` 가 다른 게 당연하다. **인덱스와 무관한 차이를 인덱스 탓으로 읽을 뻔했다.**
+  타임스탬프를 빼고 집합으로 비교해서야 진짜 2건이 남았다.
+
+### 왜 마이그레이션 파일을 만들지 않았나
+
+`run_daily.bat` 3단계가 `storage/migrations/` 의 **미적용 파일을 전부 자동 적용**한다.
+즉 `026_*.sql` 을 넣는 순간 다음 실행에서 운영 DB 에 적용된다 — 그것은 이 세션의
+"운영 DB 변경은 승인 영역" 규칙에 걸린다. SQL 은 아래 그대로면 되고, 적용 여부는
+사람이 정한다.
+
+```sql
+DROP INDEX IF EXISTS idx_case_no;      -- auction(case_no)
+DROP INDEX IF EXISTS idx_court_name;   -- auction(court_name)
+DROP INDEX IF EXISTS idx_validation;   -- auction(validation_status)
+```
+
+`storage/database.py` 의 `CREATE_INDEX_SQL` 에서도 같은 3줄을 빼야 fresh clone 과
+기존 DB 가 같은 상태가 된다(안 그러면 021 이 겪은 "소스는 만들고 마이그레이션은 지운다"가
+반복된다).
+
+### 적용 판단에 필요한 것 — 지금 규모에서는 급하지 않다
+
+현재 `auction` 은 1,876행이고 `upsert_batch` 는 약 16ms다. 17~26%는 **4ms** 다.
+이 항목의 가치는 누적이 2만 행을 넘어설 때 생긴다. #247 과 달리 **동시성 실패 같은
+급한 사유가 없으므로** 다음 스키마 작업에 묶어 처리하는 것이 낫다.
+
+--------
+
+#249
+
+`#247` 과 **같은 계열이 큐 쓰기 두 곳에 더** 있었다 — "바뀌었는지 판정을 DB 에 맡기고
+문장은 전부 보낸다". `refresh_queue_priority()` 는 누적 대기 큐를 따라 커진다
+
+상태
+
+**해결 (2026-08-27). 변이 15/15 검출, 회귀 `test_queue_write_batching.py`(10묶음).**
+
+### 어떻게 찾았나 — 같은 결함을 다른 경로에서 의도적으로 다시 찾았다
+
+`#247`(migrate_execute)을 고친 뒤, 같은 모양이 더 있는지 **AST 로 전수 탐색**했다.
+"루프 안에서 행마다 쓰기 문장을 보내는" 함수를 뽑으니 제품 코드에 20곳이 나왔고,
+그중 **no-op 판정을 DB 에 맡기는** 것이 둘이었다.
+
+```
+enqueue_documents()       행마다 INSERT OR IGNORE 4개 (+ 안 들어가면 UPDATE 4개)
+refresh_queue_priority()  대기 행마다 UPDATE 1개, no-op 은 `AND priority!=?` 로 거름
+```
+
+둘 다 **결과는 옳았다.** DB 가 걸러 주기 때문이다. 낭비되는 것은 문장이다.
+
+### 실측 (같은 데이터를 다시 수집한, 아무것도 안 바뀐 정상적인 날)
+
+```
+입력/대기 25,000행
+    upsert_batch              1,550ms   50,002문장
+    enqueue_documents         2,677ms  200,002문장  ->  실제로 추가된 행  0건
+    refresh_queue_priority    2,081ms  100,003문장  ->  실제로 바뀐 행    0건
+```
+
+**30만 문장을 보내고 0행이 바뀐다.**
+
+### 왜 `refresh_queue_priority` 가 특히 나쁜가 — 누적을 따라간다
+
+이 함수는 01:50 에 **대기 중인 큐 전체**를 훑는다. `document_queue` 는 물건 하나당
+최대 4행이고 과거 사건까지 누적된다. 즉 비용이 그날 일감이 아니라 **쌓인 양**에 붙는다 —
+`#247` 이 10만 행에서 동시 writer 를 `database is locked` 로 죽인 것과 같은 구조다.
+
+운영 현재값(2026-08-27 실측): `pending 2,753 / done 559 / SKIPPED_EXPIRED 186`.
+매일 밤 2,753개의 UPDATE 를 보내고 대부분의 밤 0건이 바뀐다.
+
+### 수정
+
+```
+enqueue_documents()
+    지금 입력의 (법원,사건,물건)만 **선조회** -> 없는 것만 executemany INSERT,
+    기일이 다른 것만 executemany UPDATE
+    ★ 큐 전체를 읽지 않는다. 메모리가 누적이 아니라 **입력 크기**(하루 약 1,900행)에 묶인다.
+
+refresh_queue_priority()
+    `priority` 를 함께 읽어 **파이썬에서** 비교 -> 바뀌는 것만 목표값별로 묶는다.
+    목표는 1/2/3 셋뿐이라 **최대 3묶음**으로 끝난다.
+    ★ `AND priority<>?` 가드는 그대로 둔다 — 한 묶음은 목표값이 하나라 IN 목록에 그대로
+      얹히고, `rowcount` 가 "정말 바뀐 행 수"라는 뜻을 유지한다.
+```
+
+측정(회귀 테스트가 세는 값):
+
+```
+대기 120행, 바뀔 것 없음   ->  UPDATE 문장 0개   (예전 121개)
+대기 120행, 전부 틀어 놓음 ->  문장 6개          (예전 121개)
+큐 200행 재적재            ->  INSERT 0 / UPDATE 0
+```
+
+### `IN (...)` 이 새로 둘 생겼다 — 상한 보호를 **작은 데이터로** 고정했다
+
+둘 다 `chunked_for_sql()` 로 나눈다(#243). 문제는 그 보호가 기본 상한(32,766)에서는
+수만 행을 넣어야 발동한다는 것이다 — 그래서 지금까지 검사가 없었고, 변이로 청크 나누기를
+지워도 **아무도 잡지 못했다**(실측: 변이 2종 생존).
+
+`sqlite3.Connection.setlimit()` 으로 **커넥션의 변수 상한을 10으로 내리면** 20행짜리
+입력으로 같은 경계를 만들 수 있다. 대량 DB 없이 계약을 지킨다
+(`test_queue_write_batching.py` 10번). `sql_variable_limit()` 이 `conn.getlimit()` 을
+쓴다는 성질까지 함께 고정된다 — 상수를 박으면 이 검사가 붉어진다.
+
+`test_schema_hygiene.py` 의 `SQL_PLACEHOLDER_SITES` 인벤토리에도 두 곳을 등록했다.
+등록하지 않으면 그 가드가 붉어진다 — **실제로 붉어져서 알았다.**
+
+### [2026-08-27 후속] `upsert_batch()` 도 결국 했다 — 다만 **다른 방법으로**
+
+아래 절은 "계약 위험이 이득보다 크다"고 판단해 미뤘던 기록이다. 그 뒤 계약을 안전하게
+바꾸는 방법(`unchanged` 칸 신설 + `persisted` 에 합산)을 그대로 실행해 해소했다.
+
+★ **첫 구현은 성능을 되레 깎았다.** 비교할 15개 컬럼을 함께 `SELECT` 해 파이썬에서
+튜플로 맞춰 봤는데, 실측하니 **1,876행에서 41.6ms -> 63.4ms(0.7배)** 였다. 넓은 SELECT 와
+튜플 생성 비용이 절약한 쓰기보다 컸다. "덜 쓰면 빠르다"는 짐작이 틀렸다.
+
+비교를 **SQL 의 WHERE** 로 옮기고서야 이득이 났다 —
+`UPDATE ... WHERE <식별키> AND (col IS NOT ? OR ...)`. 문장 수는 예전과 같고
+(SELECT 1 + UPDATE 1) **실제 쓰기만 사라진다.** `rowcount` 가 곧 "정말 바뀌었나"다.
+
+```
+하루 재크롤(값이 안 바뀐 정상적인 날, 5회 중앙값)
+  행수      수정 전    수정 후    쓴 행 전 -> 후
+  1,876     38.6ms    23.9ms    1,876 -> 0   (1.6배)
+  5,000    100.4ms    61.5ms    5,000 -> 0   (1.6배)
+ 10,000    241.6ms   120.4ms   10,000 -> 0   (2.0배)
+```
+
+`IS NOT` 를 쓴다 — `<>` 는 한쪽이 NULL 이면 NULL(=거짓)이라 **NULL 이 든 열의 변경을
+통째로 놓친다.** 레거시 행에 NULL 이 실재하므로 이것이 실제 차이다.
+
+**계약 변경(위험한 쪽)은 이렇게 막았다.**
+
+```
+upsert_batch() -> {"inserted", "updated", "unchanged", "failed"}
+CrawlOutcome.persisted = inserted + updated + unchanged
+```
+
+`unchanged` 를 빼먹으면 법원 자료가 그대로인 **정상적인 날에 `persisted == 0` 이 되어
+크롤이 실패로 끝나고 `migrate_execute.py` 가 아예 실행되지 않는다.**
+`test_crawl_exit_code.py` §4 와 `test_crawl_orchestration.py` §3-b 가 그 경로를 고정한다.
+
+`updated` 를 "찾은 행 수"로 두는 손쉬운 길은 택하지 않았다 — 그러면 아무것도 안 바뀐 날에도
+배치 로그가 *"업데이트: 1,876건"* 을 찍는다(#47 과 같은 부류).
+
+### 변이 10/10 검출 — 그리고 두 번은 검사가 스스로를 속였다
+
+`test_upsert_change_detection.py`(5묶음) 신설. 변이 10종 전부 검출.
+★ 처음엔 **8/10** 이었고, 놓친 둘이 전부 **검사 설계 잘못**이었다.
+
+1. **NULL 검사가 열을 여러 개 동시에 비웠다.** 그러면 서로가 서로를 가려 준다 —
+   한 열의 비교가 망가져도 **다른 열이 UPDATE 를 유발**해 그 김에 같이 써진다.
+   `IS NOT` -> `<>` 변이가 그렇게 살아남았다. **한 번에 한 열만** 비우도록 고쳐 잡았다.
+2. **`mvp_scraper` 의 배선을 아무도 실제로 태우지 않았다.** 유일한 검사가
+   `upsert_batch` 를 가짜로 덮고 있어서, 그 값을 `outcome` 으로 옮기는지 볼 수 없었다.
+   **진짜 upsert 로 `run_courts()` 를 재실행**하는 검사를 넣어 잡았다.
+
+그 과정에서 **가짜와 실제 계약의 불일치**도 드러났다 — `test_crawl_orchestration.py` 의
+가짜 `upsert_batch` 가 `unchanged` 를 안 돌려줘 `mvp_scraper` 가 KeyError 로 죽었다.
+제품 결함이 아니라 가짜가 낡은 것이었고, 가짜를 실제 계약에 맞췄다.
+
+### 하지 않은 것 — `upsert_batch()` 의 무조건 UPDATE (일부러 남긴다)
+
+같은 계열이 하나 더 있다: `upsert_batch()` 는 값이 같아도 매번 18컬럼 UPDATE 를 보낸다.
+**고치지 않았다.** 이유는 성능이 아니라 **계약**이다.
+
+```python
+persisted = inserted + updated
+if self.persisted == 0: return "DB 저장 0건"   # -> exit 1 -> run_daily.bat [FAILED]
+```
+
+`updated` 를 "정말 바뀐 행"으로 줄이면, 법원 자료가 하루 종일 그대로인 **정상적인 날에
+크롤이 실패로 판정**되고 `migrate_execute.py` 가 아예 실행되지 않는다. 이 저장소가
+반복해서 잡아 온 "배치 로그가 사실이 아닌 것을 말한다"(#47)의 정반대 방향 사고다.
+
+안전하게 고치려면 `unchanged` 카운터를 새로 만들고 `persisted = inserted + updated +
+unchanged` 로 바꿔야 한다 — `CrawlOutcome` / `mvp_scraper` / 관련 검사까지 함께 가는
+계약 변경이다. 그런데 `upsert_batch()` 는 **오늘 크롤분에만 비례**하고(누적과 무관,
+약 1,876행/일 = 약 16ms) 위 둘과 달리 급한 사유가 없다. 그래서 다음 스프린트로 남긴다.

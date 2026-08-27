@@ -19,8 +19,16 @@ def calc_bid_rate(appraisal: int, minimum: int) -> float:
     return 0.0
 
 def dryrun():
+    # 읽고 **바로** 놓는다 (2026-08-27, 자원 누수 감사).
+    # 예전에는 함수 마지막 줄에서 닫았다. 그 사이 100줄은 전부 순수 파이썬 집계라
+    # 커넥션이 필요 없는데도 잡고 있었고, 중간에서 예외가 나면 아예 닫히지 않았다.
+    # 미리보기 도구라 피해가 작지만, 이 저장소의 나머지 69개 함수는 전부 finally 로
+    # 닫는다 — 규칙이 두 벌이 되지 않게 여기도 맞춘다.
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM auction").fetchall()
+    try:
+        rows = conn.execute("SELECT * FROM auction").fetchall()
+    finally:
+        conn.close()
 
     # auction_case 중복 제거
     #
@@ -119,8 +127,6 @@ def dryrun():
     fc = Counter(it["fail_count"] for it in items)
     for k in sorted(fc.keys()):
         print(f"  {k}회: {fc[k]}건")
-
-    conn.close()
 
 if __name__ == "__main__":
     dryrun()

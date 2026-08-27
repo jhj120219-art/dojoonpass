@@ -130,14 +130,15 @@ def test_cross_court_upsert_safety():
             "court_code": "QA법원A", "court_name": "QA법원A",
             "case_no": case_no, "item_no": "1", "full_address": "A",
         }])
-        check("court A first insert", r1, {"inserted": 1, "updated": 0, "failed": 0})
+        check("court A first insert", r1,
+              {"inserted": 1, "updated": 0, "unchanged": 0, "failed": 0})
 
         r2 = dbmod.upsert_batch([{
             "court_code": "QA법원B", "court_name": "QA법원B",
             "case_no": case_no, "item_no": "1", "full_address": "B",
         }])
         check("court B upsert with SAME case_no+item_no -> separate INSERT, not overwrite",
-              r2, {"inserted": 1, "updated": 0, "failed": 0})
+              r2, {"inserted": 1, "updated": 0, "unchanged": 0, "failed": 0})
 
         conn = dbmod.get_connection()
         rows = conn.execute(
@@ -155,7 +156,7 @@ def test_cross_court_upsert_safety():
             "case_no": case_no, "item_no": "1", "full_address": "A-updated",
         }])
         check("court A re-upsert with same key -> UPDATE in place, not a new row",
-              r3, {"inserted": 0, "updated": 1, "failed": 0})
+              r3, {"inserted": 0, "updated": 1, "unchanged": 0, "failed": 0})
         rows2 = conn.execute(
             "SELECT COUNT(*) FROM auction WHERE case_no=?", (case_no,)
         ).fetchone()[0]
@@ -393,14 +394,15 @@ def test_upsert_partial_failure_isolation():
         except Exception as exc:  # noqa: BLE001
             _check_true("깨진 행이 배치 전체를 죽이지 않는다(행 단위 격리)", False,
                         "예외가 그대로 올라왔다: %r" % (exc,))
-            result = {"inserted": 0, "updated": 0, "failed": 0}
+            result = {"inserted": 0, "updated": 0, "unchanged": 0, "failed": 0}
         else:
             _check_true("깨진 행이 배치 전체를 죽이지 않는다(행 단위 격리)", True)
 
         check("깨진 행은 failed로 계수된다", result["failed"], 1)
         check("정상 행은 그대로 저장된다", result["inserted"], 2)
         _check_true("합계가 입력 행 수와 같다(조용히 사라지는 행이 없다)",
-                    result["inserted"] + result["updated"] + result["failed"] == 3, result)
+                    result["inserted"] + result["updated"]
+                    + result["unchanged"] + result["failed"] == 3, result)
 
         conn = dbmod.get_connection()
         try:
@@ -430,15 +432,16 @@ def test_upsert_partial_failure_isolation():
 
         # 빈 배치: 크롤이 0건을 돌려준 날에도 예외 없이 0을 보고해야 한다
         # (mvp_scraper는 rows가 비면 enqueue를 건너뛰지만 upsert 자체는 호출될 수 있다).
-        check("빈 배치는 0/0/0", dbmod.upsert_batch([]),
-              {"inserted": 0, "updated": 0, "failed": 0})
+        check("빈 배치는 전부 0", dbmod.upsert_batch([]),
+              {"inserted": 0, "updated": 0, "unchanged": 0, "failed": 0})
 
         # 필수 키가 아예 없는 행 — 크롤러 파싱이 실패했을 때의 모습이다.
         # 지금 구현은 빈 문자열 기본값으로 저장한다(예외가 아니다). 그 동작을 고정한다:
         # 조용히 죽지 않는다는 것이 계약이고, 빈 키 행을 어떻게 다룰지는 크롤러 정책이다.
         empty = dbmod.upsert_batch([{}])
         _check_true("키 없는 행도 배치를 죽이지 않는다",
-                    empty["inserted"] + empty["updated"] + empty["failed"] == 1, empty)
+                    empty["inserted"] + empty["updated"]
+                    + empty["unchanged"] + empty["failed"] == 1, empty)
         conn = dbmod.get_connection()
         try:
             conn.execute("DELETE FROM auction WHERE case_no=? OR case_no=''", (case,))

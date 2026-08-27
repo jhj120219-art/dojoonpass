@@ -242,9 +242,36 @@ def init_db() -> None:
 
 
 def upsert_batch(rows: List[Dict]) -> Dict:
+    """크롤 결과를 `auction` 에 반영한다.
+
+    돌려주는 것: `{"inserted", "updated", "unchanged", "failed"}`
+
+    ## `unchanged` 가 왜 따로 있는가 (2026-08-27, docs/BUGS.md #249)
+
+    예전에는 **값이 같아도 매번 18컬럼 UPDATE 를 보냈다.** 법원 자료는 대부분 어제와
+    같으므로 그 대부분이 아무것도 바꾸지 않는 쓰기였다. `#247`(migrate_execute)과
+    `#249`(큐)에서 없앤 것과 **같은 계열**이다.
+
+    그런데 여기만은 바로 고칠 수 없었다. `updated` 를 "실제로 쓴 행"으로 줄이면
+    `CrawlOutcome.persisted` 가 함께 줄어들기 때문이다:
+
+        persisted = inserted + updated
+        if persisted == 0: -> "DB 저장 0건" -> exit 1 -> run_daily.bat [FAILED]
+
+    법원 자료가 하루 종일 그대로인 **정상적인 날에 크롤이 실패로 판정**되고
+    `migrate_execute.py` 가 아예 실행되지 않는다. 그래서 세 번째 칸을 만들었다 —
+    "찾았고, 이미 올바르다". 이것도 **저장에 성공한 것**이므로
+    `CrawlOutcome.persisted` 는 셋을 다 더한다(`models/crawl_outcome.py` 참고).
+
+    ★ `updated` 를 "찾은 행 수"로 두는 손쉬운 길을 택하지 않았다. 그러면 아무것도
+      안 바뀐 날에도 배치 로그가 *"업데이트: 1,876건"* 을 찍는다 — 이 저장소가 #47 에서
+      고친 "배치 로그가 사실이 아닌 것을 말한다"와 정확히 같은 문제다.
+      `refresh_queue_priority()` 도 같은 이유로 실제로 바뀐 행 수를 돌려준다.
+    """
     conn = get_connection()
     inserted = 0
     updated = 0
+    unchanged = 0
     failed = 0
     try:
         for row in rows:
@@ -259,9 +286,19 @@ def upsert_batch(rows: List[Dict]) -> Dict:
                     "SELECT id FROM auction WHERE court_code=? AND case_no=? AND item_no=?",
                     (row.get("court_code", ""), row.get("case_no", ""), row.get("item_no", ""))
                 ).fetchone()
-
                 if existing:
-                    conn.execute("""
+                    # ★ 값이 이미 같으면 **행을 다시 쓰지 않는다.**
+                    #
+                    #   비교를 파이썬이 아니라 **UPDATE 의 WHERE** 로 한다. 처음에는
+                    #   15개 컬럼을 함께 SELECT 해 파이썬에서 튜플로 비교했는데,
+                    #   실측하니 **더 느렸다**(1,876행에서 41.6ms -> 63.4ms, 0.7배).
+                    #   넓은 SELECT 와 튜플 생성 비용이, 절약한 UPDATE 보다 컸다.
+                    #   여기서는 문장 수가 예전과 같고(SELECT 1 + UPDATE 1) 대신
+                    #   **실제 쓰기만 사라진다.** `rowcount` 가 곧 '정말 바뀌었나'다.
+                    #
+                    #   `IS NOT` 를 쓴다 — `<>` 는 한쪽이 NULL 이면 NULL(=거짓)이라
+                    #   NULL 이 든 열의 변경을 놓친다. `IS NOT` 는 NULL 도 제대로 비교한다.
+                    cur = conn.execute("""
                         UPDATE auction SET
                             court_code=?, court_name=?, property_type=?,
                             sido=?, sigungu=?, dong=?, lot_number=?,
@@ -271,6 +308,13 @@ def upsert_batch(rows: List[Dict]) -> Dict:
                             validation_reasons=?, crawl_date=?,
                             updated_at=?
                         WHERE court_code=? AND case_no=? AND item_no=?
+                          AND (court_name IS NOT ? OR property_type IS NOT ?
+                            OR sido IS NOT ? OR sigungu IS NOT ? OR dong IS NOT ?
+                            OR lot_number IS NOT ? OR full_address IS NOT ?
+                            OR appraisal_price IS NOT ? OR minimum_bid_price IS NOT ?
+                            OR auction_date IS NOT ? OR status IS NOT ?
+                            OR validation_status IS NOT ? OR validation_reasons IS NOT ?
+                            OR crawl_date IS NOT ?)
                     """, (
                         row.get("court_code", ""),
                         row.get("court_name", ""),
@@ -291,8 +335,27 @@ def upsert_batch(rows: List[Dict]) -> Dict:
                         row.get("court_code", ""),
                         row.get("case_no", ""),
                         row.get("item_no", ""),
+                        # 아래 14개는 WHERE 의 변경 감지용이다(SET 과 같은 값).
+                        row.get("court_name", ""),
+                        row.get("property_type", ""),
+                        row.get("sido", ""),
+                        row.get("sigungu", ""),
+                        row.get("dong", ""),
+                        row.get("lot_number", ""),
+                        row.get("full_address", ""),
+                        int(row.get("appraisal_price", 0) or 0),
+                        int(row.get("minimum_bid_price", 0) or 0),
+                        row.get("auction_date", ""),
+                        row.get("status", ""),
+                        row.get("validation_status", ""),
+                        row.get("validation_reasons", ""),
+                        row.get("crawl_date", ""),
                     ))
-                    updated += 1
+                    # rowcount 가 0 이면 값이 이미 같아 **아무것도 쓰지 않은 것**이다.
+                    if cur.rowcount:
+                        updated += 1
+                    else:
+                        unchanged += 1
                 else:
                     conn.execute("""
                         INSERT INTO auction (
@@ -331,9 +394,10 @@ def upsert_batch(rows: List[Dict]) -> Dict:
                 failed += 1
 
         conn.commit()
-        logger.info("DB UPSERT 완료 - 신규: %d, 업데이트: %d, 실패: %d",
-                    inserted, updated, failed)
-        return {"inserted": inserted, "updated": updated, "failed": failed}
+        logger.info("DB UPSERT 완료 - 신규: %d, 갱신: %d, 변화없음: %d, 실패: %d",
+                    inserted, updated, unchanged, failed)
+        return {"inserted": inserted, "updated": updated,
+                "unchanged": unchanged, "failed": failed}
 
     except Exception as e:
         conn.rollback()
@@ -470,6 +534,49 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
     try:
         now = datetime.now().isoformat()
         today = datetime.now().strftime("%Y-%m-%d")
+
+        # ── 이미 큐에 있는 행을 **먼저 한 번에** 읽는다 (2026-08-27, BUGS #249) ──────
+        #
+        # 예전에는 행마다 4종을 `INSERT OR IGNORE` 로 밀어 넣고, 안 들어갔으면(=이미 있으면)
+        # 다시 `UPDATE ... AND IFNULL(auction_date,'') <> ?` 를 보냈다. 두 번 다
+        # **no-op 여부 판정을 DB 에 맡겨** 문장은 전부 나갔다. 실측(같은 데이터 재수집):
+        #
+        #     입력 25,000행 -> 200,002문장 / 실제로 추가된 행 **0건**
+        #
+        # `migrate_execute` 가 같은 이유로 10만 행에서 동시 writer 를 죽였던 것과
+        # 같은 계열이다(#247). 여기서도 답은 "빨리 보내기"가 아니라 **안 보내기**다.
+        #
+        # ★ 큐 전체를 읽지 않는다. 지금 입력에 있는 **(법원,사건,물건)만** 조회한다 —
+        #   `document_queue` 는 누적 테이블이라 전체를 들면 메모리가 누적을 따라간다.
+        #   이렇게 하면 메모리가 **입력 크기**에만 묶인다(하루 약 1,900행).
+        #
+        # ★ IN 목록은 **나눈다**(#243). 키 하나가 `?` 를 3개 쓰므로 나누지 않으면
+        #   입력 10,922행에서 `too many SQL variables` 로 그날 적재가 통째로 실패한다.
+        wanted_keys = []
+        seen_key = set()
+        for row in rows:
+            k = (row.get("court_code", ""), row.get("case_no", ""),
+                 str(row.get("item_no", "") or "1"))
+            if k not in seen_key:
+                seen_key.add(k)
+                wanted_keys.append(k)
+
+        existing_q = {}      # (court_code, case_no, item_no, doc_type) -> auction_date
+        for key_chunk in chunked_for_sql(wanted_keys, vars_per_item=3, conn=conn):
+            placeholders = ",".join(["(?,?,?)"] * len(key_chunk))
+            params = [v for triple in key_chunk for v in triple]
+            for q in conn.execute(
+                "SELECT court_code, case_no, item_no, doc_type, auction_date"
+                " FROM document_queue"
+                " WHERE (court_code, case_no, item_no) IN (" + placeholders + ")",
+                params,
+            ):
+                existing_q[(q["court_code"], q["case_no"], q["item_no"],
+                            q["doc_type"])] = q["auction_date"]
+
+        to_insert = []       # 새로 넣을 큐 행
+        to_refresh = []      # 기일이 바뀌어 갱신할 큐 행
+
         for row in rows:
             court_code = row.get("court_code", "")
             case_no = row.get("case_no", "")
@@ -486,14 +593,15 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
             # 캐러셀이 이미 DOM에 있다(법원 원천 실측). 그래서 doc_worker는 이 종류만
             # 버튼 id 검사를 건너뛴다.
             for doc_type in ("spec", "status", "appraisal", "image"):
-                cur = conn.execute("""
-                    INSERT OR IGNORE INTO document_queue
-                        (court_code, case_no, item_no, doc_type, priority, auction_date, status, retry_count, enqueued_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)
-                """, (court_code, case_no, item_no, doc_type, priority, auction_date, now))
-                if cur.rowcount > 0:
+                qkey = (court_code, case_no, item_no, doc_type)
+                if qkey not in existing_q:
+                    to_insert.append((court_code, case_no, item_no, doc_type,
+                                      priority, auction_date, now))
+                    # 같은 배치 안에 같은 키가 두 번 나와도 두 벌 넣지 않는다
+                    # (auction 의 UNIQUE 제약상 없어야 하지만 가정에 기대지 않는다)
+                    existing_q[qkey] = auction_date
                     added += 1
-                elif auction_date:
+                elif auction_date and (existing_q[qkey] or "") != auction_date:
                     # 이미 있는 행 — 기일이 바뀌었으면 최신 값으로 맞춘다 (2026-08-13 Sprint 74).
                     #
                     # 유찰 후 재매각은 한국 경매에서 일상이고, 그때 같은
@@ -510,14 +618,30 @@ def enqueue_documents(rows: List[Dict]) -> Dict:
                     #   것인지는 재수집 정책이라 제품 판단이다(docs/roadmap.md 결정 대기).
                     #   여기서 고치는 것은 큐가 자기 필드에 **사실과 다른 값**을 들고 있는 것뿐이다.
                     #   그것만으로 pending 행의 오판은 사라진다.
-                    upd = conn.execute("""
-                        UPDATE document_queue
-                           SET auction_date = ?, priority = ?
-                         WHERE court_code = ? AND case_no = ? AND item_no = ? AND doc_type = ?
-                           AND IFNULL(auction_date, '') <> ?
-                    """, (auction_date, priority, court_code, case_no, item_no, doc_type,
-                          auction_date))
-                    refreshed += upd.rowcount
+                    to_refresh.append((auction_date, priority,
+                                       court_code, case_no, item_no, doc_type,
+                                       auction_date))
+                    existing_q[qkey] = auction_date
+
+        # `INSERT OR IGNORE` / `IFNULL(...) <> ?` 가드를 **그대로** 둔다. 위 조회와
+        # 여기 사이에 다른 실행이 같은 행을 넣었을 수 있다(운영에서 두 프로세스가 겹치는
+        # 것은 락으로 막지만, 방어를 조회 시점 가정에 기대게 만들지 않는다).
+        # `executemany` 는 문장을 한 번만 준비하고 N번 실행하므로, 같은 행 수라도
+        # `execute()` 를 N번 부르는 것보다 훨씬 싸다.
+        if to_insert:
+            conn.executemany("""
+                INSERT OR IGNORE INTO document_queue
+                    (court_code, case_no, item_no, doc_type, priority, auction_date, status, retry_count, enqueued_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+            """, to_insert)
+        if to_refresh:
+            conn.executemany("""
+                UPDATE document_queue
+                   SET auction_date = ?, priority = ?
+                 WHERE court_code = ? AND case_no = ? AND item_no = ? AND doc_type = ?
+                   AND IFNULL(auction_date, '') <> ?
+            """, to_refresh)
+            refreshed = len(to_refresh)
         conn.commit()
         logger.info("document_queue 적재: %d건 (기일 갱신: %d건, 기일경과로 사전제외: %d건)",
                     added, refreshed, skipped_expired)
@@ -652,26 +776,57 @@ def refresh_queue_priority() -> int:
     try:
         # 'refresh'도 **워커가 집어갈 대기 행**이므로 같이 재계산한다 — 빠지면 재수집
         # 대기분만 옛 우선순위로 남아 임박 물건이 뒤로 밀린다(2026-08-18 Sprint 189).
+        # ── 바뀌는 행만 **묶어서** 갱신한다 (2026-08-27, docs/BUGS.md #249) ─────────
+        #
+        # 예전에는 대기 행 하나마다 UPDATE 를 한 번씩 보냈다. no-op 걸러내기를
+        # `AND priority!=?` 로 **DB 에 맡겼기 때문에** 문장은 그대로 다 나갔다.
+        # 실측(하루치 재실행, 값이 안 바뀐 정상적인 밤):
+        #
+        #     대기 행 25,000 -> UPDATE 100,003문장 / 실제로 바뀐 행 **0건**
+        #     운영 현재      ->  2,753문장 / 대부분의 밤 0건
+        #
+        # `pending` 은 누적을 따라간다(물건 하나당 4행). 그래서 이 비용은 그날 일감이
+        # 아니라 **쌓인 양**에 붙는다 — `migrate_execute` 가 같은 이유로 10만 행에서
+        # 동시 writer 를 죽였던 것과 같은 계열이다(#247).
+        #
+        # `priority` 를 함께 읽어 **파이썬에서** 비교하면 보낼 문장이 사라진다.
+        # 그리고 남은 것은 목표 우선순위가 1/2/3 셋뿐이라 **최대 3묶음**으로 끝난다.
+        #
+        # ★ `AND priority<>?` 가드는 그대로 둔다. 한 묶음은 목표값이 하나라 IN 목록에
+        #   그대로 얹힌다 — SELECT 와 UPDATE 사이에 다른 실행이 끼어들어도 결과가 같고,
+        #   `rowcount` 가 "정말 바뀐 행 수"라는 뜻을 유지한다(아래 반환값의 근거).
+        #
+        # ★ IN 목록은 **나눈다**(#243). id 하나가 `?` 하나를 쓰므로 나누지 않으면
+        #   대기 행 32,766개에서 `too many SQL variables` 로 죽는다 — 느려지는 게
+        #   아니라 그날 우선순위 갱신이 통째로 실패한다.
         rows = conn.execute(
-            "SELECT id, auction_date FROM document_queue WHERE status IN ("
+            "SELECT id, auction_date, priority FROM document_queue WHERE status IN ("
             + QUEUE_CLAIMABLE_PLACEHOLDERS + ")",
             QUEUE_CLAIMABLE_STATUSES,
         ).fetchall()
+
+        by_target = {}
         for row in rows:
-            new_priority = calc_priority(row["auction_date"])
-            cur = conn.execute(
-                "UPDATE document_queue SET priority=? WHERE id=? AND priority!=?",
-                (new_priority, row["id"], new_priority)
-            )
             examined += 1
-            # UPDATE에 `AND priority!=?`가 걸려 있어 대부분의 행은 실제로 바뀌지 않는다.
-            # 예전에는 검토한 행 수를 그대로 반환해서, 배치 로그가 매일 밤
-            # "우선순위 재계산 완료: 2,736건"을 남겼다 — 실제로 바뀐 것이 0건인 날에도
-            # 똑같이 찍혀 운영자가 "매일 수천 건이 갱신된다"고 오해하게 만들었다
-            # (BUGS #47과 같은 부류 — 배치 로그가 사실이 아닌 것을 말하는 문제).
-            # 이제 **실제로 바뀐 행 수**를 반환한다.
-            if cur.rowcount > 0:
-                changed += 1
+            new_priority = calc_priority(row["auction_date"])
+            if row["priority"] == new_priority:
+                continue                       # 보낼 문장이 없다
+            by_target.setdefault(new_priority, []).append(row["id"])
+
+        for new_priority, ids in sorted(by_target.items()):
+            # vars_per_item=1 은 id 용. 목표 우선순위 2개(SET, 가드)는 headroom 이 덮는다.
+            for chunk in chunked_for_sql(ids, vars_per_item=1, conn=conn):
+                placeholders = ",".join("?" * len(chunk))
+                cur = conn.execute(
+                    "UPDATE document_queue SET priority=? WHERE id IN ("
+                    + placeholders + ") AND priority<>?",
+                    (new_priority,) + tuple(chunk) + (new_priority,))
+                # 예전에는 검토한 행 수를 그대로 반환해서, 배치 로그가 매일 밤
+                # "우선순위 재계산 완료: 2,736건"을 남겼다 — 실제로 바뀐 것이 0건인 날에도
+                # 똑같이 찍혀 운영자가 "매일 수천 건이 갱신된다"고 오해하게 만들었다
+                # (BUGS #47과 같은 부류 — 배치 로그가 사실이 아닌 것을 말하는 문제).
+                # 이제 **실제로 바뀐 행 수**를 반환한다.
+                changed += cur.rowcount or 0
         conn.commit()
         logger.info("document_queue 우선순위 재계산: %d건 검토, %d건 변경", examined, changed)
         return changed

@@ -271,11 +271,16 @@ return { focusVisibleRules: fvRules, globalOutlineNone: globalOutlineNone };
 """
 
 
-def build_driver(headed: bool, width: int, height: int):
-    from selenium import webdriver
+class DriverUnavailable(RuntimeError):
+    """브라우저를 띄우지 못했다. **결함이 아니라 측정 불가**다 (종료코드 2).
+
+    이 예외를 따로 두는 이유는 BUGS #188 과 같다 - "모른다"와 "고장났다"를 같은
+    값으로 뭉개면, 환경 문제 하나가 제품 결함으로 보고된다.
+    """
+
+
+def _chrome_options(headed: bool, width: int, height: int):
     from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
 
     opts = Options()
     if not headed:
@@ -290,10 +295,188 @@ def build_driver(headed: bool, width: int, height: int):
     #       숨김   vw=320 컨테이너 288 트랙 288 -> 안 넘친다(결함이 안 보인다)
     #       안숨김 vw=305 컨테이너 273 트랙 277.6 -> 넘친다(결함이 보인다)
     opts.add_argument("--window-size=%d,%d" % (width, height))
-    svc = Service(ChromeDriverManager().install())
-    drv = webdriver.Chrome(service=svc, options=opts)
-    drv.set_page_load_timeout(60)
-    return drv
+    return opts
+
+
+def _via_selenium_manager(headed, width, height):
+    """Selenium 4.6+ 에 내장된 드라이버 해석기. 캐시에 맞는 드라이버가 있으면
+    바깥 네트워크를 타지 않는다."""
+    from selenium import webdriver
+    return webdriver.Chrome(options=_chrome_options(headed, width, height))
+
+
+def _via_webdriver_manager(headed, width, height):
+    """예전 경로. 버전 확인을 위해 매번 googlechromelabs.github.io 를 두드린다."""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()),
+                            options=_chrome_options(headed, width, height))
+
+
+# ★ 순서에 이유가 있다 (2026-08-25, docs/BUGS.md #193).
+#
+#   예전에는 `webdriver_manager` **하나뿐**이었다. 그것은 실행할 때마다
+#   googlechromelabs.github.io 에서 최신 버전 목록을 받아 온다 - 즉 **바깥 네트워크가
+#   되어야만** 이 도구가 돈다. 2026-08-25 이 PC 에서 실제로 그것이 깨졌다:
+#
+#       requests(= webdriver_manager 가 쓰는 경로) -> SSLCertVerificationError
+#                                                    "unable to get local issuer certificate"
+#       stdlib urllib 로 같은 URL                  -> HTTP 200, 0.05초
+#
+#   즉 **오프라인이 아니다.** 그런데 webdriver_manager 는 그 예외를 삼키고
+#   "Could not reach host. Are you offline?" 로 바꿔 던졌고, `audit_contrast.py` 는
+#   그것을 그대로 40줄짜리 트레이스백으로 토했다. 판정문은 한 줄도 없었다.
+#
+#   Selenium Manager 는 같은 순간에 9.6초 만에 크롬 151.0.7922.170 을 띄웠다.
+#   그래서 **먼저 시도한다.** 실패하면 예전 경로로 떨어지고, 둘 다 실패하면
+#   두 이유를 **함께** 들고 DriverUnavailable 로 올린다 - 어느 쪽이 왜 안 됐는지
+#   모르면 고칠 수 없기 때문이다.
+DRIVER_FACTORIES = (
+    ("Selenium Manager", _via_selenium_manager),
+    ("webdriver_manager", _via_webdriver_manager),
+)
+
+
+def build_driver(headed: bool, width: int, height: int, factories=None):
+    """드라이버를 띄운다. 전부 실패하면 `DriverUnavailable` 을 올린다(트레이스백 금지).
+
+    `factories` 는 검사용 주입구다 - 실제 브라우저 없이 순서/실패 처리를 검증한다.
+    """
+    reasons = []
+    for name, make in (DRIVER_FACTORIES if factories is None else factories):
+        try:
+            drv = make(headed, width, height)
+        except Exception as exc:
+            reasons.append("%s -> %s: %s"
+                           % (name, type(exc).__name__, " ".join(str(exc).split())[:160]))
+            continue
+        drv.set_page_load_timeout(60)
+        return drv
+    raise DriverUnavailable("; ".join(reasons) if reasons else "시도할 방법이 없다")
+
+
+class _FakeDriver(object):
+    """selftest 전용. 진짜 브라우저를 띄우지 않고 build_driver 의 계약만 확인한다."""
+
+    def __init__(self, tag):
+        self.tag = tag
+        self.timeout = None
+
+    def set_page_load_timeout(self, secs):
+        self.timeout = secs
+
+
+def selftest() -> int:
+    """브라우저도 네트워크도 쓰지 않고 이 도구의 판정 로직을 검증한다.
+
+    회귀 스위트(`test_audit_selftests.py`)가 이것을 돌린다. 실제 측정은 서버와
+    브라우저가 필요해 스위트에 넣을 수 없지만, **판정이 공허해지는 것**은 여기서 잡힌다.
+    """
+    fails = []
+
+    def check(name, cond, detail=""):
+        print("[%s] %s%s" % ("PASS" if cond else "FAIL", name,
+                             "" if cond else " -- %s" % (detail,)))
+        if not cond:
+            fails.append(name)
+
+    print("--- verdict(): 측정 불가를 정상으로 뭉개지 않는가 ---")
+    base = dict(asked="/", path="/", requested=390, innerWidth=390,
+                detectorWorks=True, cssApplied=True, nodes=200,
+                pageHScroll=False, scrollWidth=390, vw=390,
+                realOverflow=0, realSample=[], parentOverflow=0, parentSample=[],
+                clipped=0, clippedSample=[], imgBroken=0, imgOverflow=0,
+                missingAccName=[], unreachable=[], formNoLabel=[], posTabIndex=0,
+                h1=1, headingSkips=[], landmarks=["main"], globalOutlineNone=0)
+
+    def v(**over):
+        r = dict(base)
+        r.update(over)
+        return verdict(r)[0]
+
+    check("깨끗한 화면은 OK", v() == "OK", v())
+    # ★ 아래 넷이 핵심이다 - "재지 못했다"를 OK 로 돌려주면 이 도구 전체가 무의미해진다.
+    check("빈 화면(노드 0)은 UNUSABLE", v(nodes=0) == "UNUSABLE", v(nodes=0))
+    check("뷰포트가 요청과 다르면 UNUSABLE",
+          v(innerWidth=500) == "UNUSABLE", v(innerWidth=500))
+    check("넘침 탐지기가 죽었으면 UNUSABLE",
+          v(detectorWorks=False) == "UNUSABLE", v(detectorWorks=False))
+    check("CSS 가 안 붙었으면 UNUSABLE",
+          v(cssApplied=False) == "UNUSABLE", v(cssApplied=False))
+    check("로그인으로 튕기면 AUTH(통과가 아니다)",
+          v(asked="/search", path="/login") == "AUTH", v(asked="/search", path="/login"))
+    check("가로 스크롤은 FAIL", v(pageHScroll=True) == "FAIL", v(pageHScroll=True))
+    check("h1 이 0개면 FAIL", v(h1=0) == "FAIL", v(h1=0))
+    check("main 랜드마크가 없으면 FAIL",
+          v(landmarks=["banner"]) == "FAIL", v(landmarks=["banner"]))
+    check("접근이름 없는 버튼은 FAIL",
+          v(missingAccName=["button.x"]) == "FAIL", v(missingAccName=["button.x"]))
+
+    print("--- build_driver(): 드라이버 해석 순서와 실패 처리 ---")
+    calls = []
+
+    def ok_factory(tag):
+        def make(headed, width, height):
+            calls.append(tag)
+            return _FakeDriver(tag)
+        return make
+
+    def bad_factory(tag, exc):
+        def make(headed, width, height):
+            calls.append(tag)
+            raise exc
+        return make
+
+    def try_build(factories):
+        """예외를 값으로 바꾼다. 이렇게 하지 않으면 회귀가 **트레이스백**으로 나와
+        어느 단언이 깨졌는지 알 수 없다 - 이 저장소가 반복해서 당한 '증거 없는 실패'다."""
+        try:
+            return build_driver(False, 390, 900, factories=factories), None
+        except Exception as exc:
+            return None, "%s: %s" % (type(exc).__name__, exc)
+
+    del calls[:]
+    drv, why = try_build([("A", ok_factory("A")), ("B", ok_factory("B"))])
+    check("첫 방법이 되면 두 번째는 부르지 않는다", calls == ["A"], (calls, why))
+    check("첫 방법이 돌려준 드라이버를 그대로 쓴다", drv is not None and drv.tag == "A", why or drv)
+    check("띄운 드라이버에 페이지 타임아웃을 건다", drv is not None and drv.timeout == 60, why or drv)
+
+    del calls[:]
+    drv, why = try_build([("A", bad_factory("A", RuntimeError("깨짐"))),
+                          ("B", ok_factory("B"))])
+    check("첫 방법이 실패하면 다음 방법으로 넘어간다(폴백이 살아 있다)",
+          calls == ["A", "B"], (calls, why))
+    check("두 번째가 돌려준 것을 쓴다", drv is not None and drv.tag == "B", why or drv)
+
+    del calls[:]
+    err = None
+    try:
+        build_driver(False, 390, 900,
+                     factories=[("A", bad_factory("A", RuntimeError("SSL 실패"))),
+                                ("B", bad_factory("B", RuntimeError("경로 없음")))])
+    except DriverUnavailable as exc:
+        err = str(exc)
+    except Exception as exc:            # 다른 예외로 새면 호출부가 트레이스백을 토한다
+        err = "WRONG:%s" % type(exc).__name__
+    check("전부 실패하면 DriverUnavailable 이다(트레이스백 아님)",
+          err is not None and not err.startswith("WRONG:"), err)
+    check("실패 사유에 두 방법이 **모두** 들어 있다",
+          err is not None and "A ->" in err and "B ->" in err, err)
+    check("실패 사유에 원래 메시지가 남는다",
+          err is not None and "SSL 실패" in err and "경로 없음" in err, err)
+
+    # 자기 검증: 이 검사가 공허하지 않다 - 일부러 틀린 입력을 넣으면 OK 가 아니어야 한다.
+    broken = dict(base)
+    broken["nodes"] = 0
+    check("자기 검증: 빈 화면은 OK 가 아니다", verdict(broken)[0] != "OK", verdict(broken))
+
+    print()
+    if fails:
+        print("FAILED (%d): %s" % (len(fails), ", ".join(fails)))
+        return 1
+    print("ALL SELFTESTS PASSED (audit_viewport.py)")
+    return 0
 
 
 def set_viewport(drv, width, height):
@@ -414,7 +597,13 @@ def main() -> int:
     #   주지 않으면 그 화면들은 AUTH(측정 안 함)로 남는다 - 통과로 세지 않는다.
     ap.add_argument("--cookie", help="로그인된 브라우저의 document.cookie 문자열")
     ap.add_argument("--json", help="결과를 이 경로에 JSON 으로 남긴다")
+    # 브라우저도 서버도 네트워크도 쓰지 않는다 - 회귀 스위트가 이것만 돌린다
+    # (test_audit_selftests.py). 2026-08-25 신설, docs/BUGS.md #193.
+    ap.add_argument("--selftest", action="store_true",
+                    help="판정 로직만 검사한다(브라우저/서버 불필요)")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
     widths = args.width or WIDTHS_DEFAULT
 
     # 서버부터 확인한다 — 없는데 "넘침 0" 이라고 말하지 않기 위해서다.
@@ -430,8 +619,16 @@ def main() -> int:
     driver = None
     try:
         driver = build_driver(args.headed, widths[0], 900)
+    except DriverUnavailable as e:
+        # 시도한 방법이 각각 왜 실패했는지 **전부** 찍는다. 하나만 찍으면
+        # 네트워크 문제와 크롬 부재를 구별할 수 없다 (docs/BUGS.md #193).
+        print("브라우저를 띄우지 못했다 - 시도한 방법과 사유:")
+        for reason in str(e).split("; "):
+            print("    %s" % reason)
+        print("(측정 불가 = 종료코드 2. 정상으로 뭉개지 않는다.)")
+        return 2
     except Exception as e:
-        print("브라우저를 띄우지 못했다: %s" % str(e)[:200])
+        print("브라우저를 띄우지 못했다: %s: %s" % (type(e).__name__, str(e)[:200]))
         print("(측정 불가 = 종료코드 2. 정상으로 뭉개지 않는다.)")
         return 2
 

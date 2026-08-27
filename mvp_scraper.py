@@ -195,11 +195,16 @@ def run_courts(courts: List[CourtInfo], outcome: CrawlOutcome = None) -> list:
     result = upsert_batch(rows)
     outcome.inserted = result["inserted"]
     outcome.updated = result["updated"]
+    # ★ 반드시 함께 넘긴다 — 빠뜨리면 `persisted` 가 실제보다 작아져,
+    #   법원 자료가 그대로인 정상적인 날에 크롤이 "DB 저장 0건"으로 실패한다
+    #   (docs/BUGS.md #249, `models/crawl_outcome.py:persisted` 주석).
+    outcome.unchanged = result["unchanged"]
     outcome.upsert_failed = result["failed"]
     print("")
     print("[DB 저장 결과]")
     print("  신규    :", result["inserted"], "건")
-    print("  업데이트:", result["updated"], "건")
+    print("  갱신    :", result["updated"], "건")
+    print("  변화없음:", result["unchanged"], "건")
     print("  실패    :", result["failed"], "건")
 
     # 4. DB 통계
@@ -258,8 +263,9 @@ def main() -> int:
         if reason:
             logger.error("===== 사건 수집 실패: %s =====", reason)
         else:
-            logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d) =====",
-                        outcome.persisted, outcome.inserted, outcome.updated)
+            logger.info("===== 사건 수집 완료: 저장 %d건(신규 %d/갱신 %d/변화없음 %d) =====",
+                        outcome.persisted, outcome.inserted, outcome.updated,
+                        outcome.unchanged)
         return outcome.exit_code()
     finally:
         lock.release()

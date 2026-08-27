@@ -19,13 +19,27 @@ class CrawlOutcome:
     failed: List[str] = field(default_factory=list)   # 예외로 실패한 법원
     collected: int = 0                       # 크롤로 얻은 사건 수
     inserted: int = 0                        # DB 신규
-    updated: int = 0                         # DB 갱신
+    updated: int = 0                         # DB 갱신 (값이 실제로 바뀌어 쓴 것)
+    unchanged: int = 0                       # DB에 이미 올바르게 있던 것 (쓸 필요가 없었다)
     upsert_failed: int = 0                   # DB 저장 실패
 
     @property
     def persisted(self) -> int:
-        """실제로 DB에 남은 건수. 0이면 그 실행은 아무것도 이루지 못한 것이다."""
-        return self.inserted + self.updated
+        """실제로 DB에 남은 건수. 0이면 그 실행은 아무것도 이루지 못한 것이다.
+
+        ## `unchanged`를 반드시 더한다 (2026-08-27, docs/BUGS.md #249)
+
+        `upsert_batch()`는 값이 이미 같은 행에 UPDATE를 보내지 않는다(무의미한 쓰기 제거).
+        그 행들은 `updated`가 아니라 `unchanged`로 돌아온다.
+
+        **셋을 다 더하지 않으면 정상적인 날에 크롤이 실패로 판정된다.** 법원 자료가
+        하루 종일 그대로면 `inserted=0, updated=0, unchanged=1876`이 되는데,
+        `persisted`가 0이 되어 아래 `failure_reason()`이 "DB 저장 0건"을 돌려주고
+        `run_daily.bat`이 exit 1로 멈춘다 — `migrate_execute.py`가 아예 실행되지 않는다.
+
+        "찾았고 이미 올바르다"는 **저장에 성공한 것**이다. 실패는 `upsert_failed`다.
+        """
+        return self.inserted + self.updated + self.unchanged
 
     def failure_reason(self) -> Optional[str]:
         """치명적 실패면 사유 문자열, 아니면 None.

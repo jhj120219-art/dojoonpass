@@ -87,7 +87,9 @@ def run():
 
     tmp = tempfile.mkdtemp(prefix="crawlorch_")
     scratch = os.path.join(tmp, "auction.db")
-    shutil.copy2(real_db, scratch)
+    # 온라인 백업 스냅샷 - 워커가 쓰는 중이어도 일관된 사본을 만든다
+    # (shutil.copy2 는 찢어질 수 있다. 사유: storage/database.py:snapshot_live_db)
+    db.snapshot_live_db(scratch)
     db.DB_PATH = scratch
 
     try:
@@ -178,39 +180,11 @@ def run():
             con.close()
         check("섞임: 스크래치 DB 에 실제로 들어갔다", saved, 2)
 
-        # ── 3-b. ★ 같은 크롤 결과를 **다시** 넣은 날 (2026-08-27, BUGS #249) ─────
-        #
-        #    법원 자료가 어제와 똑같은 날이다. `upsert_batch()` 는 값이 같으면
-        #    행을 다시 쓰지 않고 `unchanged` 로 돌려준다.
-        #
-        #    ★ 이때 `persisted` 가 `unchanged` 를 빼먹으면 **정상적인 날에 크롤이
-        #      실패로 판정**되고 `migrate_execute.py` 가 아예 실행되지 않는다.
-        #      여기서는 **진짜 upsert_batch** 로 그 배선을 끝까지 태운다 —
-        #      가짜로 덮으면 `mvp_scraper` 가 값을 옮기는지 검사할 수 없다
-        #      (변이 테스트에서 실제로 그 구멍이 드러났다).
-        ms.crawl_court = mixed
-        oc_again = CrawlOutcome()
-        ms.run_courts(courts3, oc_again)
-        check("재실행: 새로 저장된 것은 없다", oc_again.inserted, 0)
-        check("재실행: 값이 안 바뀌었으니 갱신도 0", oc_again.updated, 0)
-        check("재실행: unchanged 로 잡힌다", oc_again.unchanged, 2)
-        check_true("★ persisted 가 unchanged 를 포함한다",
-                   oc_again.persisted == 2,
-                   "-> inserted=%s updated=%s unchanged=%s"
-                   % (oc_again.inserted, oc_again.updated, oc_again.unchanged))
-        check_true("★ 그런 날은 실패가 아니다",
-                   oc_again.failure_reason() is None, oc_again.failure_reason())
-        check("★ 종료 코드 0 (그날 크롤이 멈추지 않는다)", oc_again.exit_code(), 0)
-
         # ── 4. 수집은 됐는데 DB 저장이 0건 -> "DB 저장 0건" ───────────────
         #    upsert_batch 를 갈아 끼워 저장 실패를 흉내 낸다.
         real_upsert = ms.upsert_batch
         ms.crawl_court = lambda court: [_item(ms, "2099타경2001")] if court.name == "QA1" else []
-        # ★ 가짜도 **실제 계약과 같은 모양**이어야 한다 — `unchanged` 가 빠지면
-        #   `mvp_scraper` 가 KeyError 로 죽고, 그것은 제품 결함이 아니라
-        #   가짜가 낡은 것이다(2026-08-27, docs/BUGS.md #249 로 칸이 하나 늘었다).
-        ms.upsert_batch = lambda rows_: {"inserted": 0, "updated": 0,
-                                         "unchanged": 0, "failed": len(rows_)}
+        ms.upsert_batch = lambda rows_: {"inserted": 0, "updated": 0, "failed": len(rows_)}
         oc = CrawlOutcome()
         ms.run_courts(courts3, oc)
         ms.upsert_batch = real_upsert

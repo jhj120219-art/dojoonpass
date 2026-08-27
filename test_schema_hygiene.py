@@ -1939,6 +1939,14 @@ SQL_PLACEHOLDER_SITES = {
         "모듈 상수 튜플(2개).",
     ("storage/database.py", "len(saved_seqs)"):
         "한 물건의 사진 순번. 법원 캐러셀 장수라 수십 장 규모.",
+    # 2026-08-27 (BUGS #249). 큐 쓰기 두 곳을 행 단위 UPDATE/INSERT 에서 묶음으로 바꾸면서
+    # 새로 생긴 `IN (...)` 이다. 둘 다 `chunked_for_sql()` 로 나눠 넣으므로 상한에 닿지 않고,
+    # `test_queue_write_batching.py` 10번이 **커넥션 변수 상한을 10으로 낮춰** 나누기가
+    # 실제로 동작하는지 소량 데이터로 검증한다(대량 DB 없이 계약을 지킨다).
+    ("storage/database.py", "len(chunk)"):
+        "refresh_queue_priority(): chunked_for_sql(vars_per_item=1) 로 나눈 조각 (BUGS #243/#249).",
+    ("storage/database.py", "len(key_chunk)"):
+        "enqueue_documents() 선조회: chunked_for_sql(vars_per_item=3) 로 나눈 조각 (BUGS #243/#249).",
 }
 
 
@@ -2211,28 +2219,58 @@ def test_migration_runner_skip_and_failure():
         check_true("실패한 파일은 이력에 없다", "004_bad.sql" not in history(), history())
         check("앞선 이력은 그대로", history(), ["001_a.sql", "002_b.sql", "003_c.sql"])
 
-        # --- 부분 적용 위험을 사실로 고정한다 ---
+        # --- ★ 부분 적용은 이제 일어나지 않는다 (2026-08-27 정정) ---
         #
-        # `conn.executescript()`는 실행 전에 **암묵적으로 커밋**한다. 그래서 여러 문장짜리
-        # 마이그레이션이 중간에 실패하면 **앞 문장은 이미 반영된 채 남는다.**
-        # 그런데 이력에는 기록되지 않으므로 재실행이 처음부터 다시 돌린다 - 앞 문장이
-        # `IF NOT EXISTS` 같은 가드 없이 쓰였다면 "already exists"로 **영원히 완료되지 못한다.**
+        # 예전 이 자리에는 정반대가 적혀 있었다 — *"실패해도 앞 문장은 남아 있다"* 를
+        # **사실로 고정**해 두고 "019를 쓰는 사람이 알아야 하는 성질", "코드는 바꾸지
+        # 않았다(실행 모델 변경은 부트스트랩 전체에 영향을 준다)"로 남겨 두었다.
         #
-        # 이것은 지금까지 발현된 적이 없다(18개 전부 정상 적용됨). 그러나 019를 쓰는 사람이
-        # 알아야 하는 성질이라 검사로 남긴다 - 코드는 바꾸지 않았다(실행 모델 변경은
-        # 부트스트랩 전체에 영향을 준다).
-        check_true("실패해도 앞 문장은 남아 있다(부분 적용)",
-                   "qa_d" in tables(),
-                   "이 전제가 바뀌었다면 위 주석과 019 작성 지침을 갱신해야 한다: %s" % tables())
+        # 그 판단이 뒤집힌 이유는 위험을 **실제로 재현**했기 때문이다
+        # (2026-08-27 크롤->DB 경로 감사, `test_migration_atomicity.py`):
+        #
+        #   - `ALTER ADD COLUMN` 두 개 뒤에서 실패 -> 컬럼 둘 다 남는다. 재실행은
+        #     `duplicate column name` 으로 죽는다. SQLite 에는 ADD COLUMN 용
+        #     IF NOT EXISTS 가 없으므로 **가드를 쓸 수가 없다**(025 주석이 인정한다).
+        #     즉 "가드 없이 쓰면"이 아니라 **가드를 쓸 수 없는 문장이 이미 있었다.**
+        #   - 023/024 의 `DROP 원본` -> `RENAME` 사이에서 죽으면 **원본 테이블이
+        #     사라진 채 확정**된다. 대상이 payment_webhooks / registry_credits 다.
+        #   - 그 상태에서 러너가 raise -> `run_daily.bat` 3단계 exit 1 ->
+        #     **mvp_scraper.py 가 아예 실행되지 않는다.** 한 번의 사고가 매일 06:00
+        #     크롤을 영구히 세운다.
+        #
+        # "지금까지 발현된 적이 없다"는 옛 사유는 파일이 18개일 때의 이야기였고,
+        # 그 뒤 021~025 가 들어오면서 **가드 불가 문장과 DROP/RENAME 이 둘 다 생겼다.**
+        #
+        # 고친 방법: 한 파일 + history INSERT 를 **한 트랜잭션**으로 묶는다. SQLite 는
+        # MySQL/Oracle 과 달리 DDL 도 트랜잭션에 참여하므로 이것으로 충분하다.
+        # (`storage/migrations/run_migrations.py` 의 적용 루프 주석 참고)
+        check_true("실패한 파일은 앞 문장까지 통째로 롤백된다",
+                   "qa_d" not in tables(),
+                   "러너가 다시 executescript()로 돌아갔는가? %s" % tables())
 
-        # 재실행하면 같은 지점에서 다시 실패한다(가드 없는 문장의 결과).
+        # 재실행해도 같은 지점에서 다시 실패한다 — 파일 자체가 아직 잘못됐으니 당연하다.
+        # 달라진 것은 **실패의 성질**이다: 예전에는 "이미 존재한다"로 원인이 바뀌어
+        # 영구히 막혔고, 이제는 매번 원래 오류로 실패하므로 파일만 고치면 풀린다.
         raised_again = False
         try:
             runmig.run()
         except Exception:
             raised_again = True
-        check("가드 없는 문장은 재실행에서도 실패한다", raised_again, True)
+        check("잘못된 파일은 재실행에서도 실패한다", raised_again, True)
         check_true("여전히 이력에 없다", "004_bad.sql" not in history(), history())
+        check_true("재실행 뒤에도 부분 적용이 없다", "qa_d" not in tables(), tables())
+
+        # ★ 그리고 **고치면 그냥 풀린다** — 이것이 원자성으로 얻은 실제 가치다.
+        #   예전 러너에서는 파일을 고쳐도 앞 문장의 잔여물 때문에 계속 막혔다.
+        write("004_bad.sql", "CREATE TABLE IF NOT EXISTS qa_d (w INTEGER);")
+        fixed_error = None
+        try:
+            runmig.run()
+        except Exception as exc:
+            fixed_error = exc
+        check_true("고친 뒤 재실행이 성공한다", fixed_error is None, fixed_error)
+        check("고친 파일이 이력에 들어간다", history(),
+              ["001_a.sql", "002_b.sql", "003_c.sql", "004_bad.sql"])
     finally:
         dbmod.DB_PATH, runmig.MIGRATIONS_DIR = real_db, real_dir
         shutil.rmtree(d, ignore_errors=True)

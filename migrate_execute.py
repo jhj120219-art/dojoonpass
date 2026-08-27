@@ -68,10 +68,51 @@ def calc_bid_rate(appraisal: int, minimum: int) -> float:
         return round(minimum / appraisal, 4)
     return 0.0
 
+# 이 스크립트가 auction_item 에 **쓰는** 컬럼 중, 번호 마이그레이션이 나중에 추가한 것들.
+# 없으면 아래 preflight 가 알아볼 수 있는 말로 막는다.
+REQUIRED_ITEM_COLUMNS = {
+    "building_area": "025_add_auction_item_area_columns.sql",
+    "land_area": "025_add_auction_item_area_columns.sql",
+}
+
+
+def _preflight(conn):
+    """스키마가 이 스크립트보다 뒤처져 있으면 **알아볼 수 있는 말로** 막는다.
+
+    왜 필요한가 (2026-08-27):
+    `run_daily.bat` 은 3단계에서 마이그레이션을 먼저 돌리므로 운영 경로에서는 이 검사가
+    걸리지 않는다. 걸리는 것은 **마이그레이션을 안 돌린 DB 에 이 스크립트만 따로 돌릴 때**다
+    (개발/QA 장비에서 흔하고, 지금 이 저장소의 `auction.db` 가 정확히 그 상태다 —
+    021~025 미적용).
+
+    그때 나오던 메시지가 원인을 가렸다:
+
+        (예전)  sqlite3.OperationalError: no such column: building_area
+        (증분 비교 도입 후)  IndexError: No item with that key   <- 더 나쁘다
+
+    둘 다 "무엇을 하면 되는지"를 말해 주지 않는다. 특히 뒤엣것은 `sqlite3.Row` 가
+    없는 키에 내는 예외라 SQL 문제로 보이지도 않는다. 스키마 문제는 스키마 문제라고
+    말하고, 실행할 명령까지 알려 준다.
+    """
+    have = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)")}
+    missing = sorted(c for c in REQUIRED_ITEM_COLUMNS if c not in have)
+    if missing:
+        raise SystemExit(
+            "\n[중단] auction_item 에 필요한 컬럼이 없습니다: %s\n"
+            "\n이 컬럼들은 아래 마이그레이션이 만듭니다:\n    %s\n"
+            "\n먼저 실행하십시오:\n"
+            "\n    python -m storage.migrations.run_migrations\n"
+            "\n(`run_daily.bat` 은 이 스크립트보다 먼저 그것을 돌립니다. 지금 중단했으므로"
+            "\n DB 는 전혀 변경되지 않았습니다.)\n"
+            % (", ".join(missing),
+               "\n    ".join(sorted({REQUIRED_ITEM_COLUMNS[c] for c in missing}))))
+
+
 def execute():
     conn = get_connection()
     now = datetime.now().isoformat()
     try:
+        _preflight(conn)
         rows = conn.execute("SELECT * FROM auction").fetchall()
         logger.info("원본 데이터 로드: %d건", len(rows))
 
@@ -86,57 +127,74 @@ def execute():
             if key not in case_map:
                 case_map[key] = row
 
-        for (court_code, case_no), row in case_map.items():
-            conn.execute("""
+        # ── 이미 있는 사건은 **문장을 보내지 않는다** (2026-08-27) ────────────────
+        #
+        # 예전에는 유니크 사건 전부에 `INSERT OR IGNORE` 를 한 건씩 보냈다. 그런데 이 표는
+        # 과거 사건까지 계속 누적되므로, 며칠만 지나면 그 문장은 **거의 전부 no-op** 이다.
+        # 그래도 문장 하나당 UNIQUE 인덱스 탐색 + 파이썬<->C 왕복 비용은 그대로 든다.
+        #
+        # 실측(누적 50,000행 / 하루 1,900건이 바뀐 정상 상태, N=50,500 유니크 사건):
+        #     INSERT OR IGNORE INTO auction_case   50,500회  346ms
+        # 그중 실제로 행이 생기는 것은 그날 새로 등장한 사건 몇백 건뿐이다.
+        #
+        # 그래서 순서를 뒤집는다 — **먼저 있는 것을 읽고, 없는 것만 넣는다.**
+        # 어차피 바로 아래에서 `case_id` 를 얻으려고 같은 조회를 하고 있었으므로
+        # 조회가 늘지도 않는다(그 조회를 앞으로 옮긴 것뿐이다).
+        # 결과는 `INSERT OR IGNORE` 와 동일하다: 있으면 그대로 두고, 없으면 만든다.
+        case_keys = list(case_map.keys())
+        case_id_by_key = {}
+
+        def _load_case_ids(keys):
+            """(court_code, case_no) 목록의 id 를 `case_id_by_key` 에 채운다.
+
+            ★★ 한 번에 다 넣지 않고 **나눈다** (2026-08-27, `docs/BUGS.md` #243).
+
+              쌍 하나가 `?` 를 2개 쓰므로 SQLite 의 바인딩 변수 상한
+              (`SQLITE_LIMIT_VARIABLE_NUMBER`, 이 환경 32,766)에 **유니크 사건
+              16,384건째**에서 닿는다. 넘으면 느려지는 것이 아니라
+              `OperationalError: too many SQL variables` 로 **실행이 죽는다.**
+
+              실측(사본 DB, 합성 사건):  16,383건 정상 / 16,384건 파손
+              파손 시 rollback 은 깨끗하지만 auction_case/item/document_status 가
+              **전부 0건** — 그날 크롤이 통째로 버려진다.
+
+              값을 SQL 텍스트로 밀어 넣는 우회(인젝션 위험)로 풀지 않는다 — **나누기만**
+              한다. 나눠도 결과는 동일하다: 각 청크가 서로소인 키 집합을 조회한다.
+              상한은 **이 커넥션에 직접 물어본다** — 상수로 박으면 SQLite 3.31 이하
+              (기본값 999)에서 500건대부터 같은 사고가 난다.
+            """
+            for key_chunk in chunked_for_sql(keys, vars_per_item=2, conn=conn):
+                placeholders = ",".join(["(?,?)"] * len(key_chunk))
+                params = [v for pair in key_chunk for v in pair]
+                for cc_row in conn.execute(
+                    f"SELECT id, court_code, case_no FROM auction_case "
+                    f"WHERE (court_code, case_no) IN ({placeholders})",
+                    params,
+                ).fetchall():
+                    case_id_by_key[(cc_row["court_code"], cc_row["case_no"])] = cc_row["id"]
+
+        _load_case_ids(case_keys)
+        missing_cases = [k for k in case_keys if k not in case_id_by_key]
+        if missing_cases:
+            # `INSERT OR IGNORE` 는 그대로 둔다 — 위 조회와 이 삽입 사이에 다른 실행이
+            # 같은 사건을 넣었을 수 있다(운영에서 두 프로세스가 겹치는 것은 락으로 막지만,
+            # 방어를 조회 시점 가정에 기대게 만들지 않는다).
+            conn.executemany("""
                 INSERT OR IGNORE INTO auction_case
                 (case_no, court_code, court_name, case_type, filed_date, demand_deadline, created_at, updated_at)
                 VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
-            """, (case_no, court_code, row["court_name"],
-                  row["created_at"] or now, row["updated_at"] or now))
+            """, [(case_no, court_code, case_map[(court_code, case_no)]["court_name"],
+                   case_map[(court_code, case_no)]["created_at"] or now,
+                   case_map[(court_code, case_no)]["updated_at"] or now)
+                  for (court_code, case_no) in missing_cases])
+            _load_case_ids(missing_cases)
 
-        logger.info("auction_case 완료: %d건", len(case_map))
+        logger.info("auction_case 완료: %d건 (신규 %d건, 기존 %d건)",
+                    len(case_map), len(missing_cases), len(case_map) - len(missing_cases))
 
-        # 2026-08-15 Sprint 129: (court_code, case_no) -> case_id를 한 번에 메모리로 읽어 온다.
-        # 아래 두 루프(§2 auction_item, §3 document_status)가 원래 각자 row마다
-        # `SELECT ... WHERE court_code=? AND case_no=?`를 따로 실행했다(N+1) — 위에서 이미
-        # case_map으로 (court_code, case_no) 단위 유니크 집합을 구해 뒀는데, 그 뒤 row 단위로
-        # 다시 조회하고 있었다. 인덱스가 있어 각 조회 자체는 빠르지만(현재 실측 2,156건에서
-        # 체감 지연 없음), row 수만큼 배로 늘어나는 구조라 크롤 데이터가 늘수록 그대로
-        # 커진다. `auction_case`는 과거 사건까지 계속 누적되는 테이블이라(오늘 기준
-        # 1,574건 = case_map과 우연히 같지만 항상 같다는 보장은 없다) 전체를 긁는 대신,
-        # SQLite의 row-value IN(3.15+, 이 환경 3.50)으로 지금 필요한 키만 한 번에 읽는다 —
-        # 결과는 기존 개별 조회와 동일하다(같은 UNIQUE(court_code, case_no) 제약을 그대로 사용).
-        #
-        # ★★ 그 "한 번에"에는 **상한이 있다** (2026-08-27, `docs/BUGS.md` #243).
-        #
-        #   쌍 하나가 `?` 를 2개 쓰므로 SQLite 의 바인딩 변수 상한
-        #   (`SQLITE_LIMIT_VARIABLE_NUMBER`, 이 환경 32,766)에 **유니크 사건 16,384건째**
-        #   에서 닿는다. 넘으면 느려지는 것이 아니라
-        #   `OperationalError: too many SQL variables` 로 **실행이 죽는다.**
-        #
-        #   실측(사본 DB, 합성 사건):  16,383건 정상 / 16,384건 파손
-        #   파손 시 결과: rollback 은 깨끗하지만(부분 커밋 0) auction_case/item/
-        #   document_status 가 **전부 0건** — 그날 크롤이 통째로 버려진다.
-        #
-        #   지금 운영 DB 는 유니크 사건 1,882건(상한의 11%)이라 아직 닿지 않는다.
-        #   그러나 이 스크립트는 **60개 법원을 매일 전수**로 도는 구조라 수집 범위가
-        #   넓어지면 닿는 수이고, 닿는 날 조용히가 아니라 **전면 중단**된다.
-        #
-        #   값을 SQL 텍스트로 밀어 넣는 우회(인젝션 위험)로 풀지 않는다 — **나누기만** 한다.
-        #   나눠도 결과는 동일하다: 각 청크가 서로소인 키 집합을 조회해 같은 dict 에 담는다.
-        case_keys = list(case_map.keys())
-        case_id_by_key = {}
-        #   상한은 **이 커넥션에 직접 물어본다** — 상수로 박으면 SQLite 3.31 이하
-        #   (기본값 999)에서 500건대부터 같은 사고가 난다.
-        for key_chunk in chunked_for_sql(case_keys, vars_per_item=2, conn=conn):
-            placeholders = ",".join(["(?,?)"] * len(key_chunk))
-            params = [v for pair in key_chunk for v in pair]
-            for cc_row in conn.execute(
-                f"SELECT id, court_code, case_no FROM auction_case "
-                f"WHERE (court_code, case_no) IN ({placeholders})",
-                params,
-            ).fetchall():
-                case_id_by_key[(cc_row["court_code"], cc_row["case_no"])] = cc_row["id"]
+        # (이 조회는 위 auction_case 블록의 `_load_case_ids()` 로 옮겼다 — 2026-08-27.
+        #  Sprint 129 가 §2/§3 의 row 단위 N+1 조회를 없애려고 여기 만든 것인데, 이제
+        #  삽입 전에 먼저 읽어야 해서 앞으로 갔다. 상한 나누기 사유는 그 함수 docstring 참고.)
 
         # 2. auction_item UPSERT
         # Sprint: auction -> auction_item 최신화 동기화.
@@ -157,6 +215,7 @@ def execute():
         item_count = 0
         item_inserted = 0
         item_updated = 0
+        item_unchanged = 0   # 값이 그대로라 UPDATE 를 보내지 않은 행
         field_changes = {}    # 필드명 -> 실제로 값이 바뀐 행 수
         changed_samples = []  # 로그에 남길 예시(최대 10건)
         changed_items = []    # 재수집 예약 대상(물건 키 + 바뀐 필드 목록)
@@ -237,25 +296,79 @@ def execute():
                 # (2026-08-26). 못 뽑으면 None 이 들어가 컬럼이 NULL 로 남는다.
                 _areas = extract_areas(full_address or "")
 
-                conn.execute("""
-                    UPDATE auction_item SET
-                        court_name=?, property_type=?, sido=?, sigungu=?, dong=?,
-                        lot_number=?, full_address=?, appraisal_price=?,
-                        minimum_bid_price=?, auction_date=?, status=?,
-                        fail_count=?, bid_rate=?, validation_status=?,
-                        crawl_date=?, updated_at=?,
-                        building_area=?, land_area=?
-                    WHERE case_id=? AND item_no=?
-                """, (
-                    court_name, property_type, sido, sigungu, dong,
-                    lot_number, full_address, appraisal_price,
-                    minimum_bid_price, auction_date, status,
-                    fail_count, bid_rate, validation_status,
-                    crawl_date, now,
-                    _areas["building_area"], _areas["land_area"],
-                    case_id, row["item_no"],
-                ))
-                item_updated += 1
+                # ── 값이 그대로면 UPDATE 를 보내지 않는다 (2026-08-27) ─────────
+                #
+                # 이 함수는 `SELECT * FROM auction` 으로 **누적 전체**를 읽어 매일 전부
+                # UPDATE 했다. 하루에 새로 들어오는 것은 1,900건 안팎인데, 비용은
+                # 그날 수집량이 아니라 **누적 행수**를 따라간다. 실측(하루치 실행 1회):
+                #
+                #     누적       upsert   enqueue  migrate   합계
+                #      2,000      46ms      89ms    208ms     0.34초
+                #      5,000      81ms     148ms    508ms     0.74초
+                #     10,000     246ms     652ms  3,902ms     4.80초
+                #     25,000   1,377ms   1,653ms 10,322ms    13.35초
+                #     50,000   2,478ms   2,718ms 15,942ms    21.14초
+                #
+                # 25배 데이터에 62배 시간이다. 비용이 어디로 가는지도 쟀다 —
+                # N=25,000 프로파일에서 `INSERT/UPDATE auction_item` 한 문장이
+                # 전체의 49.8%(25,000회 1,625ms, 건당 65µs)였다. 같은 실행의
+                # `document_status` INSERT 는 건당 9.8µs 다. 차이는 **인덱스 개수**다
+                # (auction_item 15개 vs document_status 2개, 65/9.8 = 6.6배로 거의 정확히
+                # 비례한다). 즉 진짜 병목은 쿼리 횟수가 아니라 **인덱스 쓰기 증폭**이고,
+                # 행 단위 SELECT 는 전체의 2.5%에 불과했다(그쪽을 고쳐도 소용없다).
+                #
+                # 그러면 답은 "더 빨리 쓴다"가 아니라 **안 바뀐 행은 쓰지 않는다**이다.
+                # 누적분의 대부분은 오늘 크롤 대상이 아니라 `auction` 쪽 값이 그대로이므로,
+                # 지금 쓰려는 값이 `existing` 과 전부 같으면 UPDATE 를 건너뛴다.
+                #
+                # ★ 비교는 **쓰는 값 전부**로 한다. 위 `changed_fields` 4개(기일/최저가/
+                #   상태/감정가)만 보면 안 된다 — 주소 정정이나 면적 백필처럼 그 4개 밖에서
+                #   일어나는 갱신을 놓치고 조용히 반영되지 않는다.
+                #
+                # ★ `updated_at` 은 비교에서 뺀다. 매 실행 `now` 라 넣으면 항상 달라져
+                #   건너뛸 수 있는 행이 하나도 없어진다. 대신 의미가 **좋아진다** —
+                #   지금까지는 전 행이 마지막 실행 시각이라 아무 정보가 없었고
+                #   (실측: 1,876행 100%가 같은 값), 이제 "이 행이 마지막으로 실제
+                #   변한 시각"이 된다. 제품 코드에 `auction_item.updated_at` 을 읽는 곳은
+                #   없다(전수 확인). 수집 신선도는 `audit_schedule_health.py` 가
+                #   `MAX(auction_item.crawl_date)` 로 보는데, 오늘 크롤된 행은 crawl_date 가
+                #   달라져 그대로 UPDATE 되므로 그 판정은 바뀌지 않는다.
+                _new = (court_name, property_type, sido, sigungu, dong,
+                        lot_number, full_address, appraisal_price,
+                        minimum_bid_price, auction_date, status,
+                        fail_count, bid_rate, validation_status, crawl_date,
+                        _areas["building_area"], _areas["land_area"])
+                _old = (existing["court_name"], existing["property_type"],
+                        existing["sido"], existing["sigungu"], existing["dong"],
+                        existing["lot_number"], existing["full_address"],
+                        existing["appraisal_price"], existing["minimum_bid_price"],
+                        existing["auction_date"], existing["status"],
+                        existing["fail_count"], existing["bid_rate"],
+                        existing["validation_status"], existing["crawl_date"],
+                        existing["building_area"], existing["land_area"])
+
+                if _new == _old:
+                    item_unchanged += 1
+                else:
+                    conn.execute("""
+                        UPDATE auction_item SET
+                            court_name=?, property_type=?, sido=?, sigungu=?, dong=?,
+                            lot_number=?, full_address=?, appraisal_price=?,
+                            minimum_bid_price=?, auction_date=?, status=?,
+                            fail_count=?, bid_rate=?, validation_status=?,
+                            crawl_date=?, updated_at=?,
+                            building_area=?, land_area=?
+                        WHERE case_id=? AND item_no=?
+                    """, (
+                        court_name, property_type, sido, sigungu, dong,
+                        lot_number, full_address, appraisal_price,
+                        minimum_bid_price, auction_date, status,
+                        fail_count, bid_rate, validation_status,
+                        crawl_date, now,
+                        _areas["building_area"], _areas["land_area"],
+                        case_id, row["item_no"],
+                    ))
+                    item_updated += 1
                 item_id_by_key[(case_id, row["item_no"])] = existing["id"]
             else:
                 _areas = extract_areas(row["full_address"] or "")
@@ -287,11 +400,41 @@ def execute():
                 item_id_by_key[(case_id, row["item_no"])] = cur.lastrowid
             item_count += 1
 
-        logger.info("auction_item 완료: %d건 (신규 %d건, 갱신 %d건)",
-                    item_count, item_inserted, item_updated)
+        # 건너뛴 건수를 **반드시 함께** 남긴다. 이 값이 0에 가까우면 위 최적화가
+        # 무력화된 것이고(예: 매일 달라지는 필드가 새로 UPDATE 목록에 들어옴),
+        # 그때 조용히 느려지는 대신 로그에서 먼저 보이게 하려는 것이다.
+        logger.info("auction_item 완료: %d건 (신규 %d건, 갱신 %d건, 변화없어 건너뜀 %d건)",
+                    item_count, item_inserted, item_updated, item_unchanged)
 
         # 3. document_status 마이그레이션
         logger.info("document_status 마이그레이션 시작...")
+
+        # ── 이미 있는 (item_id, doc_type) 은 **문장을 보내지 않는다** (2026-08-27) ──
+        #
+        # 이 루프는 auction 한 행마다 `INSERT OR IGNORE` 를 3번 보냈다. `document_status`
+        # 는 물건이 처음 등장할 때 한 번 만들어지고 그 뒤로는 계속 남으므로, 정상 상태에서
+        # 이 문장은 **거의 전부 no-op** 이다. 그런데도 매번 UNIQUE 인덱스 탐색과
+        # 파이썬<->C 왕복 비용을 낸다. 이 파일에서 **가장 많이 실행되는 문장**이었다.
+        #
+        # 실측(누적 50,000행, 하루 1,900건 변경의 정상 상태):
+        #     INSERT OR IGNORE INTO document_status   151,500회  1,116ms  (SQL 시간의 18.8%)
+        #     실제로 행이 생기는 것                     1,500건 (그날 신규 물건 500 x 3종)
+        #
+        # cProfile 로 보면 이 파일 전체(4.87초)에서 `sqlite3.Connection.execute` 가
+        # 2.54초(52%)였고 호출이 254,892회였다 — 즉 남은 병목은 쿼리 하나의 무게가 아니라
+        # **문장 개수 그 자체**다. 그래서 "빨리 보내기"가 아니라 **안 보내기**로 푼다.
+        #
+        # 있는 것을 한 번에 읽어 집합으로 들고, 없는 것만 `executemany` 로 넣는다.
+        # 결과는 `INSERT OR IGNORE` 와 동일하다 — 있으면 그대로 두고(상태도 그대로:
+        # OR IGNORE 는 원래 갱신하지 않았다) 없으면 만든다.
+        #
+        # doc_worker 가 만드는 IMAGE 행도 이 집합에 섞여 들어오지만 무해하다 —
+        # 아래 루프는 `MIGRATED_DOC_TYPE_COLUMNS` 의 3종만 조회한다.
+        existing_ds = set()
+        for _ds in conn.execute("SELECT item_id, doc_type FROM document_status"):
+            existing_ds.add((_ds["item_id"], _ds["doc_type"]))
+
+        ds_pending = []
         ds_count = 0
         for row in rows:
             # ★ 조회에 법원이 들어가야 한다 (2026-08-14).
@@ -326,15 +469,28 @@ def execute():
                 continue
 
             for doc_type, col in MIGRATED_DOC_TYPE_COLUMNS:
-                status = "READY" if row[col] == 1 else "COLLECTING"
-                conn.execute("""
-                    INSERT OR IGNORE INTO document_status
-                    (item_id, doc_type, status, updated_at)
-                    VALUES (?, ?, ?, ?)
-                """, (item_id, doc_type, status, now))
                 ds_count += 1
+                if (item_id, doc_type) in existing_ds:
+                    continue
+                status = "READY" if row[col] == 1 else "COLLECTING"
+                ds_pending.append((item_id, doc_type, status, now))
+                # 같은 실행 안에서 같은 키가 두 번 나오는 것도 막는다
+                # (auction 의 UNIQUE 제약상 있어서는 안 되지만, 방어를 그 가정에 기대지 않는다)
+                existing_ds.add((item_id, doc_type))
 
-        logger.info("document_status 완료: %d건", ds_count)
+        if ds_pending:
+            # `INSERT OR IGNORE` 를 그대로 둔다 — 위 조회와 이 삽입 사이에 다른 실행이
+            # 같은 행을 넣었을 수 있다(auction_case 쪽과 같은 이유).
+            conn.executemany("""
+                INSERT OR IGNORE INTO document_status
+                (item_id, doc_type, status, updated_at)
+                VALUES (?, ?, ?, ?)
+            """, ds_pending)
+
+        # 대상 건수와 **실제로 넣은 건수**를 함께 남긴다. 둘째 값이 매일 크게 나오면
+        # document_status 가 어딘가에서 지워지고 있다는 뜻이라 그 자체가 신호다.
+        logger.info("document_status 완료: 대상 %d건 (신규 %d건, 기존 %d건)",
+                    ds_count, len(ds_pending), ds_count - len(ds_pending))
 
         conn.commit()
         logger.info("마이그레이션 커밋 완료")

@@ -63,6 +63,21 @@ TOOLS = [
     "audit_asset_integrity.py",
     "audit_schedule_health.py",
     "audit_auth_health.py",
+    # 2026-08-25 추가 - 이 도구는 "다른 검사가 공허하지 않은가"를 재면서
+    #   정작 자기 자신은 아무도 재지 않았다. 실제로 측정 실패의 이유를
+    #   한 글자도 남기지 않는 구멍이 있었다(BUGS #188).
+    "audit_test_reality.py",
+    # 2026-08-25 추가 - 감사기는 아니지만 같은 부류다(측정 전용, 쓰지 않는다).
+    #   이 도구의 분류 라벨이 틀렸을 때 나오는 것은 오류가 아니라
+    #   **그럴듯한 숫자**라 조용히 틀린다 - 실제로 한 번 그랬했다(BUGS #189).
+    "measure_endless_collecting.py",
+    # 2026-08-25 추가 (BUGS #193) - 이 둘은 BUGS #188 이 "--selftest 가 아직 없다"고
+    #   남겨 둔 항목이다. 그 사이 실제로 대가를 치렀다: audit_contrast.py 는
+    #   드라이버 해석 실패를 40줄짜리 트레이스백으로 토했고, 텍스트 노드를
+    #   0개 보고도 "기준 미달 0" 으로 **종료코드 0** 을 돌려줄 수 있었다.
+    #   selftest 는 브라우저도 서버도 네트워크도 쓰지 않는다(판정 로직만 본다).
+    "audit_viewport.py",
+    "audit_contrast.py",
 ]
 
 
@@ -90,7 +105,7 @@ def test_tools_are_tracked():
 
 def test_selftests_pass():
     print("\n--- 감사 도구 --selftest ---")
-    check_true("검사가 공허하지 않다(도구 목록이 비어 있지 않다)", len(TOOLS) >= 3, TOOLS)
+    check_true("검사가 공허하지 않다(도구 목록이 비어 있지 않다)", len(TOOLS) >= 7, TOOLS)
     for tool in TOOLS:
         path = os.path.join(ROOT, tool)
         if not os.path.exists(path):
