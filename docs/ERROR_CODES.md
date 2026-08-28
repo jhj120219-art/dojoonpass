@@ -40,7 +40,7 @@ Owner: CTO
 | `REGISTRY` | 등기부 신청·무료횟수 (`api/v1/registry.py`, `registry_credits.py`) |
 | `ADMIN` | 관리자 (`api/v1/admin.py`) |
 | `SUBSCRIPTION` | 구독 (`api/v1/subscriptions.py`) |
-| `FAVORITE` | 관심물건 (`api/v1/favorites.py`) |
+| `FAVORITE` | 관심물건 (`api/v1/favorites.py`, `favorite_import.py`) |
 | `ITEM` / `INTERNAL` | 물건 공통 / 서버 내부 |
 
 ---
@@ -112,6 +112,9 @@ Owner: CTO
 |---|---|
 | `FAVORITE_ALREADY_EXISTS` | 이미 관심물건으로 등록됨 |
 | `FAVORITE_NOT_FOUND` | 등록된 관심물건 없음 |
+| `FAVORITE_IMPORT_EMPTY` | 가져오기 커밋에 항목이 하나도 없음 |
+| `FAVORITE_IMPORT_TOO_LARGE` | 가져오기 1회 상한(500건) 초과 |
+| `FAVORITE_NOTE_UNAVAILABLE` | 메모/태그 테이블(migration 026) 미적용 |
 | `ITEM_NOT_FOUND` | 물건 없음 |
 | `INTERNAL_ERROR` | 분류되지 않은 서버 오류 |
 

@@ -226,6 +226,21 @@ export async function postJSON<T>(path: string, body: unknown, token: string,
   }, REQUEST_TIMEOUT_MS, path, jsonConsumer<ApiEnvelope<T>>(path))
 }
 
+// PUT. `postJSON` 과 계약이 같다(타임아웃/detail 전달/envelope). 2026-08-28 Sprint 270 에
+// 관심물건 메모 편집(`PUT /api/v1/favorites/{id}/note`)이 처음 PUT 을 쓰면서 추가했다.
+// 화면에서 맨 fetch 를 부르지 않는다는 규칙을 지키기 위해 여기에 둔다
+// (`tests/api-timeout.test.mjs` 가 그 규칙을 잠근다).
+export async function putJSON<T>(path: string, body: unknown, token: string,
+                                 signal?: AbortSignal): Promise<ApiEnvelope<T>> {
+  return timedRequest<ApiEnvelope<T>>(`${API_BASE_URL}${path}`, {
+    method: 'PUT',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+    signal,
+  }, REQUEST_TIMEOUT_MS, path, jsonConsumer<ApiEnvelope<T>>(path))
+}
+
 export async function deleteJSON<T>(path: string, token: string,
                                     signal?: AbortSignal): Promise<ApiEnvelope<T>> {
   return timedRequest<ApiEnvelope<T>>(`${API_BASE_URL}${path}`, {

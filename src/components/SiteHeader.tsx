@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import PrimaryNav, { type PrimaryNavCurrent } from './PrimaryNav'
 import LogoutButton from '@/app/properties/LogoutButton'
+import TextSizeToggle from './TextSizeToggle'
 import { createClient } from '@/lib/supabaseClient'
 import { CONTAINER } from '@/lib/layout'
 
@@ -82,6 +83,10 @@ export default function SiteHeader({ current, title }: SiteHeaderProps) {
             `justify-end` 는 접혔을 때도 지금처럼 오른쪽 정렬을 유지하기 위한 것이다
             (한 줄에 들어갈 때는 바깥 `justify-between` 이 이미 오른쪽에 붙이므로 변화 없음). */}
         <div className="flex flex-wrap items-center justify-end gap-3 min-w-0">
+          {/* 큰글씨 토글은 **모든 화면**에 있어야 한다 — 목록에서 켠 크기가 상세로
+              넘어가면 그 화면에서도 끌 수 있어야 하고, 헤더는 8개 화면이 공유하는
+              유일한 자리다(Master Spec §5.3). 새 화면이 생겨도 자동으로 따라간다. */}
+          <TextSizeToggle />
           <PrimaryNav current={current} />
           {authChecked &&
             (email ? (

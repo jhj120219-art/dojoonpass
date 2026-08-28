@@ -298,6 +298,9 @@ EMITTED_ERROR_CODES = {
     "REGISTRY_SUBSCRIPTION_REQUIRED", "REGISTRY_NOT_COMPLETED", "REGISTRY_DOCUMENT_NOT_FOUND",
     # api/v1/favorites.py
     "FAVORITE_ALREADY_EXISTS", "FAVORITE_NOT_FOUND",
+    # api/v1/favorite_import.py (2026-08-28 마이리스트 가져오기)
+    "FAVORITE_IMPORT_EMPTY", "FAVORITE_IMPORT_TOO_LARGE",
+    "FAVORITE_NOTE_UNAVAILABLE", "ITEM_NOT_FOUND",
 }
 
 
@@ -1826,6 +1829,12 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
     ("api/v1/audit.py",
      "SELECT * FROM audit_logs WHERE %s ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"),
     ("api/v1/payments.py", "UPDATE payment_logs SET payment_id=? WHERE id IN (%s)"),
+    # 2026-08-28 마이리스트 가져오기 (api/v1/favorite_import.py:fetch_candidates).
+    # 첫 `%s` 는 **모듈 상수** `_ITEM_COLUMNS`(컬럼 이름 리터럴)이고, 둘째 `%s` 는
+    # `",".join("?" * len(chunk))` / `" OR ".join(["case_no LIKE ?"] * len(chunk))` --
+    # 즉 **`?` 반복뿐**이다. 사용자가 붙여넣은 사건번호는 예외 없이 바인딩된다.
+    ("api/v1/favorite_import.py", "SELECT %s FROM auction_item WHERE case_no IN (%s)"),
+    ("api/v1/favorite_import.py", "SELECT %s FROM auction_item WHERE %s"),
     ("storage/database.py", "PRAGMA foreign_keys = %s"),
     # 2026-08-26 신설. `%s` 자리에 들어가는 것은 `",".join("?" * len(MIGRATED_DOC_TYPES))`,
     # 즉 **`?` 반복뿐**이고 값은 전부 바인딩된다. `MIGRATED_DOC_TYPES` 는 모듈 상수
@@ -2003,6 +2012,10 @@ SQL_PLACEHOLDER_SITES = {
         "refresh_queue_priority(): chunked_for_sql(vars_per_item=1) 로 나눈 조각 (BUGS #243/#249).",
     ("storage/database.py", "len(key_chunk)"):
         "enqueue_documents() 선조회: chunked_for_sql(vars_per_item=3) 로 나눈 조각 (BUGS #243/#249).",
+    # 2026-08-28 마이리스트 가져오기. 붙여넣은 사건번호는 사용자 입력이라 개수를
+    # 우리가 정하지 못한다(파서 상한 500줄 x 병합 사건 구성요소). chunked_for_sql() 로 나눈다.
+    ("api/v1/favorite_import.py", "len(chunk)"):
+        "fetch_candidates(): chunked_for_sql(vars_per_item=1) 로 나눈 조각 (BUGS #243).",
 }
 
 

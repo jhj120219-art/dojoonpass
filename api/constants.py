@@ -235,6 +235,13 @@ class ErrorCode(StrEnum):
     # FAVORITE / COMMON
     FAVORITE_ALREADY_EXISTS = "FAVORITE_ALREADY_EXISTS"
     FAVORITE_NOT_FOUND = "FAVORITE_NOT_FOUND"
+    # 마이리스트 가져오기 (2026-08-28, api/v1/favorite_import.py)
+    FAVORITE_IMPORT_EMPTY = "FAVORITE_IMPORT_EMPTY"
+    FAVORITE_IMPORT_TOO_LARGE = "FAVORITE_IMPORT_TOO_LARGE"
+    # 메모/태그 테이블(migration 026)이 아직 적용되지 않은 환경. **조용히 성공하지
+    # 않기 위해** 별도 코드를 둔다 - INTERNAL_ERROR 로 뭉뚱그리면 화면이 "서버 오류"를
+    # 띄워, 운영자가 고쳐야 할 것(마이그레이션 적용)을 알 수 없다.
+    FAVORITE_NOTE_UNAVAILABLE = "FAVORITE_NOTE_UNAVAILABLE"
     ITEM_NOT_FOUND = "ITEM_NOT_FOUND"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 

@@ -2513,6 +2513,12 @@ EXPECTED_ENDPOINTS = {
     ("GET", "/api/v1/favorites"),
     ("POST", "/api/v1/favorites"),
     ("DELETE", "/api/v1/favorites/{item_id}"),
+    # 2026-08-28 마이리스트 가져오기 (api/v1/favorite_import.py).
+    # preview 는 **읽기 전용**이지만 붙여넣은 텍스트가 본문에 실려야 하므로 POST 다
+    # (URL 길이 제한 때문에 GET 으로는 500줄을 보낼 수 없다).
+    ("POST", "/api/v1/favorites/import/preview"),
+    ("POST", "/api/v1/favorites/import/commit"),
+    ("PUT", "/api/v1/favorites/{item_id}/note"),
     ("GET", "/api/v1/recent-items"),
     ("GET", "/api/v1/search-presets"),
     ("POST", "/api/v1/search-presets"),

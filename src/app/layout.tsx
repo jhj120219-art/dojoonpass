@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { textSizeBootScript } from "@/lib/textSize";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -31,6 +32,14 @@ export default function RootLayout({
       lang="ko"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
+      <head>
+        {/* 큰글씨 설정을 **첫 페인트 전에** 반영한다.
+            없으면 기본 크기로 한 번 그려진 뒤 커져서 글자가 눈에 띄게 튄다(FOUC).
+            스크립트 본문은 `@/lib/textSize` 가 자기 상수로 만들어 낸다 — 배율과
+            저장키를 여기에 다시 적지 않는다(정본 하나). 사용자 입력이 들어가지
+            않는 고정 문자열이라 주입 위험이 없다. */}
+        <script dangerouslySetInnerHTML={{ __html: textSizeBootScript() }} />
+      </head>
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );

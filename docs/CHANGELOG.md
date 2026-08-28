@@ -4824,7 +4824,8 @@ Sprint 232~233 - 불필요한 드라이버 재시작 제거 / Admin 키 회귀 /
 **전면 Audit (전부 이번 세션 실측)**
 ```
 라우트 인증 경계  38개: 보호 16 / 공개 8 / 422 1 / 500 13(admin) / SKIP 4
-                  공개 8개에 개인정보·관리 기능 없음
+                  공개 8개에 관리 기능 없음
+                  ("개인정보 없음"은 오판이었다 - 2026-08-28 BUGS #254)
 Cache            사진 235KB·문서 396KB 모두 ETag+Last-Modified, If-None-Match -> 304/0B
                   틀린 ETag -> 200(공허하지 않음). JSON API 는 캐시 헤더 없음
 성능             search20 14.8ms / search100 20.6ms / item 4.3ms / image 5.5ms / stats 4.1ms

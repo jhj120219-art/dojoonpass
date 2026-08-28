@@ -287,7 +287,7 @@ export default function MyPage() {
         {/* --- 이미 전용 화면이 있는 것들은 링크만 --- */}
         <section className={CARD}>
           <h2 className={SECTION_TITLE}>내 물건</h2>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Link
               href="/favorites"
               className="flex-1 text-center rounded-xl bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-600"
@@ -299,6 +299,16 @@ export default function MyPage() {
               className="flex-1 text-center rounded-xl bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-600"
             >
               최근 본 물건
+            </Link>
+            {/* 2026-08-28 — 다른 곳에서 관리하던 목록을 가져오는 진입점.
+                마이페이지에 두는 이유: 처음 온 사용자가 "내 것을 옮겨 오는" 일을
+                찾는 자리가 여기다. 화면 자체는 /favorites/import 하나뿐이고
+                여기서는 링크만 둔다(기능 중복 구현 금지). */}
+            <Link
+              href="/favorites/import"
+              className="flex-1 text-center rounded-xl bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-600"
+            >
+              목록 가져오기
             </Link>
           </div>
         </section>

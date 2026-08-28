@@ -25,6 +25,57 @@ def _area_of(row, key):
         return row[key]
     except (IndexError, KeyError):
         return None
+# ---------------------------------------------------------------------------
+# 곁딸린 테이블을 응답에 실을 때 **컬럼을 명시한다** (2026-08-28)
+#
+# 이 엔드포인트는 **비인증 공개 경로**다(`test_api_regression.PUBLIC_ENDPOINTS`).
+# 본체(auction_item)는 아래에서 필드를 하나씩 적어 내보내는데, 곁딸린 세 테이블만
+# `dict(row)` 로 **행 전체**를 실었다. 그래서 마이그레이션이 그 테이블에 컬럼을 하나
+# 추가하면 **그날로 인증 없이 읽히는 API 에 실린다** ― 아무도 그렇게 결정하지 않았고,
+# 알려 줄 검사도 없었다.
+#
+# 실제로 그 세 테이블에는 개인정보가 들어 있다(2026-08-28 실측).
+#
+#     tenant_rights   tenant_name 240/519 행이 **실명** + occupied_area(전체 주소)
+#                     + deposit / monthly_rent / move_in_date / fixed_date
+#
+# 그리고 감사 문서 두 곳은 **"공개 경로에 개인정보 없음"** 이라고 적고 있었다
+# (`docs/CURRENT_STATE.md` §9229, `docs/CHANGELOG.md` §4827). `docs/BUGS.md` #254.
+#
+# ★ 아래 목록은 **지금 나가고 있는 컬럼 그대로**다. 응답은 한 글자도 바뀌지 않는다.
+#   좁히지 않는 이유: 그것은 API 계약 축소라 소비자를 먼저 옮겨야 한다. 여기서 막는
+#   것은 "앞으로 늘어나는 것"이다 ― 새 컬럼은 이 목록에 적기 전에는 나가지 않고,
+#   적는 순간 그것이 곧 공개 결정이 된다.
+#
+#   마스킹 여부(임차인 성명을 김○○ 로 가릴 것인가)는 **제품·법무 판단**이라 여기서
+#   정하지 않는다. 임차인 성명은 대항력 판단의 근거라 가리면 권리분석이 약해진다 ―
+#   `docs/BUGS.md` #254 에 승인 대기로 등록했다.
+_TENANT_FIELDS = (
+    "id", "item_id", "tenant_name", "occupied_area", "deposit", "monthly_rent",
+    "move_in_date", "fixed_date", "demand_date", "has_demand", "source", "created_at",
+)
+_CASE_FIELDS = (
+    "id", "case_no", "court_code", "court_name", "case_type", "filed_date",
+    "demand_deadline", "created_at", "updated_at",
+)
+_RIGHTS_FIELDS = (
+    "id", "item_id", "priority_right", "priority_date", "total_tenant_count",
+    "dangerous_tenant_count", "total_deposit", "estimated_inheritance", "lien_exists",
+    "superficies_exists", "foreclosure_note", "occupancy_status", "is_vacant",
+    "occupancy_difficulty", "risk_level", "risk_reason", "analysis_explanation",
+    "analysis_version", "analysis_date", "created_at", "updated_at",
+)
+
+
+def _project(row, fields):
+    """`row` 에서 `fields` 만 뽑는다. 없는 컬럼은 `_area_of` 와 같은 이유로 null 이다.
+
+    옛 스키마(마이그레이션 지연 백업 등)에서 컬럼 하나가 없다고 상세 전체가 500 이
+    되면 안 된다 ― 이 파일이 면적 컬럼에서 이미 내린 판단과 같다.
+    """
+    return {f: _area_of(row, f) for f in fields}
+
+
 bearer_scheme = HTTPBearer(auto_error=False)
 
 @router.get("/item/{item_id}")
@@ -147,7 +198,7 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             # 못 뽑는 물건(차량/선박 등)은 null 이다 — 0 이 아니다.
             "building_area": _area_of(row, "building_area"),
             "land_area": _area_of(row, "land_area"),
-            "case": dict(case) if case else None,
+            "case": _project(case, _CASE_FIELDS) if case else None,
             # ★ 기존 계약 유지: `doc_type`/`status`는 그대로 있고 **키만 늘었다**.
             #    프런트의 기존 코드(`property.documents.some(d => d.doc_type==='SPEC' ...)`)는
             #    무변경으로 계속 동작한다.
@@ -159,8 +210,8 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             # 원천에 그런 개념이 없어서 우리가 임의로 정하면 근거 없는 값이 되기 때문이다.
             "representative_image": (_image_entry(item_id, images[0]) if images else None),
             "images_status": _images_status(doc_status, len(images)),
-            "tenants": [dict(t) for t in tenants],
-            "rights_summary": dict(rights) if rights else None,
+            "tenants": [_project(t, _TENANT_FIELDS) for t in tenants],
+            "rights_summary": _project(rights, _RIGHTS_FIELDS) if rights else None,
             "is_favorited": is_favorited,
         }
     finally:

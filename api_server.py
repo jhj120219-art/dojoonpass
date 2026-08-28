@@ -34,6 +34,7 @@ from api.v1.search import router as search_router
 from api.v1.item import router as item_router
 from api.v1.doc_stats import router as doc_stats_router
 from api.v1.favorites import router as favorites_router
+from api.v1.favorite_import import router as favorite_import_router
 from api.v1.recent_items import router as recent_router
 from api.v1.search_presets import router as presets_router
 from api.v1.registry import router as registry_router
@@ -159,6 +160,11 @@ app.include_router(search_router, prefix="/api/v1", tags=["search"])
 app.include_router(item_router, prefix="/api/v1", tags=["item"])
 app.include_router(doc_stats_router, prefix="/api/v1", tags=["document"])
 app.include_router(favorites_router, prefix="/api/v1", tags=["favorites"])
+# 마이리스트 가져오기 / 메모·태그 (2026-08-28). favorites_router **뒤에** 둔다 -
+# 두 라우터가 같은 접두사를 쓰므로, FastAPI 는 먼저 등록된 경로를 먼저 본다.
+# `/favorites/{item_id}` (DELETE) 와 `/favorites/import/preview` (POST) 는 메서드가
+# 달라 충돌하지 않지만, 순서를 바꾸면 앞으로 추가될 GET 경로에서 갈릴 수 있다.
+app.include_router(favorite_import_router, prefix="/api/v1", tags=["favorites"])
 app.include_router(recent_router, prefix="/api/v1", tags=["recent"])
 app.include_router(presets_router, prefix="/api/v1", tags=["presets"])
 app.include_router(registry_router, prefix="/api/v1", tags=["registry"])

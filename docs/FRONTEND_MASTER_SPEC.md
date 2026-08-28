@@ -57,6 +57,7 @@ Scope: DOJOONPASS(서비스명 **콕찰**) Frontend 전체
 | `/login` | `src/app/login/page.tsx` + `actions.ts` | 로그인 / 회원가입 통합 폼 | **공개** |
 | `/properties/[id]` | `src/app/properties/[id]/page.tsx` | 물건 상세 | **로그인 필수** |
 | `/favorites` | `src/app/favorites/page.tsx` | 관심물건 목록 | **로그인 필수** (Sprint 45부터 서버 게이트 — 현재 `src/proxy.ts`) |
+| `/favorites/import` | `src/app/favorites/import/page.tsx` | **마이리스트 가져오기**(2026-08-28 Sprint 270). 다른 곳에서 관리하던 목록을 붙여넣어 물건과 맞춘 뒤 담는다 | **로그인 필수** (`/favorites` 접두사 게이트가 그대로 덮는다 — 새 게이트를 추가하지 않았다) |
 | `/properties/recent` | `src/app/properties/recent/page.tsx` | 최근 본 물건 목록 | **로그인 필수** |
 | `/properties` | `src/app/properties/page.tsx` | **`/`로 영구 이동**(2026-08-11 Sprint 51). 레거시 목록 화면은 제거됨 | 로그인 게이트는 유지(비로그인 → `/login`) |
 
@@ -628,6 +629,7 @@ Frontend가 사용하지 않는 백엔드 라우터: `admin`, `doc_stats`, `paym
 | 결과 목록 table 뷰 도입 | SKIP | 카드/표 이중 구현. 별도 결정 필요(§12.4) |
 | Admin 화면 / 권리분석 전용 화면 | 미착수 | Admin은 운영자별 신원 체계 선행 필요(공유 `X-Admin-Key` 하나뿐) |
 | 마이페이지 | **완료** (2026-08-11 Sprint 54) | 기존 API 3종 조합, 읽기 전용 |
+| ~~마이리스트 가져오기(경쟁사 마이페이지 정보 이관)~~ | **✅ 2026-08-28 Sprint 270 완료** | Sprint 227 내보내기의 짝. **외부 서비스 로그인/크롤링은 만들지 않는다** — 사람이 복사해 온 텍스트만 읽는다. 형식을 가정하지 않고 우리 CSV/TSV 되붙이기·탭 구분 표·자유 텍스트 세 갈래를 받고, 사건번호 구성요소 겹침으로 매칭한다(`crawler/resume.py` 와 같은 규칙). **후보가 여럿이면 우리가 고르지 않고**(`AMBIGUOUS`) 사람이 고른 `item_id` 만 커밋한다. 못 찾은 줄은 원문과 함께 남긴다. 재실행 안전(멱등)이고 빈 값으로 기존 메모를 지우지 않는다. 상세는 `docs/SPRINT270_MYLIST_IMPORT.md` |
 | ~~`SortBar`에 `crawl_date` 정렬 노출~~ | **✅ 2026-08-11 Sprint 52 완료** | 백엔드 화이트리스트·프론트 타입에 이미 있는 값을 UI만 노출하지 않아 **URL을 직접 편집해야 쓸 수 있는 도달 불가 정렬**이었다. 정렬 칩 하나 추가로 해소(API 계약·정렬 규칙 무변경). 계약 테스트가 "타입에 있는 정렬은 UI에도 있어야 한다"를 고정한다 |
 | ~~검색 Form 면적조건 활성화~~ | **✅ 2026-08-26 완료** | migration 025(`building_area`/`land_area` 컬럼+인덱스) + `normalizer.extract_areas()` + `api/v1/search.py` WHERE 절로 실제 동작한다. 결합 규칙은 **계열 안 AND / 계열 간 OR** — 한 물건은 두 면적 중 하나만 가지므로 AND 로 묶으면 항상 공집합이었다(`docs/BUGS.md` #239). 회귀 `test_search.py` `check_area_families_are_a_union_not_a_pair()`, 변이 8/8 검출 |
 | 검색 Form 특수조건 활성화 | 불가 | 백엔드 미지원(`auction_item`에 대응 컬럼 없음). "준비 중" 표기 유지 |

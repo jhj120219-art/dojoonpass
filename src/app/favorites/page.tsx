@@ -8,6 +8,7 @@ import { formatPrice } from '@/lib/format'
 import SiteHeader from '@/components/SiteHeader'
 import ResultThumbnail from '@/components/ResultThumbnail'
 import ExportButtons from './ExportButtons'
+import FavoriteNote from './FavoriteNote'
 import { CONTAINER } from '@/lib/layout'
 
 interface FavoriteItem {
@@ -28,6 +29,10 @@ interface FavoriteItem {
   /** 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없는 물건은 null 이다. */
   thumbnail_url: string | null
   favorited_at: string
+  /** 사용자 메모/태그 (2026-08-28, migration 026). 없으면 빈 값이지 null 이 아니다 —
+      화면이 `?? ''` 분기를 만들 필요가 없게 백엔드가 그렇게 맞춰 준다. */
+  memo: string
+  tags: string[]
 }
 
 export default function FavoritesPage() {
@@ -77,13 +82,29 @@ export default function FavoritesPage() {
         {!error && items && items.length === 0 && (
           <div className="text-center py-20">
             <p className="text-gray-400">관심물건이 없습니다.</p>
+            {/* 빈 상태가 막다른 길이 되지 않게 다음 행동을 준다 —
+                다른 곳에서 이미 목록을 갖고 있는 사용자가 가장 먼저 만나는 화면이다. */}
+            <Link
+              href="/favorites/import"
+              className="mt-3 inline-block rounded-xl bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-600"
+            >
+              다른 목록에서 가져오기
+            </Link>
           </div>
         )}
         {/* 내보내기 (2026-08-20 Sprint 227).
             0건이어도 버튼을 감추지 않는다 — 사라지는 UI 는 "기능이 없다"로 읽힌다.
             대신 비활성으로 두어 담은 것이 없다는 사실만 전한다. */}
         {!error && items && (
-          <div className="flex justify-end pb-3">
+          <div className="flex flex-wrap items-center justify-end gap-2 pb-3">
+            {/* 가져오기(2026-08-28)는 내보내기 **옆**에 둔다 — 같은 성격의 동작이고,
+                0건일 때 가장 필요한 기능이라 빈 목록에서도 비활성화하지 않는다. */}
+            <Link
+              href="/favorites/import"
+              className="rounded-xl bg-gray-100 px-4 py-2 text-sm font-medium text-gray-600"
+            >
+              목록 가져오기
+            </Link>
             <ExportButtons rows={items} disabled={items.length === 0} />
           </div>
         )}
@@ -94,8 +115,12 @@ export default function FavoritesPage() {
           //   실측(2026-08-21, 실제 320px 창): 컨테이너 257px vs 카드 728px,
           //   오른쪽 끝 744px -> 페이지 전체 가로 스크롤. 자세한 사유는
           //   src/app/search/ResultList.tsx 의 같은 자리 주석 참고.
-          <Link key={item.id} href={`/properties/${item.id}`} className="block min-w-0">
-            <div className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+          // ★ 카드 전체를 <Link> 로 감싸지 않는다 (2026-08-28 Sprint 270).
+          //   메모 편집 입력칸이 링크 안에 있으면 글자를 고치려고 누르는 순간
+          //   상세로 이동한다. 링크는 **정보 영역에만** 걸고 메모는 그 형제로 둔다.
+          //   상세로 가는 동선은 그대로다 — 누르는 면적만 카드 아래쪽에서 빠진다.
+          <div key={item.id} className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 min-w-0">
+            <Link href={`/properties/${item.id}`} className="block min-w-0">
               {/* 대표 사진 (2026-08-20 Sprint 224).
 
                   사용자는 검색목록에서 **사진을 보고** 담는다. 그런데 여기서는 사진이
@@ -139,8 +164,11 @@ export default function FavoritesPage() {
                 <span>{item.court_name || '-'}</span>
                 <span>{new Date(item.favorited_at).toLocaleDateString('ko-KR')} 찜함</span>
               </div>
-            </div>
-          </Link>
+            </Link>
+            {/* 메모/태그 보기 + 편집. 가져오기가 쓴 값을 나중에 고칠 수 있어야
+                `PUT /api/v1/favorites/{id}/note` 가 도달 가능한 기능이 된다. */}
+            <FavoriteNote itemId={item.id} memo={item.memo} tags={item.tags} />
+          </div>
         ))}
         </div>
       </main>

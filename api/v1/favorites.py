@@ -101,13 +101,37 @@ def get_favorites(user_id: str = Depends(get_current_user)):
         #   FK를 끄고 도는 재작성 마이그레이션 중 대상 행이 빠지면 이 상태가 된다(admin.py가
         #   이미 이 시나리오로 실측한 사례). 화면에 깨진 카드(전부 null)를 보여줄 필요는 없으므로
         #   사용자에게 보이는 목록은 그대로 걸러내되, 걸러진 사실 자체는 로그에 남긴다.
-        rows = conn.execute("""
-            SELECT ai.*, f.created_at AS favorited_at
-            FROM favorites f
-            LEFT JOIN auction_item ai ON f.item_id = ai.id
-            WHERE f.user_id = ?
-            ORDER BY f.created_at DESC, f.id DESC
-        """, (user_id,)).fetchall()
+        # 메모/태그(2026-08-28, migration 026)는 **있을 때만** 붙인다.
+        #
+        # 왜 조건부인가 - 026 의 운영 적용은 승인 영역이라, 테이블이 없는 환경이
+        # 실제로 존재한다. 무조건 JOIN 하면 `no such table: favorite_notes` 로
+        # **관심물건 목록 전체가 500** 이 된다. 즉 아직 아무도 쓰지 않는 부가 정보
+        # 하나 때문에 이미 잘 돌던 핵심 화면이 죽는다.
+        #
+        # LEFT JOIN 인 것도 같은 성격이다 - 메모가 없는 물건이 목록에서 사라지면 안 된다.
+        notes_ready = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='favorite_notes'"
+        ).fetchone() is not None
+        if notes_ready:
+            rows = conn.execute("""
+                SELECT ai.*, f.created_at AS favorited_at,
+                       fn.memo AS note_memo, fn.tags AS note_tags, fn.source AS note_source
+                FROM favorites f
+                LEFT JOIN auction_item ai ON f.item_id = ai.id
+                LEFT JOIN favorite_notes fn
+                       ON fn.user_id = f.user_id AND fn.item_id = f.item_id
+                WHERE f.user_id = ?
+                ORDER BY f.created_at DESC, f.id DESC
+            """, (user_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT ai.*, f.created_at AS favorited_at,
+                       NULL AS note_memo, NULL AS note_tags, NULL AS note_source
+                FROM favorites f
+                LEFT JOIN auction_item ai ON f.item_id = ai.id
+                WHERE f.user_id = ?
+                ORDER BY f.created_at DESC, f.id DESC
+            """, (user_id,)).fetchall()
         orphaned = [r for r in rows if r["id"] is None]
         if orphaned:
             logger.warning(
@@ -139,6 +163,12 @@ def get_favorites(user_id: str = Depends(get_current_user)):
                 # 사진이 없는 물건은 null — 프런트가 썸네일 자리를 아예 만들지 않는다.
                 "thumbnail_url": thumbnail_url(row["id"], thumbnails),
                 "favorited_at": row["favorited_at"],
+                # 가산 필드다 - 기존 필드는 하나도 바뀌지 않는다(Breaking Change 금지).
+                # 메모가 없으면 빈 문자열/빈 배열이지 `null` 이 아니다: 화면이
+                # `memo ?? '메모 없음'` 같은 분기를 만들 필요가 없게 한다.
+                "memo": row["note_memo"] or "",
+                "tags": [t for t in (row["note_tags"] or "").split(",") if t],
+                "note_source": row["note_source"] or "",
             })
         return success(items)
     finally:

@@ -363,7 +363,10 @@ def check_every_list_screen_contract():
 
     SCREENS = [
         ("관심물건", "src/app/favorites/page.tsx", "item",
-         "api/v1/favorites.py", "get_favorites", {"favorited_at"}),
+         # `joined` = auction_item 이 아니라 **JOIN 이 붙여 주는** 컬럼.
+         # note_* 는 favorite_notes(migration 026, 2026-08-28) 에서 온다.
+         "api/v1/favorites.py", "get_favorites",
+         {"favorited_at", "note_memo", "note_tags", "note_source"}),
         ("최근 본 물건", "src/app/properties/recent/page.tsx", "item",
          "api/v1/recent_items.py", "get_recent_items", {"viewed_at"}),
     ]
