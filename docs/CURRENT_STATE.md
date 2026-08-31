@@ -337,7 +337,8 @@ KG이니시스) 대기로 수렴
 
 ☑ Payment Flow Migration (`payments.py`가 `create_order`→`confirm_payment`→`verify_payment` 순서로 provider 호출, `SUBSCRIPTION`/`OVERAGE_USAGE` 둘 다 새 Flow로 정상 동작 확인. `cancel_payment`/`handle_webhook`은 이 시점엔 미연결이었으나 **2026-08-11 Sprint 52에서 연결 완료** — 아래 396행 정정 참고)
 
-☑ `SUBSCRIPTION` 결제 금액 서버 검증 (`PLAN_PRICES`, `OVERAGE_USAGE`와 동일 방식 — 이제 둘 다 완료)
+☑ `SUBSCRIPTION` 결제 금액 서버 검증 (`OVERAGE_USAGE`와 동일 방식 — 이제 둘 다 완료)
+  ※ 2026-08-31 정정: 당시 상수명 `PLAN_PRICES` 는 지금 없다. Sprint 28 의 Plan API 서버화로 `api/v1/payments.py:PLAN_CATALOG` + `resolve_plan_price()` 가 됐다 — 표시 금액과 검증 금액이 같은 함수에서 나온다(`docs/architecture.md`)
 
 ☑ 등기부 무료횟수 레이스 컨디션 수정 (`registry.py`에 `BEGIN IMMEDIATE` 적용, 5/10/20 스레드 동시 요청 테스트로 재검증 — Release Blocking 해소)
 

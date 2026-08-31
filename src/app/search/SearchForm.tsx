@@ -8,6 +8,7 @@ import PriceRangeSelect from '@/components/PriceRangeSelect'
 import RangeSelect from '@/components/RangeSelect'
 import SearchAccordionSection from '@/components/SearchAccordionSection'
 import PropertyTypeTree from '@/components/PropertyTypeTree'
+import { formatNumber } from '@/lib/format'
 
 const SIDO_LIST = [
   '서울', '부산', '대구', '인천', '광주', '대전', '울산', '세종',
@@ -696,7 +697,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           maxValue={form.buildingAreaMax}
           onMinChange={(v) => update('buildingAreaMin', v)}
           onMaxChange={(v) => update('buildingAreaMax', v)}
-          options={BUILDING_AREA_OPTIONS.map((v) => ({ value: v, label: `${Number(v).toLocaleString()}㎡` }))}
+          options={BUILDING_AREA_OPTIONS.map((v) => ({ value: v, label: `${formatNumber(Number(v))}㎡` }))}
           placeholder="선택 안함"
           selectClassName={inputClass}
           labelClassName={labelClass}
@@ -707,7 +708,7 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
           maxValue={form.landAreaMax}
           onMinChange={(v) => update('landAreaMin', v)}
           onMaxChange={(v) => update('landAreaMax', v)}
-          options={LAND_AREA_OPTIONS.map((v) => ({ value: v, label: `${Number(v).toLocaleString()}㎡` }))}
+          options={LAND_AREA_OPTIONS.map((v) => ({ value: v, label: `${formatNumber(Number(v))}㎡` }))}
           placeholder="선택 안함"
           selectClassName={inputClass}
           labelClassName={labelClass}

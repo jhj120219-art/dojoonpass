@@ -149,7 +149,8 @@ Last Updated: 2026-08-07
 
 - `registry.py`의 `has_active_subscription()`이 실제로 `True`를 반환할 수 있게 됨 (기존에는 subscriptions row가 생성될 방법이 없어 항상 False)
 - ~~프론트엔드는 아직 이 API를 호출하지 않음~~ → 2026-08-05 같은 날 후속 Sprint(Registry Frontend 통합)에서 `properties/[id]/page.tsx`가 실제로 호출하도록 연동됨
-- PG 실연동 시 `create_mock_payment()`를 PG 콜백 처리로 교체 필요 (구조는 유지 가능)
+- ~~PG 실연동 시 `create_mock_payment()`를 PG 콜백 처리로 교체 필요~~ → **2026-08-31 정정: 그 이름의 함수는 없다.** 저장소 전수 검색 결과 `create_mock_payment` 는 어디에도 정의돼 있지 않다(2026-08-05 서술 당시 이름으로 보이며, 이후 Provider 구조가 들어오면서 사라졌다). 이 지시를 그대로 따르려던 사람은 없는 함수를 찾게 된다.
+  **지금의 교체 지점은 함수가 아니라 Provider 다** — `api/v1/payments.py:create_payment_record()` 가 `get_payment_provider()` 로 얻은 Provider 의 `create_order()` / `confirm_payment()` 를 부르고, PG 실연동은 `KGInicisProvider` 의 그 메서드들을 구현하는 일이다(현재 전부 `NotImplementedError`). 라우터는 손대지 않는다 — `docs/architecture.md` 의 Payment Provider 절이 그 경계를 그려 둔다
 
 ---
 

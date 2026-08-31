@@ -1,12 +1,30 @@
 ﻿from fastapi import APIRouter
+from api.constants import DocumentStatus, DocumentType
 from storage.database import (
     get_connection,
     QUEUE_STATUS_PENDING,
     QUEUE_STATUS_REFRESH,
+    QUEUE_STATUS_FAILED,
     QUEUE_IN_PROGRESS_STATUSES,
 )
 
 router = APIRouter()
+
+# 이 화면이 세는 대상. **값을 SQL 텍스트에 넣지 않는다** — `?` 반복만 만들고 값은
+# 예외 없이 바인딩한다(`storage/database.py:QUEUE_CLAIMABLE_PLACEHOLDERS` 와 같은 패턴,
+# `test_schema_hygiene.py` 의 SQL 조립 감사가 허용하는 형태).
+#
+# 2026-08-31: 이 세 종류와 두 상태가 SQL 문자열에 직접 박혀 있었다. 같은 파일이 아래
+# 큐 상태는 이미 상수로 세고 있어(`QUEUE_STATUS_*`) **한 파일 안에서 규칙이 둘**이었다.
+# 값은 바뀌지 않는다 — 리터럴을 상수로 옮기기만 한다.
+_STAT_DOC_TYPES = (DocumentType.SPEC.value, DocumentType.STATUS.value,
+                   DocumentType.APPRAISAL.value)
+_STAT_STATUSES = (DocumentStatus.READY.value, DocumentStatus.FAILED.value)
+
+
+def _marks(values):
+    return ", ".join("?" * len(values))
+
 
 @router.get("/document-stats")
 def document_stats():
@@ -24,9 +42,10 @@ def document_stats():
                 """
                 SELECT doc_type, status, COUNT(*) AS cnt
                 FROM document_status
-                WHERE doc_type IN ('SPEC','STATUS','APPRAISAL') AND status IN ('READY','FAILED')
+                WHERE doc_type IN (%s) AND status IN (%s)
                 GROUP BY doc_type, status
-                """
+                """ % (_marks(_STAT_DOC_TYPES), _marks(_STAT_STATUSES)),
+                _STAT_DOC_TYPES + _STAT_STATUSES,
             ).fetchall()
         }
 
@@ -95,7 +114,9 @@ def document_stats():
             # "지금 작업 중인 건수"는 최초 수집이든 재수집이든 같은 뜻이므로 합산한다.
             "queue_in_progress": sum(queue_counts.get(v, 0)
                                      for v in QUEUE_IN_PROGRESS_STATUSES),
-            "queue_failed": queue_counts.get("failed", 0),
+            # 2026-08-31: 이 한 칸만 리터럴이었다. 위 세 칸과 같은 단일 소스를 쓴다 —
+            # 어휘가 바뀌면 여기만 조용히 0 이 되던 자리다.
+            "queue_failed": queue_counts.get(QUEUE_STATUS_FAILED, 0),
         }
     finally:
         conn.close()

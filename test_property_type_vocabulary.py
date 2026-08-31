@@ -35,6 +35,7 @@
 
     python test_property_type_vocabulary.py
 """
+import io
 import os
 import re
 import sqlite3
@@ -174,12 +175,123 @@ def test_the_bridge_actually_carries_weight():
         print("   %s: 별칭 덕분에 %d건" % (_safe(key), count))
 
 
+# 어휘를 **설명하는 글**도 계약이다 (2026-08-31 신설)
+#
+# `storage/migrate_v4_1.py` 주석과 `docs/backend.md` 주의사항은 이 컬럼을
+# "APARTMENT / OFFICETEL / LAND / FACTORY / COMMERCIAL / MULTI_FAMILY" ENUM 이라고
+# 적고 있었다. **그 값을 쓰는 행은 0건이고 그 문자열을 만드는 소스도 없다.**
+# 실제 값은 법원 표기 그대로의 한국어 자유 문자열이며 콤마 복합값이 있다.
+#
+# 왜 검사로 잠그나 — 이 종류의 거짓 서술은 **실행해도 드러나지 않는다.** 그 문장을
+# 읽고 `property_type='APARTMENT'` 로 필터를 짜면 오류 없이 그냥 0건이 나오고,
+# 그것은 #33 이 발견까지 오래 걸렸던 실패 모양 그대로다.
+#
+# ## 어떻게 잠그나 — 산문을 읽지 않고 **표를 DB 와 대조한다**
+#
+# "정정 표시가 근처에 있는가" 로 판정하려다 실패했다(변이 2건이 그대로 통과했다).
+# 산문은 어떤 규칙을 세워도 우회된다. 그래서 두 파일에 기계가 읽을 표를 두고
+# **거기 적힌 어휘가 실제 DB 에 존재하는지**를 본다. 지어낸 어휘(ENUM 코드 포함)를
+# 표에 적으면 즉시 잡히고, 표를 지우면 커버리지 단언이 잡는다.
+#
+#     [VOCAB-TABLE] 다음 줄부터 "<값> <건수>" 목록
+#
+# ★ 한계를 정직하게 적는다: 표를 정확히 둔 채 **다른 문단에서** ENUM 을 다시
+#   주장하는 것까지는 기계가 판별하지 못한다. 그 경우를 위해 (d) 에서 예전 문장을
+#   **그대로** 되붙이는 것만 따로 막는다. 그 이상은 사람 리뷰의 몫이다.
+_ENUM_GHOSTS = ("APARTMENT", "OFFICETEL", "MULTI_FAMILY", "COMMERCIAL", "FACTORY")
+_VOCAB_DOCS = (
+    os.path.join(ROOT, "storage", "migrate_v4_1.py"),
+    os.path.join(ROOT, "docs", "backend.md"),
+)
+_VOCAB_MARK = "[VOCAB-TABLE]"
+# 정정 이전의 서술 그대로. 이 문자열이 다시 나타나면 정정이 되돌려진 것이다.
+_OLD_CLAIMS = (
+    "property_type 코드: APARTMENT/OFFICETEL/LAND/FACTORY/COMMERCIAL/MULTI_FAMILY",
+    "auction_item.property_type 코드 규칙:",
+)
+
+
+def documented_vocab(path):
+    """`[VOCAB-TABLE]` 아래에 적힌 <값> <건수> 목록을 읽는다."""
+    text = io.open(path, encoding="utf-8-sig").read()
+    if _VOCAB_MARK not in text:
+        return None
+    tail = text.split(_VOCAB_MARK, 1)[1]
+    found = {}
+    for line in tail.split(chr(10))[1:]:
+        pairs = re.findall(r"([가-힣][가-힣,()]*)\s+(\d+)", line)
+        if not pairs:
+            # 표는 연속된 줄로 적는다. 값이 없는 줄을 만나면 표가 끝난 것이다.
+            if found:
+                break
+            continue
+        for value, count in pairs:
+            found[value] = int(count)
+    return found
+
+
+def test_no_document_claims_an_enum_the_data_does_not_use():
+    print("\n--- 5. 문서가 적어 둔 어휘가 실제 DB 어휘인가 ---")
+
+    values = db_types()
+    total = sum(values.values())
+
+    # (a) 그 ENUM 이 정말로 안 쓰이는지 **데이터로** 먼저 확인한다.
+    #     쓰이고 있다면 옛 서술이 옳은 것이고 이 검사가 틀린 것이다.
+    used = sorted(v for v in values if any(g in v for g in _ENUM_GHOSTS))
+    check("ENUM 코드를 쓰는 물건종류가 DB 에 없다", not used, used)
+
+    for path in _VOCAB_DOCS:
+        name = os.path.relpath(path, ROOT)
+        documented = documented_vocab(path)
+
+        # (b) 표가 실제로 있다 — 검사가 공허하지 않다.
+        check("%s 에 %s 표가 있다" % (name, _VOCAB_MARK), documented is not None,
+              "기계가 대조할 어휘 표가 없다")
+        if not documented:
+            continue
+
+        # (c) 표에 적힌 어휘가 전부 DB 에 실재한다 — 지어낸 어휘를 적지 않는다.
+        invented = sorted(v for v in documented if v not in values)
+        check("%s 의 어휘가 전부 DB 에 실재한다" % name, not invented,
+              "%s - DB 에 없는 값을 어휘로 적어 두었다" % invented)
+
+        # (d) 표가 실제 재고를 대표한다 — 지워 버리거나 몇 줄만 남기지 못한다.
+        covered = sum(values[v] for v in documented if v in values)
+        ratio = covered * 100 // max(1, total)
+        check("%s 의 표가 재고 대부분을 덮는다 (>=90%%)" % name, ratio >= 90,
+              "%d%% (%d/%d건)" % (ratio, covered, total))
+        print("   %s: %d종 / 재고의 %d%%" % (_safe(name), len(documented), ratio))
+
+        # (e) 정정 이전 문장을 **살아 있는 주장으로** 되붙이지 않았다.
+        #     사료는 지우지 않는다 - 마크다운 취소선(~~)으로 감싼 줄은 통과시킨다.
+        #     취소선은 산문이 아니라 **표기**라 기계가 판별할 수 있다.
+        restored = []
+        for lineno, line in enumerate(io.open(path, encoding="utf-8-sig"), 1):
+            for claim in _OLD_CLAIMS:
+                if claim in line and "~~" not in line:
+                    restored.append("%s:%d" % (name, lineno))
+        check("%s 에 옛 ENUM 서술이 살아 있는 주장으로 되살아나지 않았다" % name,
+              not restored, restored)
+
+    # (f) 파서가 공허하지 않다는 것을 합성 입력으로 증명한다.
+    probe = {}
+    for line in ["아파트 201 / 전답 188", "임야 123"]:
+        for v, n in re.findall(r"([가-힣][가-힣,()]*)\s+(\d+)", line):
+            probe[v] = int(n)
+    check("표 파서가 값을 실제로 읽는다",
+          probe == {"아파트": 201, "전답": 188, "임야": 123}, probe)
+    check("표 파서가 ENUM 코드를 어휘로 읽지 않는다",
+          not re.findall(r"([가-힣][가-힣,()]*)\s+(\d+)", "APARTMENT 201"))
+
+
 def run():
     test_the_tree_and_the_backend_are_both_readable()
     test_every_stored_type_is_reachable_from_the_tree()
     test_no_tree_item_drags_in_unrelated_types()
     test_the_alias_table_has_no_dead_entries()
     test_the_bridge_actually_carries_weight()
+    test_no_document_claims_an_enum_the_data_does_not_use()
     print(_safe("\n%s (실패 %d)" % ("모두 통과" if not failures else "실패: %s" % failures,
                                     len(failures))))
     return 1 if failures else 0

@@ -158,7 +158,7 @@
 ## Routing 구조
 
 - Next.js App Router, `src/app/` 하위만 유효 라우트
-- `src/login/`(`app/` 밖)은 Next.js가 라우팅하지 않는 도달 불가능한 코드. 예전 로그인 페이지의 잔재이며 구 브랜드명 "도준 경매 패스"를 그대로 쓰고 있음 — `docs/decision-log.md`가 명시적으로 금지한 표기
+- ~~`src/login/`(`app/` 밖)은 Next.js가 라우팅하지 않는 도달 불가능한 코드. 예전 로그인 페이지의 잔재이며 구 브랜드명 "도준 경매 패스"를 그대로 쓰고 있음~~ → **2026-08-31 정정: 그 디렉터리는 없다**(2026-08-31 실측, `src/` 아래는 `app`/`components`/`lib`/`proxy.ts`). 구 브랜드명 금지 규칙 자체는 유효하다 — `docs/decision-log.md` Service Name
 
 ## API 호출 방식
 
@@ -236,27 +236,35 @@
   복귀 후 **입력했던 이름은 남지 않는다**(검색조건 자체는 URL로 보존됨)
 
 
-- **데이터 소스 불일치(`/properties`만 해당, 2026-08-05 기준 범위 축소)**: `/properties`(목록)와 `/properties/[id]`의 물건 목록 진입 경로는 여전히 Supabase 테이블 `properties`(컬럼: `title`, `bid_date`, `case_number`, `detail_info`, `status` 등 — `auction_item`과 이름·구조가 다름)를 직접 조회해 크롤러 데이터(`auction_item`)가 노출되지 않는다. 반면 `/search`, `/favorites`, `/properties/recent`와 `/properties/[id]`의 상세 데이터 자체는 FastAPI(`auction_item` 경유)를 사용하므로 이 문제는 `/properties` 목록 화면에 한정된다 — `docs/decision-log.md`의 "검색은 SQLite 기반" 결정과는 `/search`에서는 이미 일치, `/properties`에서는 여전히 어긋남
+- ~~**데이터 소스 불일치(`/properties`만 해당, 2026-08-05 기준 범위 축소)**: `/properties`(목록)와 `/properties/[id]`의 물건 목록 진입 경로는 여전히 Supabase 테이블 `properties`(컬럼: `title`, `bid_date`, `case_number`, `detail_info`, `status` 등 — `auction_item`과 이름·구조가 다름)를 직접 조회해 크롤러 데이터(`auction_item`)가 노출되지 않는다. 반면 `/search`, `/favorites`, `/properties/recent`와 `/properties/[id]`의 상세 데이터 자체는 FastAPI(`auction_item` 경유)를 사용하므로 이 문제는 `/properties` 목록 화면에 한정된다 — `docs/decision-log.md`의 "검색은 SQLite 기반" 결정과는 `/search`에서는 이미 일치, `/properties`에서는 여전히 어긋남~~
+
+  **→ 2026-08-31 정정: 더 이상 사실이 아니다.** 2026-08-11 Sprint 51 에 `/properties` 는 `redirect('/')` 한 줄이 됐고 `SearchFilters.tsx` 는 삭제됐다. 2026-08-31 실측: `src/app/properties/` 아래는 `page.tsx`(redirect) / `LogoutButton.tsx` / `[id]/` / `recent/` 뿐이고, 화면에서 Supabase 데이터 테이블을 조회하는 곳은 **0건**이다(`tests/supabase-boundary.test.mjs` 가 회귀로 고정). `docs/BETA_RELEASE_CHECKLIST.md` 는 P1-1/P2 에서 2026-08-22 에 이미 해소로 적었는데 이 문서만 갱신되지 않았다.
 - ~~등기부 열람 로직 이중 구현~~ → 2026-08-05 해소됨: `properties/[id]/actions.ts`(Supabase `view_counts`) 삭제, `api/v1/registry.py` 하나로 일원화. 정책도 2026-08-06 확정 + **코드 반영 완료**(플랜별 월 단위: 베이직 5회/프로 10회, `registry.py:get_user_free_limit()`/`get_free_count()`). 이전 문서의 "코드는 아직 평생 누적 5회"는 2026-08-07 기준 stale
 - ~~`PLAN_OPTIONS` 확정 Spec 미반영~~ → **2026-08-06 완료**: `properties/[id]/page.tsx`가 월/연 결제주기 토글 + 플랜 카드(베이직 12,900원·월5회 / 프로 22,900원·월10회)를 표시하고, 연 결제 시 프로는 정상가 274,800원 취소선 + 판매가 198,000원을 함께 노출한다. 결제 요청에 `billing_cycle`을 함께 보내며 금액은 서버(`PLAN_CATALOG`)가 재검증한다. 할인은 `listPrice`/`price` 분리 구조라 이벤트 적용 시 값만 교체하면 된다
-- `src/login/`(도달 불가)이 구 브랜드명을 쓰는 죽은 코드로 남아있음 — 사용 여부가 확실하지 않은 코드는 임의로 삭제하지 않는다는 프로젝트 규칙에 따라 그대로 둠
+- ~~`src/login/`(도달 불가)이 구 브랜드명을 쓰는 죽은 코드로 남아있음~~ → **2026-08-31 정정: 디렉터리 자체가 없다.** 2026-08-31 실측 `src/` 아래는 `app` / `components` / `lib` / `proxy.ts` 넷뿐이다. `docs/FRONTEND_MASTER_SPEC.md` §2.2 와 `docs/BETA_RELEASE_CHECKLIST.md` P2 는 이미 해소로 적고 있었다
 - ~~**[2026-08-06 Sprint 21 발견] 로그아웃 기능이 화면에 전혀 노출되지 않음**~~ → **2026-08-06 Sprint 23 해결**: `src/app/properties/page.tsx` 헤더에 `LogoutButton`을 연결했다(`docs/BUGS.md` #15).
   단 **2026-08-07 추가 확인**: 로그아웃 버튼이 붙은 `/properties`는 아래 "데이터 소스 불일치" 항목의
   Supabase 직접 조회 화면이다 — 로그아웃 자체는 동작하지만, 유일한 로그아웃 경로가 그 화면에만
   있어 `/search`·`/favorites`·`/properties/recent`에서는 여전히 로그아웃할 수 없다(`PrimaryNav`에는
   로그아웃이 없음). 어느 화면에 추가로 노출할지는 화면 스펙 결정 사항이라 임의로 배치하지 않음
-- **[2026-08-07 발견] `/properties` 목록의 링크 대상 id가 다른 시스템의 id다**: 목록은 Supabase
+- ~~**[2026-08-07 발견] `/properties` 목록의 링크 대상 id가 다른 시스템의 id다**: 목록은 Supabase
   `properties` 테이블 행을 그리면서 `href={/properties/${property.id}}`로 이동시키는데, 상세
   화면 `/properties/[id]`는 그 id로 FastAPI `GET /api/v1/item/{id}`(SQLite `auction_item`)를
   조회한다. 두 id는 서로 다른 채번 체계라 **엉뚱한 물건이 열리거나 404가 난다**. 데이터 소스
   불일치(아래 항목)의 직접적인 사용자 영향이며, `/properties` 목록의 처리 방향(FastAPI 전환 vs
-  화면 폐지)이 정해져야 고칠 수 있어 이번에는 기록만 함
-- **[2026-08-07 발견] `properties/page.tsx`의 지역 `formatPrice`가 공용 구현과 다르게 동작**:
+  화면 폐지)이 정해져야 고칠 수 있어 이번에는 기록만 함~~
+
+  **→ 2026-08-31 정정: 더 이상 사실이 아니다.** 2026-08-11 Sprint 51 에 `/properties` 는 `redirect('/')` 한 줄이 됐고 `SearchFilters.tsx` 는 삭제됐다. 2026-08-31 실측: `src/app/properties/` 아래는 `page.tsx`(redirect) / `LogoutButton.tsx` / `[id]/` / `recent/` 뿐이고, 화면에서 Supabase 데이터 테이블을 조회하는 곳은 **0건**이다(`tests/supabase-boundary.test.mjs` 가 회귀로 고정). `docs/BETA_RELEASE_CHECKLIST.md` 는 P1-1/P2 에서 2026-08-22 에 이미 해소로 적었는데 이 문서만 갱신되지 않았다.
+- ~~**[2026-08-07 발견] `properties/page.tsx`의 지역 `formatPrice`가 공용 구현과 다르게 동작**:
   `src/lib/format.ts`의 공용 `formatPrice()`는 0을 `'-'`로, 1만~1억 미만을 `'N만'`으로 표시하지만,
   `properties/page.tsx` 안의 동명 지역 함수는 항상 1억으로 나눠 `0` → `"0.0억"`, `500만` →
   `"0.1억"`으로 표시한다. Sprint 18의 중복 제거에서 이 화면만 "표기 기준 UX 결정 필요"로 제외됐던
-  잔여분이며, 위 id 불일치와 같은 화면이라 함께 처리하는 것이 맞다
-- `src/app/properties/SearchFilters.tsx`는 `properties/page.tsx`에서 실제로 사용 중이나, 자체 `SIDO_LIST`(정식 명칭 표기, 17개)·`SIGUNGU_MAP`(서울/부산/경기 3개 시도만 하드코딩)·`PRICE_OPTIONS`(10단계)를 갖고 있어 `/search` 화면의 `SearchForm.tsx`(축약 표기 시도, `GET /api/v1/search/regions` 실시간 조회, `PriceRangeSelect`의 60단계 프리셋)와 완전히 다른 데이터·정밀도를 쓴다. `/properties`가 Supabase 직접 조회라는 기존 데이터 소스 불일치(위 항목)와 같은 뿌리이며, `/properties` 목록의 향후 처리 방향이 정해지기 전에는 통합 대상이 아님(미결정, PM 확인 필요)
+  잔여분이며, 위 id 불일치와 같은 화면이라 함께 처리하는 것이 맞다~~
+
+  **→ 2026-08-31 정정: 더 이상 사실이 아니다.** 2026-08-11 Sprint 51 에 `/properties` 는 `redirect('/')` 한 줄이 됐고 `SearchFilters.tsx` 는 삭제됐다. 2026-08-31 실측: `src/app/properties/` 아래는 `page.tsx`(redirect) / `LogoutButton.tsx` / `[id]/` / `recent/` 뿐이고, 화면에서 Supabase 데이터 테이블을 조회하는 곳은 **0건**이다(`tests/supabase-boundary.test.mjs` 가 회귀로 고정). `docs/BETA_RELEASE_CHECKLIST.md` 는 P1-1/P2 에서 2026-08-22 에 이미 해소로 적었는데 이 문서만 갱신되지 않았다.
+- ~~`src/app/properties/SearchFilters.tsx`는 `properties/page.tsx`에서 실제로 사용 중이나, 자체 `SIDO_LIST`(정식 명칭 표기, 17개)·`SIGUNGU_MAP`(서울/부산/경기 3개 시도만 하드코딩)·`PRICE_OPTIONS`(10단계)를 갖고 있어 `/search` 화면의 `SearchForm.tsx`(축약 표기 시도, `GET /api/v1/search/regions` 실시간 조회, `PriceRangeSelect`의 60단계 프리셋)와 완전히 다른 데이터·정밀도를 쓴다. `/properties`가 Supabase 직접 조회라는 기존 데이터 소스 불일치(위 항목)와 같은 뿌리이며, `/properties` 목록의 향후 처리 방향이 정해지기 전에는 통합 대상이 아님(미결정, PM 확인 필요)~~
+
+  **→ 2026-08-31 정정: 더 이상 사실이 아니다.** 2026-08-11 Sprint 51 에 `/properties` 는 `redirect('/')` 한 줄이 됐고 `SearchFilters.tsx` 는 삭제됐다. 2026-08-31 실측: `src/app/properties/` 아래는 `page.tsx`(redirect) / `LogoutButton.tsx` / `[id]/` / `recent/` 뿐이고, 화면에서 Supabase 데이터 테이블을 조회하는 곳은 **0건**이다(`tests/supabase-boundary.test.mjs` 가 회귀로 고정). `docs/BETA_RELEASE_CHECKLIST.md` 는 P1-1/P2 에서 2026-08-22 에 이미 해소로 적었는데 이 문서만 갱신되지 않았다.
 - ~~`app/layout.tsx` 메타데이터가 `create-next-app` 기본값 그대로~~ → 2026-08-07 해결(`콕찰 — 법원경매 검색` + `lang="ko"`)
 - 색상/스타일이 각 페이지에 Tailwind 유틸리티 클래스로 하드코딩되어 있음 (`bg-blue-500`, `text-gray-400` 등). 별도 디자인 토큰 파일(`styles/auction-theme.css` 등)은 존재하지 않음 — `globals.css`는 `create-next-app` 기본값(배경/전경색 변수, 폰트)만 정의
 - ~~등기부 실제 발급(다운로드)은 여전히 없음~~ → 2026-08-05 완전히 해결됨: `status=COMPLETED`이면 "📥 등기부 다운로드" 버튼이 나타나고, 클릭 시 `GET /registry-requests/{id}/download`를 호출해 실제 파일을 브라우저 다운로드로 저장한다(`handleDownloadRegistry`, `fetch`+`blob`+`<a download>`). `FAILED`는 `reason`(백엔드가 노출)을 그대로 보여준다
@@ -362,15 +370,27 @@ API   http://127.0.0.1:8000      Swagger UI: /docs
 ★ 긴 개발 세션에서 `node` 프로세스가 누적되면 Turbopack 이 `0xc0000142` 로 죽어
 dev 서버가 **500** 을 낸다(코드 결함 아님). 남은 node 프로세스를 모두 종료하면 정상화된다.
 
-## 화면 간 사진 일관성 — 검색목록에만 썸네일이 있다 (2026-08-19)
+## 화면 간 사진 일관성 — ~~검색목록에만 썸네일이 있다~~ **해소됨** (2026-08-19 발견 / 2026-08-20 Sprint 224 해결)
 
-`thumbnail_url` 을 주는 API 는 `api/v1/search.py` 하나뿐이다.
+~~`thumbnail_url` 을 주는 API 는 `api/v1/search.py` 하나뿐이다.
 **관심물건·최근 본 물건 화면에는 `<img>` 가 없다.** 사용자는 검색목록에서 사진을 보고
-담았는데 관심물건에서는 사진이 사라진다.
+담았는데 관심물건에서는 사진이 사라진다.~~
 
-의도된 제외라는 기록이 없어 **미문서화 공백**으로 판단했고, 고치는 것은 제품 결정이라
-`docs/roadmap.md` 에 Backlog 로 등록했다. 그동안 `test_search.py` 가 규칙을 건다 —
-**그리기 시작하면 API 도 주어야 한다.**
+**→ 2026-08-31 정정: 이 서술은 더 이상 사실이 아니다.** Sprint 224 가 닫았는데
+(`docs/roadmap.md` Sprint 221 절 · `docs/BUGS.md` #156) 이 문서만 갱신되지 않아,
+읽는 사람이 **이미 있는 기능을 다시 만들게** 되는 상태였다. 2026-08-31 실측:
+
+```
+API    thumbnail_url 을 주는 라우터 4개   search / item / favorites / recent_items
+       URL 규칙·배치 조회의 유일한 출처는 api/v1/thumbnails.py
+화면   ResultThumbnail 을 쓰는 화면 3개   ResultList / favorites / properties/recent
+       세 곳 모두 `{item.thumbnail_url && <ResultThumbnail .../>}` 형태 —
+       사진이 없으면 자리를 만들지 않아 종전 텍스트 전용 카드와 픽셀이 같다
+```
+
+여전히 유효한 규칙: **그리기 시작하면 API 도 주어야 한다**(`test_search.py` 가 건다).
+여전히 열린 항목: 서버 측 썸네일 생성(원본을 80x80 으로 줄여 그리는 상태, 약 101 KB/장) —
+승인 영역이라 `docs/roadmap.md` Sprint 218 절에 남아 있다.
 
 ## 폼 접근성 — 이름은 `aria-label` 로 준다 (2026-08-19 Sprint 222, BUGS #150)
 

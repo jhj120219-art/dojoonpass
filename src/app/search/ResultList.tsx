@@ -1,31 +1,14 @@
 import Link from 'next/link'
 import type { SearchResponse, SearchResultItem } from './types'
 import FavoriteButton from './FavoriteButton'
-import { formatPrice, parseArea, formatArea } from '@/lib/format'
+import { formatPrice, formatNumber, formatDday, formatBidRate, displayArea, formatArea } from '@/lib/format'
 import ResultThumbnail from '@/components/ResultThumbnail'
-
-function formatBidRate(bidRate: number) {
-  if (bidRate === null || bidRate === undefined) return '-'
-  return (bidRate * 100).toFixed(1) + '%'
-}
-
-// 매각기일까지 남은 일수를 "오늘" 기준으로 계산한다. 절대 날짜(auction_date)는 그대로 유지하고
-// 이 값은 보조 표시로만 사용한다.
-export function formatDday(auctionDate: string | null): string | null {
-  if (!auctionDate) return null
-  const target = new Date(`${auctionDate}T00:00:00`)
-  if (Number.isNaN(target.getTime())) return null
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const diffDays = Math.round((target.getTime() - today.getTime()) / 86400000)
-  if (diffDays > 0) return `입찰 ${diffDays}일전`
-  if (diffDays === 0) return 'D-Day'
-  return `입찰 ${Math.abs(diffDays)}일 경과`
-}
 
 function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: string }) {
   const location = item.full_address || [item.sido, item.sigungu, item.dong].filter(Boolean).join(' ')
-  const area = parseArea(item.full_address)
+  // 서버가 준 면적(검색 필터가 쓰는 값)이 먼저다. 없으면 주소 원문에서 읽는다.
+  // 두 구현이 갈라져 카드와 필터가 다른 사실을 말하던 문제 — src/lib/format.ts 주석 참고.
+  const area = displayArea(item)
   const dday = formatDday(item.auction_date)
 
   return (
@@ -172,7 +155,7 @@ export default function ResultList({
         <div className="text-center py-20">
           <p className="text-gray-500 font-medium">이 페이지에는 표시할 물건이 없습니다</p>
           <p className="mt-1 text-sm text-gray-400">
-            조건에 맞는 물건은 총 {data.total.toLocaleString()}건이지만, 요청한 페이지
+            조건에 맞는 물건은 총 {formatNumber(data.total)}건이지만, 요청한 페이지
             ({data.page}페이지)가 마지막 페이지({Math.max(data.total_pages, 1)}페이지)를 넘어섰습니다
           </p>
           <Link
@@ -226,7 +209,7 @@ export default function ResultList({
   return (
     <div>
       <p className="mb-2 px-1">
-        <span className="text-sm font-bold text-blue-600">총 {data.total.toLocaleString()}건</span>
+        <span className="text-sm font-bold text-blue-600">총 {formatNumber(data.total)}건</span>
         <span className="text-xs font-medium text-gray-600"> ({data.page}/{data.total_pages}페이지)</span>
       </p>
       {/* 목록 밀도(FRONTEND_MASTER_SPEC.md §6): 모바일 1열 / 태블릿 2열 / 데스크톱 3열.

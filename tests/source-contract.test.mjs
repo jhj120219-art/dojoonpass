@@ -1124,3 +1124,695 @@ describe('면적 조건 — 두 컬럼은 판별 합집합이다 (BUGS #239) —
     }
   })
 })
+
+// ================================================================
+// 표시 로케일 고정 — 소스 계약 (2026-08-31 신설)
+//
+// ## 무엇을 막는가
+//
+// `x.toLocaleString()` / `toLocaleDateString()` 를 **인자 없이** 부르면 구분자와
+// 날짜 형식을 보는 사람의 브라우저가 정한다. 실측:
+//
+//     (12900).toLocaleString('de-DE')  ->  "12.900"
+//
+// 청구 금액이 그렇게 나가면 한국식으로는 12.9 로 읽힌다. 오류도 로그도 없다.
+// 이 저장소는 날짜에서는 이미 'ko-KR' 을 명시하고 있었는데(3곳) 숫자만 빠져 있었고,
+// 그 결과 **같은 관심사에 규칙이 둘**이었다.
+//
+// ## 왜 소스 검사인가
+//
+// 실행 로케일이 ko-KR/en-US 이면 두 방식의 출력이 **완전히 같다.** 즉 이 결함은
+// 이 PC 에서 값을 찍어 보는 방식으로는 영원히 드러나지 않는다. 소스에서 막아야 한다.
+// ================================================================
+
+describe('표시 로케일이 고정돼 있다 (2026-08-31) — 소스 계약', () => {
+  // 문자열/주석 오탐을 줄이기 위해 주석을 걷어낸 뒤 본다.
+  // (`https://` 의 `//` 를 주석으로 오인하지 않도록 앞 문자가 `:` 인 경우는 남긴다.)
+  const stripComments = (code) =>
+    code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+  const BARE = /\.toLocale(?:String|DateString|TimeString)\(\s*\)/g
+
+  const listSources = async () => {
+    const { promises: fs } = await import('node:fs')
+    const out = []
+    const walk = async (dir) => {
+      for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+        const p = `${dir}/${e.name}`
+        if (e.isDirectory()) await walk(p)
+        else if (/\.tsx?$/.test(e.name)) out.push(p)
+      }
+    }
+    await walk('src')
+    return out
+  }
+
+  test('검사가 공허하지 않다 — 파일을 실제로 찾았고 탐지기가 동작한다', async () => {
+    const files = await listSources()
+    assert.ok(files.length > 20, `src 아래 .ts/.tsx 를 제대로 못 찾았습니다: ${files.length}개`)
+    // 탐지기 자체를 합성 입력으로 증명한다.
+    assert.ok(BARE.test('const s = n.toLocaleString()'), '탐지기가 인자 없는 호출을 못 잡습니다')
+    BARE.lastIndex = 0
+    assert.ok(!BARE.test("const s = n.toLocaleString('ko-KR')"), '탐지기가 로케일 지정까지 잡습니다(오탐)')
+    BARE.lastIndex = 0
+    // 주석 제거가 코드를 지우지 않는지도 같은 자리에서 본다.
+    assert.ok(stripComments("const u = 'https://a.b' // note").includes('https://a.b'),
+      '주석 제거가 URL 을 망가뜨립니다')
+    assert.ok(!stripComments('a() // x.toLocaleString()').includes('toLocaleString'),
+      '주석이 제거되지 않습니다')
+  })
+
+  test('★ src 어디에도 인자 없는 toLocale* 호출이 없다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const offenders = []
+    for (const file of await listSources()) {
+      const code = stripComments(await fs.readFile(file, 'utf8'))
+      BARE.lastIndex = 0
+      if (BARE.test(code)) offenders.push(file)
+    }
+    assert.deepEqual(
+      offenders, [],
+      `로케일을 지정하지 않은 표시 포맷이 있습니다(보는 사람의 브라우저가 구분자를 정합니다): ${offenders.join(', ')}`
+    )
+  })
+
+  test('청구 금액 표기가 formatWon 한 곳에서만 만들어진다(상세 구독 카드 포함)', async () => {
+    const { promises: fs } = await import('node:fs')
+    const detail = await fs.readFile('src/app/properties/[id]/page.tsx', 'utf8')
+    // 2026-08-31 이전에는 이 화면이 formatWon 을 import 해 두고도 구독/초과결제 5곳에서
+    // `.toLocaleString() + '원'` 을 손으로 다시 적고 있었다(중복 구현).
+    assert.ok(
+      !/toLocaleString\([^)]*\)\s*(\+\s*'원'|}원)/.test(stripComments(detail)),
+      '상세 페이지가 원 단위 표기를 손으로 다시 만듭니다 — formatWon 을 쓰십시오'
+    )
+    assert.ok(detail.includes('formatWon('), '상세 페이지가 formatWon 을 쓰지 않습니다')
+  })
+
+  test('공용 포맷 함수가 로케일을 실제로 고정한다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const lib = await fs.readFile('src/lib/format.ts', 'utf8')
+    assert.ok(/export const DISPLAY_LOCALE = 'ko-KR'/.test(lib),
+      'src/lib/format.ts 의 DISPLAY_LOCALE 이 ko-KR 로 고정돼 있지 않습니다')
+    assert.ok(/export function formatNumber/.test(lib), 'formatNumber 가 없습니다')
+    // formatWon 이 formatNumber 를 우회해 직접 만들면 규칙이 다시 갈린다.
+    const won = lib.slice(lib.indexOf('export function formatWon'))
+    assert.ok(/formatNumber\(amount\)/.test(won.slice(0, 200)),
+      'formatWon 이 formatNumber 를 거치지 않습니다(표기 규칙이 갈립니다)')
+  })
+})
+
+
+// ================================================================
+// D-day 계산이 한 곳에만 있다 — 소스 계약 (2026-08-31 신설)
+//
+// 이 함수는 원래 `src/app/search/ResultList.tsx`(JSX) 안에 있었고 상세 페이지가
+// **다른 라우트의 컴포넌트 파일에서** 꺼내 쓰고 있었다. 그래서 (1) Node 타입
+// 스트리핑으로 import 할 수 없어 동작 테스트가 없었고, (2) 화면이 화면을 import 하는
+// 계층 우회가 생겼다. `src/lib/format.ts` 로 옮기면서 그 둘을 함께 닫는다.
+// ================================================================
+
+describe('D-day 계산의 위치와 기준 (2026-08-31) — 소스 계약', () => {
+  const read = async (p) => (await (await import('node:fs')).promises).readFile(p, 'utf8')
+
+  test('formatDday 가 공용 모듈 한 곳에만 정의된다', async () => {
+    const lib = await read('src/lib/format.ts')
+    assert.ok(/export function formatDday/.test(lib),
+      'src/lib/format.ts 에 formatDday 가 없습니다')
+    for (const file of ['src/app/search/ResultList.tsx', 'src/app/properties/[id]/page.tsx']) {
+      const src = await read(file)
+      assert.ok(!/function formatDday/.test(src),
+        `${file} 에 formatDday 지역 사본이 되살아났습니다(중복 정의)`)
+    }
+  })
+
+  test('화면이 다른 라우트의 컴포넌트에서 유틸을 가져오지 않는다', async () => {
+    const detail = await read('src/app/properties/[id]/page.tsx')
+    assert.ok(!/from '@\/app\/search\/ResultList'/.test(detail),
+      '상세 페이지가 검색 화면의 컴포넌트 파일에서 유틸을 가져옵니다(계층 우회)')
+    assert.ok(/formatDday/.test(detail) && /from '@\/lib\/format'/.test(detail),
+      '상세 페이지가 공용 모듈에서 formatDday 를 가져오지 않습니다')
+  })
+
+  test('"오늘" 이 보는 사람의 시계가 아니라 한국 시각으로 정해진다', async () => {
+    const lib = await read('src/lib/format.ts')
+    assert.ok(/export const DISPLAY_TIME_ZONE = 'Asia\/Seoul'/.test(lib),
+      'DISPLAY_TIME_ZONE 이 Asia/Seoul 로 고정돼 있지 않습니다')
+    // 옛 구현의 형태 — 로컬 자정으로 되돌리면 시간대마다 하루씩 어긋난다.
+    assert.ok(!/setHours\(0,\s*0,\s*0,\s*0\)/.test(lib),
+      '로컬 자정 기준 계산이 되살아났습니다(보는 사람의 시계를 따릅니다)')
+    const body = lib.slice(lib.indexOf('export function formatDday'))
+    assert.ok(/todayInDisplayZone\(now\)/.test(body.slice(0, 400)),
+      'formatDday 가 todayInDisplayZone 을 거치지 않습니다')
+  })
+})
+
+
+// ================================================================
+// 검색 타입 파일이 미지원 정본과 어긋나지 않는다 (2026-08-31 신설)
+//
+// 2026-08-26 에 면적 4종이 구현되면서 `SearchForm.tsx` 와
+// `tests/_search_param_contract.mjs` 는 갱신됐는데 **`src/app/search/types.ts` 만**
+// "아래 4개 필드는 백엔드가 읽지 않는다"를 계속 적고 있었다(2026-08-31 발견).
+//
+// 이 종류의 드리프트는 실행해도 드러나지 않는다 — 타입은 맞고 검색도 잘 돈다.
+// 드러나는 순간은 누군가 그 주석을 믿고 **"죽은 파라미터니 지우자"** 로 갈 때이고,
+// 그때 실동작 필터가 사라진다. 그래서 "미지원"이라는 **서술**을 정본과 대조한다.
+// ================================================================
+
+describe('검색 타입 파일의 미지원 서술이 정본과 같다 (2026-08-31) — 소스 계약', () => {
+  const TYPES = 'src/app/search/types.ts'
+
+  // 프런트가 보내는 파라미터가 types.ts 에서 "백엔드가 읽지 않는다" 류의 서술과
+  // **같은 주석 블록**에 묶여 있는지 본다.
+  // 문장 전체를 본다. '미지원' 같은 한 단어는 정본을 가리키는 정상 문장
+  // ("미지원 파라미터의 정본은 ...")에도 나와 오탐이 된다.
+  const NEGATIONS = ['백엔드가 읽지 않는다', '백엔드가 받지 않는다',
+                     '백엔드가 아직 받지 않는다', '아직 구현되지 않음']
+
+  // 사료(옛 문장 인용)와 살아 있는 주장을 **표기로** 가른다 — 산문 판정은 우회된다.
+  // 이 저장소는 정정할 때 옛 문장을 **큰따옴표로 인용**한다. 인용 밖에 남은 부정
+  // 서술만 "지금도 그렇다"는 주장이다. `~~취소선~~`도 같은 취급(마크다운 표기).
+  const stripQuoted = (text) => text.replace(/"[^"]*"/g, ' ').replace(/~~[^~]*~~/g, ' ')
+
+  test('검사가 공허하지 않다 — 정본과 타입 파일을 실제로 읽었다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(TYPES, 'utf8')
+    assert.ok(src.includes('min_building_area'), 'types.ts 에서 면적 파라미터를 찾지 못했습니다')
+    assert.ok(KNOWN_UNSUPPORTED.size >= 1, '정본 목록이 비었습니다')
+
+    // 인용/취소선 제거기가 실제로 동작한다(공허한 통과 방지).
+    const strip = (t) => t.replace(/"[^"]*"/g, ' ').replace(/~~[^~]*~~/g, ' ')
+    assert.ok(!strip('// 예전엔 "백엔드가 읽지 않는다" 였다').includes('백엔드가 읽지 않는다'),
+      '인용된 옛 문장이 제거되지 않습니다')
+    assert.ok(strip('// 백엔드가 읽지 않는다').includes('백엔드가 읽지 않는다'),
+      '인용 밖 서술까지 지워집니다(검사가 공허해집니다)')
+  })
+
+  test('★ 백엔드가 지원하는 파라미터를 types.ts 가 미지원이라고 적지 않는다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(TYPES, 'utf8')
+    const api = await fs.readFile('api/v1/search.py', 'utf8')
+
+    const backend = new Set()
+    for (const m of api.matchAll(/^\s{4}(\w+)\s*:\s*[^=]+=\s*Query\(/gm)) backend.add(m[1])
+    assert.ok(backend.size > 10, `백엔드 파라미터 추출 실패 (${backend.size}개)`)
+
+    const lines = src.split('\n')
+    const offenders = []
+    for (const name of backend) {
+      const idx = lines.findIndex((l) => new RegExp(String.raw`^\s*${name}\?:`).test(l))
+      if (idx === -1) continue
+      // 선언 바로 위의 연속된 주석 블록만 본다(다른 필드의 주석까지 넘어가지 않는다).
+      const block = []
+      for (let i = idx - 1; i >= 0; i--) {
+        const l = lines[i].trim()
+        if (l.startsWith('//')) { block.push(l); continue }
+        // 하나의 주석이 나란한 여러 선언을 함께 덮는다(면적 4줄). 그래서 아직
+        // 주석을 만나기 전이면 이웃 선언을 건너뛴다. 그러나 **이미 자기 주석을
+        // 읽은 뒤라면** 멈춘다 - 계속 올라가면 윗 필드의 주석까지 자기 것으로
+        // 삼아, 전혀 상관없는 page/size/sort_by 가 함께 걸린다(실제로 걸렸다).
+        if (block.length === 0 && /^[a-z_]+\??:/.test(l)) continue
+        break
+      }
+      const text = stripQuoted(block.join(' '))
+      if (NEGATIONS.some((n) => text.includes(n))) offenders.push(name)
+    }
+    assert.deepEqual(
+      offenders.sort(), [],
+      `백엔드가 이미 받는 파라미터를 types.ts 가 미지원으로 서술합니다 — 그 주석을 믿으면 실동작 필터를 지우게 됩니다: ${offenders.join(', ')}`
+    )
+  })
+
+  test('미지원 정본이 한 곳뿐이다(타입 파일이 두 번째 목록을 만들지 않는다)', async () => {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(TYPES, 'utf8')
+    assert.ok(
+      !/KNOWN_UNSUPPORTED\s*=/.test(src),
+      'types.ts 가 미지원 목록을 따로 정의합니다 — 정본은 tests/_search_param_contract.mjs 하나입니다'
+    )
+    // 남은 미지원 항목은 **자기 주석 블록에서** 정본을 가리켜야 한다.
+    // 파일 어딘가에 한 번 언급되는 것으로는 부족하다 — 다른 필드의 주석이
+    // 대신 통과시켜 주면 그 항목은 다시 고아가 된다.
+    const lines = src.split('\n')
+    for (const key of KNOWN_UNSUPPORTED) {
+      const idx = lines.findIndex((l) => new RegExp(String.raw`^\s*${key}\??:`).test(l))
+      assert.ok(idx !== -1, `types.ts 에 ${key} 선언이 없습니다`)
+      const block = []
+      for (let i = idx - 1; i >= 0; i--) {
+        const l = lines[i].trim()
+        if (l.startsWith('//')) { block.push(l); continue }
+        break
+      }
+      assert.ok(
+        block.join(' ').includes('_search_param_contract'),
+        `types.ts 의 ${key} 주석이 미지원 정본(tests/_search_param_contract.mjs)을 가리키지 않습니다`
+      )
+    }
+  })
+})
+
+
+// ================================================================
+// 서비스명 표기 — 소스 계약 (2026-08-31 신설)
+//
+// `docs/decision-log.md` "Service Name": 서비스명은 **"콕찰"** 이다.
+// `docs/frontend.md` "절대 변경하면 안 되는 것": `"도준패스"/"도준 경매 패스" 사용 금지`.
+//
+// ## 왜 지금 생겼나 — 확정된 정책인데 지키는 검사가 없었다
+//
+// 2026-08-31 실측에서 **가장 최근에 추가된 화면**(2026-08-28 Sprint 270,
+// 마이리스트 가져오기)이 사용자에게 구 브랜드명을 두 번 보여주고 있었다.
+//
+//     src/app/favorites/import/page.tsx:245  "... 도준패스 물건과 맞춰 봅니다"
+//     src/app/favorites/import/page.tsx:421  "도준패스에 아직 없는 사건이거나 ..."
+//
+// 나머지 화면(`layout.tsx` / `login` / `SiteHeader`)은 전부 "콕찰"이다. 즉 정책이
+// 없어서가 아니라 **정책을 확인하지 않고 새 화면을 만들어서** 갈라졌다. 문서에만
+// 있는 규칙은 다음 기능에서 다시 깨진다 — 그래서 검사로 옮긴다.
+//
+// 사용자에게 보이지 않는 자리(주석의 경위 서술 등)까지 막지는 않는다.
+// 금지 대상은 **화면에 렌더되는 문구**다.
+// ================================================================
+
+describe('서비스명이 "콕찰" 하나다 (2026-08-31) — 소스 계약', () => {
+  const FORBIDDEN = ['도준패스', '도준 경매 패스', '도준경매패스']
+
+  const listSources = async () => {
+    const { promises: fs } = await import('node:fs')
+    const out = []
+    const walk = async (dir) => {
+      for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+        const p = `${dir}/${e.name}`
+        if (e.isDirectory()) await walk(p)
+        else if (/\.tsx?$/.test(e.name)) out.push(p)
+      }
+    }
+    await walk('src')
+    return out
+  }
+
+  // 주석은 경위를 적는 자리다 — 화면 문구만 본다.
+  const stripComments = (code) =>
+    code.replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+  test('검사가 공허하지 않다 — 파일을 찾았고 탐지기가 동작한다', async () => {
+    const files = await listSources()
+    assert.ok(files.length > 20, `src 아래 .ts/.tsx 를 못 찾았습니다: ${files.length}개`)
+    assert.ok(stripComments('const s = "도준패스 물건"').includes('도준패스'),
+      '탐지기가 화면 문구를 못 잡습니다')
+    assert.ok(!stripComments('// 구 브랜드명 도준패스 를 쓰지 않는다').includes('도준패스'),
+      '주석까지 잡습니다(오탐)')
+  })
+
+  test('★ 화면 문구에 구 브랜드명이 없다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const offenders = []
+    for (const file of await listSources()) {
+      const code = stripComments(await fs.readFile(file, 'utf8'))
+      for (const bad of FORBIDDEN) {
+        if (code.includes(bad)) offenders.push(`${file} (${bad})`)
+      }
+    }
+    assert.deepEqual(
+      offenders, [],
+      `구 브랜드명이 화면에 나갑니다 — 서비스명은 "콕찰"입니다(docs/decision-log.md "Service Name"): ${offenders.join(', ')}`
+    )
+  })
+
+  test('확정된 서비스명을 실제로 쓰고 있다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const layout = await fs.readFile('src/app/layout.tsx', 'utf8')
+    assert.ok(layout.includes('콕찰'), 'layout.tsx 의 metadata 에 서비스명이 없습니다')
+    const header = await fs.readFile('src/components/SiteHeader.tsx', 'utf8')
+    assert.ok(header.includes('콕찰'), '공통 헤더에 서비스명이 없습니다')
+  })
+})
+
+
+// ================================================================
+// 카드 면적의 출처 — 소스 계약 (2026-08-31 신설)
+//
+// 면적 규칙이 두 곳에 있다(백엔드 컬럼 = 검색 필터가 쓰는 값 / 프런트 주소 파서).
+// 화면이 다시 주소 파서만 쓰면 **필터와 표시가 다른 사실을 말한다** — 실제로
+// 단위가 '평'인 7건이 그랬다(걸러 놓고 카드는 빈 칸).
+// ================================================================
+
+describe('검색 카드가 서버 면적을 먼저 쓴다 (2026-08-31) — 소스 계약', () => {
+  const read = async (p) => (await (await import('node:fs')).promises).readFile(p, 'utf8')
+
+  test('ResultList 가 displayArea 를 통해 면적을 얻는다', async () => {
+    const src = await read('src/app/search/ResultList.tsx')
+    assert.ok(/const area = displayArea\(item\)/.test(src),
+      '검색 카드가 displayArea 를 쓰지 않습니다 — 필터가 쓰는 값과 다른 숫자를 보여주게 됩니다')
+    assert.ok(!/parseArea\(/.test(src),
+      '검색 카드가 주소 파서를 직접 부릅니다 — 폴백은 displayArea 안에서만 합니다')
+  })
+
+  test('폴백은 남아 있다 (구 백엔드에서 카드가 비지 않는다)', async () => {
+    const lib = await read('src/lib/format.ts')
+    const body = lib.slice(lib.indexOf('export function displayArea'))
+    assert.ok(/serverArea\([^)]*\)\s*\?\?\s*parseArea\(/.test(body.slice(0, 400)),
+      'displayArea 의 우선순위(서버 -> 주소)가 깨졌습니다')
+  })
+
+  test('타입이 응답에 실리는 면적 키를 선언한다', async () => {
+    const types = await read('src/app/search/types.ts')
+    const item = types.slice(types.indexOf('export type SearchResultItem'))
+    for (const key of ['building_area', 'land_area']) {
+      assert.ok(new RegExp(String.raw`^\s*${key}\?:`, 'm').test(item),
+        `SearchResultItem 에 ${key} 선언이 없습니다 — 응답에는 실려 있습니다`)
+    }
+  })
+
+  test('백엔드가 실제로 그 키를 내려준다', async () => {
+    const api = await read('api/v1/search.py')
+    const fn = api.slice(api.indexOf('def row_to_item'))
+    for (const key of ['building_area', 'land_area']) {
+      assert.ok(fn.slice(0, 2000).includes(`"${key}"`),
+        `row_to_item 이 ${key} 를 내려주지 않습니다 — 프런트 계약이 앞서 나갔습니다`)
+    }
+  })
+})
+
+
+// ================================================================
+// 최저가율 표기가 한 곳에서만 만들어진다 — 소스 계약 (2026-08-31 신설)
+//
+// 검색 카드와 상세가 같은 필드(`bid_rate`)를 **각자** 퍼센트로 바꾸고 있었고,
+// 상세 쪽에는 값 없음 가드가 없어 "0.0%" 를 지어냈다.
+//
+// ★ 라벨이 화면마다 다른 것(검색 "최저가율" / 상세 "입찰가율")은 **의도된 상태**다 —
+//   `search/00_SEARCH_MVP.md` §5.2 와 `docs/FRONTEND_MASTER_SPEC.md` §9.2 가 각각
+//   그렇게 정하고 있다. 여기서 고정하는 것은 **숫자 표기 규칙 하나**뿐이다.
+// ================================================================
+
+describe('최저가율 표기가 한 곳에서만 만들어진다 (2026-08-31) — 소스 계약', () => {
+  const read = async (p) => (await (await import('node:fs')).promises).readFile(p, 'utf8')
+  const SCREENS = ['src/app/search/ResultList.tsx', 'src/app/properties/[id]/page.tsx']
+
+  test('공용 함수가 존재하고 값 없음을 지어내지 않는다', async () => {
+    const lib = await read('src/lib/format.ts')
+    assert.ok(/export function formatBidRate/.test(lib), 'formatBidRate 가 공용에 없습니다')
+    const body = lib.slice(lib.indexOf('export function formatBidRate'))
+    assert.ok(/return '-'/.test(body.slice(0, 300)),
+      'formatBidRate 에 값 없음 가드가 없습니다 — null 이 "0.0%" 로 찍힙니다')
+  })
+
+  test('★ 화면이 퍼센트 계산을 손으로 다시 하지 않는다', async () => {
+    const offenders = []
+    for (const file of SCREENS) {
+      const src = await read(file)
+      // `bid_rate * 100` / `bidRate * 100` 같은 직접 계산.
+      if (/bid_?[Rr]ate\s*\*\s*100/.test(src)) offenders.push(file)
+      if (/function formatBidRate/.test(src)) offenders.push(`${file} (지역 사본)`)
+    }
+    assert.deepEqual(offenders, [],
+      `최저가율을 화면에서 직접 계산합니다 — formatBidRate 를 쓰십시오: ${offenders.join(', ')}`)
+  })
+
+  test('두 화면 모두 공용 함수를 실제로 쓴다 (검사가 공허하지 않다)', async () => {
+    for (const file of SCREENS) {
+      const src = await read(file)
+      assert.ok(/formatBidRate\(/.test(src), `${file} 이 formatBidRate 를 쓰지 않습니다`)
+      assert.ok(/from '@\/lib\/format'/.test(src), `${file} 이 공용 모듈에서 가져오지 않습니다`)
+    }
+    // 탐지기 자체 증명.
+    assert.ok(/bid_?[Rr]ate\s*\*\s*100/.test('x = property.bid_rate * 100'),
+      '직접 계산 탐지기가 동작하지 않습니다')
+    assert.ok(!/bid_?[Rr]ate\s*\*\s*100/.test('formatBidRate(property.bid_rate)'),
+      '탐지기가 정상 호출까지 잡습니다(오탐)')
+  })
+
+  test('문서가 정한 화면별 라벨이 그대로 있다', async () => {
+    // 라벨 통일은 제품 결정이라 하지 않았다. 다만 **문서와 어긋나지는 않게** 고정한다.
+    const list = await read('src/app/search/ResultList.tsx')
+    assert.ok(list.includes('최저가율'),
+      '검색 카드 라벨이 search/00_SEARCH_MVP.md §5.2 와 다릅니다')
+    const detail = await read('src/app/properties/[id]/page.tsx')
+    assert.ok(detail.includes('입찰가율'),
+      '상세 라벨이 docs/FRONTEND_MASTER_SPEC.md §9.2 와 다릅니다')
+  })
+})
+
+
+// ================================================================
+// 인증 필요 응답 ↔ 프런트 타입 — 소스 대조 (2026-08-31 신설)
+//
+// ## 왜 소스로 보나
+//
+// 공개 API 는 `tests/frontend-contract.test.mjs` 가 **살아 있는 서버**로 대조한다.
+// 인증이 필요한 목록(`/favorites`, `/recent-items`)은 같은 방법을 쓰려면 JWT 가 필요하고,
+// 그 서명 시크릿을 읽는 것은 승인 영역이다(`docs/CLAUDE.md` — Secret 값 열람 금지).
+// 그래서 **같은 질문에 소스로 답한다** — 라우터가 만드는 dict 의 키와 TS 인터페이스의 키.
+//
+// ## 무엇을 잡았나
+//
+// 2026-08-31 이 검사를 만들면서 실제 드리프트를 하나 찾았다.
+//
+//     GET /api/v1/favorites  ->  note_source (favorite_notes.source)
+//     src/app/favorites/page.tsx:FavoriteItem  ->  선언 없음
+//
+// 검색·상세에서 고친 것과 같은 모양이다(면적 4종 / sido·sigungu·dong).
+// 선언되지 않은 키는 "응답에 없는 것"으로 읽혀 **이미 있는 데이터를 다시 만들게** 한다.
+// ================================================================
+
+describe('인증 필요 응답 ↔ 프런트 타입 (2026-08-31) — 소스 계약', () => {
+  const read = async (p) => (await (await import('node:fs')).promises).readFile(p, 'utf8')
+
+  /** 파이썬 함수 안에서 만들어지는 가장 큰 문자열-키 dict 의 키 목록. */
+  async function apiKeys(file, funcName) {
+    const src = await read(file)
+    const at = src.indexOf(`def ${funcName}(`)
+    assert.ok(at !== -1, `${file} 에서 ${funcName}() 를 찾지 못했습니다`)
+    // 다음 최상위 def 까지가 그 함수다.
+    const rest = src.slice(at)
+    const nextDef = rest.slice(1).search(/\nsdef |\n@router|\ndef /)
+    const body = nextDef === -1 ? rest : rest.slice(0, nextDef + 1)
+    let best = []
+    // `{ "a": ..., "b": ... }` 블록마다 키를 센다.
+    for (const m of body.matchAll(/\{([\s\S]*?)\n\s*\}/g)) {
+      const keys = [...m[1].matchAll(/"([a-z_][a-z0-9_]*)"\s*:/g)].map((k) => k[1])
+      if (keys.length > best.length) best = keys
+    }
+    return new Set(best)
+  }
+
+  async function tsKeys(file, name) {
+    const src = await read(file)
+    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
+    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
+    let depth = 1
+    let i = m.index + m[0].length
+    const start = i
+    while (i < src.length && depth > 0) {
+      if (src[i] === '{') depth++
+      else if (src[i] === '}') depth--
+      i++
+    }
+    let body = src.slice(start, i - 1)
+    for (;;) {
+      const next = body.replace(/\{[^{}]*\}/g, '')
+      if (next === body) break
+      body = next
+    }
+    const required = new Set()
+    const optional = new Set()
+    for (const line of body.split('\n')) {
+      const code = line.split('//')[0].trim()
+      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
+      if (!km) continue
+      ;(km[2] === '?' ? optional : required).add(km[1])
+    }
+    return { required, optional, all: new Set([...required, ...optional]) }
+  }
+
+  const CASES = [
+    ['GET /api/v1/favorites', 'api/v1/favorites.py', 'get_favorites',
+     'src/app/favorites/page.tsx', 'FavoriteItem'],
+    ['GET /api/v1/recent-items', 'api/v1/recent_items.py', 'get_recent_items',
+     'src/app/properties/recent/page.tsx', 'RecentItem'],
+  ]
+
+  test('검사가 공허하지 않다 — 양쪽 키를 실제로 뽑았다', async () => {
+    for (const [label, py, fn, ts, iface] of CASES) {
+      const api = await apiKeys(py, fn)
+      const t = await tsKeys(ts, iface)
+      assert.ok(api.size > 10, `${label}: API 키 추출 실패 (${api.size}개)`)
+      assert.ok(t.all.size > 10, `${label}: TS 키 추출 실패 (${t.all.size}개)`)
+      // 두 쪽 다 아는 대표 키가 실제로 잡히는지 확인한다.
+      assert.ok(api.has('case_no') && t.all.has('case_no'), `${label}: case_no 를 못 찾았습니다`)
+    }
+  })
+
+  test('★ 응답의 모든 키가 타입에 선언돼 있다', async () => {
+    for (const [label, py, fn, ts, iface] of CASES) {
+      const api = await apiKeys(py, fn)
+      const t = await tsKeys(ts, iface)
+      const undeclared = [...api].filter((k) => !t.all.has(k)).sort()
+      assert.deepEqual(undeclared, [],
+        `${label}: 응답에는 있는데 ${iface} 에 없는 키입니다 — "응답에 없다"로 읽혀 같은 데이터를 다시 만들게 됩니다: ${undeclared.join(', ')}`)
+    }
+  })
+
+  test('타입이 필수라고 적은 키가 응답에 실제로 있다', async () => {
+    for (const [label, py, fn, ts, iface] of CASES) {
+      const api = await apiKeys(py, fn)
+      const t = await tsKeys(ts, iface)
+      const phantom = [...t.required].filter((k) => !api.has(k)).sort()
+      assert.deepEqual(phantom, [],
+        `${label}: ${iface} 가 필수라고 적었는데 응답에 없는 키입니다: ${phantom.join(', ')}`)
+    }
+  })
+
+  test('두 목록 화면이 같은 카드 필드를 받는다 (화면마다 다른 데이터가 되지 않는다)', async () => {
+    // 관심물건/최근본은 같은 카드 컴포넌트 모양을 쓴다. 화면 전용 필드만 달라야 한다.
+    const fav = await apiKeys('api/v1/favorites.py', 'get_favorites')
+    const rec = await apiKeys('api/v1/recent_items.py', 'get_recent_items')
+    const favOnly = [...fav].filter((k) => !rec.has(k)).sort()
+    const recOnly = [...rec].filter((k) => !fav.has(k)).sort()
+    assert.deepEqual(favOnly, ['favorited_at', 'memo', 'note_source', 'tags'],
+      `관심물건에만 있는 필드가 달라졌습니다: ${favOnly.join(', ')}`)
+    assert.deepEqual(recOnly, ['viewed_at'],
+      `최근본에만 있는 필드가 달라졌습니다: ${recOnly.join(', ')}`)
+  })
+})
+
+
+// ================================================================
+// 마이페이지 3종 응답 ↔ 프런트 타입 (2026-08-31 신설)
+//
+// `/mypage` 는 기존 API 3개를 조합한 읽기 전용 화면이다(`docs/FRONTEND_MASTER_SPEC.md` §16).
+// 위 관심물건/최근본과 같은 방식으로 소스 대조한다 — JWT 시크릿 열람은 승인 영역이라
+// 살아 있는 서버로는 대조하지 못한다.
+//
+// ## 여기서는 "타입에 다 적는다"가 답이 아니다
+//
+// 검색·상세에서는 미선언 키를 **타입에 추가**했다(면적/주소 조각 — 화면이 쓸 수 있는 값).
+// 마이페이지 쪽 미선언 키는 성격이 다르다.
+//
+//     user_id / updated_at / created_at   화면이 쓸 일이 없는 내부 필드
+//     pg_provider / pg_transaction_id     결제 내부 식별자 (PG 연동 전이라 전부 null)
+//     metadata                            결제 부가 정보(JSON 문자열)
+//     completed_at                        등기부 발급 완료 시각 — **사용자에게 의미가 있다**
+//
+// 어느 것을 타입에 올리고 어느 것을 응답에서 뺄지는 **정보 구성/계약 축소 결정**이라
+// 여기서 정하지 않는다(`docs/BUGS.md` #254 가 `tenants[]` 3키를 같은 이유로 남겨 둔 것과
+// 같은 취급이다). 대신 **지금 상태를 명시적으로 적어 고정**한다 —
+//   1. 목록에 없는 새 키가 응답에 생기면 실패한다 (조용히 늘지 않는다)
+//   2. 목록에 있는데 응답에서 사라지면 실패한다 (죽은 예외 금지)
+// ================================================================
+
+describe('마이페이지 3종 응답 ↔ 프런트 타입 (2026-08-31) — 소스 계약', () => {
+  const read = async (p) => (await (await import('node:fs')).promises).readFile(p, 'utf8')
+
+  async function apiKeys(file, funcName) {
+    const src = await read(file)
+    const at = src.indexOf(`def ${funcName}(`)
+    assert.ok(at !== -1, `${file} 에서 ${funcName}() 를 찾지 못했습니다`)
+    const rest = src.slice(at)
+    const nextDef = rest.slice(1).search(/\ndef |\n@router/)
+    const body = nextDef === -1 ? rest : rest.slice(0, nextDef + 1)
+    let best = []
+    for (const m of body.matchAll(/\{([\s\S]*?)\n\s*\}/g)) {
+      const keys = [...m[1].matchAll(/"([a-z_][a-z0-9_]*)"\s*:/g)].map((k) => k[1])
+      if (keys.length > best.length) best = keys
+    }
+    return new Set(best)
+  }
+
+  async function tsKeys(file, name) {
+    const src = await read(file)
+    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
+    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
+    let depth = 1
+    let i = m.index + m[0].length
+    const start = i
+    while (i < src.length && depth > 0) {
+      if (src[i] === '{') depth++
+      else if (src[i] === '}') depth--
+      i++
+    }
+    let body = src.slice(start, i - 1)
+    for (;;) {
+      const next = body.replace(/\{[^{}]*\}/g, '')
+      if (next === body) break
+      body = next
+    }
+    const required = new Set()
+    const all = new Set()
+    for (const line of body.split('\n')) {
+      const code = line.split('//')[0].trim()
+      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
+      if (!km) continue
+      all.add(km[1])
+      if (km[2] !== '?') required.add(km[1])
+    }
+    return { required, all }
+  }
+
+  // 응답에는 있지만 타입에 적지 않기로 **한 것**. 늘리려면 근거가 있어야 한다.
+  const MYPAGE = [
+    {
+      label: 'GET /api/v1/subscriptions/me',
+      py: 'api/v1/subscriptions.py', fn: 'row_to_subscription',
+      ts: 'src/app/mypage/page.tsx', iface: 'Subscription',
+      undeclared: ['created_at', 'updated_at', 'user_id'],
+    },
+    {
+      label: 'GET /api/v1/payments',
+      py: 'api/v1/payments.py', fn: 'row_to_payment',
+      ts: 'src/app/mypage/page.tsx', iface: 'Payment',
+      undeclared: ['metadata', 'pg_provider', 'pg_transaction_id', 'updated_at', 'user_id'],
+    },
+    {
+      label: 'GET /api/v1/registry-requests',
+      py: 'api/v1/registry.py', fn: 'get_registry_requests',
+      ts: 'src/app/mypage/page.tsx', iface: 'RegistryRequest',
+      // 사용자에게 의미가 있는 유일한 항목. 화면에 올릴지는 정보 구성 결정이라 SKIP.
+      undeclared: ['completed_at'],
+    },
+  ]
+
+  test('검사가 공허하지 않다 — 세 응답과 세 타입을 실제로 읽었다', async () => {
+    for (const c of MYPAGE) {
+      const api = await apiKeys(c.py, c.fn)
+      const ts = await tsKeys(c.ts, c.iface)
+      assert.ok(api.size >= 5, `${c.label}: API 키 추출 실패 (${api.size}개)`)
+      assert.ok(ts.all.size >= 5, `${c.label}: TS 키 추출 실패 (${ts.all.size}개)`)
+      assert.ok(api.has('status') && ts.all.has('status'), `${c.label}: status 를 못 찾았습니다`)
+    }
+  })
+
+  test('★ 목록에 없는 새 키가 응답에 조용히 생기지 않는다', async () => {
+    for (const c of MYPAGE) {
+      const api = await apiKeys(c.py, c.fn)
+      const ts = await tsKeys(c.ts, c.iface)
+      const unexpected = [...api]
+        .filter((k) => !ts.all.has(k) && !c.undeclared.includes(k))
+        .sort()
+      assert.deepEqual(unexpected, [],
+        `${c.label}: 타입에도 없고 예외 목록에도 없는 응답 키입니다 — 타입에 올리거나 예외에 근거와 함께 적으십시오: ${unexpected.join(', ')}`)
+    }
+  })
+
+  test('★ 예외 목록이 코드보다 앞서 나가지 않는다 (죽은 예외 금지)', async () => {
+    for (const c of MYPAGE) {
+      const api = await apiKeys(c.py, c.fn)
+      const dead = c.undeclared.filter((k) => !api.has(k)).sort()
+      assert.deepEqual(dead, [],
+        `${c.label}: 응답에 더 이상 없는 키가 예외 목록에 남아 있습니다 — 목록에서 빼십시오: ${dead.join(', ')}`)
+    }
+  })
+
+  test('타입이 필수라고 적은 키가 응답에 실제로 있다', async () => {
+    for (const c of MYPAGE) {
+      const api = await apiKeys(c.py, c.fn)
+      const ts = await tsKeys(c.ts, c.iface)
+      const phantom = [...ts.required].filter((k) => !api.has(k)).sort()
+      assert.deepEqual(phantom, [],
+        `${c.label}: ${c.iface} 가 필수라고 적었는데 응답에 없는 키입니다: ${phantom.join(', ')}`)
+    }
+  })
+})

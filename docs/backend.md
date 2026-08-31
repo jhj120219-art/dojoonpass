@@ -354,7 +354,20 @@ Task Scheduler (매일 06:00)
 ### 서비스 테이블
 - `auction_case`: 사건 단위
 - `auction_item`: 물건 단위. 검색/상세 API 기준 테이블.
-- `document_status`: COLLECTING/OCR/PARSING/ANALYZING/READY/FAILED
+- `document_status`: ~~COLLECTING/OCR/PARSING/ANALYZING/READY/FAILED~~
+  → **2026-08-31 정정: `NO_IMAGE` 가 빠져 있었다.** 수집기·API·화면·감사기가 전부 쓰는
+  값인데 이 목록과 `api/constants.py:DocumentStatus` 에만 없었다.
+
+  ```
+  실제로 쓰이는 값   COLLECTING / READY / NO_IMAGE / FAILED
+  자리만 잡아 둔 값   OCR / PARSING / ANALYZING   (쓰는 코드 0곳, DB 행 0건)
+  ```
+
+  `NO_IMAGE` 는 "법원이 사진을 제공하지 않는다"는 **확인된 답**이지 실패가 아니다 —
+  재시도해도 결과가 같고, `DOC_STATUS_HAS_ARTIFACT`(`storage/database.py`)가
+  `READY` 와 함께 "보여 줄 자산이 있다"로 센다. 실패로 표시하면 사용자가 기다리면
+  생길 것처럼 오해한다. 회귀: `test_queue_safety_invariants.py` 의 `test_document_status_vocabulary_is_declared_in_one_place`
+  (큐 상태 어휘 검사와 같은 자리 — 같은 파이프라인의 이웃 컬럼이라 함께 본다)
 - `doc_raw`: 원본 파일 보관
 - `parsed_document`: parsed_json, parser_version (raw_text 없음)
 - `tenant_rights`: 임차인 원본 데이터. 분석 결과 없음.
@@ -501,7 +514,26 @@ Task Scheduler (매일 06:00)
 - PG 연동 코드 작성 금지 — 2026-08-06 PG사는 KG이니시스로 확정됐으나, **실제 연동 코드 작성은 여전히 금지**(외부 API Key/계약이 필요한 승인 대상). `pg_provider`는 계속 null, `MockProvider` 동작 유지
 - ~~결제 성공 가정 Mock 로직 백엔드 작성 금지~~ → **2026-08-05 Sprint 1에서 예외적으로 구현됨** (`api/v1/payments.py`, CTO 승인). 기존 결정(`docs/decision-log.md`)을 이 범위에 한해 대체함. Payment↔Subscription↔Premium 내부 체인 검증 목적이며 PG 실연동과는 무관
 - ~~`registry_requests`의 PAYMENT_REQUIRED(등기부 초과분) 상태는 결제와 연결되지 않는다~~ → 2026-08-05 자동 연결 구현 완료(위 "결제(Payment)..." 참고)
-- property_type 코드: APARTMENT/OFFICETEL/LAND/FACTORY/COMMERCIAL/MULTI_FAMILY
+- ~~property_type 코드: APARTMENT/OFFICETEL/LAND/FACTORY/COMMERCIAL/MULTI_FAMILY~~
+  → **2026-08-31 정정: 그런 코드 체계는 존재한 적이 없다.** `auction_item.property_type`은
+  **법원 표기 그대로의 한국어 자유 문자열**이고, 한 물건이 여러 종류를 겸하면 콤마로 이어
+  붙는다. 실측(2026-08-31, `auction.db` 1,876행 전수) **18종**이며 위 ENUM 값을 쓰는 행은
+  **0건**, 저장소 어느 소스도 그 문자열을 만들지 않는다(같은 문장이 `storage/migrate_v4_1.py`
+  주석에도 복사돼 있어 함께 정정했다).
+
+  ```
+  [VOCAB-TABLE]
+  기타 259 / 다세대 246 / 상가,오피스텔,근린시설 205 / 아파트 201 / 전답 188
+  근린시설 164 / 연립주택,다세대,빌라 133 / 임야 123 / 오피스텔 102
+  대지,임야,전답 56 / 대지 47 / 단독주택,다가구주택 43 / 단독주택 42
+  다가구주택 33 / 상가 18 / 자동차,중기 9 / 자동차 4 / 연립주택 3
+  ```
+
+  검색은 `LIKE %패턴%`으로 맞추고, UI 어휘(`PropertyTypeTree` 69종)와의 차이는
+  `api/v1/search.py:PROPERTY_TYPE_ALIASES`가 잇는다(`docs/BUGS.md` #33).
+  이 문장을 믿고 ENUM으로 필터를 짜면 **모든 조회가 0건**이 된다 — 그래서
+  `test_property_type_vocabulary.py`가 "없는 ENUM을 있다고 적지 않는다"를 회귀로 고정한다.
+  어휘를 어느 쪽으로 통일할지는 여전히 제품 판단(미결정, `docs/frontend.md` 알려진 문제점)
 - payments.pg_provider: 현재 null (Mock 결제이므로)
 - Admin MVP(`api/v1/admin.py`) 도입: `X-Admin-Key` 인증, `registry_requests.reason` 컬럼 추가(`010_add_registry_request_reason.sql`) — 스키마 변경 사용자 승인 완료
 

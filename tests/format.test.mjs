@@ -21,7 +21,7 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatPrice, formatPriceEok, formatWon, parseArea, formatArea, SQM_PER_PYEONG } from '../src/lib/format.ts'
+import { formatPrice, formatPriceEok, formatWon, formatNumber, DISPLAY_LOCALE, formatDday, todayInDisplayZone, DISPLAY_TIME_ZONE, serverArea, displayArea, formatBidRate, parseArea, formatArea, SQM_PER_PYEONG } from '../src/lib/format.ts'
 
 describe('formatPrice — 물건 시세(억/만 축약)', () => {
   test('0과 falsy는 하이픈으로 표시한다', () => {
@@ -330,6 +330,243 @@ describe('parseArea — 천단위 쉼표 (BUGS #240)', () => {
         Number(got.sqm.toFixed(4)), expected,
         `백엔드와 다른 값입니다: ${addr}`
       )
+    }
+  })
+})
+
+// ================================================================
+// 천 단위 구분자의 로케일 (2026-08-31 신설)
+//
+// `toLocaleString()`을 인자 없이 부르면 **보는 사람의 브라우저 로케일**이 구분자를
+// 정한다. 이 저장소는 화면 10곳에서 그렇게 쓰고 있었고 그중 5곳이 실제 청구 금액이었다.
+// de-DE 브라우저에서 `12,900원`이 `12.900원`이 되는데, 오류도 로그도 없이 금액만
+// 다르게 읽힌다. 날짜는 이미 `toLocaleDateString('ko-KR')`로 고정돼 있었으므로
+// 숫자에도 같은 규칙을 적용했다(새 정책이 아니라 기존 규칙의 확장).
+//
+// ★ 이 테스트가 잡는 것: 누군가 `formatNumber`에서 로케일 인자를 지우는 변경.
+//   그러면 실행 환경 로케일에 따라 통과/실패가 갈리므로 아래처럼 **다른 로케일을
+//   기본값으로 강제한 상태에서도** 결과가 같아야 한다는 형태로 고정한다.
+// ================================================================
+
+describe('formatNumber / formatWon — 로케일 고정 (2026-08-31)', () => {
+  test('천 단위 구분자는 쉼표다', () => {
+    assert.equal(formatNumber(0), '0')
+    assert.equal(formatNumber(999), '999')
+    assert.equal(formatNumber(1000), '1,000')
+    assert.equal(formatNumber(1876), '1,876')
+    assert.equal(formatNumber(1234567), '1,234,567')
+  })
+
+  test('DISPLAY_LOCALE 이 ko-KR 로 고정돼 있다', () => {
+    // 제품은 한국어 전용이다(src/app/layout.tsx 의 lang="ko").
+    // 날짜 표기 3곳이 이미 'ko-KR' 을 명시하고 있어 숫자만 다른 규칙일 이유가 없다.
+    assert.equal(DISPLAY_LOCALE, 'ko-KR')
+  })
+
+  test('★ 브라우저 로케일이 달라도 같은 문자열이 나온다 (de-DE 대조)', () => {
+    // 고정 전 동작을 그대로 재현한다: 인자 없는 toLocaleString 은 환경을 따라간다.
+    // de-DE 에서는 "12.900" 이 되어 한국식으로 읽으면 12.9 다.
+    assert.equal((12900).toLocaleString('de-DE'), '12.900')
+    // 제품 함수는 환경과 무관하게 언제나 쉼표여야 한다.
+    assert.equal(formatNumber(12900), '12,900')
+    assert.equal(formatWon(12900), '12,900원')
+  })
+
+  test('formatWon 은 formatNumber 위에서 만들어진다(표기가 갈리지 않는다)', () => {
+    for (const amount of [0, 999, 12900, 198000, 274800, 1234567]) {
+      assert.equal(formatWon(amount), formatNumber(amount) + '원',
+        `formatWon 과 formatNumber 의 구분자 규칙이 갈렸습니다: ${amount}`)
+    }
+  })
+})
+
+
+// ================================================================
+// 매각기일 D-day — "오늘"의 기준 시간대 (2026-08-31 신설)
+//
+// ## 왜 지금 생겼나
+//
+// `formatDday()` 는 검색 카드와 상세 배지에 **매번 찍히는 값**인데, 원래
+// `src/app/search/ResultList.tsx`(JSX) 안에 있어 Node 타입 스트리핑으로 import 할 수
+// 없었다 — 그래서 **동작이 한 번도 검증된 적이 없었다.** `parseArea` 를 옮길 때와
+// 같은 이유로 `src/lib/format.ts` 로 옮기면서 계약을 고정한다.
+//
+// ## 무엇을 고정하나
+//
+// "오늘" 이 두 곳에서 따로 계산되고 있었다 — 백엔드는 서버 로컬(`date.today()`),
+// 프런트는 **보는 사람의 시계**(`new Date()`). 서버는 한국에서 도는데 브라우저는
+// 아무 데서나 돈다. 아래 테스트는 같은 순간을 **다른 시간대의 시계로** 보더라도
+// 같은 D-day 가 나오는지를 본다.
+// ================================================================
+
+describe('formatDday — 한국 날짜 기준 (2026-08-31)', () => {
+  // 2026-08-31 09:00 KST == 2026-08-31 00:00 UTC
+  const KST_0900 = new Date('2026-08-31T00:00:00Z')
+
+  test('오늘이면 D-Day', () => {
+    assert.equal(formatDday('2026-08-31', KST_0900), 'D-Day')
+  })
+
+  test('미래는 남은 일수, 과거는 경과 일수', () => {
+    assert.equal(formatDday('2026-09-01', KST_0900), '입찰 1일전')
+    assert.equal(formatDday('2026-09-07', KST_0900), '입찰 7일전')
+    assert.equal(formatDday('2026-08-30', KST_0900), '입찰 1일 경과')
+    assert.equal(formatDday('2026-08-24', KST_0900), '입찰 7일 경과')
+  })
+
+  test('값이 없거나 형식이 다르면 아무것도 표시하지 않는다', () => {
+    // 없는 것을 "D-Day" 로 지어내지 않는다 — 이 저장소의 추측 금지 원칙.
+    assert.equal(formatDday(null), null)
+    assert.equal(formatDday(''), null)
+    assert.equal(formatDday('2026/08/31', KST_0900), null)
+    assert.equal(formatDday('미정', KST_0900), null)
+  })
+
+  test('★ 자정 경계 — 한국에서 날짜가 바뀌는 순간에 바뀐다', () => {
+    // 2026-08-31 00:00 KST 직전(= 08-30 14:59:59 UTC)에는 아직 8월 30일이다.
+    const justBefore = new Date('2026-08-30T14:59:59Z')
+    const justAfter = new Date('2026-08-30T15:00:00Z')
+    assert.equal(todayInDisplayZone(justBefore), '2026-08-30')
+    assert.equal(todayInDisplayZone(justAfter), '2026-08-31')
+    assert.equal(formatDday('2026-08-31', justBefore), '입찰 1일전')
+    assert.equal(formatDday('2026-08-31', justAfter), 'D-Day')
+  })
+
+  test('★ 브라우저 시간대가 달라도 같은 값이 나온다 (고친 결함 그 자체)', () => {
+    // 같은 순간을 UTC-05:00 / UTC+13:00 브라우저에서 본다.
+    // 고치기 전에는 로컬 자정을 썼기 때문에 여기서 하루씩 어긋났다.
+    const moment = new Date('2026-08-30T15:30:00Z') // = 2026-08-31 00:30 KST
+    assert.equal(todayInDisplayZone(moment), '2026-08-31')
+    assert.equal(formatDday('2026-08-31', moment), 'D-Day')
+
+    // 참고: 같은 순간의 각 지역 로컬 날짜는 실제로 다르다(그래서 결함이었다).
+    const localDay = (tz) => new Intl.DateTimeFormat('en-CA',
+      { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(moment)
+    assert.equal(localDay('America/New_York'), '2026-08-30')
+    assert.equal(localDay('Pacific/Auckland'), '2026-08-31')
+    assert.notEqual(localDay('America/New_York'), todayInDisplayZone(moment))
+  })
+
+  test('DISPLAY_TIME_ZONE 이 Asia/Seoul 로 고정돼 있다', () => {
+    // 저장소가 선언한 시각 기준(storage/database.py 의 _NOW_LOCAL 주석)과 같다.
+    assert.equal(DISPLAY_TIME_ZONE, 'Asia/Seoul')
+  })
+
+  test('윤년/월말 경계에서도 일수가 정확하다', () => {
+    const feb28 = new Date('2028-02-27T15:00:00Z') // 2028-02-28 00:00 KST (윤년)
+    assert.equal(todayInDisplayZone(feb28), '2028-02-28')
+    assert.equal(formatDday('2028-02-29', feb28), '입찰 1일전')
+    assert.equal(formatDday('2028-03-01', feb28), '입찰 2일전')
+
+    const dec31 = new Date('2026-12-30T15:00:00Z') // 2026-12-31 00:00 KST
+    assert.equal(formatDday('2027-01-01', dec31), '입찰 1일전')
+  })
+})
+
+
+// ================================================================
+// 카드 면적의 출처 — 필터가 쓰는 값과 같은 값을 보여준다 (2026-08-31 신설)
+//
+// 면적 규칙이 두 곳에 있었다: 백엔드 `normalizer.extract_areas()`(검색 필터가 쓰는
+// 컬럼을 채운다)와 프런트 `parseArea()`(카드에 표시). 2026-08-31 전수 대조
+// (auction.db 1,876행)에서 라벨/값 불일치는 0 이었지만 **커버리지가 달랐다** —
+// 단위가 '평'인 7건은 백엔드가 ㎡ 로 환산해 저장하는데 프런트는 표시하지 못했다.
+// 그래서 면적 조건으로 걸러 놓고 그 카드에는 면적이 비어 있었다.
+//
+// 이제 표시도 서버 값을 먼저 쓴다. `parseArea()` 는 폴백으로만 남는다.
+// ================================================================
+
+describe('serverArea / displayArea — 필터와 표시가 같은 값을 본다 (2026-08-31)', () => {
+  test('서버가 준 값이 있으면 그것을 쓴다', () => {
+    assert.deepEqual(serverArea(84.5, null), { label: '건물', sqm: 84.5 })
+    assert.deepEqual(serverArea(null, 3464.4628), { label: '토지', sqm: 3464.4628 })
+    assert.equal(serverArea(null, null), null)
+    assert.equal(serverArea(undefined, undefined), null)
+  })
+
+  test('0 은 면적으로 보지 않는다 (모르는 것과 0㎡ 를 섞지 않는다)', () => {
+    // 실데이터에 0 은 없다. 있다면 파싱 사고이며, 틀린 숫자보다 빈 칸이 낫다.
+    assert.equal(serverArea(0, 0), null)
+    // 0 은 무시하되 다른 쪽에 값이 있으면 그쪽을 쓴다.
+    assert.deepEqual(serverArea(0, 120), { label: '토지', sqm: 120 })
+  })
+
+  test('건물과 토지가 둘 다 오면 건물을 쓴다', () => {
+    // 실데이터에 둘 다 가진 행은 0건이지만, 온다면 대지권처럼 토지 값이 이 물건의
+    // 몫이 아닐 수 있어 건물 쪽이 이 물건을 더 정확히 말한다.
+    assert.deepEqual(serverArea(74.55, 500), { label: '건물', sqm: 74.55 })
+  })
+
+  test('★ 서버 값이 없으면 주소 원문으로 폴백한다 (구 백엔드에서 카드가 비지 않는다)', () => {
+    const item = { full_address: '서울특별시 강남구 역삼동 1 [건물 84.50㎡]' }
+    assert.deepEqual(displayArea(item), { label: '건물', sqm: 84.5 })
+    assert.deepEqual(displayArea({ ...item, building_area: null, land_area: null }),
+      { label: '건물', sqm: 84.5 })
+  })
+
+  test('★ 서버 값이 주소 파싱을 이긴다', () => {
+    // 필터는 서버 컬럼으로 도는데 화면이 다른 숫자를 보여주면 안 된다.
+    const item = {
+      full_address: '경기도 평택시 [건물 1층 3,005.35㎡]',
+      building_area: 14438.85,
+      land_area: null,
+    }
+    assert.deepEqual(displayArea(item), { label: '건물', sqm: 14438.85 })
+  })
+
+  test("★ 단위가 '평'인 물건 — 실데이터 (백엔드만 읽던 7건)", () => {
+    // auction.db id=185 의 실제 주소. 프런트 파서는 ㎡ 표기만 읽어 null 이다.
+    const addr = '경상북도 포항시 북구 죽장면 월평리 690 [토지 전 1048평]'
+    assert.equal(parseArea(addr), null, '전제: 주소 파서는 평 표기를 읽지 못한다')
+    // 백엔드는 ㎡ 로 환산해 저장한다(1048평 * 3.305785 = 3464.4628).
+    assert.deepEqual(displayArea({ full_address: addr, land_area: 3464.4628 }),
+      { label: '토지', sqm: 3464.4628 })
+    assert.equal(formatArea(displayArea({ full_address: addr, land_area: 3464.4628 })),
+      '토지 3464.46㎡ (1048.00평)')
+  })
+
+  test('면적 개념이 없는 물건은 여전히 아무것도 표시하지 않는다', () => {
+    // 차량/선박 등 — 없는 것을 0 으로 지어내지 않는다.
+    assert.equal(displayArea({ full_address: '서울 [자동차 그랜저]' }), null)
+    assert.equal(displayArea({ full_address: null }), null)
+  })
+})
+
+
+// ================================================================
+// 최저가율(= 입찰가율) 표기 (2026-08-31 신설)
+//
+// 같은 계산이 두 곳에 있었고 규칙이 달랐다 — 검색 카드는 값이 없으면 '-' 였는데
+// 상세는 가드가 없어 `(null*100).toFixed(1)` = **"0.0%"** 를 찍었다.
+// 없는 것을 0 으로 지어내는 것이라 가드가 있는 쪽으로 모았다.
+//
+// 값은 0~1 비율이다(`migrate_execute.calc_bid_rate` = 최저가/감정가).
+// ================================================================
+
+describe('formatBidRate — 최저가율 표기 (2026-08-31)', () => {
+  test('0~1 비율을 한 자리 소수 퍼센트로 쓴다', () => {
+    assert.equal(formatBidRate(0.7), '70.0%')
+    assert.equal(formatBidRate(1), '100.0%')
+    assert.equal(formatBidRate(0.6428), '64.3%')   // 반올림
+    assert.equal(formatBidRate(0.3199), '32.0%')
+  })
+
+  test('0 은 0.0% 다 — 유효한 값이므로 하이픈으로 바꾸지 않는다', () => {
+    // 감정가가 0 이면 calc_bid_rate 가 0.0 을 준다. "모른다"가 아니라 계산 결과다.
+    assert.equal(formatBidRate(0), '0.0%')
+  })
+
+  test('★ 값이 없으면 0 을 지어내지 않는다', () => {
+    // 고치기 전 상세 화면은 여기서 "0.0%" 를 찍었다.
+    assert.equal(formatBidRate(null), '-')
+    assert.equal(formatBidRate(undefined), '-')
+    assert.equal(formatBidRate(NaN), '-')
+  })
+
+  test('실제 DB 값 범위에서 자릿수가 흔들리지 않는다', () => {
+    // auction_item.bid_rate 는 round(x, 4) 로 저장된다(calc_bid_rate).
+    for (const [raw, shown] of [[0.0001, '0.0%'], [0.1234, '12.3%'], [0.9999, '100.0%']]) {
+      assert.equal(formatBidRate(raw), shown, `${raw} -> ${formatBidRate(raw)}`)
     }
   })
 })

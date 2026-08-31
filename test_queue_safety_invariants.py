@@ -385,6 +385,213 @@ def test_resume_position():
                case_no_matches_list_entry("2024타경1", "2024타경1"), False)
 
 
+def test_queue_status_vocabulary_is_declared_in_one_place():
+    """`document_queue.status` 의 어휘가 **상수 한 곳**에서만 나오는가 (2026-08-31 신설).
+
+    ## 왜 필요한가
+
+    이 컬럼의 값은 전부 `WHERE status='...'` 로 **비교**된다. 오타는 예외가 아니라
+    **0행 매치**다 - `mark_queue_done()` 이 아무 행도 바꾸지 못하면 그 행은
+    `in_progress` 로 남아 stale 회수까지 붙잡혀 있고, 화면에는 수집이 끝난 것으로
+    보인다. 로그에도 남지 않는 조용한 실패다.
+
+    2026-08-31 실측: 여덟 값 중 여섯은 상수인데 **`done`/`failed` 만 상수가 없었고**,
+    상수가 있는 값조차 SQL 문자열에 리터럴로 박힌 자리가 있었다(`'SKIPPED_EXPIRED'`).
+    같은 파일의 주석이 "문자열로 구별하면 언젠가 어긋난다"고 경고한 바로 그 모양이다.
+    """
+    print("\n--- 큐 상태 어휘가 한 곳에서만 나오는가 ---")
+    import re
+    from storage.database import (
+        QUEUE_STATUSES, QUEUE_STATUS_DONE, QUEUE_STATUS_FAILED,
+        QUEUE_CLAIM_STATUS, QUEUE_RESUME_STATUS, QUEUE_CLAIMABLE_STATUSES,
+        QUEUE_IN_PROGRESS_STATUSES,
+    )
+
+    # (a) 선언이 실제로 있고 비어 있지 않다 - 검사가 공허하지 않다.
+    check("어휘 집합이 선언돼 있다", len(QUEUE_STATUSES) >= 8, True)
+    check("done 이 상수로 있다", QUEUE_STATUS_DONE, "done")
+    check("failed 가 상수로 있다", QUEUE_STATUS_FAILED, "failed")
+
+    # (b) 파생 목록이 전부 그 집합 안에 있다. 하나라도 밖이면 전이표가 어휘를 벗어난 것이다.
+    derived = set(QUEUE_CLAIM_STATUS) | set(QUEUE_CLAIM_STATUS.values())
+    derived |= set(QUEUE_RESUME_STATUS) | set(QUEUE_RESUME_STATUS.values())
+    derived |= set(QUEUE_CLAIMABLE_STATUSES) | set(QUEUE_IN_PROGRESS_STATUSES)
+    check("파생 목록이 어휘를 벗어나지 않는다",
+          sorted(derived - set(QUEUE_STATUSES)), [])
+
+    # (c) 제품 SQL 이 상태값을 **문자열로 박지 않는다.**
+    #     값을 SQL 텍스트에 넣으면 오타가 조용히 0행 매치가 되고, 이 저장소의
+    #     SQL 조립 감사 규칙(값은 예외 없이 바인딩)과도 어긋난다.
+    root = os.path.dirname(os.path.abspath(__file__))
+    literal = re.compile(r"status\s*=\s*'(%s)'" % "|".join(
+        re.escape(v) for v in sorted(QUEUE_STATUSES)))
+
+    def code_strings(path):
+        """그 파일의 **실제 코드에 쓰이는 문자열**만. docstring 은 뺀다.
+
+        줄 단위로 훑으면 docstring 안의 설명문("status='SKIPPED_EXPIRED' 는 ...")까지
+        결함으로 잡는다. SQL 은 삼중따옴표 문자열이라 삼중따옴표를 통째로 지울 수도
+        없다. 그래서 구문 트리로 **docstring 자리만** 정확히 제외한다.
+        """
+        import ast as _ast
+        tree = _ast.parse(io.open(path, encoding="utf-8-sig").read())
+        docs = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.Module, _ast.FunctionDef,
+                                 _ast.AsyncFunctionDef, _ast.ClassDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], _ast.Expr) and                         isinstance(body[0].value, _ast.Constant) and                         isinstance(body[0].value.value, str):
+                    docs.add(id(body[0].value))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Constant) and isinstance(node.value, str)                     and id(node) not in docs:
+                yield getattr(node, "lineno", 0), node.value
+
+    offenders = []
+    for rel in ("storage/database.py", "doc_worker.py", "api/v1/doc_stats.py",
+                "refresh_priority.py"):
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            continue
+        for lineno, text in code_strings(path):
+            if literal.search(text):
+                offenders.append("%s:%d" % (rel, lineno))
+    check("SQL 에 상태값 리터럴이 박혀 있지 않다", sorted(set(offenders)), [])
+
+    # 탐지기 자체 증명 - 합성 입력에서는 반드시 잡혀야 한다.
+    check_true("리터럴 탐지기가 동작한다",
+               bool(literal.search("UPDATE q SET status='done' WHERE id=?")))
+    check_true("바인딩 형태는 잡지 않는다(오탐 없음)",
+               not literal.search("UPDATE q SET status=? WHERE id=?"))
+
+    # (d) 실제 DB 에 어휘 밖의 값이 없다. 스크립트가 몰래 늘렸는지까지 본다.
+    db_path = os.path.join(root, "auction.db")
+    if os.path.exists(db_path):
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"), uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM document_queue GROUP BY 1").fetchall()
+        finally:
+            conn.close()
+        unknown = sorted(st for st, _ in rows if st not in QUEUE_STATUSES)
+        check("실제 DB 의 상태가 전부 선언된 어휘다", unknown, [])
+        print("   DB 실측: %s" % ", ".join("%s=%d" % (st, n) for st, n in rows))
+    else:
+        # 검사를 조용히 건너뛰지 않는다 - 무엇을 못 봤는지 화면에 남긴다.
+        print("   (auction.db 없음 - DB 대조는 이번 실행에서 하지 못했다)")
+
+    # (e) ★ 상수 **값 자체**의 오타를 잡는다.
+    #
+    #     (b)/(c) 는 전부 같은 상수에서 파생되므로, 상수 값에 오타가 나면 양쪽이
+    #     함께 틀려 **조용히 통과한다**(2026-08-31 변이 검증에서 실제로 생존했다).
+    #     그래서 여기서는 제품 코드가 **DB 에 실제로 쓴 값**을 읽어, 이 파일에
+    #     손으로 적은 기대 문자열과 맞춘다. 두 출처가 독립이라 오타가 드러난다.
+    db2, path2 = fresh_db()
+    seed_queue(path2, [("B9", "2026타경9", "1", "spec", "pending", 0, None)])
+    claimed = db2.claim_next_queue_item()
+    check_true("전제: 큐에서 한 건을 집었다", claimed is not None, claimed)
+    check("claim 이 DB 에 쓴 상태 = 'in_progress'",
+          q(path2, "SELECT status FROM document_queue"), "in_progress")
+    db2.mark_queue_done(claimed["id"], "B9", "2026타경9", "1", "spec",
+                        None, "hash-9",
+                        claim_token=claimed.get("claim_token"))
+    check("mark_queue_done 이 DB 에 쓴 상태 = 'done'",
+          q(path2, "SELECT status FROM document_queue"), "done")
+
+
+def test_document_status_vocabulary_is_declared_in_one_place():
+    """`document_status.status` 어휘가 상수와 어긋나지 않는가 (2026-08-31 신설).
+
+    큐(`document_queue.status`)와 **같은 파이프라인의 이웃 컬럼**이라 같은 자리에서 본다.
+    큐가 "워커가 어디까지 했는가"라면 이쪽은 "화면이 무엇을 보여 줄 수 있는가"다.
+
+    ## 왜 필요한가
+
+    2026-08-31 실측: `api/constants.py:DocumentStatus` 가 여섯 값만 선언하고 있었는데
+    제품은 **일곱 번째 값(`NO_IMAGE`)을 실제로 쓰고 있었다.**
+
+        doc_worker.py            done_status = "NO_IMAGE" if result.get("no_asset") else "READY"
+        api/v1/item.py           `_images_status()` 가 그대로 내보낸다
+        storage/database.py      DOC_STATUS_HAS_ARTIFACT = ("READY", "NO_IMAGE")
+        audit_asset_integrity.py 정합성 판정이 정상으로 센다
+        properties/[id]/page.tsx '사진 없음' 라벨
+
+    DB·수집기·API·화면·감사기가 전부 아는 값을 **상태값 정의만 몰랐다.**
+    이런 어긋남은 실행해도 드러나지 않는다 — 상태값이 문자열이라 열거형을 거치지 않고도
+    잘 돌기 때문이다. 드러나는 순간은 누군가 열거형만 보고 분기를 짤 때다.
+    """
+    print("\n--- 문서 상태 어휘가 상수와 맞는가 ---")
+    import re
+    from api.constants import DocumentStatus, DOCUMENT_STATUSES_IN_USE
+
+    declared = {e.value for e in DocumentStatus}
+    in_use = {str(v) for v in DOCUMENT_STATUSES_IN_USE}
+
+    # (a) 검사가 공허하지 않다.
+    check("열거형이 비어 있지 않다", len(declared) >= 6, True)
+    check("사용 집합이 선언의 부분집합이다", sorted(in_use - declared), [])
+
+    # (b) 제품 코드가 실제로 쓰는 값이 전부 선언돼 있다.
+    #     `_set_document_status(...)` 호출과 `document_status` 관련 상수를 훑는다.
+    root = os.path.dirname(os.path.abspath(__file__))
+    written = set()
+    scanned = 0
+    for rel in ("storage/database.py", "doc_worker.py", "api/v1/item.py",
+                "repair_document_status.py", "repair_unsupported_status_docs.py"):
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            continue
+        scanned += 1
+        src = io.open(path, encoding="utf-8-sig").read()
+        for m in re.finditer(r"_set_document_status\([^)]*?['\"]([A-Z_]+)['\"]", src, re.S):
+            written.add(m.group(1))
+        for m in re.finditer(r"done_status\s*=\s*['\"]([A-Z_]+)['\"]"
+                             r"|done_status\s*=\s*['\"]([A-Z_]+)['\"]\s+if", src):
+            written.add(m.group(1) or m.group(2))
+        for m in re.finditer(r"DOC_STATUS_HAS_ARTIFACT\s*=\s*\(([^)]*)\)", src):
+            written |= set(re.findall(r"['\"]([A-Z_]+)['\"]", m.group(1)))
+    check_true("훑을 파일을 실제로 찾았다", scanned >= 3, scanned)
+    check_true("코드가 쓰는 값을 실제로 찾았다", len(written) >= 3, sorted(written))
+    check("코드가 쓰는 값이 전부 선언돼 있다", sorted(written - declared), [])
+    print("   코드가 쓰는 값: %s" % ", ".join(sorted(written)))
+
+    # (c) 실제 DB 에 선언 밖의 값이 없다.
+    db_path = os.path.join(root, "auction.db")
+    if os.path.exists(db_path):
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"), uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM document_status GROUP BY 1").fetchall()
+        finally:
+            conn.close()
+        check("DB 의 문서 상태가 전부 선언된 어휘다",
+              sorted(st for st, _ in rows if st not in declared), [])
+        print("   DB 실측: %s" % ", ".join("%s=%d" % (st, n) for st, n in rows))
+    else:
+        print("   (auction.db 없음 - DB 대조는 이번 실행에서 하지 못했다)")
+
+    # (d) ★ NO_IMAGE 가 "실패가 아니다"라는 규칙이 코드에 살아 있는가.
+    #     이 값이 FAILED 로 뭉뚱그려지면 사용자는 기다리면 사진이 생길 것으로 오해한다.
+    from storage.database import DOC_STATUS_HAS_ARTIFACT
+    check("NO_IMAGE 는 '보여 줄 자산이 있다' 쪽에 있다",
+          "NO_IMAGE" in DOC_STATUS_HAS_ARTIFACT, True)
+    check("READY 도 같은 쪽에 있다", "READY" in DOC_STATUS_HAS_ARTIFACT, True)
+    check("FAILED 는 그 쪽이 아니다", "FAILED" in DOC_STATUS_HAS_ARTIFACT, False)
+
+    # (e) 화면 라벨이 선언된 값을 덮는가 - 라벨 없는 값은 사용자에게 원문이 노출된다.
+    #     (원문 노출 자체는 이 저장소의 의도된 폴백이므로 결함이 아니다.
+    #      여기서는 **실제로 쓰이는 값**만 라벨이 있어야 한다고 본다.)
+    detail = os.path.join(root, "src", "app", "properties", "[id]", "page.tsx")
+    if os.path.exists(detail):
+        src = io.open(detail, encoding="utf-8-sig").read()
+        m = re.search(r"DOC_STATUS_LABEL[^=]*=\s*\{(.*?)\n\}", src, re.S)
+        check("화면 라벨표를 찾았다", m is not None, True)
+        if m:
+            labelled = set(re.findall(r"^\s*([A-Z_]+)\s*:", m.group(1), re.M))
+            missing = sorted(v for v in in_use if v not in labelled)
+            check("실제로 쓰이는 상태는 전부 화면 라벨이 있다", missing, [])
+
+
+
 if __name__ == "__main__":
     try:
         test_claim_cas_rejects_row_taken_meanwhile()
@@ -393,6 +600,8 @@ if __name__ == "__main__":
         test_claim_race_retries_other_rows()
         test_checkpoint_overwrite_is_atomic()
         test_resume_position()
+        test_queue_status_vocabulary_is_declared_in_one_place()
+        test_document_status_vocabulary_is_declared_in_one_place()
     finally:
         for d in _TMP:
             shutil.rmtree(d, ignore_errors=True)

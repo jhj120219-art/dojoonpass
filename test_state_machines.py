@@ -335,6 +335,98 @@ def test_corrupt_expiry_is_safe_and_logged():
         sm_logger.setLevel(prev_level)
 
 
+def test_status_vocabulary_is_not_hardcoded_in_sql():
+    """결제/구독/등기부 상태값이 **SQL 문자열에 박혀 있지 않은가** (2026-08-31 신설).
+
+    ## 왜 필요한가
+
+    이 값들은 전부 `WHERE status='...'` 로 비교된다. 오타는 예외가 아니라 **0행 매치**다 --
+    조건이 아무 행도 고르지 못하면 "대상이 없다"로 조용히 끝난다. 결제 경로에서는
+    그것이 곧 "초과결제 대상 신청을 못 찾음" 또는 "이미 처리됨" 오판이 된다.
+
+    2026-08-31 실측으로 세 자리를 찾았다.
+
+        api/v1/payments.py  SELECT ... WHERE user_id=? AND status='PAYMENT_REQUIRED'
+        api/v1/payments.py  UPDATE ... SET status='PENDING' WHERE ... status='PAYMENT_REQUIRED'
+        api/v1/doc_stats.py WHERE doc_type IN ('SPEC',...) AND status IN ('READY','FAILED')
+
+    같은 파일들이 다른 자리에서는 이미 상수를 쓰고 있어(`PaymentStatus` / `QUEUE_STATUS_*`)
+    **한 파일 안에서 규칙이 둘**이었다. 큐 상태에 대해 같은 정리를 한 것과 같은 취지다
+    (`test_queue_safety_invariants.py`).
+
+    ## 무엇을 보나
+
+    어휘는 `api/constants.py` 의 열거형에서 **파생**한다 -- 목록을 여기 베끼면 한쪽만
+    갱신되는 날이 오고, 그때 이 검사는 옛 목록을 지키게 된다.
+    docstring 은 제외한다(설명문에 값을 적는 것은 정상이다).
+    """
+    print("\n--- 상태값이 SQL 리터럴로 박혀 있지 않은가 ---")
+    import ast
+    import io as _io
+    import re
+    from api.constants import (
+        PaymentStatus, SubscriptionStatus, RegistryRequestStatus,
+        DocumentStatus, DocumentType,
+    )
+
+    vocab = set()
+    for enum in (PaymentStatus, SubscriptionStatus, RegistryRequestStatus,
+                 DocumentStatus, DocumentType):
+        vocab |= {e.value for e in enum}
+    check_true("어휘를 열거형에서 뽑았다(검사가 공허하지 않다)", len(vocab) >= 20)
+
+    # `status='X'` / `status IN ('X', ...)` / `doc_type IN ('X', ...)` 형태만 본다.
+    col = r"(?:status|doc_type)"
+    pat = re.compile(
+        r"%s\s*(?:=|==)\s*'(%s)'|%s\s+IN\s*\(\s*'(%s)'"
+        % (col, "|".join(re.escape(v) for v in sorted(vocab)),
+           col, "|".join(re.escape(v) for v in sorted(vocab))),
+        re.I)
+
+    def code_strings(path):
+        """실제 코드에 쓰이는 문자열만. docstring 은 뺀다."""
+        tree = ast.parse(_io.open(path, encoding="utf-8-sig").read())
+        docs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], ast.Expr) and \
+                        isinstance(body[0].value, ast.Constant) and \
+                        isinstance(body[0].value.value, str):
+                    docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and id(node) not in docs:
+                yield getattr(node, "lineno", 0), node.value
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    api_dir = os.path.join(root, "api", "v1")
+    offenders = []
+    scanned = 0
+    for name in sorted(os.listdir(api_dir)):
+        if not name.endswith(".py"):
+            continue
+        path = os.path.join(api_dir, name)
+        scanned += 1
+        for lineno, text in code_strings(path):
+            if pat.search(text):
+                offenders.append("api/v1/%s:%d" % (name, lineno))
+    check_true("훑을 파일을 실제로 찾았다", scanned >= 10)
+    check("SQL 에 상태값 리터럴이 박혀 있지 않다", sorted(set(offenders)), [])
+
+    # 탐지기 자체 증명 -- 합성 입력에서는 반드시 잡히고, 바인딩은 잡히지 않아야 한다.
+    check_true("탐지기가 `status='PENDING'` 을 잡는다",
+               bool(pat.search("UPDATE t SET x=? WHERE status='PENDING'")))
+    check_true("탐지기가 `IN ('READY',...)` 를 잡는다",
+               bool(pat.search("WHERE status IN ('READY','FAILED')")))
+    check_true("바인딩 형태는 잡지 않는다(오탐 없음)",
+               not pat.search("UPDATE t SET status=? WHERE status=?"))
+    check_true("어휘 밖 문자열은 잡지 않는다",
+               not pat.search("WHERE status='NOT_A_REAL_STATUS'"))
+
+
+
 def run():
     test_payment_transitions_allowed()
     test_payment_transitions_forbidden()
@@ -345,6 +437,7 @@ def run():
     test_is_entitled()
     test_grace_period_end()
     test_corrupt_expiry_is_safe_and_logged()
+    test_status_vocabulary_is_not_hardcoded_in_sql()
 
     print("\n" + "=" * 55)
     if failures:

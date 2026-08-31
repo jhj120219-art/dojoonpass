@@ -6,11 +6,34 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# document_status.status ENUM:
-# COLLECTING / OCR / PARSING / ANALYZING / READY / FAILED
+# document_status.status 값 (2026-08-31 정정 — NO_IMAGE 가 빠져 있었다)
+#   실제로 쓰이는 값   COLLECTING / READY / NO_IMAGE / FAILED
+#   자리만 잡아 둔 값   OCR / PARSING / ANALYZING   (쓰는 코드 0곳, DB 행 0건)
+# 정의는 `api/constants.py:DocumentStatus` 가 기준이다. NO_IMAGE 는 "법원이 사진을
+# 제공하지 않는다"는 **확인된 답**이지 실패가 아니다(재시도해도 같다).
 
-# auction_item.property_type 코드 규칙:
-# APARTMENT / OFFICETEL / LAND / FACTORY / COMMERCIAL / MULTI_FAMILY
+# auction_item.property_type 의 실제 어휘 (2026-08-31 정정 — 아래 서술은 실측이다)
+#
+# ★ 이 자리에는 원래 "APARTMENT / OFFICETEL / LAND / FACTORY / COMMERCIAL /
+#   MULTI_FAMILY" 라는 ENUM 코드 규칙이 적혀 있었다. **그 값은 코드에도 DB 에도
+#   존재한 적이 없다** — 2026-08-31 auction.db 전수(1,876행)에서 사용 행 0건이고,
+#   저장소 어느 소스도 그 문자열을 만들지 않는다(`grep -r APARTMENT` = 이 주석뿐).
+#   `docs/backend.md` 주의사항에도 같은 문장이 복사돼 있었고 함께 정정했다.
+#
+#   실제로는 **법원 표기 그대로의 한국어 자유 문자열**이며, 콤마로 이어 붙은
+#   복합값이 있다(한 물건이 여러 종류를 겸한다). 2026-08-31 실측 18종
+#   [VOCAB-TABLE]  <- 이 표는 test_property_type_vocabulary.py 가 DB 와 대조한다:
+#
+#       기타 259 / 다세대 246 / 상가,오피스텔,근린시설 205 / 아파트 201 / 전답 188
+#       근린시설 164 / 연립주택,다세대,빌라 133 / 임야 123 / 오피스텔 102
+#       대지,임야,전답 56 / 대지 47 / 단독주택,다가구주택 43 / 단독주택 42
+#       다가구주택 33 / 상가 18 / 자동차,중기 9 / 자동차 4 / 연립주택 3
+#
+#   검색은 이 값을 `LIKE %패턴%` 으로 맞추고, UI 어휘(69종)와의 차이는
+#   `api/v1/search.py:PROPERTY_TYPE_ALIASES` 가 잇는다(`docs/BUGS.md` #33).
+#   어휘를 어느 쪽으로 통일할지는 제품 판단이라 여기서 정하지 않는다 —
+#   여기서는 **없는 규칙을 있다고 적어 두지 않는 것**까지만 한다.
+#   회귀: `test_property_type_vocabulary.py` 의 어휘 계약 검사.
 
 def migrate():
     conn = get_connection()
@@ -65,7 +88,7 @@ def migrate():
         logger.info("auction_item 생성 완료")
 
         # 3. document_status
-        # status: COLLECTING / OCR / PARSING / ANALYZING / READY / FAILED
+        # status: 값 목록은 이 파일 상단 주석과 `api/constants.py:DocumentStatus` 참고
         conn.execute("""
         CREATE TABLE IF NOT EXISTS document_status (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

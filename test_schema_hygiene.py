@@ -1835,6 +1835,14 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
     # 즉 **`?` 반복뿐**이다. 사용자가 붙여넣은 사건번호는 예외 없이 바인딩된다.
     ("api/v1/favorite_import.py", "SELECT %s FROM auction_item WHERE case_no IN (%s)"),
     ("api/v1/favorite_import.py", "SELECT %s FROM auction_item WHERE %s"),
+    # 2026-08-31. 두 `%s` 자리에 들어가는 것은 `_marks()` 가 만드는 **`?` 반복뿐**이고,
+    # 값은 모듈 상수 튜플(`_STAT_DOC_TYPES` 3개 / `_STAT_STATUSES` 2개)에서 바인딩된다.
+    #   왜 리터럴을 상수로 옮겼나 — 같은 파일이 큐 상태는 이미 상수로 세고 있어
+    #   (`QUEUE_STATUS_*`) 한 파일 안에서 규칙이 둘이었다. 어휘의 단일 소스는
+    #   `api/constants.py` 의 DocumentType / DocumentStatus 다.
+    ("api/v1/doc_stats.py",
+     "SELECT doc_type, status, COUNT(*) AS cnt FROM document_status "
+     "WHERE doc_type IN (%s) AND status IN (%s) GROUP BY doc_type, status"),
     ("storage/database.py", "PRAGMA foreign_keys = %s"),
     # 2026-08-26 신설. `%s` 자리에 들어가는 것은 `",".join("?" * len(MIGRATED_DOC_TYPES))`,
     # 즉 **`?` 반복뿐**이고 값은 전부 바인딩된다. `MIGRATED_DOC_TYPES` 는 모듈 상수
@@ -2016,6 +2024,10 @@ SQL_PLACEHOLDER_SITES = {
     # 우리가 정하지 못한다(파서 상한 500줄 x 병합 사건 구성요소). chunked_for_sql() 로 나눈다.
     ("api/v1/favorite_import.py", "len(chunk)"):
         "fetch_candidates(): chunked_for_sql(vars_per_item=1) 로 나눈 조각 (BUGS #243).",
+    # 2026-08-31. 문서 통계가 세는 대상을 상수로 옮기면서 생긴 `IN (...)` 이다.
+    # 입력이 **모듈 상수 튜플**(문서 종류 3 / 상태 2)이라 요청이 크기를 정하지 못한다.
+    ("api/v1/doc_stats.py", "len(values)"):
+        "모듈 상수 튜플(_STAT_DOC_TYPES 3개 / _STAT_STATUSES 2개). 요청이 크기를 정하지 못한다.",
 }
 
 

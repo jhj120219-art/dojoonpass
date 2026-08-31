@@ -125,14 +125,36 @@ def run_one(test_file: str):
 
 
 def main():
-    files = sorted(f for f in os.listdir(REPO)
-                   if f.startswith("test_") and f.endswith(".py") and f not in SKIP)
+    # OneDrive 충돌 사본은 **제품 검사가 아니다** (2026-08-31 추가).
+    #
+    #   `run_python_tests.py` 는 이미 이것들을 실행 대상에서 빼고 요약에 따로 센다
+    #   (그 파일의 주석 + `docs/BUGS.md` #253/#258). 그런데 이 감사기는 빼지 않아서
+    #   **두 도구가 다른 말을 하고 있었다** — 실행기는 "제품 검사가 아니다"라고 하고
+    #   이 감사기는 그 사본을 재서 의심 목록에 올렸다(2026-08-31 전수 실행에서
+    #   `test_audit_selftests-DESKTOP-DVRJEGP.py` 가 실제로 올라왔다).
+    #
+    #   규칙을 여기 베끼지 않고 **그 실행기의 판정 함수를 그대로 쓴다** — 목록이 두 벌이면
+    #   갈라진다. 숨기지도 않는다: 실행기와 같이 몇 개를 뺐는지 화면에 남긴다.
+    try:
+        from run_python_tests import is_conflict_copy
+    except Exception:                       # noqa: BLE001 - 실행기가 없어도 감사는 돌아야 한다
+        def is_conflict_copy(_name):
+            return False
+
+    all_tests = sorted(f for f in os.listdir(REPO)
+                       if f.startswith("test_") and f.endswith(".py") and f not in SKIP)
+    conflicts = [f for f in all_tests if is_conflict_copy(f)]
+    files = [f for f in all_tests if not is_conflict_copy(f)]
     only = [a for a in sys.argv[1:] if not a.startswith("-")]
     if only:
         files = [f for f in files if any(o in f for o in only)]
+        conflicts = [f for f in conflicts if any(o in f for o in only)]
     print("=" * 78)
     print(" 검사별 제품 코드 실행 줄 수 (2026-08-21 실측)")
     print("=" * 78)
+    if conflicts:
+        print("  OneDrive 충돌 사본 %d개는 재지 않았다(제품 검사가 아니다, BUGS #253/#258): %s"
+              % (len(conflicts), ", ".join(conflicts)))
     rows = []
     for i, f in enumerate(files, 1):
         r = run_one(f)
@@ -156,6 +178,10 @@ def main():
     print()
     print("  ※ 실행 줄이 적다고 결함이 아니다. 드리프트 가드는 원래 소스만 본다.")
     print("     판정은 mutation 으로 한다.")
+    # 2026-08-31 추가. 0줄의 두 번째 원인을 적어 둔다 - 이것을 모르면 멀쩡한 검사를
+    # "공허하다"고 오독한다(2026-08-21 에 도구의 분류 목록이 좁아 같은 일이 있었다).
+    print("  ※ **subprocess 로 도는 검사는 0줄로 나온다** - coverage 는 부모 프로세스만 센다.")
+    print("     예: test_audit_selftests.py 는 감사 도구를 `--selftest` 로 실제 실행하지만 0줄이다.")
 
 
 # ---------------------------------------------------------------------------

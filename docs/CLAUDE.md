@@ -52,7 +52,7 @@ Note (2026-08-07 정정): `docs/architecture.md`는 **저장소 안에 존재한
 
 Each `docs/*.md` file has its own "절대 변경하면 안 되는 것" (do-not-change) and "알려진 문제점" (known issues) sections — read those before touching the corresponding area (frontend, backend, crawler, search). They are more current and detailed than anything summarized below; treat this file as the index, not a replacement.
 
-One correction to keep in mind: `docs/search-engine.md`와 `docs/crawler.md`는 `storage/database.py`를 `.gitignore` 때문에 "저장소에 없다"고 서술한다. **두 서술 모두 지금은 사실이 아니다** (2026-08-13 Sprint 75 실측). Sprint 51의 `.gitignore` 정밀화 이후 이 파일은 git이 추적하고 있고, 작업 디렉터리에도 당연히 존재한다. 미확인 파일로 취급하거나 역추론하지 말고 그냥 읽으면 된다.
+~~One correction to keep in mind: `docs/search-engine.md`와 `docs/crawler.md`는 `storage/database.py`를 `.gitignore` 때문에 "저장소에 없다"고 서술한다.~~ **2026-08-31 정정: 이 지적 자체가 이제 stale이다.** 두 문서는 이미 고쳐져 있다 — `docs/search-engine.md`는 그 서술을 취소선으로 정정했고(190행), `docs/crawler.md`에는 그런 서술이 아예 없다(2026-08-31 전수 확인). 사실 관계만 남긴다: `storage/database.py`는 **git이 추적하고 작업 디렉터리에도 있다**(Sprint 51의 `.gitignore` 정밀화 이후 `storage/*.py` + `storage/migrations/*.sql` 23개 파일이 추적 대상). 미확인 파일로 취급하거나 역추론하지 말고 그냥 읽으면 된다.
 
 ## Commands
 

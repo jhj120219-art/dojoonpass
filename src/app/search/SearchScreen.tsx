@@ -3,6 +3,7 @@ import SearchPresets from './SearchPresets'
 import SortBar from './SortBar'
 import ResultList from './ResultList'
 import Pagination from './Pagination'
+import { formatNumber } from '@/lib/format'
 import Link from 'next/link'
 import { fetchJSON, ApiError } from '@/lib/api'
 import type { SearchResponse } from './types'
@@ -105,7 +106,7 @@ export default async function SearchScreen({ searchParams, basePath }: SearchScr
               ? '검색 결과를 불러오지 못했습니다'
               : data
                 ? data.total > 0
-                  ? `검색 결과 총 ${data.total.toLocaleString()}건, ${data.page} / ${data.total_pages} 페이지`
+                  ? `검색 결과 총 ${formatNumber(data.total)}건, ${data.page} / ${data.total_pages} 페이지`
                   : '검색 결과가 없습니다'
                 : ''}
         </p>

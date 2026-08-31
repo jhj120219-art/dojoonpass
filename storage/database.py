@@ -823,9 +823,10 @@ def requeue_changed_documents(changes: List[Dict],
                     UPDATE document_queue
                        SET status=?, retry_count=0, last_attempt_at=NULL
                      WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
-                       AND status='done'
+                       AND status=?
                        AND (IFNULL(auction_date, '') = '' OR auction_date >= ?)
-                """, (QUEUE_STATUS_REFRESH, court_code, case_no, item_no, doc_type, today))
+                """, (QUEUE_STATUS_REFRESH, court_code, case_no, item_no, doc_type,
+                      QUEUE_STATUS_DONE, today))
                 refreshed += cur.rowcount or 0
 
                 # 기일이 지나 종결됐던 행은, 기일이 **미래로 다시 잡혔을 때만** 되살린다.
@@ -835,9 +836,10 @@ def requeue_changed_documents(changes: List[Dict],
                     UPDATE document_queue
                        SET status=?, retry_count=0, last_attempt_at=NULL
                      WHERE court_code=? AND case_no=? AND item_no=? AND doc_type=?
-                       AND status='SKIPPED_EXPIRED'
+                       AND status=?
                        AND IFNULL(auction_date, '') >= ?
-                """, (QUEUE_STATUS_PENDING, court_code, case_no, item_no, doc_type, today))
+                """, (QUEUE_STATUS_PENDING, court_code, case_no, item_no, doc_type,
+                      QUEUE_STATUS_SKIPPED_EXPIRED, today))
                 revived += cur.rowcount or 0
         conn.commit()
         if refreshed or revived:
@@ -958,18 +960,18 @@ def reset_stale_queue() -> None:
         # 되돌릴 대상을 **먼저** 식별한다 — UPDATE 뒤에는 어느 행이 failed였는지 알 수 없다.
         recovered = conn.execute("""
             SELECT court_code, case_no, item_no, doc_type FROM document_queue
-            WHERE status='failed'
+            WHERE status=?
               AND last_attempt_at IS NOT NULL
               AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-1 day')
-        """).fetchall()
+        """, (QUEUE_STATUS_FAILED,)).fetchall()
 
         conn.execute("""
             UPDATE document_queue
-            SET status='pending', retry_count=0
-            WHERE status='failed'
+            SET status=?, retry_count=0
+            WHERE status=?
               AND last_attempt_at IS NOT NULL
               AND datetime(last_attempt_at) < datetime(""" + _NOW_LOCAL + """, '-1 day')
-        """)
+        """, (QUEUE_STATUS_PENDING, QUEUE_STATUS_FAILED))
 
         # ★ 이미 실체를 가진 문서는 'pending' 이 아니라 'refresh' 로 되돌린다
         #   (2026-08-18 Sprint 210).
@@ -1210,9 +1212,9 @@ def mark_queue_skipped_expired(queue_id: int, court_code: str, case_no: str, ite
         now = datetime.now().isoformat()
         conn.execute("""
             UPDATE document_queue
-            SET status='SKIPPED_EXPIRED', last_attempt_at=?
+            SET status=?, last_attempt_at=?
             WHERE id=?
-        """, (now, queue_id))
+        """, (QUEUE_STATUS_SKIPPED_EXPIRED, now, queue_id))
 
         conn.commit()
         logger.info(
@@ -1281,9 +1283,9 @@ def mark_queue_unsupported(queue_id: int, court_code: str, case_no: str, item_no
         now = datetime.now().isoformat()
         conn.execute("""
             UPDATE document_queue
-            SET status='SKIPPED_UNSUPPORTED', last_attempt_at=?
+            SET status=?, last_attempt_at=?
             WHERE id=?
-        """, (now, queue_id))
+        """, (QUEUE_STATUS_SKIPPED_UNSUPPORTED, now, queue_id))
 
         # 화면이 읽는 것은 document_status다 — 같은 트랜잭션에서 함께 갱신한다 (BUGS #50).
         _set_document_status(conn, court_code, case_no, item_no, doc_type, "FAILED")
@@ -1346,6 +1348,35 @@ QUEUE_STATUS_IN_PROGRESS_REFRESH = "in_progress_refresh"
 #   그것이다 — 되살리는 쪽과 되살리지 않는 쪽을 문자열로 구별하면 언젠가 어긋난다.
 QUEUE_STATUS_SKIPPED_EXPIRED = "SKIPPED_EXPIRED"
 QUEUE_STATUS_SKIPPED_UNSUPPORTED = "SKIPPED_UNSUPPORTED"
+
+# 워커가 끝낸 상태. **2026-08-31 신설** — 이 둘만 상수 없이 SQL 문자열에 직접 박혀
+# 있었다. 같은 컬럼의 나머지 여섯은 상수인데 종결 둘만 리터럴이라, 바로 위 주석이
+# 경고한 것("문자열로 구별하면 언젠가 어긋난다")이 같은 파일 안에서 반쯤 지켜지고
+# 있었다. 값은 DB 에 들어 있는 것 그대로다(`api/constants.py` 가 상태값을 모을 때
+# 세운 규칙과 같다 — 리터럴을 모으되 값은 새로 정하지 않는다).
+#
+#   done    수집이 실제로 끝났다
+#   failed  재시도 예산(MAX_DOC_RETRY)을 다 쓰고도 실패했다
+#
+# ★ 왜 오타가 위험한가: 이 값들은 전부 `WHERE status='...'` 로 **비교**된다.
+#   오타가 나면 예외가 아니라 **0행 매치**다. `mark_queue_done()` 이 아무 행도 바꾸지
+#   못하면 그 행은 `in_progress` 로 남아 stale 회수까지 붙잡혀 있고, 화면에는 수집이
+#   끝난 것으로 보인다. 조용한 실패라 로그로도 드러나지 않는다.
+QUEUE_STATUS_DONE = "done"
+QUEUE_STATUS_FAILED = "failed"
+
+# 이 컬럼이 가질 수 있는 값 전부. 여기 없는 값이 DB 에 있으면 어딘가가 어휘를 늘렸거나
+# 오타를 냈다는 뜻이다 — `test_queue_safety_invariants.py` 가 실제 DB 와 대조한다.
+QUEUE_STATUSES = frozenset({
+    QUEUE_STATUS_PENDING,
+    QUEUE_STATUS_REFRESH,
+    QUEUE_STATUS_IN_PROGRESS,
+    QUEUE_STATUS_IN_PROGRESS_REFRESH,
+    QUEUE_STATUS_DONE,
+    QUEUE_STATUS_FAILED,
+    QUEUE_STATUS_SKIPPED_EXPIRED,
+    QUEUE_STATUS_SKIPPED_UNSUPPORTED,
+})
 
 # 워커가 집어갈 수 있는 상태. `claim_next_queue_item()`과 `refresh_queue_priority()`가
 # **같은 목록**을 봐야 한다 — 갈라지면 refresh 행이 우선순위 재계산에서 빠진다.
@@ -2339,7 +2370,8 @@ def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, 
         #     같은 값을 다시 써도 결과는 같다(멱등).
         owns = _claim_is_still_ours(conn, queue_id, claim_token)
         if owns:
-            conn.execute("UPDATE document_queue SET status='done' WHERE id=?", (queue_id,))
+            conn.execute("UPDATE document_queue SET status=? WHERE id=?",
+                         (QUEUE_STATUS_DONE, queue_id))
         else:
             logger.warning(
                 "[%s-%s] %s 수집은 끝났지만 그 사이 큐 행(id=%s)이 회수돼 다른 실행이 "
@@ -2405,9 +2437,9 @@ def mark_queue_failed(queue_id: int, retry_count: int,
         if new_retry >= MAX_DOC_RETRY:
             conn.execute("""
                 UPDATE document_queue
-                SET status='failed', retry_count=?, last_attempt_at=?
+                SET status=?, retry_count=?, last_attempt_at=?
                 WHERE id=?
-            """, (new_retry, now, queue_id))
+            """, (QUEUE_STATUS_FAILED, new_retry, now, queue_id))
             # 재시도가 소진된 **최종** 실패만 화면에 반영한다. 중간 재시도까지 FAILED로
             # 바꾸면 다음 시도에서 성공할 문서가 잠깐 "실패"로 보였다가 돌아온다.
             row = conn.execute(

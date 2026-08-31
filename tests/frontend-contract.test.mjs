@@ -959,3 +959,161 @@ describe('검색 파라미터 계약 — 보내는 것과 읽는 것이 일치�
     }
   })
 })
+
+
+// ================================================================
+// API 응답 ↔ 프런트 타입 대조 (2026-08-31 신설)
+//
+// ## 왜 생겼나
+//
+// 이 저장소의 계약 검사는 지금까지 **파라미터 방향**(프런트가 보내는 것 ↔ 백엔드가 받는 것)
+// 만 봤다. 반대 방향 — **백엔드가 주는 것 ↔ 프런트가 선언한 것** — 은 아무것도 보지
+// 않았고, 실제로 두 번 드리프트가 쌓여 있었다(2026-08-31 실측).
+//
+//     GET /api/v1/search  items[]     building_area / land_area   2026-08-26 부터 응답에 있음
+//     GET /api/v1/item/{id}           sido / sigungu / dong       처음부터 응답에 있음
+//                                     building_area / land_area
+//
+// 타입에 없는 키는 런타임에 아무 문제도 일으키지 않는다. 그래서 **드러나지 않는다.**
+// 드러나는 순간은 누군가 "그 데이터는 응답에 없다"고 읽고 **이미 있는 것을 다시 만들 때**다 —
+// 검색 카드가 서버 면적을 두고 주소를 다시 파싱하고 있던 것이 정확히 그 결과였다.
+//
+// ## 무엇을 단언하나
+//
+//   1. 응답의 모든 키가 타입에 선언돼 있다   (미선언 키 = 위 드리프트)
+//   2. 타입에만 있는 키는 optional(`?`) 이다  (없는 것을 있다고 적지 않는다)
+//   3. 예외 목록이 코드보다 앞서 나가지 않는다 (죽은 예외 금지)
+// ================================================================
+
+describe('API 응답 ↔ 프런트 타입 (2026-08-31)', () => {
+  // TS 소스에서 인터페이스의 **최상위 키**를 뽑는다. 중첩 블록은 지우고 본다.
+  async function tsKeys(file, name) {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(file, 'utf8')
+    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
+    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
+    let depth = 1
+    let i = m.index + m[0].length
+    const start = i
+    while (i < src.length && depth > 0) {
+      if (src[i] === '{') depth++
+      else if (src[i] === '}') depth--
+      i++
+    }
+    let body = src.slice(start, i - 1)
+    for (;;) {
+      const next = body.replace(/\{[^{}]*\}/g, '')
+      if (next === body) break
+      body = next
+    }
+    const required = new Set()
+    const optional = new Set()
+    for (const line of body.split('\n')) {
+      const code = line.split('//')[0].trim()
+      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
+      if (!km) continue
+      ;(km[2] === '?' ? optional : required).add(km[1])
+    }
+    return { required, optional, all: new Set([...required, ...optional]) }
+  }
+
+  async function apiJson(path) {
+    const res = await fetch(`${API_BASE}${path}`, { cache: 'no-store' })
+    assert.equal(res.status, 200, `${path} 가 200 이 아닙니다 (${res.status})`)
+    return res.json()
+  }
+
+  // 응답에 있지만 타입에 적지 않기로 **한 것**. 이유 없이 늘리지 않는다.
+  //   tenant_rights 는 12컬럼인데 프런트는 9개만 쓴다(`docs/BUGS.md` #254).
+  //   좁히는 것은 API 계약 축소라 소비자를 먼저 옮겨야 해서 지금은 그대로 둔다.
+  const KNOWN_UNDECLARED = {
+    'tenants[]': new Set(['id', 'item_id', 'created_at']),
+  }
+
+  function diff(label, apiKeys, ts) {
+    const allowed = KNOWN_UNDECLARED[label] ?? new Set()
+    const undeclared = [...apiKeys].filter((k) => !ts.all.has(k) && !allowed.has(k)).sort()
+    // 타입에만 있는 키는 optional 이어야 한다 — 필수라고 적어 두면 없는 것을 있다고 말한다.
+    const phantom = [...ts.required].filter((k) => !apiKeys.has(k)).sort()
+    // 죽은 예외: 더 이상 나오지 않는 키를 예외 목록이 붙들고 있으면 1번 검사가 눈감는다.
+    const deadAllow = [...allowed].filter((k) => !apiKeys.has(k)).sort()
+    return { undeclared, phantom, deadAllow }
+  }
+
+  let searchItem = null
+  let detail = null
+
+  before(async () => {
+    const s = await apiJson('/api/v1/search?size=1&include_closed=true')
+    if (s.items && s.items.length) {
+      searchItem = s.items[0]
+      detail = await apiJson(`/api/v1/item/${searchItem.id}`)
+    }
+  })
+
+  test('검사가 공허하지 않다 — 실제 응답과 타입을 둘 다 얻었다', async () => {
+    assert.ok(searchItem, '검색 응답에 항목이 없어 대조할 수 없습니다(데이터 전제)')
+    assert.ok(detail && detail.id, '상세 응답을 얻지 못했습니다')
+    const ts = await tsKeys('src/app/search/types.ts', 'SearchResultItem')
+    assert.ok(ts.all.size > 10, `타입 키 추출 실패 (${ts.all.size}개)`)
+  })
+
+  test('★ GET /api/v1/search items[] 의 모든 키가 타입에 선언돼 있다', async () => {
+    const ts = await tsKeys('src/app/search/types.ts', 'SearchResultItem')
+    const d = diff('items[]', new Set(Object.keys(searchItem)), ts)
+    assert.deepEqual(d.undeclared, [],
+      `응답에는 있는데 SearchResultItem 에 없는 키입니다 — "응답에 없다"로 읽혀 같은 데이터를 다시 만들게 됩니다: ${d.undeclared.join(', ')}`)
+    assert.deepEqual(d.phantom, [],
+      `타입이 필수라고 적었는데 응답에 없는 키입니다: ${d.phantom.join(', ')}`)
+  })
+
+  test('★ GET /api/v1/item/{id} 의 모든 키가 타입에 선언돼 있다', async () => {
+    const ts = await tsKeys('src/app/properties/[id]/page.tsx', 'AuctionItemDetail')
+    const d = diff('item', new Set(Object.keys(detail)), ts)
+    assert.deepEqual(d.undeclared, [],
+      `응답에는 있는데 AuctionItemDetail 에 없는 키입니다: ${d.undeclared.join(', ')}`)
+    assert.deepEqual(d.phantom, [],
+      `타입이 필수라고 적었는데 응답에 없는 키입니다: ${d.phantom.join(', ')}`)
+  })
+
+  test('상세의 곁딸린 배열도 타입과 맞는다 (documents / images / tenants)', async () => {
+    const cases = [
+      ['documents', 'src/app/properties/[id]/page.tsx', 'DocumentStatusItem', 'documents[]'],
+      ['images', 'src/app/properties/[id]/page.tsx', 'AuctionImage', 'images[]'],
+      ['tenants', 'src/app/properties/[id]/rightsAnalysis.ts', 'TenantRow', 'tenants[]'],
+    ]
+    let checked = 0
+    for (const [key, file, name, label] of cases) {
+      const rows = detail[key]
+      if (!rows || !rows.length) continue      // 이 물건에는 없다 — 다른 물건에서 본다
+      checked++
+      const ts = await tsKeys(file, name)
+      const d = diff(label, new Set(Object.keys(rows[0])), ts)
+      assert.deepEqual(d.undeclared, [], `${label}: 타입에 없는 응답 키 ${d.undeclared.join(', ')}`)
+      assert.deepEqual(d.phantom, [], `${label}: 응답에 없는 필수 키 ${d.phantom.join(', ')}`)
+    }
+    // 하나도 못 봤으면 "통과"가 아니라 **못 봤다**고 말한다.
+    assert.ok(checked > 0,
+      '이 물건에는 documents/images/tenants 가 하나도 없어 곁딸린 배열을 대조하지 못했습니다')
+  })
+
+  test('★ 예외 목록이 코드보다 앞서 나가지 않는다 (죽은 예외 금지)', async () => {
+    // tenants[] 예외는 그 키들이 **실제로 응답에 실릴 때만** 의미가 있다.
+    // 응답에서 사라졌는데 예외가 남으면, 그 키가 다시 생겨도 위 검사가 눈감는다.
+    let tenants = detail.tenants
+    if (!tenants || !tenants.length) {
+      // 임차인 있는 물건을 몇 개만 찾아본다(전수 순회는 하지 않는다).
+      const s = await apiJson('/api/v1/search?size=40&include_closed=true')
+      for (const it of s.items ?? []) {
+        const d = await apiJson(`/api/v1/item/${it.id}`)
+        if (d.tenants && d.tenants.length) { tenants = d.tenants; break }
+      }
+    }
+    assert.ok(tenants && tenants.length,
+      '임차인이 있는 물건을 찾지 못해 예외 목록을 검증하지 못했습니다')
+    const keys = new Set(Object.keys(tenants[0]))
+    const dead = [...KNOWN_UNDECLARED['tenants[]']].filter((k) => !keys.has(k)).sort()
+    assert.deepEqual(dead, [],
+      `응답에 더 이상 없는 키가 예외 목록에 남아 있습니다 — 목록에서 빼십시오: ${dead.join(', ')}`)
+  })
+})

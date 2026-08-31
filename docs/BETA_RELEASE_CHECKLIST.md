@@ -1830,8 +1830,34 @@ python test_schema_hygiene.py   # §3 통과 확인
 - `KGInicisProvider`의 6개 메서드가 전부 `NotImplementedError`(2026-08-07 클래스 자리만 신설).
   현재 `PAYMENT_PROVIDER` 미설정 = `MockProvider` = **결제가 항상 성공으로 기록되지만 실제 입금은 없다.**
 - 선행 조건: KG이니시스 사업자 계약·심사 → `KG_MID`/`KG_API_KEY`/`KG_SECRET_KEY` 발급
-- 함께 필요: 환불(`cancel_payment`) / Webhook 수신(`handle_webhook`) 엔드포인트 신규 구현 —
-  두 메서드는 인터페이스에만 있고 호출부가 없다
+- ~~함께 필요: 환불(`cancel_payment`) / Webhook 수신(`handle_webhook`) 엔드포인트 신규 구현 —
+  두 메서드는 인터페이스에만 있고 호출부가 없다~~
+  → **2026-08-31 정정: 두 엔드포인트는 이미 있다.** 실측(코드 대조):
+
+  ```
+  환불    POST /api/v1/admin/payments/{id}/refund   api/v1/admin.py:975
+          -> api/v1/payments.py:refund_payment() -> provider.cancel_payment()  (payments.py:679)
+  Webhook POST /api/v1/payments/webhook/{provider} api/v1/payments.py:736
+          -> provider.verify_webhook_signature() (:759) -> provider.handle_webhook() (:792, :912)
+  ```
+
+  즉 **호출부가 없는 것이 아니라 `KGInicisProvider` 쪽 구현만 비어 있다**(그 클래스의
+  6개 메서드가 전부 `NotImplementedError`). 2026-08-11 Sprint 52 에 수신 경로가 연결됐고
+  (`docs/decision-log.md` CTO 승인 5번 · 서명 검증 fail-closed + `event_id` 멱등),
+  환불 경로는 상태머신 관문(`assert_payment_transition()`)까지 붙어 있다
+  (`docs/STATE_MACHINES.md` §1 "현재 흐름과의 관계").
+  **살아 있는 서버의 OpenAPI 로도 확인했다**(2026-08-31, 전체 41경로):
+
+  ```
+  POST /api/v1/payments/webhook/{provider_name}
+  POST /api/v1/admin/payments/{payment_id}/refund
+  GET  /api/v1/admin/payments/webhooks            (수신 원문 조회)
+  GET  /api/v1/admin/payments/webhooks/{id}
+  POST /api/v1/admin/payments/webhooks/{id}/reprocess
+  ```
+
+  **남은 일의 크기가 다르다** — "엔드포인트 신규 구현"이 아니라 "Provider 메서드 구현"이다.
+  이 문장을 그대로 믿고 일정을 잡으면 이미 있는 것을 다시 만들게 된다
 - **승인/외부 절차 필요 → 코드로 해결 불가**
 
 ### P0-2. `ADMIN_API_KEY` / `SUPER_ADMIN_API_KEY` — **2026-08-25 해소**

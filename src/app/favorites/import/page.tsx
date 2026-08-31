@@ -242,7 +242,7 @@ export default function ImportPage() {
           <h2 className={SECTION_TITLE}>목록 붙여넣기</h2>
           <p className="text-sm text-gray-500 mb-3">
             다른 곳에서 정리해 둔 관심물건 목록을 그대로 붙여넣으면 사건번호를 읽어
-            도준패스 물건과 맞춰 봅니다. 확인한 뒤에만 저장됩니다.
+            콕찰 물건과 맞춰 봅니다. 확인한 뒤에만 저장됩니다.
           </p>
           <textarea
             id="import-text"
@@ -418,7 +418,7 @@ export default function ImportPage() {
                     {/* 찾지 못한 줄은 무엇이 문제인지 알려 준다 */}
                     {row.status === 'NOT_FOUND' && (
                       <p className="mt-1 text-sm text-gray-500">
-                        도준패스에 아직 없는 사건이거나 매각이 끝난 물건일 수 있습니다.
+                        콕찰에 아직 없는 사건이거나 매각이 끝난 물건일 수 있습니다.
                       </p>
                     )}
                     {row.status === 'NO_CASE_NO' && (

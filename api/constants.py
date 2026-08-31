@@ -129,12 +129,50 @@ ADJUSTMENT_REASONS = frozenset({
 # Document (크롤러 수집 문서)
 # ---------------------------------------------------------------------------
 class DocumentStatus(StrEnum):
+    """`document_status.status` — 화면이 읽는 수집 상태.
+
+    ★ 2026-08-31 정정: **`NO_IMAGE` 가 빠져 있었다.** 이 열거형은 여섯 값만 선언했는데,
+      제품은 일곱 번째 값을 실제로 쓰고 있었다 —
+
+          doc_worker.py:381        done_status = "NO_IMAGE" if result.get("no_asset") else "READY"
+          api/v1/item.py           `_images_status()` 가 NO_IMAGE 를 그대로 내보낸다
+          storage/database.py      DOC_STATUS_HAS_ARTIFACT = ("READY", "NO_IMAGE")
+          audit_asset_integrity.py 정합성 판정이 NO_IMAGE 를 정상으로 센다
+          properties/[id]/page.tsx DOC_STATUS_LABEL 에 '사진 없음' 으로 있다
+
+      즉 DB·수집기·API·화면·감사기가 전부 아는 값을 **상태값 정의만 몰랐다.**
+      이 모듈의 목적이 "흩어져 있던 리터럴을 한곳에 모아 오타와 누락을 막는 것"이므로
+      그 목적에 반하는 상태였다. 값은 이미 DB 에 들어 있는 것 그대로 옮긴다.
+
+      NO_IMAGE 를 FAILED 로 뭉뚱그리면 안 되는 이유가 코드 주석에 이미 적혀 있다 —
+      "법원이 사진을 제공하지 않는다"는 **확인된 답**이지 실패가 아니고, 재시도해도
+      결과가 같다. 실패로 보이면 사용자가 기다리면 생길 것처럼 오해한다.
+
+    ★ OCR / PARSING / ANALYZING 은 **선언만 있고 아무도 쓰지 않는다**
+      (2026-08-31 실측: 저장소 전체에서 이 값을 쓰는 코드 0곳, DB 행 0건).
+      파이프라인 후반부를 위해 자리를 잡아 둔 값이며, 지우는 것은 상태 체계 축소라
+      제품 결정이다. "정의됐다"와 "쓰인다"가 다르다는 것은 `docs/ERROR_CODES.md` 가
+      Error Code 40개 중 19개만 방출된다고 적어 둔 것과 같은 구분이다.
+    """
     COLLECTING = "COLLECTING"
     OCR = "OCR"
     PARSING = "PARSING"
     ANALYZING = "ANALYZING"
     READY = "READY"
+    NO_IMAGE = "NO_IMAGE"
     FAILED = "FAILED"
+
+
+# 지금 **실제로 쓰이는** 값. 위 열거형은 자리만 잡아 둔 값(OCR/PARSING/ANALYZING)을
+# 포함하므로, "DB 에 이 값이 있어야 정상"을 판정할 때는 이쪽을 쓴다.
+# `test_queue_safety_invariants.py` 의
+# `test_document_status_vocabulary_is_declared_in_one_place` 가 실제 DB·코드와 대조한다.
+DOCUMENT_STATUSES_IN_USE = frozenset({
+    DocumentStatus.COLLECTING,
+    DocumentStatus.READY,
+    DocumentStatus.NO_IMAGE,
+    DocumentStatus.FAILED,
+})
 
 
 class DocumentType(StrEnum):

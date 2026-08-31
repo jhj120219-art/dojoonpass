@@ -562,18 +562,46 @@ def test_export_header_contract():
     ts = open(os.path.join(root, "src", "lib", "exportList.ts"), encoding="utf-8-sig").read()
     headers = re.findall(r"header:\s*'([^']+)'", ts)
     check("내보내기 열을 읽었다(검사가 공허하지 않다)", len(headers) > 0, True)
-    for key in ("법원", "사건번호", "물건번호", "소재지"):
+
+    # 열 이름이 **있는지**만 보면 부족하다 (2026-08-31 강화).
+    # `"법원": "case_no"` 처럼 잘못 매핑돼도 이름은 그대로 있어서, 예전 검사는
+    # 통과하면서 되붙이기만 조용히 틀린다. 의도한 필드까지 못박는다.
+    intended = {"법원": "court_name", "사건번호": "case_no",
+                "물건번호": "item_no", "소재지": "address"}
+    for key, field in intended.items():
         check("내보내기에 '%s' 열이 있다" % key, key in headers, True)
-        check("가져오기가 '%s' 를 안다" % key, key in HEADER_ALIASES, True)
+        check("가져오기가 '%s' 를 %s 로 읽는다" % (key, field),
+              HEADER_ALIASES.get(key), field)
+
+    # 내보내기가 내는 열 중 가져오기가 아는 것은 **전부** 의도표에 있어야 한다.
+    # 새 열이 생겼는데 의미가 기록되지 않으면 다음 사람이 추측하게 된다.
+    unrecorded = sorted(h for h in headers
+                        if h in HEADER_ALIASES and h not in intended)
+    check("의미가 기록되지 않은 공유 열이 없다", unrecorded, [])
 
     # 실제로 되붙여 본다 - 계약을 문자열 비교가 아니라 **동작**으로 확인한다.
-    line = ",".join(headers) + "\n" + ",".join(
-        {"법원": "안산지원", "사건번호": "2024타경5", "물건번호": "2"}.get(h, "")
-        for h in headers)
+    sample = {"법원": "안산지원", "사건번호": "2024타경5", "물건번호": "2",
+              "소재지": "경기도 안산시 단원구 원곡동 1"}
+    line = ",".join(headers) + "\n" + ",".join(sample.get(h, "") for h in headers)
     parsed = parse_mylist_text(line)
     check("우리 내보내기를 되붙이면 헤더로 읽힌다", parsed["header_detected"], True)
-    check("되붙인 사건번호", parsed["rows"][0]["case_no"], "2024타경5")
-    check("되붙인 물건번호", parsed["rows"][0]["item_no"], "2")
+    row = parsed["rows"][0]
+    check("되붙인 사건번호", row["case_no"], "2024타경5")
+    check("되붙인 물건번호", row["item_no"], "2")
+    # 법원/소재지도 살아 와야 한다 - 이 둘이 빠지면 후보 좁히기가 약해진다.
+    check("되붙인 법원", row["court_name"], "안산지원")
+    check("되붙인 소재지가 비지 않는다", bool(row["address"]), True)
+
+    # 이 모듈의 주석이 가리키는 검사가 **실제로 존재하는가** (2026-08-31 신설).
+    # 예전 주석은 tests/ 아래의 존재하지 않는 .mjs 계약 파일을 가리키고 있었다
+    # (죽은 인용을 다시 만들지 않으려고 그 이름은 여기 적지 않는다).
+    # 없는 검사를 가리키는 주석은 "지키고 있다"는 거짓 보증이 된다.
+    src = open(os.path.join(root, "normalizer", "mylist_import.py"),
+               encoding="utf-8-sig").read()
+    cited = set(re.findall(r"`?(tests/[A-Za-z0-9_.-]+|test_[A-Za-z0-9_]+\.py)`?", src))
+    check("주석이 검사 파일을 실제로 가리킨다(공허하지 않다)", len(cited) > 0, True)
+    missing = sorted(c for c in cited if not os.path.exists(os.path.join(root, c)))
+    check("존재하지 않는 검사 파일을 가리키지 않는다", missing, [])
 
 
 if __name__ == "__main__":

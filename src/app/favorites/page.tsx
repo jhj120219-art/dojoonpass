@@ -33,6 +33,12 @@ interface FavoriteItem {
       화면이 `?? ''` 분기를 만들 필요가 없게 백엔드가 그렇게 맞춰 준다. */
   memo: string
   tags: string[]
+  /** 메모의 출처. **응답에는 있었는데 이 타입에만 없었다**(2026-08-31 소스 대조로 추가).
+      `favorite_notes.source` — 마이리스트 가져오기가 "어디서 옮겨 왔는지"를 적어 둔다
+      (`api/v1/favorite_import.py`). 없으면 빈 문자열이지 null 이 아니다(memo/tags 와 같은 규칙).
+      화면에 보여 줄지는 정보 구성 결정이라 여기서 정하지 않고 계약만 적는다 —
+      선언되지 않은 키는 "응답에 없는 것"으로 읽혀 이미 있는 데이터를 다시 만들게 한다. */
+  note_source: string
 }
 
 export default function FavoritesPage() {

@@ -33,7 +33,14 @@ PG사 (KG이니시스 — 2026-08-06 확정, 실연동 미착수)
 
 Frontend
 
-↓ (인증 세션 공통 + /properties 목록·상세진입 데이터, 2026-08-05 기준 API 미경유)
+↓ (**인증 세션 전용**. 2026-08-31 정정 — 경매 데이터 경로는 남아 있지 않다)
+
+  ~~+ /properties 목록·상세진입 데이터, 2026-08-05 기준 API 미경유~~
+  → 2026-08-11 Sprint 51 에 `/properties` 는 `redirect('/')` 한 줄이 됐고
+    `SearchFilters.tsx` 는 삭제됐다(2026-08-31 실측: `src/app/properties/` 아래는
+    `page.tsx`(redirect) / `LogoutButton.tsx` / `[id]/` / `recent/` 뿐).
+    즉 **경매 데이터를 Supabase 에서 직접 읽는 화면은 이제 0개**이고,
+    `docs/CLAUDE.md` 의 "경매 데이터는 항상 Python API 경유" 규칙에 위반이 없다.
 
 Supabase (Auth + Postgres)
 
@@ -67,8 +74,12 @@ Frontend(본인 확인 후) ↓ GET /api/v1/registry-requests/{id}/download ↓ 
 
 ---
 
-주의: Frontend는 위 두 경로(FastAPI / Supabase)를 화면별로 병행 사용 중이며 하나로 통합되지 않았다
-(`/properties` 목록만 Supabase 직접 조회로 남아있음 — 자세한 화면별 경로는 `docs/frontend.md` "API 호출 방식" 참고).
+~~주의: Frontend는 위 두 경로(FastAPI / Supabase)를 화면별로 병행 사용 중이며 하나로 통합되지 않았다
+(`/properties` 목록만 Supabase 직접 조회로 남아있음).~~
+**2026-08-31 정정: 병행 사용은 끝났다.** Supabase 는 인증 세션만 담당하고, 경매 데이터는
+전 화면이 FastAPI 를 경유한다(`/properties` 는 2026-08-11 Sprint 51 에 `/` 로 영구 이동).
+화면별 경로는 `docs/frontend.md` "API 호출 방식" 참고.
+이 경계는 `tests/supabase-boundary.test.mjs` 가 회귀로 고정한다.
 Payment(payments.py) → Subscription(subscriptions) → Premium(has_active_subscription) →
 Registry(registry.py) → **Download(registry_documents/, 2026-08-05 추가)** 체인은 전부
 Frontend↔API 화살표에 포함된다(`properties/[id]/page.tsx`가 `payments`/`registry-requests`를

@@ -6,11 +6,10 @@ import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, headO
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { resolveNavContext } from './navContext'
-import { formatDday } from '@/app/search/ResultList'
 import { CONTAINER } from '@/lib/layout'
 // '억' 고정 표기(0 -> "0.0억"). 공용 formatPrice()와 표기 기준이 다르며,
 // 어느 쪽으로 통일할지는 미결정이라 중복만 제거했다 — src/lib/format.ts 주석 참고.
-import { formatPriceEok as formatPrice, formatWon } from '@/lib/format'
+import { formatPriceEok as formatPrice, formatWon, formatDday, formatBidRate } from '@/lib/format'
 import SiteHeader from '@/components/SiteHeader'
 import { useFocusTrap } from '@/lib/useFocusTrap'
 
@@ -61,7 +60,24 @@ interface AuctionItemDetail {
   court_name: string
   property_type: string
   full_address: string
+  // 주소 구성요소. **응답에는 계속 있었는데 이 타입에만 없었다**(2026-08-31 실측 추가,
+  // `api/v1/item.py` 가 내려준다). 화면에 쓰이지 않아도 계약에는 적어 둔다 —
+  // 선언되지 않은 키는 "응답에 없는 것"으로 읽혀, 이미 있는 데이터를 다시 만들게 한다
+  // (같은 드리프트가 검색 쪽 면적 4종에서 실제로 일어났다).
+  //
+  // ★ 화면 표시는 `full_address` 하나로 한다. 세 조각을 이어 붙여 주소를 만들면
+  //   같은 주소의 두 번째 계산 경로가 생긴다 — 목록 화면들이 `full_address` 가 없을
+  //   때의 **폴백으로만** 쓰는 것과 같은 규칙이다.
+  sido: string | null
+  sigungu: string | null
+  dong: string | null
   lot_number: string | null
+  // 면적(㎡). 2026-08-26 migration 025 이후 응답에 실린다. optional 인 이유는
+  // 그 이전 스키마에서 서버가 null 을 주기 때문이다(`api/v1/item.py:_area_of`).
+  // 검색 **필터가 쓰는 바로 그 값**이다 — 상세 화면에 표시할지는 정보 구성 결정이라
+  // (`docs/FRONTEND_MASTER_SPEC.md` §9.3 범위 밖) 여기서는 계약만 적어 둔다.
+  building_area?: number | null
+  land_area?: number | null
   appraisal_price: number
   minimum_bid_price: number
   bid_rate: number
@@ -770,7 +786,7 @@ export default function PropertyDetailPage() {
               <span className="text-sm text-gray-400">가격 지표</span>
               <div className="flex gap-1.5">
                 <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">
-                  입찰가율 {(property.bid_rate * 100).toFixed(1)}%
+                  입찰가율 {formatBidRate(property.bid_rate)}
                 </span>
                 <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">
                   유찰 {property.fail_count}회
@@ -1205,10 +1221,10 @@ export default function PropertyDetailPage() {
                         <span className="text-sm font-bold text-blue-500">
                           {p.discounted && (
                             <span className="mr-1.5 text-xs font-normal text-gray-400 line-through">
-                              {p.list_price.toLocaleString()}원
+                              {formatWon(p.list_price)}
                             </span>
                           )}
-                          {p.price.toLocaleString()}원{billingCycle === 'MONTHLY' ? '/월' : '/년'}
+                          {formatWon(p.price)}{billingCycle === 'MONTHLY' ? '/월' : '/년'}
                         </span>
                       </div>
                       <p className="text-xs text-gray-400 mt-1">등기부등본 월 {opt.registry_monthly_limit}회 제공</p>
@@ -1224,7 +1240,7 @@ export default function PropertyDetailPage() {
                 {registryBusy
                   ? '처리 중...'
                   : selectedPlanPrice
-                    ? `구독하기 (${selectedPlanPrice.price.toLocaleString()}원${billingCycle === 'MONTHLY' ? '/월' : '/년'})`
+                    ? `구독하기 (${formatWon(selectedPlanPrice.price)}${billingCycle === 'MONTHLY' ? '/월' : '/년'})`
                     : '요금제를 불러오는 중...'}
               </button>
             </div>
@@ -1232,14 +1248,14 @@ export default function PropertyDetailPage() {
             <div className="text-center py-4">
               <p className="text-sm text-gray-400 mb-2">무료 열람 횟수를 모두 사용했습니다</p>
               <p className="text-xs text-gray-300 mb-5">
-                건당 {(registryRequest.charged_amount ?? overageFee ?? 0).toLocaleString()}원 결제가 필요합니다
+                건당 {formatWon(registryRequest.charged_amount ?? overageFee ?? 0)} 결제가 필요합니다
               </p>
               <button
                 onClick={handlePayOverage}
                 disabled={registryBusy}
                 className="w-full py-4 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-2xl transition-all duration-200 disabled:opacity-50"
               >
-                {registryBusy ? '처리 중...' : `${(registryRequest.charged_amount ?? overageFee ?? 0).toLocaleString()}원 결제하기`}
+                {registryBusy ? '처리 중...' : `${formatWon(registryRequest.charged_amount ?? overageFee ?? 0)} 결제하기`}
               </button>
             </div>
           ) : registryRequest?.status === 'COMPLETED' ? (

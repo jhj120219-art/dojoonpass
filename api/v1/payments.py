@@ -7,7 +7,7 @@ from storage.database import get_connection
 from api.auth import get_current_user, success, error_response
 from api.constants import (
     ErrorCode, PaymentType, PaymentStatus, BillingCycle as BillingCycleEnum,
-    SubscriptionStatus, is_paid, is_sqlite_int,
+    SubscriptionStatus, RegistryRequestStatus, is_paid, is_sqlite_int,
 )
 from api.v1.registry import OVERAGE_FEE, get_entitled_subscription
 from api.v1.payment_providers import get_payment_provider, get_payment_provider_by_name
@@ -485,10 +485,10 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
             target_request = conn.execute(
                 """
                 SELECT * FROM registry_requests
-                WHERE user_id=? AND status='PAYMENT_REQUIRED' AND payment_id IS NULL
+                WHERE user_id=? AND status=? AND payment_id IS NULL
                 ORDER BY requested_at ASC, id ASC LIMIT 1
                 """,
-                (user_id,)
+                (user_id, RegistryRequestStatus.PAYMENT_REQUIRED.value)
             ).fetchone()
             if not target_request:
                 conn.commit()
@@ -544,10 +544,11 @@ def create_payment(req: PaymentCreateRequest, user_id: str = Depends(get_current
                 # 선점했다면(동시 결제 레이스) rowcount=0으로 감지해 이 결제를 롤백한다.
                 cursor = conn.execute(
                     """
-                    UPDATE registry_requests SET payment_id=?, status='PENDING'
-                    WHERE id=? AND payment_id IS NULL AND status='PAYMENT_REQUIRED'
+                    UPDATE registry_requests SET payment_id=?, status=?
+                    WHERE id=? AND payment_id IS NULL AND status=?
                     """,
-                    (payment_id, target_request["id"]),
+                    (payment_id, RegistryRequestStatus.PENDING.value,
+                     target_request["id"], RegistryRequestStatus.PAYMENT_REQUIRED.value),
                 )
                 if cursor.rowcount == 0:
                     conn.rollback()
