@@ -159,7 +159,13 @@ const read = (p) => readFileSync(new URL(p, import.meta.url), 'utf8')
 // `test_frontend_accessibility.py` 가 `_strip_comments` 를 두는 이유와 같다.
 const NEWLINE = String.fromCharCode(10)
 const code = (p) => {
-  const withoutBlocks = read(p).replace(/\/\*[\s\S]*?\*\//g, ' ')
+  // ★ CRLF 를 먼저 고른다. 이 저장소는 core.autocrlf=true 라 작업트리가 CRLF 인데,
+  //   아래 split(NEWLINE) 은 개행문자로만 자른다 -> 각 줄 끝에 캐리지리턴이 남는다.
+  //   JS 정규식에서 '.' 은 그 문자를 못 먹고, 플래그 없는 '$' 는 문자열 끝에서만
+  //   맞는다 -> 줄주석 제거 정규식이 **한 줄도 안 지워졌다.**
+  //   그래서 이 헬퍼가 주석을 못 걷어낸 채로 돌고 있었다(2026-09-01 확인).
+  //   그 결과 이 파일의 code() 기반 검사 2개가 설명 주석을 집어 **거짓 실패**했다.
+  const withoutBlocks = read(p).replace(/\r\n/g, NEWLINE).replace(/\/\*[\s\S]*?\*\//g, ' ')
   const lines = withoutBlocks.split(NEWLINE)
   const stripped = lines.map((line) => line.replace(/(^|\s)\/\/.*$/, '$1'))
   return stripped.join(NEWLINE)

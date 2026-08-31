@@ -118,21 +118,80 @@ def test_max_items_has_two_distinct_meanings():
                "mvp_scraper 가 crawl_court 를 부르지 않는다")
 
 
+# 조회 창 >= 공급 상한 인가. **판정은 여기 한 곳에만 둔다** — 아래 실제 검사와
+# 자기 검증이 각자 구현하면 갈라진다(이 저장소가 BUGS #204/#224 에서 반복해 겪은 모양).
+def _lookup_window_ok(lookup_win: int, supply_cap: int) -> bool:
+    return lookup_win >= supply_cap
+
+
 def test_lookup_window_is_not_smaller_than_supply_cap():
     """조회 창이 공급 상한보다 좁으면 **큐에 있는 사건을 못 찾는다.**
 
-    지금은 같은 상수라 자동으로 성립한다. 나중에 둘을 분리하더라도
-    이 관계는 반드시 지켜야 한다 - 그래서 관계 자체를 잠근다.
+    ## ★ 2026-08-26 (`docs/BUGS.md` #231) — 이 검사는 **공허했다**
+
+    예전 판은 이랬다.
+
+        supply_cap = cfg.MAX_ITEMS
+        lookup_win = getattr(cfg, "CASE_LOOKUP_MAX_ROWS", cfg.MAX_ITEMS)
+        check_true("조회 창이 공급 상한보다 좁지 않다", lookup_win >= supply_cap)
+
+    `CASE_LOOKUP_MAX_ROWS` 는 **settings 에 존재하지 않는다**(2026-08-26 확인).
+    그래서 폴백이 걸려 두 값이 **같은 객체**가 되고, 단언은 `X >= X` 가 된다 —
+    `MAX_ITEMS` 를 1 이든 999 든 0 이든 -5 든 **무엇으로 바꿔도 통과한다**(실측).
+
+    앞을 내다본 의도(*"나중에 둘을 분리하더라도 관계를 지킨다"*)는 옳다. 문제는 그
+    의도를 적어 두기만 하고, **오늘 검증력이 0 이라는 사실은 말하지 않았다**는 것이다.
+    읽는 사람은 PASS 를 보고 관계가 확인됐다고 믿는다.
+
+    ## 그래서 두 가지로 나눈다
+
+    1. **지금 상태를 정직하게 보고한다** — 아직 한 상수인지, 분리됐는지.
+    2. **판정 로직에 오늘 이빨을 준다** — 합성 값으로 위반/정상을 실제로 가려낸다.
+       분리가 실제로 들어오는 날 이 검사가 동작한다는 것을 지금 증명해 둔다.
     """
-    print("\n--- 2. 조회 창 >= 공급 상한 ---")
+    print("\n--- 2. 조회 창 >= 공급 상한 (BUGS #231) ---")
     supply_cap = cfg.MAX_ITEMS
+    split = hasattr(cfg, "CASE_LOOKUP_MAX_ROWS")
     lookup_win = getattr(cfg, "CASE_LOOKUP_MAX_ROWS", cfg.MAX_ITEMS)
-    print("    공급 상한 %d / 조회 창 %d" % (supply_cap, lookup_win))
+    print("    공급 상한 %d / 조회 창 %d / 상수 분리 여부: %s"
+          % (supply_cap, lookup_win, "분리됨" if split else "아직 한 상수(MAX_ITEMS)"))
+
     check_true("공급 상한이 양수다(검사가 공허하지 않다)", supply_cap > 0, supply_cap)
-    check_true("★ 조회 창이 공급 상한보다 좁지 않다",
-               lookup_win >= supply_cap,
-               "조회 창 %d < 공급 상한 %d - 큐에 있는데 목록에서 못 찾는 사건이 생긴다"
-               % (lookup_win, supply_cap))
+
+    if split:
+        # 분리된 뒤에는 **진짜 관계 검사**다.
+        check_true("★ 조회 창이 공급 상한보다 좁지 않다",
+                   _lookup_window_ok(lookup_win, supply_cap),
+                   "조회 창 %d < 공급 상한 %d - 큐에 있는데 목록에서 못 찾는 사건이 생긴다"
+                   % (lookup_win, supply_cap))
+    else:
+        # ★ 폴백이 사는 한 위 단언은 `X >= X` 라 **항상 참**이다. 통과로 세지 않는다 —
+        #   "검증했다"와 "검증할 것이 없었다"를 섞지 않는 것이 이 저장소의 규약이다.
+        print("    (아직 한 상수라 관계가 자동 성립한다. 이 조합에서는 검증력이 없다.")
+        print("     아래 합성 검증이 '분리되는 날 이 검사가 동작한다'를 대신 증명한다)")
+        check("전제: 폴백이 걸리면 두 값이 같다(그래서 위 비교는 공허하다)",
+              lookup_win, supply_cap)
+
+    # ------------------------------------------------------------------
+    # ★ 오늘 이빨 — 합성 값으로 판정 로직을 실제로 태운다.
+    #   `CASE_LOOKUP_MAX_ROWS` 가 생기는 날, 그 값이 작으면 붉어진다는 것을 지금 못박는다.
+    # ------------------------------------------------------------------
+    check("합성 검증: 조회 창이 좁으면 위반이다 (5 < 10)",
+          _lookup_window_ok(5, 10), False)
+    check("합성 검증: 같으면 정상이다 (10 == 10)",
+          _lookup_window_ok(10, 10), True)
+    check("합성 검증: 넓으면 정상이다 (20 > 10)",
+          _lookup_window_ok(20, 10), True)
+    check("합성 검증: 경계 바로 아래는 위반이다 (9 < 10)",
+          _lookup_window_ok(9, 10), False)
+
+    # 그리고 **분리가 실제로 들어왔을 때** 위 분기가 진짜 값을 쓰는지도 고정한다.
+    # (분기 자체가 죽어 있으면 분리되는 날에도 아무 일이 일어나지 않는다)
+    import types as _types
+    fake = _types.SimpleNamespace(MAX_ITEMS=10, CASE_LOOKUP_MAX_ROWS=5)
+    check("합성 검증: 분리된 설정을 읽으면 위반을 잡아낸다",
+          _lookup_window_ok(getattr(fake, "CASE_LOOKUP_MAX_ROWS", fake.MAX_ITEMS),
+                            fake.MAX_ITEMS), False)
 
 
 def test_truncation_is_real():

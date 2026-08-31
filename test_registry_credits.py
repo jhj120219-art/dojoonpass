@@ -79,7 +79,11 @@ def make_conn():
 def test_grant_and_deduct_sum():
     print("\n--- 1. GRANT/DEDUCT sign normalization and sum ---")
     conn = make_conn()
-    month = "2026-08"
+    # 고정하면 해가 바뀔 때 검사가 조용히 무력해진다. add_credit() 은 at 을 안 주면
+    #   **지금 달**로 쓰는데 여기만 "2026-08" 로 읽어
+    #   2026-09-01 KST 로 넘어가는 순간 실패했다.
+    #   0 을 기대하는 RESET 검사는 틀린 달에서도 0 이라 **거짓 통과**했다.
+    month = get_current_month()
     add_credit(conn, "u1", REASON_GRANT, 3, "cs", "ADMIN")
     check("after GRANT 3", get_credit_adjustment(conn, "u1", month), 3)
     add_credit(conn, "u1", REASON_DEDUCT, 1, "cs", "ADMIN")
@@ -100,7 +104,11 @@ def test_grant_and_deduct_sum():
 def test_reset_cuts_off_prior_adjustments():
     print("\n--- 2. RESET cuts off prior adjustments ---")
     conn = make_conn()
-    month = "2026-08"
+    # 고정하면 해가 바뀔 때 검사가 조용히 무력해진다. add_credit() 은 at 을 안 주면
+    #   **지금 달**로 쓰는데 여기만 "2026-08" 로 읽어
+    #   2026-09-01 KST 로 넘어가는 순간 실패했다.
+    #   0 을 기대하는 RESET 검사는 틀린 달에서도 0 이라 **거짓 통과**했다.
+    month = get_current_month()
     add_credit(conn, "u2", REASON_GRANT, 10, None, "ADMIN")
     check("before RESET", get_credit_adjustment(conn, "u2", month), 10)
 
