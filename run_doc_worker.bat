@@ -37,6 +37,33 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 4. Turn the collected documents into rights analysis (BUGS #245) -----
+REM     doc_worker.py only *collects* status.html / spec.pdf. Until these two
+REM     scripts run, document_status says READY while rights_summary stays
+REM     empty - the detail page shows a property whose documents exist but
+REM     whose rights analysis is blank. That gap grew every night because
+REM     neither script was in any .bat or scheduled task (2026-09-01: 9
+REM     documents collected, 0 parsed).
+REM
+REM     Wiring was deferred before because both scripts contain a DELETE path
+REM     (purge_orphans). That path now asks storage.database.guard_mass_purge()
+REM     first and refuses - with exit code 1 - when a single run would remove
+REM     more than 20% of existing derived rows, which is the signature of a
+REM     half-synced documents/ tree rather than real data change.
+"%PY%" load_rights_data.py >> logs\doc_run.log 2>&1
+if errorlevel 1 (
+    echo ===================================== >> logs\doc_run.log
+    echo [FAILED] load_rights_data.py exited with code %errorlevel% at %date% %time% >> logs\doc_run.log
+    exit /b 1
+)
+
+"%PY%" load_spec_data.py >> logs\doc_run.log 2>&1
+if errorlevel 1 (
+    echo ===================================== >> logs\doc_run.log
+    echo [FAILED] load_spec_data.py exited with code %errorlevel% at %date% %time% >> logs\doc_run.log
+    exit /b 1
+)
+
 echo ===================================== >> logs\doc_run.log
 echo [SUCCESS] doc_worker.py finished at %date% %time% >> logs\doc_run.log
 exit /b 0

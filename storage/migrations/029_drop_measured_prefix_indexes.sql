@@ -1,0 +1,50 @@
+-- 029_drop_measured_prefix_indexes.sql
+--
+-- [2026-08-31 적용 / 2026-09-02 파일 복원] 사용자 표의 접두 중복 인덱스 2개를 지운다.
+--
+-- ★ 이 파일은 **복원본이다** (사유는 027 파일 머리말과 같다)
+-- ---------------------------------------------------------------------------
+-- 라이브와 fresh 를 전수 대조했을 때 fresh 에만 있던 인덱스는 3개였고, 그중
+-- `idx_favorite_notes_user_id` 는 027 이 가져간다. 남는 둘이 이 파일 몫이며,
+-- 파일명의 "measured prefix indexes"(재어 보고 지운 접두 인덱스)와 일치한다.
+--
+--     idx_favorites_user_id      (001 이 만듦)  ⊂ UNIQUE(user_id, item_id)
+--     idx_recent_items_user_id   (002 가 만듦)  ⊂ UNIQUE(user_id, item_id)
+--
+-- 왜 021 의 경고가 여기엔 적용되지 않는가 — **다시 쟀다**
+-- ---------------------------------------------------------------------------
+-- 021 은 접두 중복을 **일부러 남겨 두었다.** 그때 측정에서 auction_item 의 접두를 지우니
+-- sido 검색이 38.10ms -> 243.69ms(+540%)로 무너졌기 때문이다. 그 결론은 그 표에서 옳다.
+--
+-- 다만 021 자신이 조건을 적어 두었다 — *"'접두니까 중복'은 점 조회에서만 맞고
+-- 범위/커버링 스캔에서는 틀리다."* favorites / recent_items 는 **점 조회 전용**이다:
+--
+--     SELECT item_id FROM favorites WHERE user_id = ?              api/v1/favorite_import.py
+--     SELECT 1      FROM favorites WHERE user_id=? AND item_id=?   api/v1/item.py
+--     DELETE        FROM favorites WHERE user_id=? AND item_id=?   api/v1/favorites.py
+--     SELECT id     FROM recent_items WHERE user_id = ?            api/v1/recent_items.py
+--
+-- 정렬이 필요한 최근순 조회는 `idx_recent_items_viewed_at(user_id, viewed_at)` 가
+-- 따로 받는다 — 그건 **지우지 않는다**(접두가 아니라 다른 열 조합이다).
+--
+-- 합성 100,000행 재측정 (2026-09-02, 사용자 4,000명 x 25행)
+-- ---------------------------------------------------------------------------
+--     favorites 목록      0.0207ms -> 0.0202ms  (-2.7%)  계획 SAME
+--     favorites 존재확인   0.0151ms -> 0.0148ms  (-2.3%)  계획 SAME
+--     favorites 개수      0.0155ms -> 0.0154ms  (-0.6%)  자동 인덱스로 대체(둘 다 COVERING)
+--     favorites 삭제      0.0008ms -> 0.0008ms  ( 0.0%)  계획 SAME
+--     recent 목록         0.0061ms -> 0.0061ms  ( 0.0%)  자동 인덱스로 대체(둘 다 COVERING)
+--     recent 최근순       0.0067ms -> 0.0067ms  ( 0.0%)  계획 SAME (viewed_at 인덱스 사용)
+--     20% 넘게 느려진 쿼리 0개 / DB 파일 27.1MB -> 22.4MB (17.5% 절감, 027 과 합산)
+--
+-- 계획이 바뀐 둘도 **COVERING INDEX 끼리의 교체**라 읽는 페이지 수가 늘지 않는다.
+-- 021 이 문제 삼은 "넓은 인덱스로 대체되어 I/O 가 는다"가 여기서는 일어나지 않는다 —
+-- 자동 인덱스가 (user_id, item_id) 두 열뿐이라 폭이 거의 같기 때문이다.
+--
+-- 되돌리기
+-- ---------------------------------------------------------------------------
+--     CREATE INDEX idx_favorites_user_id ON favorites(user_id);
+--     CREATE INDEX idx_recent_items_user_id ON recent_items(user_id);
+
+DROP INDEX IF EXISTS idx_favorites_user_id;
+DROP INDEX IF EXISTS idx_recent_items_user_id;

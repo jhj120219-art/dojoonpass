@@ -256,7 +256,12 @@ def test_done_rows_have_file_and_ready_status():
         ).fetchall()
         check_true("검사 대상이 실제로 존재한다", len(done) > 0, "done 행이 0건이면 이 검사는 공허하다")
 
+        # "자산을 가진 종결 상태"의 정본은 storage.database 에 있다 — 여기에 값을
+        # 베껴 두면 어휘가 늘었을 때 이 검사만 옛 목록으로 남는다(이번 결함의 원인).
+        from storage.database import DOC_STATUS_HAS_ARTIFACT
+
         no_file, no_ds, not_ready, no_item = [], [], [], []
+        contradictory = []
         for r in done:
             ai = conn.execute(
                 """SELECT ai.id, ai.court_name FROM auction_item ai
@@ -283,11 +288,41 @@ def test_done_rows_have_file_and_ready_status():
             #
             #   사진은 물건당 0~N장이라 "종류당 파일 1개" 표에 넣을 수 없다. 대신 문서에
             #   요구하는 것과 **같은 강도**로 본다: 행이 있고, 파일이 실재하고, 0바이트가 아니다.
+            # document_status 조회는 **image 를 포함한 전체 표**를 쓴다 — 사진도 화면
+            # 상태를 갖는다. 파일 검사보다 **먼저** 읽는다: 사진은 이 상태에 따라
+            # 기대하는 것이 정반대가 되기 때문이다(아래 NO_IMAGE 주석).
+            st = conn.execute("SELECT status FROM document_status WHERE item_id=? AND doc_type=?",
+                              (ai["id"], QUEUE_TO_DS_ALL.get(r["doc_type"]))).fetchone()
+            ds_status = st["status"] if st else None
+
             if r["doc_type"] == "image":
                 imgs = conn.execute(
                     "SELECT seq, storage_path FROM auction_image WHERE item_id=?",
                     (ai["id"],)).fetchall()
-                if not imgs:
+                # ★ NO_IMAGE 는 **정상 종결**이다 (2026-09-01, 실데이터 최초 관측).
+                #
+                #   `doc_worker.py` 는 사진을 못 가져온 것과 **법원에 원래 없는 것**을
+                #   구분한다: `done_status = "NO_IMAGE" if result.get("no_asset") else "READY"`.
+                #   docs/backend.md 도 *"NO_IMAGE 는 '법원이 사진을 제공하지 않는다'는
+                #   확인된 답이지 실패가 아니다"* 라고 적고 있고, `audit_asset_integrity.py`
+                #   는 이미 `ds.status NOT IN ('READY','NO_IMAGE')` 로 판정한다.
+                #
+                #   이 검사만 `auction_image` 행이 **반드시 있어야 한다**고 요구하고 있었다.
+                #   지금까지 통과한 이유는 규칙이 옳아서가 아니라 **표본에 사진 없는 물건이
+                #   없었기 때문이다** — docs/SPRINT144_ASSET_PIPELINE.md 가 *"표본 안에
+                #   법원에 사진이 없는 물건은 없었다 — NO_IMAGE 경로는 합성 테스트로만
+                #   검증됐다"* 고 적어 두었고, docs/roadmap.md 는 *"NO_IMAGE 실데이터가
+                #   처음 관측되는가"* 를 미확인 항목으로 남겨 두었다. 그 물건이 2건 들어오자
+                #   제품은 옳게 동작했는데 이 검사만 붉어졌다.
+                #
+                #   그래서 **면제하지 않고 방향을 뒤집는다**: 없다고 해 놓고 행이 남아
+                #   있으면 그것이 모순이다(`clear_images_if_absence_confirmed()` 가
+                #   정리하지 못한 경우). 검사의 강도는 줄지 않는다.
+                if ds_status == "NO_IMAGE":
+                    if imgs:
+                        contradictory.append(
+                            key + " (NO_IMAGE 인데 auction_image %d행)" % len(imgs))
+                elif not imgs:
                     no_file.append(key + " (auction_image 행 없음)")
                 for im in imgs:
                     ipath = os.path.join(ROOT, (im["storage_path"] or "").replace("/", os.sep))
@@ -299,16 +334,13 @@ def test_done_rows_have_file_and_ready_status():
                     doc_dir(ai["court_name"], r["case_no"], r["item_no"]),
                     QUEUE_DOC_FILE.get(r["doc_type"], "?"))):
                 no_file.append(key)
-            # document_status 조회는 **image 를 포함한 전체 표**를 쓴다 — 사진도 화면
-            # 상태를 갖는다(READY 여야 상세가 '수집완료'로 보인다).
-            st = conn.execute("SELECT status FROM document_status WHERE item_id=? AND doc_type=?",
-                              (ai["id"], QUEUE_TO_DS_ALL.get(r["doc_type"]))).fetchone()
             if not st:
                 no_ds.append(key)
-            elif st["status"] != "READY":
+            elif ds_status not in DOC_STATUS_HAS_ARTIFACT:
                 not_ready.append(key)
 
         check("done인데 파일이 없는 행 없음", no_file[:5], [])
+        check("NO_IMAGE 인데 사진 행이 남아 있는 물건 없음", contradictory[:5], [])
         check("done인데 document_status 행이 없는 것 없음", no_ds[:5], [])
         check("done인데 화면 상태가 READY가 아닌 것 없음", not_ready[:5], [])
 
@@ -383,6 +415,198 @@ def test_files_are_reflected_in_queue():
         check("파일이 있는데 큐가 done/refresh가 아닌 것 없음", bad[:5], [])
     finally:
         conn.close()
+
+
+def test_failure_reason_is_recorded():
+    """최종 실패에 **사유**가 남는가 (2026-09-02).
+
+    `storage/database.py:mark_queue_failed()` 의 주석은 큐 행에 아무것도 쓰지 않는
+    선택을 *"실패 사실은 로그와 `document_collect_failures` 에 이미 남는다"* 로
+    정당화한다. 그런데 **그 표에 쓰는 코드가 없었다** — INSERT 하는 곳은
+    `collect_documents.py` 뿐이고 그 스크립트는 2026-07-15 이후 돌지 않았다.
+
+    실측(2026-09-02): document_queue failed 188건(그중 기일이 남아 화면에 보이는
+    물건 129건)인데 그 실행들이 남긴 사유는 0건이었다. 왜 문서가 없는지 아무도
+    모르는 상태다.
+
+    여기서는 **실제로 한 번 실패시켜** 사유가 표에 들어가는지 본다. 문자열 검사가
+    아니라 동작 검사다(주석이 약속을 지키는지 보는 것이 이 검사의 목적이므로,
+    주석을 읽는 방식으로는 같은 착각을 되풀이한다).
+    """
+    print("\n--- 최종 실패에 사유가 남는가 (mark_queue_failed) ---")
+    import tempfile
+    import storage.database as db
+
+    prev = db.DB_PATH
+    tmp = tempfile.mkdtemp(prefix="qa-failreason-")
+    try:
+        db.DB_PATH = os.path.join(tmp, "auction.db")
+        db.init_db()
+        import storage.migrate_v4_1 as mig
+        import storage.migrations.run_migrations as runmig
+        import contextlib
+        import io as _io2
+        with contextlib.redirect_stdout(_io2.StringIO()):
+            mig.migrate()
+            runmig.run()
+
+        conn = db.get_connection()
+        try:
+            conn.execute("INSERT INTO auction_item (id, case_no, item_no, court_name) "
+                         "VALUES (7001, '2099타경1', '1', '테스트지방법원')")
+            conn.execute(
+                "INSERT INTO document_queue (id, court_code, case_no, item_no, doc_type, "
+                "status, retry_count) VALUES (901, 'T001', '2099타경1', '1', 'appraisal', ?, ?)",
+                (db.QUEUE_STATUS_IN_PROGRESS, db.MAX_DOC_RETRY - 1))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 재시도가 소진되는 마지막 실패
+        db.mark_queue_failed(901, db.MAX_DOC_RETRY - 1, None, reason="테스트사유: DOM 변경")
+
+        conn = db.get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT item_id, doc_type, error_message FROM document_collect_failures"
+            ).fetchall()
+            qstatus = conn.execute(
+                "SELECT status FROM document_queue WHERE id=901").fetchone()["status"]
+        finally:
+            conn.close()
+
+        check("최종 실패가 큐에 반영된다", qstatus, db.QUEUE_STATUS_FAILED)
+        check("실패 사유가 1건 기록된다", len(rows), 1)
+        if rows:
+            check("올바른 물건에 붙는다", rows[0]["item_id"], 7001)
+            check("문서 종류가 남는다", rows[0]["doc_type"], "appraisal")
+            check_true("사유 문자열이 그대로 남는다",
+                       "테스트사유: DOM 변경" == rows[0]["error_message"],
+                       rows[0]["error_message"])
+
+        # 사유를 안 넘겨도 표는 채워져야 한다(빈 칸으로 남기지 않는다)
+        conn = db.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO document_queue (id, court_code, case_no, item_no, doc_type, "
+                "status, retry_count) VALUES (902, 'T001', '2099타경1', '1', 'spec', ?, ?)",
+                (db.QUEUE_STATUS_IN_PROGRESS, db.MAX_DOC_RETRY - 1))
+            conn.commit()
+        finally:
+            conn.close()
+        db.mark_queue_failed(902, db.MAX_DOC_RETRY - 1, None)
+        conn = db.get_connection()
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM document_collect_failures").fetchone()[0]
+            last = conn.execute("SELECT error_message FROM document_collect_failures "
+                                "ORDER BY id DESC LIMIT 1").fetchone()["error_message"]
+        finally:
+            conn.close()
+        check("사유 없이 불러도 행은 남는다", n, 2)
+        check_true("사유가 비어 있지 않다", bool(last), last)
+
+        # 중간 재시도는 남기지 않는다 - 한 문서가 여러 행을 만들면 표가 못 쓰게 된다
+        conn = db.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO document_queue (id, court_code, case_no, item_no, doc_type, "
+                "status, retry_count) VALUES (903, 'T001', '2099타경1', '1', 'status', ?, 0)",
+                (db.QUEUE_STATUS_IN_PROGRESS,))
+            conn.commit()
+        finally:
+            conn.close()
+        db.mark_queue_failed(903, 0, None, reason="첫 시도 실패")
+        conn = db.get_connection()
+        try:
+            n2 = conn.execute("SELECT COUNT(*) FROM document_collect_failures").fetchone()[0]
+        finally:
+            conn.close()
+        check("중간 재시도는 사유를 남기지 않는다(최종 실패만)", n2, 2)
+    finally:
+        db.DB_PATH = prev
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mass_purge_guard():
+    """대량 삭제 차단기 — 부분 유실에서 파생 행을 쓸어버리지 않는가 (2026-09-02).
+
+    `load_rights_data.py` / `load_spec_data.py` 를 `run_doc_worker.bat` 에 배선하면서
+    필요해진 검사다. 배선 전에는 사람이 손으로 돌렸으므로 이상하면 바로 봤지만, 이제는
+    **무인 야간 실행**이다.
+
+    원래 안전장치는 `evidence_found == 0` 하나였다. 그것은 `documents/` 를 통째로 못 읽는
+    경우만 막는다. 막지 못하는 것이 부분 유실이다 — OneDrive 가 절반만 동기화됐거나
+    드라이브가 일부만 마운트되면 `evidence_found > 0` 이라 안전장치가 열리고, 남은 몇 건을
+    빼고 **나머지 권리분석·임차인 데이터를 전부 지운다.**
+
+    `guard_mass_purge()` 는 지우기 전에 규모를 재서 그 상황을 막는다.
+    """
+    print("\n--- 대량 삭제 차단기 (BUGS #245 배선의 전제) ---")
+    import io as _io
+    import re as _re
+    from storage.database import (guard_mass_purge, PURGE_BLOCKED,
+                                  PURGE_MAX_RATIO, PURGE_ABSOLUTE_FLOOR)
+
+    check_true("표식이 삭제 건수와 섞이지 않는다(음수)", PURGE_BLOCKED < 0, PURGE_BLOCKED)
+
+    # 통과해야 하는 것 — 평상시
+    check("지울 게 없으면 통과", guard_mass_purge(413, 0, "t"), None)
+    check("바닥값 미만 소량 삭제는 통과",
+          guard_mass_purge(413, PURGE_ABSOLUTE_FLOOR - 1, "t"), None)
+    # 비율 상한 **바로 아래**는 통과해야 한다(경계를 실제로 재는지 본다)
+    just_under = int(413 * PURGE_MAX_RATIO)
+    check_true("상한 바로 아래는 통과 (%d/413)" % just_under,
+               guard_mass_purge(413, just_under, "t") is None, just_under)
+
+    # 막아야 하는 것 — 부분 유실 시나리오
+    just_over = int(413 * PURGE_MAX_RATIO) + 2
+    check_true("상한 바로 위는 막힌다 (%d/413)" % just_over,
+               isinstance(guard_mass_purge(413, just_over, "t"), str), just_over)
+    check_true("절반이 사라지면 막힌다",
+               isinstance(guard_mass_purge(1069, 500, "t"), str))
+    check_true("전부 사라지면 막힌다",
+               isinstance(guard_mass_purge(413, 413, "t"), str))
+    check_true("기존이 0인데 지울 게 있으면 막힌다(계수 어긋남)",
+               isinstance(guard_mass_purge(0, 50, "t"), str))
+    check_true("막을 때 사유에 규모가 적힌다",
+               "413" in (guard_mass_purge(413, 400, "t") or ""))
+
+    # 두 스크립트가 **같은 판정기**를 쓰는가 — 규칙을 베끼면 갈라진다(BUGS #204)
+    import load_rights_data as LR
+    import load_spec_data as LS
+    for mod in (LR, LS):
+        src = _io.open(mod.__file__, encoding="utf-8").read()
+        name = os.path.basename(mod.__file__)
+        check_true("%s 가 차단기를 부른다" % name, "guard_mass_purge(" in src)
+        check_true("%s 가 자체 임계값을 만들지 않는다" % name,
+                   "PURGE_MAX_RATIO =" not in src and "PURGE_ABSOLUTE_FLOOR =" not in src,
+                   "임계값은 storage/database.py 한 곳에만 있어야 한다")
+        # ★ 파일 전체에서 첫 DELETE 를 찾으면 안 된다 - `load_item()` 이 물건마다
+        #   재적재하며 DELETE 하므로 항상 앞에 있다. **purge_orphans 함수 본문 안**에서
+        #   순서를 본다(이 검사를 처음 그렇게 써서 스스로 붉어졌다).
+        body = src[src.index("def purge_orphans("):]
+        nxt = body.find("\ndef ", 1)
+        if nxt > 0:
+            body = body[:nxt]
+        check_true("%s 가 지우기 전에 센다" % name,
+                   "guard_mass_purge(" in body
+                   and body.index("guard_mass_purge(") < body.index("DELETE FROM"),
+                   "COUNT 를 DELETE 뒤에 하면 이미 지운 뒤다")
+        check_true("%s 가 차단을 종료 코드로 싣는다" % name,
+                   "PURGE_BLOCKED" in src and "return 1" in src)
+
+    # 배선이 실제로 돼 있는가 — 이 검사의 존재 이유다
+    bat = _io.open(os.path.join(ROOT, "run_doc_worker.bat"), encoding="utf-8-sig").read()
+    called = set()
+    for ln in bat.splitlines():
+        if ln.strip().upper().startswith("REM"):
+            continue
+        m = _re.match(r'^\s*"%PY%"\s+(\S+\.py)', ln)
+        if m:
+            called.add(m.group(1))
+    for script in ("load_rights_data.py", "load_spec_data.py"):
+        check_true("run_doc_worker.bat 이 %s 를 부른다" % script, script in called, sorted(called))
 
 
 def test_parsing_gap_is_measurable():
@@ -2283,6 +2507,8 @@ def run():
     test_queue_state_machine_invariants()
     test_done_rows_have_file_and_ready_status()
     test_files_are_reflected_in_queue()
+    test_failure_reason_is_recorded()
+    test_mass_purge_guard()
     test_parsing_gap_is_measurable()
     test_no_orphan_rows_in_pipeline_tables()
     test_rights_data_has_evidence()

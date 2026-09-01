@@ -1506,27 +1506,105 @@ def test_sync_expired_status_does_not_clobber_a_concurrent_change():
 
 
 def test_subscription_writers_all_use_cas():
-    """구독 상태를 쓰는 **모든** 문장이 CAS 를 건다 — 새 writer 가 생겨도 걸린다.
+    """구독/결제/등기신청 상태를 쓰는 **모든** 문장이 CAS 를 건다.
 
-    위 검사는 지금 있는 한 경로를 본다. 이 검사는 **다음에 추가될 경로**를 본다.
-    `sync_expired_status()` 가 정확히 그렇게 빠져나갔다 — 나중에 붙은 함수였고,
-    조건 없는 UPDATE 한 줄이 아무 검사에도 걸리지 않았다.
+    위 검사들은 지금 있는 **한 함수씩**을 본다. 이 검사는 **다음에 추가될 경로**를
+    본다. `sync_expired_status()` 가 정확히 그렇게 빠져나갔다 - 나중에 붙은
+    함수였고, 조건 없는 UPDATE 한 줄이 아무 검사에도 걸리지 않았다.
+
+    2026-09-02 에 두 번 넓혔다: 파일 하나 -> 저장소 전체, 구독 -> 결제/등기신청까지.
     """
-    print("\n--- 18. 구독 writer 전수: 조건 없는 UPDATE 가 없다 (Sprint 254) ---")
+    print("\n--- 18. 상태 writer 전수: 조건 없는 UPDATE 가 없다 (Sprint 254) ---")
     import re
-    import api.v1.subscriptions as subs_mod
+    import subprocess
 
-    src = open(subs_mod.__file__, encoding="utf-8").read()
-    # ★ 먼저 **인접 문자열 리터럴을 잇는다.** 파이썬은 `"UPDATE ..." " WHERE ..."` 를
-    #   한 문장으로 이어 붙이는데, 조각만 보면 뒤쪽 WHERE 절을 놓쳐 멀쩡한 CAS 를
+    # ★ 2026-09-01 — **저장소 전체**로 넓혔다.
+    #
+    #   이 검사는 `api/v1/subscriptions.py` **한 파일만** 읽고 있었다. 지금 구독
+    #   writer 가 전부 거기 있는 것은 사실이지만(실측 6문장 전부), 그건 "오늘의
+    #   사실"이지 계약이 아니다 — 이 검사의 docstring 이 스스로 *"다음에 추가될
+    #   경로를 본다"* 고 적고 있는데, **다른 파일에 추가되면 못 본다.**
+    #   `sync_expired_status()` 가 같은 파일에 붙었기에 걸린 것뿐이다.
+    #
+    #   그래서 git 이 추적하는 제품 소스 전부를 훑는다(테스트는 뺀다 - 일부러 나쁜
+    #   SQL 을 문자열로 들고 있다). 오늘 결과는 그대로다: 99개 파일 / 6문장 / 위반 0.
+    root = os.path.dirname(os.path.abspath(__file__))
+    out = subprocess.run(["git", "ls-files", "*.py"], cwd=root,
+                         capture_output=True, text=True, encoding="utf-8")
+    files = [f for f in out.stdout.split() if not os.path.basename(f).startswith("test_")]
+
+    # 삼중따옴표를 잠깐 치워 둔다 - 아래 "인접 리터럴 잇기"가 삼중따옴표의 앞 두
+    # 따옴표를 지워 버려서, 삼중따옴표 SQL 을 통째로 못 보게 되기 때문이다.
+    SENT = "\x00TQ\x00"
+    TRIPLE_D = chr(34) * 3
+    TRIPLE_S = chr(39) * 3
+    # ★ 인접 문자열 리터럴을 잇는다. 파이썬은 `"UPDATE ..." " WHERE ..."` 를 한
+    #   문장으로 이어 붙이는데, 조각만 보면 뒤쪽 WHERE 절을 놓쳐 멀쩡한 CAS 를
     #   "조건 없음"으로 오판한다(이 검사를 쓰다가 실제로 `renew()` 를 오탐했다).
-    joined = re.sub(r'"[ \t]*(?:\r?\n)?[ \t]*"', "", src)
-    # 문자열 리터럴 안의 UPDATE 문만 본다(주석/설명문은 제외).
-    stmts = re.findall(r'"(UPDATE subscriptions SET[^"]*)"', joined)
-    print("    찾은 UPDATE 문: %d개" % len(stmts))
-    check_true("검사가 공허하지 않다(UPDATE 문을 실제로 찾았다)", len(stmts) >= 4)
-    naked = [q for q in stmts if "AND status=?" not in q]
-    check("★ 조건 없이 구독 상태를 덮는 UPDATE 가 없다", naked, [])
+    # ★ 2026-09-02 — 구독뿐 아니라 **상태 전이가 돈이 되는 테이블 전부**를 본다.
+    #
+    #   `payments` / `registry_requests` 에도 같은 계약이 있는데, 그것을 지키는 검사는
+    #   전부 **함수 단위**였다(`test_refund_guard_is_structural` 은 `refund_payment` 를,
+    #   `test_toctou_guard_is_structural` 은 `update_registry_request_status` 를,
+    #   `test_webhook_reprocess_guard_is_structural` 은 `_apply_webhook_event` 를 연다).
+    #   그 셋은 "그 함수가 어떻게 막는가"(BEGIN IMMEDIATE / rowcount / rollback)를
+    #   확인하는 검사라 그대로 가치가 있다 — 다만 **다른 함수에 새 writer 가 생기면
+    #   셋 중 무엇도 열어 보지 않는다.** 여기서 그 구멍을 닫는다.
+    #
+    #   여기서 보는 것은 **분실 갱신(lost update)** 이다 - "내가 읽은 뒤 남이 바꿨는가".
+    #   `test_state_machines.py:test_status_updates_call_transition_validation()` 이
+    #   보는 것은 **전이 합법성** 이다 - "이 전이가 허용되는가". 둘은 다른 성질이라
+    #   서로를 대신하지 못한다(합법인 전이도 남의 결과를 덮을 수 있다).
+    #
+    #   ★ `registry_requests` 는 **일부러 뺐다.** 그 테이블의 출발상태 CAS 는 위
+    #     검사가 이미 저장소 전수로(모듈 최상위까지) 강제한다 - 같은 계약을 두 곳에
+    #     두면 한쪽만 고쳐지는 날이 온다. 이 목록을 늘리기 전에 그 검사를 먼저 보라.
+    #
+    #   `payment_webhooks` 도 뺐다. 그 테이블의 UPDATE 두 곳은 상태 전이가 아니라
+    #   **처리 기록**이다(`payment_id` 역참조 backfill, `mark_webhook_processed`).
+    #   둘 다 CAS 로 지킨 `UPDATE payments ... AND status=?` 가 성공한 뒤에만 돌고,
+    #   같은 값을 쓰므로 누가 이겨도 결과가 같다. 필요 없는 CAS 를 요구해서
+    #   "규칙을 지키려고 코드를 비트는" 상태를 만들지 않는다.
+    #
+    #   ※ WHERE 를 문자열 연결로 만드는 writer 는 여기서 **오탐**이 된다(리터럴만
+    #     보므로). 방향은 안전하다 - 놓치는 쪽이 아니라 시끄러운 쪽이다.
+    #     실제로 그런 자리가 생기면 그때 이 목록이 아니라 그 코드를 보라.
+    CAS_REQUIRED_TABLES = ("subscriptions", "payments")
+
+    # 따옴표 네 종류를 전부 본다 - 새 writer 가 삼중따옴표로 쓸 수도 있다.
+    PAT = re.compile(
+        r'(?P<q>' + TRIPLE_D + r'|' + TRIPLE_S + r'|"|\')'
+        r'\s*(?P<sql>UPDATE\s+(?P<t>\w+)\s+SET.*?)(?P=q)', re.S | re.I)
+
+    def _norm(sql):
+        """비교용으로 납작하게 편다 - 대소문자와 `=` 주변 공백에 흔들리지 않게."""
+        return re.sub(r"\s*=\s*", "=", " ".join(sql.split())).lower()
+
+    stmts = []
+    for rel in files:
+        try:
+            text = open(os.path.join(root, rel), encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        text = text.replace(TRIPLE_D, SENT).replace(TRIPLE_S, SENT)
+        text = re.sub(r'"[ \t]*(?:\r?\n)?[ \t]*"', "", text)
+        text = re.sub(r"'[ \t]*(?:\r?\n)?[ \t]*'", "", text)
+        text = text.replace(SENT, TRIPLE_D)
+        for m in PAT.finditer(text):
+            if m.group("t").lower() in CAS_REQUIRED_TABLES:
+                stmts.append((rel, m.group("t").lower(), _norm(m.group("sql"))))
+
+    seen = sorted({t for _f, t, _q in stmts})
+    print("    스캔한 제품 소스 %d개 / 찾은 UPDATE 문 %d개 / 테이블 %s"
+          % (len(files), len(stmts), seen))
+    check_true("검사가 공허하지 않다(스캔할 파일이 있다) - %d개" % len(files), len(files) >= 20)
+    check_true("검사가 공허하지 않다(UPDATE 문을 실제로 찾았다) - %d개" % len(stmts), len(stmts) >= 4)
+    # 지켜야 할 테이블이 **하나도 안 걸리는** 상태를 막는다 - 정규식이나 파일 목록이
+    # 조용히 망가지면 위 두 단언만으로는 드러나지 않는다.
+    check("★ CAS 를 요구하는 테이블이 전부 스캔에 잡힌다", seen, sorted(CAS_REQUIRED_TABLES))
+    naked = ["%s :: %s :: %s" % (f, t, q[:90]) for f, t, q in stmts
+             if "and status=?" not in q]
+    check("★ 조건 없이 상태를 덮는 UPDATE 가 없다(구독/결제)", naked, [])
 
 
 def run():

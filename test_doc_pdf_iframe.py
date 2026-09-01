@@ -163,6 +163,65 @@ def run():
     # ── 6. 주석이 가리키는 검사 파일이 실제로 존재한다 ────────────────────
     #    이 파일이 생긴 이유 그 자체. 없는 파일을 가리키는 주석은 거짓 보증이다.
     import re
+
+    # ── 확장자 없는 감정평가서 뷰어 주소 (2026-09-02) ─────────────────────
+    #
+    # #267 은 **언제 보는가**를 고쳤지만 판정은 `.pdf` 로 끝나는지만 봤다. 감정평가서
+    # 뷰어는 확장자 없는 경로로 문서를 준다. 2026-08-30 워커 로그에 실제 주소가
+    # 그대로 남아 있다 — 아래 값들은 그 로그에서 가져온 실물이다.
+    #
+    #   appraisal 내부 PDF iframe을 찾지 못함 - 그 프레임 안의 iframe 1개:
+    #     ['https://ca.kapanet.or.kr/view/000317/20240130004507/2/25121005/20260526']
+    #
+    # 문서 종류별 성공률(2026-09-02 실측)에 그대로 드러났다:
+    #   status 98.8% / spec 97.4% / image 97.8% / **appraisal 55.7%**
+    REAL_VIEWER_SRCS = [
+        "https://ca.kapanet.or.kr/view/000317/20240130004507/2/25121005/20260526",
+        "https://ca.kapanet.or.kr/view/000317/20240130004651/1/WS2412-0137-12/20250110",
+        "https://ca.kapanet.or.kr/view/000422/20220130004979/1/20-221227-301/20230104",
+        "https://ca.kapanet.or.kr/view/000282/20230130001681/1/GS2301-0001/20230210",
+    ]
+    for u in REAL_VIEWER_SRCS:
+        d = FakeDriver([[FakeFrame(u)]])
+        check("확장자 없는 뷰어 주소를 문서로 인정한다: .../%s" % u.rsplit("/", 2)[-2],
+              pdf_src(d), u)
+
+    # 한글이 퍼센트 인코딩된 실제 사례도 같은 규칙으로 걸린다
+    enc = ("https://ca.kapanet.or.kr/view/000317/20230130004142/1/"
+           "%ED%95%9C%EA%B5%AD-1-2/20230301")
+    check("퍼센트 인코딩된 평가서번호도 인정한다", pdf_src(FakeDriver([[FakeFrame(enc)]])), enc)
+
+    # ★ 예전 규칙은 **그대로 살아 있어야 한다** — 지금 성공하는 경로다
+    for u in ("https://ca.kapanet.or.kr/a/b.pdf",
+              "https://ca.kapanet.or.kr/x/Y.PDF",
+              "/relative/path/doc.pdf"):
+        check_true(".pdf 규칙이 유지된다: %s" % u,
+                   pdf_src(FakeDriver([[FakeFrame(u)]])) == u, u)
+
+    # ★ 호스트를 넓히지 않았는가 — 아무 iframe 이나 집으면 배너·광고를 연다
+    for bad in ("https://evil.example.com/view/1/2/3/4/5",
+                "https://ca.kapanet.or.kr.evil.com/view/1/2/3/4/5",
+                "https://ca.kapanet.or.kr/login",
+                "https://ca.kapanet.or.kr/banner/ad",
+                "about:blank",
+                ""):
+        check("문서가 아닌 주소는 고르지 않는다: %s" % (bad or "(빈 문자열)"),
+              pdf_src(FakeDriver([[FakeFrame(bad)]])), None)
+
+    # 배너 iframe 이 섞여 있어도 **문서 쪽**을 고른다
+    doc = "https://ca.kapanet.or.kr/view/000317/20240130004507/2/25121005/20260526"
+    mixed = FakeDriver([[FakeFrame("https://ad.example.com/banner"),
+                         FakeFrame(None),
+                         FakeFrame(doc)]])
+    check("배너가 섞여도 문서 iframe 을 고른다", pdf_src(mixed), doc)
+
+    # src 가 나중에 채워지는 경합에서도 (가)(나) 둘 다 기다릴 수 있다 — #267 의 계약
+    late = FakeDriver([[FakeFrame(None)], [FakeFrame(None)], [FakeFrame(doc)]])
+    check("아직 src 가 없으면 None 을 돌려준다(계속 폴링)", pdf_src(late), None)
+    check("두 번째에도 아직 없다", pdf_src(late), None)
+    check("채워지면 그때 돌려준다", pdf_src(late), doc)
+
+
     root = os.path.dirname(os.path.abspath(__file__))
     src = open(os.path.join(root, "crawler", "doc_crawler.py"),
                encoding="utf-8-sig").read()

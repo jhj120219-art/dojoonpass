@@ -65,17 +65,19 @@ def document_stats():
         #   spec/status/appraisal_failed  <- document_status        (살아있는 경로)
         #   total_failures                <- document_collect_failures
         #
-        # `document_collect_failures`에 INSERT 하는 코드는 `collect_documents.py` 하나뿐이고,
-        # **어떤 배치도 그 스크립트를 실행하지 않는다**(`run_*.bat` 전수 확인). 살아있는
-        # 수집기 `doc_worker.py`는 실패를 `document_queue.status='failed'`와
-        # `document_status='FAILED'`에만 남긴다.
+        # [2026-09-02 갱신] 위 서술은 더 이상 사실이 아니다 — 이제 살아있는 수집기가
+        # 이 표를 채운다. `storage/database.py:mark_queue_failed()` 가 **최종 실패**
+        # (재시도 소진)에서 `_record_collect_failure()` 로 사유를 남긴다.
         #
-        #   document_collect_failures 최신 행  2026-07-15  (그 뒤로 멈춤)
-        #   document_status 최신 갱신          2026-08-12
+        # 왜 바꿨나: `mark_queue_failed()` 의 주석이 큐 행에 아무것도 쓰지 않는 선택을
+        # *"실패 사실은 document_collect_failures 에 이미 남는다"* 로 정당화하고 있었는데,
+        # **그 표에 쓰는 코드가 없어서 그 근거가 성립하지 않았다.** 그 결과 2026-09-02
+        # 실측으로 document_queue failed 188건(화면에 보이는 물건 129건)의 사유가
+        # 하나도 남아 있지 않았다 — 왜 문서가 없는지 아무도 모르는 상태였다.
         #
-        # 즉 이 값은 **누적 실패 "사건" 로그**이지 위 세 값의 합이 아니다. 지금 우연히
-        # 둘 다 3이라 어긋남이 보이지 않지만, doc_worker가 실패를 하나 더 기록하면
-        # spec/status/appraisal_failed만 늘고 이 값은 그대로 있는다.
+        # 여전히 **누적 실패 "사건" 로그**이지 위 세 값의 합이 아니다. 한 문서가 여러 번
+        # 최종 실패하면(4일 주기 부활 후 재실패) 행이 늘고, `document_status` 는 현재
+        # 상태 하나만 갖는다. 중간 재시도는 남기지 않는다.
         #
         # 무엇으로 정의할지(누적 사건 vs 현재 FAILED 개수)는 제품 결정이라 바꾸지 않았다.
         # 자세한 내용은 `docs/SPRINT101_RETRY_LOOP_AND_TIMEZONE.md` #101-3 참고.

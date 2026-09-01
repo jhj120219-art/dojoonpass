@@ -18,7 +18,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pdfplumber
-from storage.database import get_connection, chunked_for_sql
+from storage.database import (get_connection, chunked_for_sql, guard_mass_purge,
+                              PURGE_BLOCKED)
 from api.v1.documents import get_doc_dir
 
 # 헤더 셀 텍스트 -> 필드명 매칭 규칙.
@@ -204,6 +205,23 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
 
     # ★ 한 문장에 몰아넣지 않는다 (2026-08-27, `docs/BUGS.md` #243).
     #   위 `load_rights_data.py` 와 같은 이유·같은 규칙이다.
+    #
+    # ★ 대량 삭제 차단기 (2026-09-02). 판정 규칙은 `storage/database.py:guard_mass_purge()`
+    #   한 곳에만 둔다 — 같은 규칙을 두 스크립트에 베끼면 갈라진다(BUGS #204).
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC'").fetchone()[0]
+    to_delete = 0
+    for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
+        placeholders = ",".join("?" * len(chunk))
+        to_delete += conn.execute(
+            "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"
+            % placeholders, chunk).fetchone()[0]
+
+    blocked = guard_mass_purge(existing, to_delete, "SPEC 파생 행 정리")
+    if blocked:
+        print("[BLOCKED] " + blocked)
+        return PURGE_BLOCKED
+
     removed = 0
     for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
         placeholders = ",".join("?" * len(chunk))
@@ -238,10 +256,14 @@ def main():
         print(f"전체 물건: {len(items)}")
         for k, v in sorted(stats.items()):
             print(f"{k}: {v}")
+        if removed == PURGE_BLOCKED:
+            print("근거 문서가 사라져 정리한 파생 행: 0 (차단됨 - 위 [BLOCKED] 참고)")
+            return 1
         print(f"근거 문서가 사라져 정리한 파생 행: {removed}")
     finally:
         conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

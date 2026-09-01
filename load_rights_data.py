@@ -14,7 +14,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage.database import get_connection, chunked_for_sql
+from storage.database import (get_connection, chunked_for_sql, guard_mass_purge,
+                              PURGE_BLOCKED)
 from api.v1.documents import get_doc_dir
 
 
@@ -151,6 +152,29 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     #   `missing_file_item_ids` 는 상한이 없다 — documents/ 가 부분적으로 유실되면
     #   물건 수만큼 커진다. SQLite 의 바인딩 변수 상한을 넘으면 정리 자체가
     #   `too many SQL variables` 로 죽는다. 상한은 이 커넥션에 직접 물어본다.
+    #
+    # ★ 지우기 **전에 먼저 센다** (2026-09-02 — 배선의 전제조건).
+    #   `evidence_found == 0` 은 전면 유실만 막는다. 부분 유실(동기화 지연 등)에서는
+    #   안전장치가 열린 채 대부분을 지운다. 이 스크립트를 `run_daily.bat` 에 넣는
+    #   순간 그 일이 **무인으로** 벌어지므로, 규모를 먼저 재고 차단기에 묻는다.
+    existing = (conn.execute("SELECT COUNT(*) FROM rights_summary").fetchone()[0]
+                + conn.execute(
+                    "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS'").fetchone()[0])
+    to_delete = 0
+    for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
+        placeholders = ",".join("?" * len(chunk))
+        to_delete += conn.execute(
+            "SELECT COUNT(*) FROM rights_summary WHERE item_id IN (%s)" % placeholders,
+            chunk).fetchone()[0]
+        to_delete += conn.execute(
+            "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"
+            % placeholders, chunk).fetchone()[0]
+
+    blocked = guard_mass_purge(existing, to_delete, "STATUS 파생 행 정리")
+    if blocked:
+        print("[BLOCKED] " + blocked)
+        return PURGE_BLOCKED
+
     removed = 0
     for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
         placeholders = ",".join("?" * len(chunk))
@@ -191,10 +215,16 @@ def main():
         print(f"적재 완료(loaded): {stats['loaded']}")
         print(f"STATUS 파일 없음: {stats['no_status_file']}")
         print(f"STATUS 파일은 있으나 추출 가능한 데이터 없음: {stats['no_extractable_data']}")
+        if removed == PURGE_BLOCKED:
+            # 부재는 어떤 실패 카운터에도 안 잡힌다(#245 의 교훈). 종료코드로 드러낸다 —
+            # `run_daily.bat` 이 [FAILED] 를 남기고 사람이 아침에 본다.
+            print("근거 문서가 사라져 정리한 파생 행: 0 (차단됨 - 위 [BLOCKED] 참고)")
+            return 1
         print(f"근거 문서가 사라져 정리한 파생 행: {removed}")
     finally:
         conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

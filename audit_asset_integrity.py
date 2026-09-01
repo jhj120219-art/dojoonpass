@@ -653,6 +653,35 @@ def selftest():
         check("[9] 가 열리지 않는 사진 URL 을 잡는다", broken > 0, True)
         check("[9] 는 서버가 없으면 '확인하지 못함'(어긋남 0)", unreachable, 0)
 
+        # 결함 E-2 — 429 를 **결함으로 세지 않는가** (2026-09-01).
+        #   위 _Fake 는 사진 URL 에 404 를 준다. 여기서는 같은 자리에 **429** 를 준다.
+        #   404 는 결함(위 검사), 429 는 미확인이어야 한다 — 둘이 같은 `HTTPError` 인데
+        #   조치가 정반대라, 코드가 둘을 실제로 갈라 놓는지 여기서 증명한다.
+        #   (이 구분이 없던 동안 운영 실행에서 213건이 거짓 결함으로 보고됐다.)
+        class _Throttled(_Fake):
+            def do_GET(self):                      # noqa: N802 - stdlib 규약
+                if "/images/" in self.path:
+                    self.send_response(429)
+                    self.send_header("Retry-After", "0")
+                    self.end_headers()
+                    return
+                _Fake.do_GET(self)
+
+        srv2 = http.server.HTTPServer(("127.0.0.1", 0), _Throttled)
+        th2 = threading.Thread(target=srv2.serve_forever, daemon=True)
+        th2.start()
+        try:
+            conn = _connect()
+            try:
+                with _scratch_output():
+                    throttled = audit_api_promises(
+                        conn, "http://127.0.0.1:%d" % srv2.server_address[1])
+            finally:
+                conn.close()
+        finally:
+            srv2.shutdown()
+        check("[9] 는 429 를 결함으로 세지 않는다(미확인)", throttled, 0)
+
         # 결함 E — [7] 의 "실제로 수집을 시도할 행" 분류 (2026-08-24 Sprint 251)
         #
         # 운영 데이터만으로는 이 분류를 검증할 수 없다. 지금 고아 대기 행은 12개인데
@@ -828,6 +857,7 @@ def audit_api_promises(conn, api_base):
     이 저장소가 지키기로 한 구분이다. 그때는 어긋남 수에 더하지 않되 그 사실을 남긴다.
     """
     import json as _json
+    import time as _time
     import urllib.error
     import urllib.request
 
@@ -851,18 +881,55 @@ def audit_api_promises(conn, api_base):
     #   실제 브라우저는 연결을 재사용하므로 같은 조건이 아니다.
     GET_ATTEMPT_TIMEOUTS = (15, 25)
 
-    def get(path):
-        """(status, content-type, body, 실패사유). 못 닿았으면 status 가 None 이다."""
+    # ★ 429 는 **404 와 다르다** (2026-09-01 실측).
+    #
+    #   위 주석은 "HTTP 오류는 재시도하지 않는다 - 몇 번을 보내도 404 는 404 다" 라고
+    #   적어 두었고 그 말은 옳다. 그런데 `HTTPError` 를 **전부** 그렇게 다루는 바람에
+    #   429(Too Many Requests) 까지 "서버가 대답했으니 판정할 수 있다" 로 새어 들어갔다.
+    #
+    #   실측: 이 감사는 자산 URL 을 전수로, 연속으로 요청한다(이번 실행은 물건 460개 /
+    #   URL 926개). `api_server.py` 의 속도 제한은 기본 **분당 1200회**라 감사기가
+    #   스스로 그 한도를 넘긴다. 그 결과 **213건이 "열리지 않음"으로 보고**됐다 —
+    #   전부 429 였고, 그 자산들은 **한 번도 실제로 검사되지 않았다.**
+    #   어긋남 23건이 236건으로 부풀어 진짜 결함이 그 옆에 묻혔다.
+    #
+    #   429 는 "이 자산이 깨졌다"가 아니라 "지금은 확인하지 못했다"이다 — 이 파일이
+    #   이미 세워 둔 결함/미확인 구분(BUGS #188/#194)에서 **미확인 쪽**이다.
+    #   그리고 404 와 달리 **재시도하면 달라진다.** 서버가 `Retry-After` 를 주므로
+    #   (api_server.py 의 429 응답) 그 값을 그대로 지킨다.
+    RATE_LIMIT_RETRIES = 4
+    RATE_LIMIT_MAX_SLEEP = 65     # Retry-After 는 슬라이딩 창이라 최대 60초쯤이다
+
+    def _get_once(path):
+        """한 번의 왕복. (status, content-type, body, 실패사유, Retry-After)"""
         last = None
         for timeout in GET_ATTEMPT_TIMEOUTS:
             try:
                 with urllib.request.urlopen(api_base + path, timeout=timeout) as r:
-                    return r.status, r.headers.get("content-type", ""), r.read(), None
+                    return r.status, r.headers.get("content-type", ""), r.read(), None, None
             except urllib.error.HTTPError as e:
-                return e.code, "", b"", None      # 서버가 대답했다 - 판정할 수 있다
+                ra = e.headers.get("Retry-After") if e.headers else None
+                return e.code, "", b"", None, ra   # 서버가 대답했다 - 판정할 수 있다
             except Exception as e:                # noqa: BLE001 - 못 닿은 것은 결함이 아니다
                 last = "%s: %s" % (type(e).__name__, str(e)[:90])
-        return None, "", b"", "%s (%d회 시도)" % (last, len(GET_ATTEMPT_TIMEOUTS))
+        return None, "", b"", "%s (%d회 시도)" % (last, len(GET_ATTEMPT_TIMEOUTS)), None
+
+    def get(path):
+        """(status, content-type, body, 실패사유). 못 닿았으면 status 가 None 이다."""
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            st, ct, body, why, retry_after = _get_once(path)
+            if st != 429:
+                return st, ct, body, why
+            if attempt < RATE_LIMIT_RETRIES:
+                try:
+                    # 서버가 준 값을 **그대로** 지킨다. 0 을 1 로 올리지 않는다 -
+                    # 그러면 자기 검증(Retry-After: 0)이 URL 마다 몇 초씩 잔다.
+                    wait = int(float(retry_after))
+                except (TypeError, ValueError):
+                    wait = 1          # 헤더가 없거나 이상하면 1초는 쉬어 준다
+                _time.sleep(min(max(wait, 0), RATE_LIMIT_MAX_SLEEP))
+        # 끝까지 throttle 이면 **판정하지 않는다**(어긋남으로 세지 않는다).
+        return None, "", b"", "429 속도 제한 - %d회 시도 후에도 throttle" % (RATE_LIMIT_RETRIES + 1)
 
     _head("[9] API 가 광고한 자산 URL 이 실제로 열리는가 (%s)" % api_base)
     try:

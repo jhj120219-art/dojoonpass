@@ -29,6 +29,7 @@
     python audit_schedule_health.py
     python audit_schedule_health.py --selftest    # 모순 탐지기가 실제로 우는지 확인
 """
+import io
 import os
 import sqlite3
 import subprocess
@@ -385,14 +386,20 @@ def queue_stall_signal(db):
     return out
 
 
-def parse_axis_lines(db):
+def parse_axis_lines(db, wired=False):
     """[6] 축의 출력 줄. **순수 함수** — selftest 가 직접 태울 수 있게 분리했다.
 
     이 축이 보는 것: doc_worker 가 받아 둔 문서가 실제로 권리분석 데이터로
-    바뀌었는가. `load_rights_data.py` / `load_spec_data.py` 가 어떤 .bat 에도
-    예약 작업에도 없어서(2026-08-27 전수 grep) **손으로 돌린 날만** 채워진다.
-    이 축이 없으면 그 사실이 어디에도 안 보인다 — 큐는 done 이고 문서 파일도
-    있으니 다른 모든 지표가 초록이기 때문이다. `docs/BUGS.md` #245.
+    바뀌었는가. 이 축이 없으면 그 사실이 어디에도 안 보인다 — 큐는 done 이고
+    문서 파일도 있으니 다른 모든 지표가 초록이기 때문이다. `docs/BUGS.md` #245.
+
+    ## 배선 여부는 **읽어서 판정한다** (2026-09-02)
+
+    예전에는 *"어떤 .bat 에도 예약 작업에도 없다"* 를 문장으로 박아 두었다.
+    2026-09-02 에 `run_doc_worker.bat` 에 실제로 배선했으므로 그 문장은 거짓이 됐다.
+    지웠으면 **배선이 풀렸을 때 다시 알려 줄 방법이 없어진다** — 그건 이 축을
+    만든 이유 자체다. 그래서 문장을 지우지 않고 `wired` 를 받아 갈라 쓴다.
+    호출부(`run_report`)가 .bat 을 실제로 읽어 넘긴다.
     """
     if db is None or db.get("parse_by_day") is None:
         return ["      판정할 재료가 없다(DB 없음 또는 관련 테이블 부재)"]
@@ -404,9 +411,32 @@ def parse_axis_lines(db):
                    % (d, got, parsed, rate, mark))
     out.append("      STATUS=READY 인데 권리분석 없음 : %s건 (그중 기일 남은 물건 %s건)"
                % (db.get("status_ready_unparsed"), db.get("status_ready_unparsed_visible")))
-    out.append("      ※ `load_rights_data.py` / `load_spec_data.py` 는 어떤 .bat/예약 작업에도")
-    out.append("        없다. 손으로 돌린 날만 채워진다 - docs/BUGS.md #245")
+    if wired:
+        out.append("      ※ `load_rights_data.py` / `load_spec_data.py` 는 run_doc_worker.bat 에")
+        out.append("        배선돼 있다(2026-09-02). 자동으로 채워진다 - docs/BUGS.md #245")
+    else:
+        out.append("      ※ `load_rights_data.py` / `load_spec_data.py` 는 어떤 .bat/예약 작업에도")
+        out.append("        없다. 손으로 돌린 날만 채워진다 - docs/BUGS.md #245")
     return out
+
+
+def parsing_scripts_are_wired(root=None):
+    """문서->권리분석 스크립트가 배치에 실제로 배선돼 있는가. 파일을 읽어 판정한다."""
+    import re as _re
+    root = root or os.path.dirname(os.path.abspath(__file__))
+    need = {"load_rights_data.py", "load_spec_data.py"}
+    found = set()
+    for name in ("run_daily.bat", "run_doc_worker.bat", "run_priority_refresh.bat"):
+        p = os.path.join(root, name)
+        if not os.path.exists(p):
+            continue
+        for ln in io.open(p, encoding="utf-8-sig", errors="replace").read().splitlines():
+            if ln.strip().upper().startswith("REM"):
+                continue
+            m = _re.match(r'^\s*"%PY%"\s+(\S+\.py)', ln)
+            if m and m.group(1) in need:
+                found.add(m.group(1))
+    return found == need
 
 
 def run_report():
@@ -514,7 +544,7 @@ def run_report():
 
     print()
     print("[6] 파이프라인 마지막 단계 - 받은 문서가 권리분석으로 바뀌었는가")
-    for line in parse_axis_lines(db):
+    for line in parse_axis_lines(db, wired=parsing_scripts_are_wired()):
         print(line)
 
     print()
@@ -648,8 +678,24 @@ def selftest():
     check("미파싱 요약 줄이 있다", len(_summary), 1)
     check("요약이 미파싱 건수와 그중 가시 건수를 함께 말한다",
           bool(_summary) and ("16건" in _summary[0]) and ("0건" in _summary[0]), True)
-    check("배선되지 않은 스크립트 이름을 지목한다",
+    check("스크립트 이름을 지목한다(배선 여부와 무관하게)",
           ("load_rights_data.py" in _blob) and ("load_spec_data.py" in _blob), True)
+    # 배선 여부를 **갈라서** 말하는가 - 한쪽만 검증하면 반대쪽이 거짓말해도 모른다.
+    _probe = {"parse_by_day": [("2026-08-26", 16, 0)],
+              "status_ready_unparsed": 16, "status_ready_unparsed_visible": 0}
+    _unwired = "\n".join(parse_axis_lines(_probe, wired=False))
+    _wired = "\n".join(parse_axis_lines(_probe, wired=True))
+    check("배선 안 됐으면 '어떤 .bat/예약 작업에도 없다' 라고 말한다",
+          "어떤 .bat/예약 작업에도" in _unwired, True)
+    check("배선됐으면 그 문장을 말하지 않는다",
+          "어떤 .bat/예약 작업에도" in _wired, False)
+    check("배선됐으면 어디에 배선됐는지 말한다",
+          "run_doc_worker.bat" in _wired, True)
+    # 판정기가 실제로 파일을 읽는가 - 저장소 현재 상태는 배선돼 있어야 한다
+    check("배선 판정기가 현재 저장소를 배선됨으로 읽는다",
+          parsing_scripts_are_wired(), True)
+    check("배선 판정기가 빈 디렉터리를 배선 안 됨으로 읽는다",
+          parsing_scripts_are_wired(root=os.path.join(ROOT, "docs")), False)
     # 대조군 - 전부 파싱된 날만 있으면 ★ 를 찍지 않는다(과잉 경보 방지)
     _clean = "\n".join(parse_axis_lines({
         "parse_by_day": [("2026-08-25", 161, 161)],

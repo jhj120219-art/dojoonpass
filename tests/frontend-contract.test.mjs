@@ -1026,7 +1026,10 @@ describe('API 응답 ↔ 프런트 타입 (2026-08-31)', () => {
   // 응답에 있지만 타입에 적지 않기로 **한 것**. 이유 없이 늘리지 않는다.
   //   tenant_rights 는 12컬럼인데 프런트는 9개만 쓴다(`docs/BUGS.md` #254).
   //   좁히는 것은 API 계약 축소라 소비자를 먼저 옮겨야 해서 지금은 그대로 둔다.
-  const KNOWN_UNDECLARED = {
+  // 임차인 보유 물건을 찾을 때 넘겨 볼 검색 페이지 수(40건/페이지). 찾는 즉시 멈춘다.
+const TENANT_SCAN_PAGES = 5
+
+const KNOWN_UNDECLARED = {
     'tenants[]': new Set(['id', 'item_id', 'created_at']),
   }
 
@@ -1101,16 +1104,31 @@ describe('API 응답 ↔ 프런트 타입 (2026-08-31)', () => {
     // tenants[] 예외는 그 키들이 **실제로 응답에 실릴 때만** 의미가 있다.
     // 응답에서 사라졌는데 예외가 남으면, 그 키가 다시 생겨도 위 검사가 눈감는다.
     let tenants = detail.tenants
+    let scanned = 0
     if (!tenants || !tenants.length) {
-      // 임차인 있는 물건을 몇 개만 찾아본다(전수 순회는 하지 않는다).
-      const s = await apiJson('/api/v1/search?size=40&include_closed=true')
-      for (const it of s.items ?? []) {
-        const d = await apiJson(`/api/v1/item/${it.id}`)
-        if (d.tenants && d.tenants.length) { tenants = d.tenants; break }
+      // 임차인 있는 물건을 찾는다(전수 순회는 하지 않는다 — 페이지 예산을 둔다).
+      //
+      // ★ 2026-09-02: 예전에는 **1페이지 40건만** 봤다. 그 표본에 임차인 보유 물건이
+      //   들어 있는 것은 그날 정렬 순서가 정해 주는 **우연**이었다. 실측으로 그 우연이
+      //   깨졌다 — 그날 크롤한 282건이 기본 정렬에서 앞으로 오는데 아직 권리분석이
+      //   붙지 않아 **1페이지 40건 전부 tenants 가 비었고**(2페이지에 3건 있었다)
+      //   이 검사가 붉어졌다. 제품은 멀쩡했고 표본이 얕았던 것뿐이다.
+      //   (전체로 보면 물건 2,781건 중 319건(11%)이 임차인을 갖는다.)
+      //
+      //   그래서 페이지를 넘겨 가며 찾되, 찾는 즉시 멈추고 예산을 넘지 않는다.
+      outer:
+      for (let page = 1; page <= TENANT_SCAN_PAGES; page++) {
+        const s = await apiJson(`/api/v1/search?size=40&include_closed=true&page=${page}`)
+        if (!s.items || !s.items.length) break
+        for (const it of s.items) {
+          scanned++
+          const d = await apiJson(`/api/v1/item/${it.id}`)
+          if (d.tenants && d.tenants.length) { tenants = d.tenants; break outer }
+        }
       }
     }
     assert.ok(tenants && tenants.length,
-      '임차인이 있는 물건을 찾지 못해 예외 목록을 검증하지 못했습니다')
+      `임차인이 있는 물건을 찾지 못해 예외 목록을 검증하지 못했습니다 (물건 ${scanned}건 확인)`)
     const keys = new Set(Object.keys(tenants[0]))
     const dead = [...KNOWN_UNDECLARED['tenants[]']].filter((k) => !keys.has(k)).sort()
     assert.deepEqual(dead, [],

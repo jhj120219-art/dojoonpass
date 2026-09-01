@@ -1440,6 +1440,65 @@ def chunked_for_sql(items, vars_per_item: int = 1, headroom: int = 64, conn=None
     if buf:
         yield buf
 
+
+# ── 대량 삭제 차단기 (2026-09-02) ──────────────────────────────────────────
+#
+# `load_rights_data.py` / `load_spec_data.py` 의 `purge_orphans()` 는 근거 문서가
+# 사라진 물건의 파생 행(권리분석·임차인)을 지운다. 안전장치는 하나뿐이었다 —
+# **`evidence_found == 0` 이면 건너뛴다.** 그건 `documents/` 를 통째로 못 읽는
+# 경우만 막는다.
+#
+# 막지 못하는 것이 **부분 유실**이다. OneDrive 가 일부만 동기화됐거나, 드라이브가
+# 절반만 마운트됐거나, 경로 규칙이 바뀌어 일부 법원만 못 찾는 상황에서는
+# `evidence_found` 가 0 보다 크므로 안전장치가 열리고, 남은 근거 문서 몇 건을 빼고
+# **나머지 권리분석 데이터를 전부 지운다.** 무인 야간 실행이라 아침에야 안다.
+#
+# 이것이 `docs/BUGS.md` #245 가 이 두 스크립트의 배선을 미뤘던 실제 사유다.
+# 그래서 배선하기 전에 차단기를 먼저 단다.
+#
+# 판정 기준 — "한 번의 실행이 기존 파생 행의 큰 몫을 지우려 하면 그건 정리가 아니라 사고다"
+#
+#   정상 정리는 소량이다. 문서는 한 건씩 사라진다(취하·재게시·경로 정정).
+#   2026-09-02 실측: 파생 행 rights_summary 413 / tenant_rights(STATUS) 1,069 이고
+#   지금 지울 대상은 **0건**이다. 즉 평상시 값은 0 근처다.
+#
+#   바닥값을 두는 이유: 파생 행이 3건뿐인 초기 상태에서 1건을 지우는 것이 33% 라
+#   비율만 보면 막힌다. 소량 삭제는 언제나 통과시킨다.
+PURGE_MAX_RATIO = 0.20      # 기존 파생 행의 20% 를 넘게 지우려 하면 막는다
+PURGE_ABSOLUTE_FLOOR = 10   # 다만 이 건수 미만이면 비율과 무관하게 통과시킨다
+
+# `purge_orphans()` 가 "막았다"를 돌려줄 때 쓰는 표식.
+# 삭제 건수와 섞이지 않도록 **음수**다 - 0 으로 두면 "지울 게 없었다"와 구분되지 않고,
+# 그러면 호출부가 조용히 정상 종료해 #245 와 같은 침묵이 다시 생긴다.
+PURGE_BLOCKED = -1
+
+
+def guard_mass_purge(existing: int, to_delete: int, label: str):
+    """대량 삭제를 막을지 판단한다. 아무것도 지우지 않는다 - 판정만 한다.
+
+    돌려주는 값
+        None      진행해도 된다
+        str       막아야 한다. 사람이 읽을 사유 문자열.
+
+    `existing` 은 지우기 **전** 파생 행 수, `to_delete` 는 이번에 지울 행 수다.
+    """
+    if to_delete <= 0:
+        return None
+    if to_delete < PURGE_ABSOLUTE_FLOOR:
+        return None
+    if existing <= 0:
+        # 기존이 0인데 지울 게 있다는 것은 세는 쪽이 어긋난 것이다. 막고 사람이 본다.
+        return ("%s: 기존 파생 행이 0인데 %d행을 지우려 한다 - 계수가 어긋났다"
+                % (label, to_delete))
+    ratio = to_delete / float(existing)
+    if ratio > PURGE_MAX_RATIO:
+        return ("%s: 한 번에 %d/%d행(%.1f%%)을 지우려 한다 - 상한 %.0f%% 초과. "
+                "근거 문서가 대량으로 사라진 것은 데이터가 아니라 환경 문제일 가능성이 "
+                "높다(동기화 지연/드라이브 미마운트/경로 규칙 변경). 지우지 않는다."
+                % (label, to_delete, existing, ratio * 100, PURGE_MAX_RATIO * 100))
+    return None
+
+
 # 집어갈 때: 대기 상태 -> 진행 상태
 QUEUE_CLAIM_STATUS = {
     QUEUE_STATUS_PENDING: QUEUE_STATUS_IN_PROGRESS,
@@ -2415,8 +2474,60 @@ def mark_queue_done(queue_id: int, court_code: str, case_no: str, item_no: str, 
         conn.close()
 
 
+def _record_collect_failure(conn, row, reason: str) -> None:
+    """최종 실패의 **사유**를 `document_collect_failures` 에 남긴다 (2026-09-02).
+
+    ## 왜 필요했나 — 약속이 지켜지지 않고 있었다
+
+    바로 아래 `mark_queue_failed()` 의 주석은 *"이 실행의 실패 사실은 로그와
+    `document_collect_failures` 에 이미 남는다"* 고 적어 두고 그것을 근거로 큐 행에
+    아무것도 쓰지 않는 선택을 정당화한다. **그런데 그 표에 쓰는 코드가 없었다.**
+    전수 확인(2026-09-02): INSERT 하는 곳은 `collect_documents.py` 뿐이고 그 스크립트는
+    2026-07-15 이후 돌지 않았다.
+
+    결과 — 실측:
+        document_queue     failed 188건 (appraisal 166 · spec 11 · image 6 · status 5)
+                           그중 기일이 남아 화면에 보이는 물건 129건
+        기록된 사유          0건 (전부 retry_count=3 으로 소진돼 있을 뿐)
+
+    즉 **사용자가 보는 129개 물건의 문서가 왜 없는지 아무도 모른다.** 법원이 안 올린
+    것인지, 버튼 DOM 이 바뀐 것인지, 그날 서버가 불안정했던 것인지 구분할 수 없어
+    고칠 수도 없다. 이 저장소가 반복해서 경계해 온 "증거 없는 실패"다.
+
+    ## 최종 실패만 남긴다
+
+    중간 재시도까지 남기면 한 문서가 3행을 만든다. 화면 상태를 최종 실패에서만
+    바꾸는 것과 같은 기준이다.
+    """
+    # ★ 기록은 **최선 노력**이다 — 여기서 예외가 나가면 큐 상태 전이가 통째로 죽는다.
+    #
+    #   사유를 못 남기는 것보다 큐가 망가지는 것이 훨씬 나쁘다. 실제로 이 함수를 처음
+    #   넣었을 때 `document_collect_failures` 가 없는 DB(마이그레이션 017 이전 스키마로
+    #   부트스트랩한 테스트 환경)에서 `no such table` 이 그대로 올라와
+    #   `mark_queue_failed()` 전체가 실패했다. 운영에서 같은 일이 나면 실패한 문서가
+    #   `in_progress` 로 굳어 다음 실행이 집지도 못한다.
+    try:
+        item = conn.execute(
+            "SELECT id FROM auction_item WHERE case_no=? AND item_no=?",
+            (row["case_no"], row["item_no"])).fetchone()
+        if not item:
+            # 큐 행은 있는데 물건이 없다 — 표의 FK 대상이 없으므로 남기지 않는다.
+            logger.warning("실패 사유를 남기지 못했다 - auction_item 없음 (%s-%s)",
+                           row["case_no"], row["item_no"])
+            return
+        conn.execute("""
+            INSERT INTO document_collect_failures (item_id, doc_type, error_message, created_at)
+            VALUES (?,?,?,?)
+        """, (item["id"], row["doc_type"], (reason or "사유 미기록")[:500],
+              datetime.now().isoformat()))
+    except sqlite3.Error as exc:
+        logger.warning("실패 사유를 남기지 못했다(%s: %s) - 큐 전이는 계속한다",
+                       type(exc).__name__, exc)
+
+
 def mark_queue_failed(queue_id: int, retry_count: int,
-                      claim_token: Optional[str] = None) -> None:
+                      claim_token: Optional[str] = None,
+                      reason: Optional[str] = None) -> None:
     conn = get_connection()
     try:
         # ★ 우리 claim 이 아직 살아 있을 때만 손댄다 (2026-08-24 Sprint 254, BUGS #181).
@@ -2472,7 +2583,11 @@ def mark_queue_failed(queue_id: int, retry_count: int,
                 else:
                     _set_document_status(conn, row["court_code"], row["case_no"],
                                          row["item_no"], row["doc_type"], "FAILED")
-            logger.warning("document_queue id=%d 최종 실패 처리 (재시도 %d회 소진)", queue_id, new_retry)
+                # 사유를 남긴다 — 위 주석이 이 표를 근거로 큐 행에 안 쓰기로 했으므로,
+                # 이 표가 비어 있으면 그 근거가 성립하지 않는다(2026-09-02).
+                _record_collect_failure(conn, row, reason)
+            logger.warning("document_queue id=%d 최종 실패 처리 (재시도 %d회 소진) - 사유: %s",
+                           queue_id, new_retry, reason or "미기록")
         else:
             # ★ 'pending'으로 고정하지 않는다 (2026-08-18 Sprint 189).
             #   재수집으로 집어간 항목(`in_progress_refresh`)을 'pending'으로 되돌리면

@@ -213,7 +213,14 @@ def test_every_scheduled_script_propagates_failure():
                 scripts.add(m.group(1))
 
     # 파이프라인 구성이 바뀌면 알린다 — 새 스크립트의 종료 코드 계약을 사람이 한 번 보게 한다.
-    EXPECTED = {"mvp_scraper.py", "migrate_execute.py", "doc_worker.py", "refresh_priority.py"}
+    #
+    # 2026-09-02: `load_rights_data.py` / `load_spec_data.py` 를 `run_doc_worker.bat` 에
+    # 배선하면서 이 목록이 늘었다(BUGS #245 — 문서를 권리분석으로 바꾸는 마지막 단계가
+    # 어떤 .bat 에도 없어서, doc_worker 가 돌 때마다 파싱되지 않은 문서가 쌓였다).
+    # 이 검사가 요구하는 계약은 아래 루프가 그대로 확인한다 — 둘 다
+    # `sys.exit(main() or 0)` 이고 `main()` 은 대량 삭제 차단 시 1 을 돌려준다.
+    EXPECTED = {"mvp_scraper.py", "migrate_execute.py", "doc_worker.py", "refresh_priority.py",
+                "load_rights_data.py", "load_spec_data.py"}
     check("배치가 실행하는 스크립트 목록", sorted(scripts), sorted(EXPECTED))
 
     # 실패를 예외로만 알리는 것이 의도된 스크립트(위 (b)).

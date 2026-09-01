@@ -318,6 +318,95 @@ def test_readonly_lookup_never_creates_directories():
             offenders.append(name)
     check("읽기 전용 스캐너가 get_doc_dir()를 import하지 않는다", offenders, [])
 
+    # ── (c) 조회 API 를 **실제로 불러 본다** (2026-09-02 추가) ────────────────
+    #
+    #   위 (a) 는 `_doc_dir_path()` 만 본다. 그런데 사고를 낸 것은 그 함수가 아니라
+    #   **`doc_exists()`** 였다 - 그 함수가 `get_doc_dir()` 을 부르는 바람에
+    #   "이 문서 있어요?" 라고 묻기만 해도 빈 디렉터리가 쌓였다(실측 잔재 1,832개가
+    #   지금도 `documents/` 에 남아 있다). 2026-08-14 에 `_doc_dir_path()` 로 바꿔
+    #   고쳤지만, **그 상태를 지키는 검사는 없었다** - 되돌려도 아무도 모른다.
+    probe_dirs = [dp._doc_dir_path(*probe),
+                  os.path.dirname(dp._doc_dir_path(*probe)),
+                  os.path.dirname(os.path.dirname(dp._doc_dir_path(*probe)))]
+
+    def _cleanup_probe():
+        for d in probe_dirs:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+    # 전체 디렉터리 수를 세지 않는다 - doc_worker 가 동시에 돌면 그 수가 흔들려
+    # 이 검사가 간헐 실패한다(이 저장소가 이미 겪은 flaky 부류). **프로브 경로가
+    # 생겼는가**만 본다: 결정적이고, 남이 무엇을 만들든 영향을 받지 않는다.
+    _cleanup_probe()
+    before = [d for d in probe_dirs if os.path.exists(d)]
+    check("검사 시작 시 프로브 경로가 없다", before, [])
+    #   `canonical_doc_path()` 는 **여기서 부르지 않는다** - 이름과 달리 조회가 아니라
+    #   **저장 경로 헬퍼**다(유일한 호출부 `collect_documents.py:finalize_download()` 가
+    #   바로 다음 줄에서 `os.replace()` 로 쓴다. 목적지 디렉터리가 없으면 그 이동이
+    #   실패하므로 거기서는 만드는 것이 맞다). 아래 (d) 의 허용 목록에 그래서 들어 있다.
+    dp.doc_exists(probe[0], probe[1], probe[2], "spec")
+    dp.existing_doc_files(probe[0], probe[1], probe[2], "spec")
+    after = [d for d in probe_dirs if os.path.exists(d)]
+    check("★ 조회 API 를 불러도 디렉터리가 생기지 않는다", after, [])
+    _cleanup_probe()
+
+    # ── (d) 앞으로 생길 조회 함수까지 본다 (구조) ────────────────────────────
+    #
+    #   (c) 는 **지금 아는 함수 셋**만 부른다. 내일 조회 함수가 하나 더 생기면
+    #   그 목록에 안 들어가고, 같은 사고가 세 번째로 난다 - 이미 두 번 났다
+    #   (`doc_paths.doc_exists`, 그리고 사진 쪽에서 같은 교훈을 다시 배웠다:
+    #   `crawler/image_assets.py` 주석 참고).
+    #
+    #   그래서 두 모듈을 통째로 훑는다. **디렉터리를 만들어도 되는 함수는 정해져 있고**
+    #   (쓰기 직전에 부르는 것), 나머지는 만들면 안 된다. 이름 목록을 여기 베끼지
+    #   않고 모듈에서 함수를 뽑으므로 새 함수가 자동으로 대상이 된다.
+    import ast
+
+    #   ★ 허용 목록에 이름을 넣는 기준은 "만들어도 되는가" 가 아니라
+    #     **"쓰기 직전인가"** 다. `canonical_doc_path()` 는 이름이 조회처럼 보이지만
+    #     저장 경로를 만들어 돌려주는 함수이고, 호출부가 곧바로 `os.replace()` 한다.
+    #     조회 목적으로 이 함수를 쓰면 그 순간 다시 사고가 된다 - 조회는
+    #     `_doc_dir_path()` / `doc_exists()` 를 쓰라.
+    DIR_CREATORS = {
+        os.path.join("crawler", "doc_paths.py"): {"get_doc_dir", "canonical_doc_path"},
+        os.path.join("crawler", "image_assets.py"): {"ensure_image_dir"},
+    }
+    CREATOR_CALLS = {"makedirs", "mkdir", "get_doc_dir", "ensure_image_dir"}
+
+    creators_seen, scanned, makers = [], 0, []
+    for rel, allowed in DIR_CREATORS.items():
+        try:
+            src = open(os.path.join(ROOT, rel), encoding="utf-8-sig").read()
+            tree = ast.parse(src)
+        except (OSError, SyntaxError):
+            continue
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            scanned += 1
+            calls = set()
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call):
+                    calls.add(getattr(n.func, "id", None)
+                              or getattr(n.func, "attr", None))
+            hit = sorted(calls & CREATOR_CALLS)
+            if fn.name in allowed:
+                if hit:
+                    creators_seen.append(fn.name)
+                continue
+            if hit:
+                makers.append("%s:%s() -> %s"
+                              % (rel.replace(os.sep, "/"), fn.name, ", ".join(hit)))
+
+    check_true("검사가 공허하지 않다(두 모듈의 함수를 훑었다) - %d개" % scanned,
+               scanned >= 15, scanned)
+    # 대조군 - 만들어도 되는 함수는 **실제로 만들고 있어야** 한다. 그렇지 않으면
+    # CREATOR_CALLS 가 안 맞는다는 뜻이고, 그러면 아래 판정이 통째로 공허해진다.
+    check("대조군: 생성 담당 함수가 실제로 생성 호출을 갖고 있다",
+          sorted(creators_seen), ["canonical_doc_path", "ensure_image_dir", "get_doc_dir"])
+    check("★ 생성 담당 함수 외에는 디렉터리를 만들지 않는다", makers, [])
+
 
 
 # ---------------------------------------------------------------------------

@@ -72,9 +72,57 @@ def _pdf_iframe_src(driver):
             src = frame.get_attribute("src") or ""
         except Exception:           # noqa: BLE001 - stale element 는 다음 폴링에서 다시 본다
             continue
-        if src.lower().endswith(".pdf"):
+        if _is_appraisal_document_src(src):
             return src
     return None
+
+
+def _is_appraisal_document_src(src: str) -> bool:
+    """이 iframe src 가 감정평가서 문서를 가리키는가.
+
+    ## 왜 `.pdf` 만으로는 부족했나 (2026-09-02, docs/BUGS.md #267 의 남은 절반)
+
+    #267 은 **언제 보는가**를 고쳤고 *"판정 규칙은 글자 그대로 같다"* 며
+    `src.lower().endswith(".pdf")` 를 그대로 두었다. 그런데 감정평가서 뷰어는
+    **확장자 없는 경로**로 문서를 준다. 2026-08-30 워커 로그 실측:
+
+        appraisal 내부 PDF iframe을 찾지 못함 - 그 프레임 안의 유일한 iframe 1개:
+          ['https://ca.kapanet.or.kr/view/000317/20240130004507/2/25121005/20260526']
+          ['https://ca.kapanet.or.kr/view/000317/20240130004651/1/WS2412-0137-12/...']
+          ['https://ca.kapanet.or.kr/view/000422/20220130004979/1/20-221227-301/...']
+
+    즉 iframe 은 제때 붙었고 src 도 채워졌는데, `.pdf` 로 끝나지 않아 **우리가 버렸다.**
+    형태는 `/view/{평가법인코드}/{사건키}/{물건번호}/{평가서번호}/{작성일}` 이다.
+
+    그 결과가 문서 종류별 성공률 차이로 그대로 나타났다(2026-09-02 실측):
+
+        status  98.8%   spec  97.4%   image  97.8%   **appraisal  55.7%**
+
+    `appraisal 내부 PDF iframe을 찾지 못함` 은 로그에서 단일 사유 1위였다(600건대).
+
+    ## 왜 이 변경이 안전한가 — 더할 뿐이다
+
+    이 함수는 **주소를 고를 뿐** 저장 여부를 정하지 않는다. 고른 주소는 새 탭으로 열리고,
+    실제 저장은 `wait_for_download()` 가 **`.pdf` 로 끝나는 새 파일이 도착했을 때만**
+    한다(그 함수의 `pdf_files` 필터). 그러니 이 주소가 PDF 가 아니면 예전과 똑같이
+    아무것도 안 오고 실패한다 — 엉뚱한 것을 저장할 경로가 없다.
+    Sprint 201(BUGS #135)이 "탭이 없어도 다운로드 도착으로 판단한다"를 넣을 때 쓴
+    것과 같은 논리다: 지금 성공하는 경로는 그대로 두고, 지금 실패하는 경로만
+    성공할 수 있게 만든다.
+
+    ★ 호스트를 넓히지 않는다. `KAPANET_BASE`(감정평가서 열람 호스트) 아래 `/view/`
+      경로만 인정한다. "iframe 이 하나뿐이면 그것"으로 두면 뷰어가 배너·광고
+      iframe 을 하나 더 붙이는 날 엉뚱한 주소를 연다.
+    """
+    if not src:
+        return False
+    low = src.lower()
+    # (가) 예전 규칙 — 글자 그대로 유지한다. 지금 성공하는 경로다.
+    if low.endswith(".pdf"):
+        return True
+    # (나) 감정평가서 열람 뷰어의 확장자 없는 문서 경로.
+    host = KAPANET_BASE.split("://", 1)[-1].lower()
+    return low.startswith(("https://" + host + "/view/", "http://" + host + "/view/"))
 NEW_WINDOW_TIMEOUT = 15
 
 # 형제 물건의 사건 단위 문서를 재사용할 수 있는 최대 나이(초). 기본 6시간.
@@ -914,7 +962,20 @@ def collect_appraisal(driver, court_code: str, case_no: str, item_no: str, btn_i
             pdf_src = None
 
         if not pdf_src:
-            logger.warning("[%s-%s] appraisal 내부 PDF iframe을 찾지 못함", case_no, item_no)
+            # ★ **무엇을 봤는지 함께 남긴다** (2026-09-02).
+            #   "찾지 못함"만 남기면 iframe 이 아예 없었던 것인지, 있었는데 우리가
+            #   버린 것인지 구분할 수 없다. 실제로 그 구분이 안 돼 #267 을 고친 뒤에도
+            #   같은 경고가 600건대로 남아 있었고, 원인(확장자 없는 뷰어 주소)은
+            #   **이 목록을 찍는 판본의 로그가 남아 있어서** 알아냈다.
+            #   그 판본이 저장소에 없어 다시 넣는다 — 진단 근거를 잃지 않기 위해서다.
+            try:
+                seen = [(f.get_attribute("src") or "")
+                        for f in driver.find_elements(By.TAG_NAME, "iframe")]
+            except Exception:       # noqa: BLE001 - 진단용이라 실패해도 흐름을 막지 않는다
+                seen = ["(목록 조회 실패)"]
+            logger.warning("[%s-%s] appraisal 내부 PDF iframe을 찾지 못함 - "
+                           "그 프레임 안의 iframe %d개: %s",
+                           case_no, item_no, len(seen), seen[:5])
         else:
             pdf_url = urljoin(KAPANET_BASE, pdf_src)
 

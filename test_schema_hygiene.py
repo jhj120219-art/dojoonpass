@@ -69,7 +69,38 @@ def test_soft_delete_columns():
         conn.close()
 
 
+# `migration_history` 에는 있는데 디스크에 파일이 없는 항목 중 **설명이 끝난 것**.
+# 016/017 은 번호가 재사용된 자리다 - 옛 파일이 적용된 뒤 같은 번호로 다른 내용이
+# 들어왔고(016_create_audit_and_credit_logs / 017_create_document_collect_failures 가
+# 지금 그 번호를 쓴다), 옛 이름만 이력에 남았다. 그 시절 열(deleted_at/deleted_by)은
+# 지금도 살아 있어(위 2번 검사가 확인한다) 잃어버린 것이 없다.
+KNOWN_APPLIED_WITHOUT_FILE = {
+    "016_create_audit_logs.sql",
+    "017_add_soft_delete_columns.sql",
+}
+
+
 def test_migration_history_complete():
+    """디스크 .sql 과 `migration_history` 를 **양방향으로** 본다.
+
+    한쪽만 보던 검사였다 (2026-09-01 확장). `on_disk - applied` 만 확인했으므로
+    **반대 방향 - 적용됐다고 기록됐는데 파일이 없는 것 - 은 영원히 보이지 않았다.**
+    실제로 그 사각지대에 3건이 들어와 있었다:
+
+        027_drop_redundant_favorite_notes_index.sql
+        028_auction_filed_date.sql
+        029_drop_measured_prefix_indexes.sql
+
+    셋 다 2026-08-30~31 에 적용 기록이 남았는데 **디스크에도 git 이력 어디에도 없다**
+    (`git log --all -- storage/migrations/027*` 등 전부 0건). 즉 마이그레이션이
+    DB 에 적용된 뒤 파일이 커밋되지 않고 사라졌다.
+
+    왜 이 방향이 중요한가 - **저장소가 자기 DB 스키마를 더 이상 재현하지 못한다.**
+    새로 clone 해서 부트스트랩하면 라이브와 다른 스키마가 나온다(실측: 라이브에만
+    `auction.filed_date`, fresh 에만 인덱스 4개). `test_bootstrap.py` 의 3-B 가 그
+    **결과**는 잡지만, 원인이 "파일이 없어졌다"라는 것은 말해 주지 못해 KNOWN_* 목록에
+    등재하는 것으로 조용히 덮일 수 있다. 여기서 원인을 직접 지목한다.
+    """
     print("\n--- 3. migration_history completeness (디스크 .sql 전수) ---")
     conn = dbmod.get_connection()
     try:
@@ -78,6 +109,19 @@ def test_migration_history_complete():
         on_disk = {f for f in os.listdir(expected_dir) if f.endswith(".sql")}
         missing = sorted(on_disk - applied)
         check("every .sql file on disk is recorded as applied", missing, [])
+
+        # 검사가 공허하지 않은지 먼저 본다 - 양쪽이 비면 위/아래가 자동으로 통과한다.
+        check_true("비교 대상이 실재한다(디스크 %d개 / 적용 %d건)"
+                   % (len(on_disk), len(applied)),
+                   len(on_disk) > 0 and len(applied) > 0, (len(on_disk), len(applied)))
+
+        orphan = sorted(applied - on_disk - KNOWN_APPLIED_WITHOUT_FILE)
+        check("★ 적용됐다고 기록됐는데 파일이 없는 마이그레이션 없음", orphan, [])
+
+        resolved = sorted(KNOWN_APPLIED_WITHOUT_FILE - (applied - on_disk))
+        if resolved:
+            print("   [정리됨] 파일이 돌아왔다 - KNOWN_APPLIED_WITHOUT_FILE 에서 "
+                  "빼십시오: %s" % ", ".join(resolved))
     finally:
         conn.close()
 
@@ -2073,6 +2117,16 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
      "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
     ("load_spec_data.py",
      "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"),
+    # 2026-09-02 — 위 DELETE 세 문장을 **지우기 전에 세는** COUNT 짝이다
+    # (`guard_mass_purge()` 에 넘길 규모를 재는 용도, BUGS #245 배선의 전제).
+    # `%s` 자리에 들어가는 것은 위 DELETE 와 **글자 그대로 같은 값** —
+    # `",".join("?" * len(chunk))` 즉 물음표 반복뿐이고, item_id 는 예외 없이 바인딩된다.
+    # 요청이 닿지 않는 CLI 운영 스크립트라는 점도 같다.
+    ("load_rights_data.py", "SELECT COUNT(*) FROM rights_summary WHERE item_id IN (%s)"),
+    ("load_rights_data.py",
+     "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
+    ("load_spec_data.py",
+     "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"),
     ("reset_failures.py",
      "SELECT COUNT(*) FROM document_status WHERE status='FAILED' AND id IN (%s)"),
     ("reset_failures.py",
@@ -4759,16 +4813,47 @@ def test_declared_indexes_survive_bootstrap():
     root = os.path.dirname(os.path.abspath(__file__))
     sources = ([os.path.join(root, "storage", "migrate_v4_1.py")]
                + sorted(_glob.glob(os.path.join(root, "storage", "migrations", "*.sql"))))
-    declared = {}          # 인덱스 이름 -> 선언한 파일(마지막에 선언한 곳)
+    # ★ CREATE 만 세면 **일부러 지운 인덱스를 결손으로 오인한다** (2026-09-02).
+    #
+    #   이 검사는 `CREATE INDEX` 만 모아 "새 DB 에 다 있는가"를 봤다. 그러면 뒤 번호
+    #   마이그레이션이 **의도적으로 DROP** 한 인덱스가 영원히 붉게 남는다.
+    #
+    #   지금까지 안 걸린 것은 규칙이 맞아서가 아니라 우연이다 — 021 이 지운 5개는
+    #   선언이 `migrate_v4_1.py`(부트스트랩 스크립트) 에 있었고, 그때 **그 CREATE 줄을
+    #   같이 지워서** 목록에서 빠졌다. 선언이 번호 마이그레이션(001/002/026)에 있으면
+    #   그 수법을 쓸 수 없다 — 이미 적용된 파일을 나중에 고쳐 쓰는 셈이라 그 파일이
+    #   과거에 한 일을 더는 설명하지 못한다.
+    #
+    #   그래서 **DROP 도 함께 읽어** 마지막 선언이 CREATE 인지 DROP 인지로 판정한다.
+    #   실제로 걸린 사례: 027/029 가 idx_favorite_notes_user_id · idx_favorites_user_id ·
+    #   idx_recent_items_user_id 를 재측정 후 지웠다(각 파일 머리말에 측정치 있음).
+    #
+    #   순서는 `sources` 의 순서 = 부트스트랩 순서 = 번호순이므로, 뒤에 오는 문장이 이긴다.
+    declared = {}          # 인덱스 이름 -> (선언한 파일, 테이블)  ※ 살아 있어야 하는 것만
+    dropped = {}           # 인덱스 이름 -> 지운 파일               ※ 없어야 하는 것
     for path in sources:
         try:
             src = _io.open(path, encoding="utf-8-sig").read()
         except OSError:
             continue
+        # 주석 줄(`--`)은 판정에서 뺀다 - 마이그레이션 머리말이 되돌리는 방법으로
+        # `CREATE INDEX ...` 를 적어 두는 관례가 있어서 그대로 세면 되살아난 것으로 읽힌다.
+        body = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("--"))
+        events = []
         for m in _re.finditer(
                 r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-                r"[\"\[`]?(\w+)[\"\]`]?\s+ON\s+[\"\[`]?(\w+)", src, _re.I):
-            declared[m.group(1)] = (os.path.basename(path), m.group(2))
+                r"[\"\[`]?(\w+)[\"\]`]?\s+ON\s+[\"\[`]?(\w+)", body, _re.I):
+            events.append((m.start(), "create", m.group(1), m.group(2)))
+        for m in _re.finditer(
+                r"DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?[\"\[`]?(\w+)", body, _re.I):
+            events.append((m.start(), "drop", m.group(1), None))
+        for _pos, kind, name, table in sorted(events):
+            if kind == "create":
+                declared[name] = (os.path.basename(path), table)
+                dropped.pop(name, None)
+            else:
+                dropped[name] = os.path.basename(path)
+                declared.pop(name, None)
 
     check_true("검사가 공허하지 않다(소스에서 인덱스 선언을 찾았다) - %d개" % len(declared),
                len(declared) >= 40, len(declared))
@@ -4804,6 +4889,18 @@ def test_declared_indexes_survive_bootstrap():
                "다시 만들지 않았을 가능성이 크다(013 이 auction_item 에 대해 그렇게 한다). "
                "재작성하는 마이그레이션의 CREATE INDEX 목록에도 함께 넣으라 (BUGS #208)"
                % [n for n, _f, _t in missing])
+
+    # 반대 방향 — DROP 을 읽기 시작했으니 **그게 면죄부가 되지 않는지**도 봐야 한다.
+    # 지웠다고 선언한 인덱스가 새 DB 에 그대로 있으면, 그 DROP 이 실제로는 안 돈 것이다
+    # (뒤 마이그레이션이 테이블을 재작성하며 되살렸거나, 이름을 잘못 적었거나).
+    resurrected = sorted((n, f) for n, f in dropped.items() if n in live)
+    if resurrected:
+        for n, f in resurrected:
+            print("      [되살아남] %-40s %s 가 지웠는데 새 DB 에 있다" % (n, f))
+    check_true("★ 지웠다고 선언한 인덱스가 새 DB 에 없다", not resurrected,
+               "-> %s" % [n for n, _f in resurrected])
+    check_true("검사가 공허하지 않다(DROP 선언을 실제로 찾았다) - %d개" % len(dropped),
+               len(dropped) >= 3, sorted(dropped))
 
     # 자기 검증 - 이 검사가 실제로 "사라짐"을 잡는가(공허하지 않은가).
     #   소스 파일을 건드리지 않고, 선언 목록에 없는 이름을 하나 끼워 넣어 판정만 흉내 낸다.
