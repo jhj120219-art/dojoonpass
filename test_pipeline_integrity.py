@@ -846,6 +846,178 @@ def test_sqlite_now_is_localtime():
 
 
 # ---------------------------------------------------------------------------
+# 9-b. 파이썬이 남기는 시각이 전부 **naive 로컬**인가 (2026-09-01 신설)
+#
+# §9 는 SQLite 쪽(`datetime('now')` -> UTC)만 본다. 반대쪽 절반 — **파이썬이 무엇을
+# 문자열로 남기는가** — 를 지키는 것은 아무것도 없었다. 전수로 재 보니 지금은 완벽하다:
+#
+#     제품 .py 전체에서 시각을 남기는 자리 60여 곳이 **전부** `datetime.now().isoformat()`
+#     또는 거기서 timedelta 로 파생된 값이다. `utcnow()` 0건 / tz-aware 0건.
+#
+# 그런데 이 일관성이 깨지면 **세 군데가 동시에, 조용히** 틀린다.
+#
+#   1) 문자열 비교가 무너진다. `api/v1/subscriptions.py` 는 만료를 이렇게 본다:
+#
+#          row["expires_at"] <= now.isoformat()          <- 사전순 비교다
+#
+#      한쪽만 `+09:00` 이 붙으면 자릿수가 달라져 비교가 뒤집힌다. 구독이 안 끝나거나
+#      멀쩡한 구독이 만료된다. 예외도 로그도 없다.
+#
+#   2) §9 가 맞춰 놓은 SQLite 비교(`datetime('now','localtime')`)와 다시 어긋난다.
+#      그것이 BUGS 의 "30분 재시도가 실제로는 9시간 30분" 결함이었다.
+#
+#   3) 화면 날짜가 하루 밀린다. 프런트는 `new Date(값).toLocaleDateString('ko-KR')`
+#      로 찍는데, **naive 문자열이라 로컬로 파싱되고 로컬로 찍혀 대칭이 성립**한다
+#      (그래서 지금은 어느 나라에서 봐도 한국 달력 날짜가 그대로 보인다).
+#      `Z` 나 오프셋이 붙는 순간 그 대칭이 깨진다.
+#
+# 즉 저장 형식은 **세 계층이 공유하는 계약**이지 한 파일의 취향이 아니다.
+#
+# 테스트는 대상에서 뺀다 — JWT 의 `exp` 는 규격상 UTC 라 `timezone.utc` 를 쓰는 것이
+# 옳다(`test_auth_jwt.py`). 대신 **그 예외가 번지지 않는지**를 아래에서 함께 센다.
+# 손으로 유지하는 예외 목록을 만들지 않기 위해서다(Sprint 118 의 교훈).
+# ---------------------------------------------------------------------------
+
+def test_python_timestamps_are_naive_local():
+    print("\n--- 9-b. 파이썬이 남기는 시각이 naive 로컬인가 ---")
+    import ast
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
+            cwd=ROOT, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("    [SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if out.returncode != 0:
+        print("    [SKIP] git 저장소가 아니다")
+        return
+
+    rel_all = [p for p in out.stdout.split() if p.endswith(".py")]
+    rel_all = [p for p in rel_all if "-DESKTOP-" not in p]   # OneDrive 충돌 사본(#253)
+    product = [p for p in rel_all if not os.path.basename(p).startswith("test_")]
+    tests = [p for p in rel_all if os.path.basename(p).startswith("test_")]
+    check_true("검사가 공허하지 않다(제품 .py 를 실제로 찾았다) - %d개" % len(product),
+               len(product) >= 40, len(product))
+
+    def scan(rel_paths):
+        """tz-aware 시각을 만드는 자리를 모은다. 주석/문자열은 AST 라 애초에 안 걸린다."""
+        found = []
+        for rel in rel_paths:
+            full = os.path.join(ROOT, rel.replace("/", os.sep))
+            try:
+                tree = ast.parse(open(full, encoding="utf-8-sig").read())
+            except (OSError, SyntaxError):
+                continue        # 작업 트리에 없거나 파싱 불가 - 판정 대상이 아니다
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                why = None
+                if name == "utcnow":
+                    why = "utcnow()"
+                elif name in ("now", "today") and (node.args or node.keywords):
+                    # `datetime.now(timezone.utc)` / `now(tz=...)` -> tz-aware
+                    why = "%s(<tz>)" % name
+                elif name == "astimezone":
+                    why = "astimezone()"
+                elif any(kw.arg == "tzinfo" for kw in node.keywords):
+                    why = "tzinfo=..."
+                if why:
+                    found.append("%s:%d %s" % (rel, node.lineno, why))
+        return sorted(found)
+
+    check("★ 제품 코드가 tz-aware 시각을 만들지 않는다", scan(product), [])
+    print("      -> 저장 형식은 `datetime.now().isoformat()` (naive 로컬) 하나다."
+          " 오프셋이 붙으면 문자열 비교와 프런트 표시가 함께 어긋난다")
+
+    # 테스트 쪽 예외가 번지지 않는가.
+    #
+    # ★ 파일 이름 목록으로 두지 않는다. 처음엔 `["test_auth_jwt.py"]` 로 적었는데
+    #   `test_api_regression.py` 가 `datetime.timezone as _tz` 로 import 해 같은 일을
+    #   하고 있었다(grep 으로는 안 보인다 — AST 라서 잡혔다). 파일 목록은 곧 낡는다.
+    #   대신 **이유**를 검사한다: tz-aware 를 쓸 정당한 이유는 JWT 의 `exp` 하나뿐이다
+    #   (규격상 UTC epoch). `exp` 키를 가진 dict 안에서 만들어졌는지를 본다.
+    def tz_aware_outside_jwt_exp(rel_paths):
+        bad = []
+        for rel in rel_paths:
+            full = os.path.join(ROOT, rel.replace("/", os.sep))
+            try:
+                tree = ast.parse(open(full, encoding="utf-8-sig").read())
+            except (OSError, SyntaxError):
+                continue
+            allowed = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict) and any(
+                        isinstance(k, ast.Constant) and k.value == "exp" for k in node.keys):
+                    for sub in ast.walk(node):
+                        allowed.add(id(sub))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or id(node) in allowed:
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if (name == "utcnow"
+                        or (name in ("now", "today") and (node.args or node.keywords))
+                        or name == "astimezone"
+                        or any(kw.arg == "tzinfo" for kw in node.keywords)):
+                    bad.append("%s:%d" % (rel, node.lineno))
+        return sorted(bad)
+
+    check("★ 테스트의 tz-aware 사용이 JWT 의 exp 밖으로 번지지 않았다",
+          tz_aware_outside_jwt_exp(tests), [])
+    print("      -> tz-aware %d곳, 전부 JWT 의 exp (규격상 UTC epoch)" % len(scan(tests)))
+
+    # ── 자기 검증: 탐지기가 실제로 각 형태를 잡는가 ──────────────────────
+    #   이 검사는 위반이 0건일 때 **아무것도 증명하지 않는 모양**이 되기 쉽다.
+    import tempfile
+    probe_dir = tempfile.mkdtemp(prefix="qa_tzscan_")
+    probe = os.path.join(probe_dir, "qa_probe.py")
+    cases = [
+        ("utcnow()", "import datetime\nx = datetime.datetime.utcnow()\n"),
+        ("now(<tz>)", "from datetime import datetime, timezone\nx = datetime.now(timezone.utc)\n"),
+        ("astimezone()", "from datetime import datetime\nx = datetime.now().astimezone()\n"),
+        ("tzinfo=...", "from datetime import datetime, timezone\nx = datetime(2026, 1, 1, tzinfo=timezone.utc)\n"),
+    ]
+    try:
+        for label, src in cases:
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            saved, globals()["ROOT_TMP"] = None, None
+            hits = []
+            tree = ast.parse(src)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if (name == "utcnow"
+                        or (name in ("now", "today") and (node.args or node.keywords))
+                        or name == "astimezone"
+                        or any(kw.arg == "tzinfo" for kw in node.keywords)):
+                    hits.append(label)
+            check_true("자기 검증: %s 를 잡는다" % label, bool(hits), src.strip())
+        # 반대 방향 — 정상 형태를 결함으로 잡지 않는가(오탐).
+        ok_src = "from datetime import datetime, timedelta\nx = datetime.now().isoformat()\ny = (datetime.now() + timedelta(days=30)).isoformat()\n"
+        false_hits = []
+        for node in ast.walk(ast.parse(ok_src)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if (name == "utcnow"
+                    or (name in ("now", "today") and (node.args or node.keywords))
+                    or name == "astimezone"
+                    or any(kw.arg == "tzinfo" for kw in node.keywords)):
+                false_hits.append(name)
+        check("자기 검증: 정상 형태(now().isoformat())는 잡지 않는다", false_hits, [])
+    finally:
+        try:
+            os.remove(probe)
+            os.rmdir(probe_dir)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 10. 법원 식별자 규약 — 코드와 데이터가 같은 것을 가리키는가 (2026-08-14 신설)
 #
 # `doc_worker`는 큐에서 꺼낸 `court_code`로 법원을 찾는다.
@@ -1570,6 +1742,48 @@ def test_stored_normalization_matches_code():
     check("검출기 자체 검증: 새 값이 있으면 (주소에 없어도) 오염이 아니라 드리프트다",
           is_stale_contamination("칠곡군", "나성동", "세종특별자치시 나성로 96"), False)
 
+    # ★ 규칙이 다시 세 벌이 되지 않는가 (2026-09-01).
+    #
+    #   `detect_stale_region_contamination_dryrun.py` 는 예전에 이 판정을 **자기 안에
+    #   따로 적어** 두었고(`stored in addr` — 대괄호까지 포함한 원문 전체와 대조),
+    #   그래서 같은 DB 를 두고 이 가드와 답이 갈렸다:
+    #
+    #       그 스크립트                오염 의심 0건
+    #       이 가드                    오염 1건 (id=1768 `sigungu='갑구'`)
+    #
+    #   같은 질문에 두 도구가 다른 답을 하면 **하나는 반드시 거짓말을 하고 있다.**
+    #   지금은 셋(백필 / 이 가드 / 그 스크립트)이 같은 함수를 부른다. 그 사실을 고정한다.
+    detector = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "detect_stale_region_contamination_dryrun.py")
+    check_true("오염 검출기가 있다", os.path.exists(detector), detector)
+    if os.path.exists(detector):
+        det_src = open(detector, encoding="utf-8-sig").read()
+        check_true("검사가 공허하지 않다(검출기를 실제로 읽었다)", len(det_src) > 1000, len(det_src))
+        check_true("★ 오염 검출기가 정본 판정을 불러 쓴다",
+                   "from backfill_region_normalize import is_stale_contamination" in det_src,
+                   "-> 판정을 스스로 다시 적으면 두 도구의 답이 갈린다")
+
+        # 문자열로 찾지 않는다 — 이 파일의 주석은 옛 판정(`stored in addr`)을 **정정 기록으로
+        # 인용**하고 있어서, 문자열 검사는 그 인용을 결함으로 잡는다(실제로 그렇게 잡혔다).
+        # 코드만 본다.
+        import ast as _ast
+        det_tree = _ast.parse(det_src)
+        scan_fn = next((n for n in det_tree.body
+                        if isinstance(n, _ast.FunctionDef) and n.name == "scan_table"), None)
+        check_true("검출기에 scan_table() 이 있다", scan_fn is not None)
+        if scan_fn is not None:
+            calls = {getattr(c.func, "id", None) or getattr(c.func, "attr", None)
+                     for c in _ast.walk(scan_fn) if isinstance(c, _ast.Call)}
+            check_true("★ scan_table() 이 정본 판정을 실제로 호출한다",
+                       "is_stale_contamination" in calls, sorted(x for x in calls if x))
+            # 옛 판정은 `stored in addr` 라는 **비교식**이었다. 코드에 그 모양이 있으면
+            # 판정을 다시 적은 것이다(주석에 적힌 인용은 여기 걸리지 않는다).
+            own_rule = [c for c in _ast.walk(scan_fn)
+                        if isinstance(c, _ast.Compare)
+                        and any(isinstance(op, _ast.In) for op in c.ops)]
+            check("★ scan_table() 이 판정을 다시 적지 않는다",
+                  [_ast.dump(c)[:60] for c in own_rule], [])
+
     if any(drift[c] for c in drift) or contaminated:
         print("      고치려면: python backfill_region_normalize.py --apply"
               "  (기본은 dry-run)")
@@ -2059,6 +2273,7 @@ def test_failed_registry_requests_value_report():
 def run():
     # 소스 형태 검사는 DB가 없어도 의미가 있으므로 fresh clone 분기보다 먼저 돌린다.
     test_sqlite_now_is_localtime()
+    test_python_timestamps_are_naive_local()
 
     if not os.path.exists(DB):
         print("[SKIPPED] auction.db 없음 (fresh clone) ― 파이프라인 정합 검사 생략")

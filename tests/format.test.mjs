@@ -21,7 +21,7 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatPrice, formatPriceEok, formatWon, formatNumber, DISPLAY_LOCALE, formatDday, todayInDisplayZone, DISPLAY_TIME_ZONE, serverArea, displayArea, formatBidRate, parseArea, formatArea, SQM_PER_PYEONG } from '../src/lib/format.ts'
+import { formatPrice, formatPriceEok, formatWon, formatNumber, DISPLAY_LOCALE, formatDday, todayInDisplayZone, DISPLAY_TIME_ZONE, serverArea, displayArea, formatBidRate, parseArea, formatArea, SQM_PER_PYEONG, ymdPlusDays } from '../src/lib/format.ts'
 
 describe('formatPrice — 물건 시세(억/만 축약)', () => {
   test('0과 falsy는 하이픈으로 표시한다', () => {
@@ -568,5 +568,73 @@ describe('formatBidRate — 최저가율 표기 (2026-08-31)', () => {
     for (const [raw, shown] of [[0.0001, '0.0%'], [0.1234, '12.3%'], [0.9999, '100.0%']]) {
       assert.equal(formatBidRate(raw), shown, `${raw} -> ${formatBidRate(raw)}`)
     }
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// ymdPlusDays - 검색폼 매각기일 퀵버튼의 날짜 계산 (2026-09-01)
+//
+// 고치기 전 `SearchForm.tsx` 는 `new Date().toISOString().slice(0, 10)` 으로
+// "오늘"을 만들었다. `toISOString()` 은 UTC 라 KST 09:00 이전에는 하루 전이
+// 나온다 — 오전에 "당일"을 누른 한국 사용자는 **어제 날짜로 검색**했고
+// 그날 매각되는 물건이 통째로 안 나왔다. 오류도 빈 화면도 아니고
+// "그날은 물건이 없네"로 보이는 것이 이 결함의 모양이다.
+// ---------------------------------------------------------------------------
+describe('ymdPlusDays - 날짜만으로 더한다', () => {
+  test('기본 덧셈', () => {
+    assert.equal(ymdPlusDays('2026-09-01', 0), '2026-09-01')
+    assert.equal(ymdPlusDays('2026-09-01', 7), '2026-09-08')
+    assert.equal(ymdPlusDays('2026-09-01', 14), '2026-09-15')
+  })
+
+  test('월·해 경계와 윤년', () => {
+    assert.equal(ymdPlusDays('2026-08-31', 1), '2026-09-01')
+    assert.equal(ymdPlusDays('2026-12-31', 1), '2027-01-01')
+    assert.equal(ymdPlusDays('2028-02-28', 1), '2028-02-29')   // 윤년
+    assert.equal(ymdPlusDays('2027-02-28', 1), '2027-03-01')   // 평년
+  })
+
+  test('음수도 된다', () => {
+    assert.equal(ymdPlusDays('2026-09-01', -1), '2026-08-31')
+  })
+
+  test('형식이 아니면 null — 지어내지 않는다', () => {
+    assert.equal(ymdPlusDays('2026/09/01', 7), null)
+    assert.equal(ymdPlusDays('', 7), null)
+    assert.equal(ymdPlusDays('미정', 7), null)
+    assert.equal(ymdPlusDays('2026-09-01', NaN), null)
+    assert.equal(ymdPlusDays('2026-09-01', Infinity), null)
+  })
+
+  test('★ KST 09:00 이전에도 "오늘"이 오늘이다 (이번 결함)', () => {
+    // 2026-09-01 08:33 KST = 2026-08-31 23:33 UTC. 실제로 이 시각에 관찰했다.
+    const morning = new Date('2026-09-01T08:33:00+09:00')
+    assert.equal(morning.toISOString().slice(0, 10), '2026-08-31')   // 예전 계산
+    const from = todayInDisplayZone(morning)
+    assert.equal(from, '2026-09-01')                                  // 지금 계산
+    assert.equal(ymdPlusDays(from, 0), '2026-09-01')
+    assert.equal(ymdPlusDays(from, 7), '2026-09-08')
+  })
+
+  test('★ "+7" 은 정확히 7일 범위다 (예전엔 8일이 됐다)', () => {
+    // 예전 계산은 시작만 UTC 로 밀리고 끝은 +7일 뒤라 경계를 다시 넘었다.
+    const morning = new Date('2026-09-01T08:33:00+09:00')
+    const end = new Date(morning)
+    end.setDate(end.getDate() + 7)
+    assert.equal(morning.toISOString().slice(0, 10), '2026-08-31')
+    assert.equal(end.toISOString().slice(0, 10), '2026-09-07')        // 8일 범위
+
+    const from = todayInDisplayZone(morning)
+    const to = ymdPlusDays(from, 7)
+    assert.equal(from, '2026-09-01')
+    assert.equal(to, '2026-09-08')                                    // 7일 범위
+  })
+
+  test('서머타임이 있는 시간대에서도 일수가 변하지 않는다', () => {
+    // 날짜 문자열만 다루므로 시간대가 개입할 자리가 없다.
+    // (미국 DST 전환일을 끌고 들어가도 결과가 같다)
+    assert.equal(ymdPlusDays('2026-03-07', 2), '2026-03-09')
+    assert.equal(ymdPlusDays('2026-10-31', 2), '2026-11-02')
   })
 })

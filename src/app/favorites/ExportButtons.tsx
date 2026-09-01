@@ -7,6 +7,7 @@ import {
   UTF8_BOM,
   type ExportRow,
 } from '@/lib/exportList'
+import { todayInDisplayZone } from '@/lib/format'
 
 /**
  * 마이리스트(관심물건) 내보내기 버튼 (2026-08-20 Sprint 227).
@@ -47,7 +48,9 @@ export default function ExportButtons({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = exportFileName('관심물건', new Date().toISOString())
+    // 파일명의 날짜도 **한국 시각**이다. `new Date().toISOString()` 은 UTC 라
+    // KST 09:00 이전에 내려받으면 어제 날짜가 붙었다(`ymdPlusDays` 주석과 같은 결함).
+    a.download = exportFileName('관심물건', todayInDisplayZone())
     document.body.appendChild(a)
     a.click()
     a.remove()

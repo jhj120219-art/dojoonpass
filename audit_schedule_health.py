@@ -213,6 +213,9 @@ def log_state(rel):
 
 
 def db_state():
+    # 상태값은 `storage.database` 의 상수를 바인딩해 쓴다 - 리터럴은
+    # 오타가 예외가 아니라 **0행 매치**로 끝나 감사가 조용히 거짓말을 한다.
+    import storage.database as dbmod
     path = db_path()
     if not os.path.exists(path):
         return None
@@ -245,8 +248,8 @@ def db_state():
             " WHERE last_attempt_at IS NOT NULL").fetchone()[0]
         row = con.execute(
             "SELECT COUNT(*), SUM(CASE WHEN auction_date < ? AND TRIM(auction_date) <> ''"
-            " THEN 1 ELSE 0 END) FROM document_queue WHERE status='pending'",
-            (today,)).fetchone()
+            " THEN 1 ELSE 0 END) FROM document_queue WHERE status=?",
+            (today, dbmod.QUEUE_STATUS_PENDING)).fetchone()
         st["queue_pending_total"] = row[0] or 0
         st["queue_pending_moot"] = row[1] or 0
 

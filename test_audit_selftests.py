@@ -135,9 +135,66 @@ def test_selftests_pass():
                        "-> 출력에 판정문이 없다:\n%s" % out[-800:])
 
 
+def test_viewport_audit_measures_real_cards():
+    """`audit_viewport.py` 가 **빈 목록을 재고 초록을 찍지** 않는가 (2026-09-01).
+
+    ## 왜 이 검사가 있는가 - 도구가 가장 복잡한 화면을 안 재고 있었다
+
+    검색 화면을 `?sido=서울` 로만 열었는데, 기일이 지난 물건만 남은 DB(개발/QA 머신이
+    그렇다)에서는 그게 0건이다. 즉 재던 것은 **카드가 하나도 없는 빈 목록**이고,
+    빈 목록은 당연히 넘치지 않는다. 상세 표본도 그 결과에서 뽑으므로 **상세는 통째로
+    건너뛰어졌고**, 그러고도 종료코드는 0이었다. Sprint 240 이 좁은 폭에서 찾아낸
+    결함 3종 중 둘이 바로 그 카드에 있었다.
+
+    행위 검사는 서버와 브라우저가 있어야 해서 스위트에 넣을 수 없다. 대신 **그 판단이
+    소스에서 사라지지 않았는지**를 고정한다 - 이 저장소가 반복해 겪은 실패 모양은
+    "검사가 조용히 좁아지는 것"이다.
+    """
+    import ast
+
+    print("\n--- audit_viewport 가 빈 목록을 초록으로 세지 않는가 (2026-09-01) ---")
+    path = os.path.join(ROOT, "audit_viewport.py")
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    check_true("카드가 0장일 때 쓸 대체 조건이 선언돼 있다",
+               "SEARCH_PATH_WITH_CLOSED" in names, sorted(names))
+    check_true("검색 경로가 상수 하나다(SCREENS 에 문자열을 다시 적지 않는다)",
+               "SEARCH_PATH" in names and src.count('"/search?sido=') == 1,
+               "-> 두 벌이면 대체 조건으로 바꿔도 재는 화면은 안 바뀐다")
+
+    # 대체 조건을 실제로 **시도**하는가.
+    check_true("두 조건을 순서대로 시도한다",
+               "for cand in (SEARCH_PATH, SEARCH_PATH_WITH_CLOSED)" in src,
+               "-> 선언만 하고 안 쓰면 죽은 상수다")
+    # 카드가 나온 조건으로 **바꿔 재는가**.
+    check_true("카드가 나온 조건으로 검색 화면을 바꿔 잰다",
+               "if used and used != SEARCH_PATH" in src)
+
+    # ★ 그래도 0장이면 정상으로 세지 않는가. 이것이 이 결함의 핵심이었다.
+    check_true("카드가 0장이면 no_cards 로 표시한다", "no_cards = True" in src)
+    check_true("★ no_cards 를 측정 불가로 센다(초록으로 뭉개지 않는다)",
+               "unusable += 2 * len(widths)" in src,
+               "-> 이것이 빠지면 상세를 통째로 건너뛰고도 종료코드 0 이 된다")
+    # 측정 불가가 종료코드 2 로 이어지는 길이 살아 있는가.
+    check_true("측정 불가가 있으면 종료코드 2 다",
+               "if unusable:" in src and "return 2" in src)
+
+    # 자기 검증: 위 문자열 검사가 공허하지 않은가(파일을 실제로 읽었는가).
+    check_true("자기 검증: 파일을 실제로 읽었다", len(src) > 5000, len(src))
+    check_true("자기 검증: 없는 문장은 잡히지 않는다", "QA_BOGUS_SENTINEL" not in src)
+
+
 def run():
     test_tools_are_tracked()
     test_selftests_pass()
+    test_viewport_audit_measures_real_cards()
     print("\n" + "=" * 55)
     if failures:
         print("FAILED (%d): %s" % (len(failures), ", ".join(failures)))

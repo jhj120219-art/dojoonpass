@@ -173,12 +173,79 @@ def test_credit_log_written_alongside_ledger():
           get_credit_adjustment(conn, "u5", get_current_month()), 6)
 
 
+
+
+def test_ledger_reason_gate_cannot_double_count():
+    """원장에 **쓸 수 있는** 사유가 전부 "합계에 넣어도 되는" 사유인가 (2026-09-01 신설).
+
+    ## 왜 필요한가 - 지금 합계는 사유로 거르지 않는다
+
+    `get_credit_adjustment()` 는 그 달의 `registry_credits` 행을 **전부** 더한다
+    (RESET 이후 자르기만 할 뿐 `reason_type` 조건이 없다). 지금 그것이 안전한 이유는
+    `add_credit()` 이 `VALID_REASON_TYPES` 3종만 받아들여, 다른 사유는 애초에 그
+    테이블에 들어갈 수 없기 때문이다. 즉 **안전이 게이트 하나에 걸려 있다.**
+
+    누가 `VALID_REASON_TYPES` 에 `USAGE` 를 더하면 그 순간
+
+        add_credit(..., "USAGE", -1)  ->  registry_credits 에 행이 생기고
+        get_credit_adjustment()       ->  거르지 않으므로 그 -1 을 합산한다
+        registry_usage                ->  같은 사용을 이미 세고 있다
+        결과                          ->  **이중 차감** (사용자가 손해를 본다)
+
+    `016_create_audit_and_credit_logs.sql` 과 `docs/CHANGELOG.md` 가 바로 이 이중 차감을
+    경고하면서 근거로 `api/constants.py:ADJUSTMENT_REASONS` 를 인용한다. 그런데 실측하니
+    (2026-09-01) 그 상수는 **코드에서 아무도 읽지 않는다** - 추적/미추적 전 파일형식을
+    훑어 참조가 정의 한 줄과 두 문서뿐이었다. 즉 두 문서가 인용하는 근거가 실제로는
+    아무것도 강제하지 않고 있었다.
+
+    기존 `test_credit_log_written_alongside_ledger()` 는 USAGE 를 `log_credit_event()` 로
+    직접 남겨 합계가 안 변하는 것을 본다. 그것은 **로그 경로**의 검증이라,
+    `VALID_REASON_TYPES` 가 넓어지는 위 시나리오는 잡지 못한다(그 테스트는 add_credit 을
+    부르지 않는다). 그래서 게이트 자체를 여기서 못박는다.
+
+    ★ 동작은 바꾸지 않는다. 합계에 `reason_type` 필터를 넣는 것은 과금 로직 변경이라
+      승인 영역이다. 여기서는 **지금 성립하는 불변식**만 고정한다.
+    """
+    print("\n[6] ledger reason gate")
+    from api.constants import ADJUSTMENT_REASONS, RegistryCreditReason
+    from api.v1.registry_credits import VALID_REASON_TYPES
+
+    writable = {str(r) for r in VALID_REASON_TYPES}
+    countable = {str(r) for r in ADJUSTMENT_REASONS}
+
+    check("gate is not empty", len(writable) >= 3, True)
+    check("countable set is not empty", len(countable) >= 3, True)
+
+    # 핵심 불변식: 원장에 쓸 수 있는 사유는 전부 합계에 넣어도 되는 사유여야 한다.
+    check("every writable reason is countable",
+          sorted(writable - countable), [])
+
+    # USAGE 는 절대 원장에 들어가면 안 된다(registry_usage 가 이미 센다).
+    check("USAGE is not writable to the ledger",
+          RegistryCreditReason.USAGE.value in writable, False)
+    check("USAGE is not in the countable set",
+          RegistryCreditReason.USAGE.value in countable, False)
+
+    # 합계가 아직 사유로 거르지 않는다는 사실도 함께 고정한다 - 이 전제가 바뀌면
+    # 위 불변식의 의미도 달라지므로 그때 이 검사를 다시 읽어야 한다.
+    import inspect
+    from api.v1.registry_credits import get_credit_adjustment as _gca
+    body = inspect.getsource(_gca)
+    check("sum still does not filter by reason_type (premise)",
+          "reason_type=?" in body and body.count("reason_type") == 1, True)
+
+    # 자기 검증: 비교가 공허하지 않은가.
+    check("selftest: a bogus reason would be caught",
+          sorted(({"QA_BOGUS"} | writable) - countable), ["QA_BOGUS"])
+
+
 def run():
     test_grant_and_deduct_sum()
     test_reset_cuts_off_prior_adjustments()
     test_month_isolation()
     test_validation()
     test_credit_log_written_alongside_ledger()
+    test_ledger_reason_gate_cannot_double_count()
 
     print("\n" + "=" * 55)
     if failures:

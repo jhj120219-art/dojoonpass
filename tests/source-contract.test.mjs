@@ -1816,3 +1816,313 @@ describe('마이페이지 3종 응답 ↔ 프런트 타입 (2026-08-31) — 소�
     }
   })
 })
+
+
+// ================================================================
+// "오늘"을 UTC 로 만들지 않는다 — 소스 계약 (2026-09-01 신설)
+//
+// `new Date().toISOString().slice(0, 10)` 은 **UTC 날짜**다. 서버도 사용자도
+// 한국인 이 제품에서는 KST 09:00 이전에 항상 하루 전이 나온다.
+//
+//   검색폼 퀵버튼 "당일"   -> 어제 날짜로 검색 -> 오늘 매각되는 물건이 0건
+//   검색폼 퀵버튼 "+7"     -> 8일 범위(시작만 밀리고 끝은 경계를 다시 넘는다)
+//   내보내기 파일명          -> 어제 날짜가 붙은 CSV
+//
+// 오류도 빈 화면도 아니고 "그날은 물건이 없네"로 보이는 것이 이 결함의 모양이다.
+// `formatDday()` 가 이미 `DISPLAY_TIME_ZONE` 으로 고친 것과 **같은 기준**을
+// 입력쪽에도 적용한다 — 새 정책이 아니라 선언된 정책의 적용 범위다.
+// ================================================================
+
+describe('"오늘"을 UTC 로 만들지 않는다 (2026-09-01) — 소스 계약', () => {
+  const stripComments = (code) =>
+    code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+  // 날짜를 **UTC 로 잘라내는** 모양. 수신자를 가리지 않는 것이 핵심이다 —
+  // 고치기 전 SearchForm.tsx 는 `const toISODate = (d: Date) => d.toISOString().slice(0, 10)`
+  // 처럼 **한 단계 건너서** 썼고, `new Date()` 에 붙은 것만 찾는 탐지기는 그 줄을
+  // 못 본다 — 이 검사를 처음 썼을 때 실제로 놓쳤고, 변이 주입이 그것을 잡았다.
+  //
+  // 반면 `.toISOString()` 자체는 막지 않는다 — 시각까지 들어 있는 전체 ISO 문자열은
+  // 시간대가 붙어 있어 모호하지 않다. 거기서 앞 10자만 떼내는 순간 UTC 의
+  // 달력을 사용자에게 강요하게 된다. **그 자르는 행위만** 금지한다.
+  const UTC_TODAY = /\.toISOString\(\)\s*\.slice\(/
+
+  const listSources = async () => {
+    const { promises: fs } = await import('node:fs')
+    const out = []
+    const walk = async (dir) => {
+      for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+        const p = `${dir}/${e.name}`
+        if (e.isDirectory()) await walk(p)
+        else if (/\.tsx?$/.test(e.name)) out.push(p)
+      }
+    }
+    await walk('src')
+    return out
+  }
+
+  test('검사가 공허하지 않다 — 파일을 찾았고 탐지기가 동작한다', async () => {
+    const files = await listSources()
+    assert.ok(files.length > 20, `src 아래 .ts/.tsx 를 제대로 못 찾았습니다: ${files.length}개`)
+    // 탐지기를 합성 입력으로 증명한다.
+    assert.ok(UTC_TODAY.test('new Date().toISOString().slice(0, 10)'),
+      '탐지기가 UTC 오늘 계산을 못 잡습니다')
+    // ★ 고치기 전에 실제로 있던 바로 그 줄. 수신자가 `new Date()` 가 아니다.
+    assert.ok(UTC_TODAY.test('const toISODate = (d: Date) => d.toISOString().slice(0, 10)'),
+      '한 단계 건너눠서 자르는 줄을 못 잡습니다(이것이 실제 결함의 모양입니다)')
+    assert.ok(!UTC_TODAY.test('new Date(row.created_at).toISOString()'),
+      '저장된 시각의 직렬화를 잡으면 오탐입니다')
+    assert.ok(!UTC_TODAY.test("new Date().toLocaleDateString('ko-KR')"),
+      '날짜 표시 자체를 잡으면 오탐입니다')
+    // 주석 제거가 코드를 지우지 않는지 같은 자리에서 본다.
+    assert.ok(stripComments("const u = 'https://a.b' // note").includes('https://a.b'),
+      '주석 제거가 URL 을 망가뜨립니다')
+  })
+
+  test('★ src 어디에도 날짜를 UTC 로 잘라내는 자리가 없다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const offenders = []
+    for (const file of await listSources()) {
+      const code = stripComments(await fs.readFile(file, 'utf8'))
+      if (UTC_TODAY.test(code)) offenders.push(file)
+    }
+    assert.deepEqual(
+      offenders, [],
+      '"오늘"을 UTC 로 만드는 자리가 있습니다(KST 09:00 이전에 하루 당깁니다). '
+      + `상세는 src/lib/format.ts 의 ymdPlusDays() 주석: ${offenders.join(', ')}`
+    )
+  })
+
+  test('검색폼 퀵버튼이 공용 함수를 쓴다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const form = await fs.readFile('src/app/search/SearchForm.tsx', 'utf8')
+    assert.ok(form.includes('todayInDisplayZone()'),
+      '매각기일 퀵버튼의 "오늘"이 한국 시각이 아닙니다')
+    assert.ok(form.includes('ymdPlusDays('),
+      '퀵버튼의 +N일 계산이 공용 함수를 거치지 않습니다')
+    // 계약을 고치면서 기능을 잃지 않는다 — 버튼 네 개가 그대로 살아 있는가.
+    for (const arg of ['(0)', '(7)', '(14)', '(null)']) {
+      assert.ok(form.includes(`setQuickAuctionDate${arg}`), `퀵버튼 ${arg} 이 사라졌습니다`)
+    }
+  })
+
+  test('공용 함수가 날짜만 다루고, 파서가 한 벌이다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const lib = await fs.readFile('src/lib/format.ts', 'utf8')
+    assert.ok(lib.includes('export function ymdPlusDays'), 'ymdPlusDays 가 없습니다')
+    assert.ok(lib.includes('function parseYmdToUtcMs'), 'parseYmdToUtcMs 가 없습니다')
+    // daysBetween 이 자기 파서를 다시 들면 규칙이 두 벌이 된다(고치기 전이 그랬다).
+    const between = lib.slice(lib.indexOf('function daysBetween'))
+    assert.ok(!/const parse = /.test(between.slice(0, 400)),
+      'daysBetween 이 자기 파서를 따로 듭니다 — parseYmdToUtcMs 를 쓰십시오')
+  })
+
+  test('내보내기 파일명도 같은 기준을 쓴다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const btn = await fs.readFile('src/app/favorites/ExportButtons.tsx', 'utf8')
+    assert.ok(btn.includes('todayInDisplayZone()'), 'CSV 파일명의 날짜가 UTC 입니다')
+  })
+})
+
+
+// ================================================================
+// 즐겨찾기 토글이 두 화면에서 **같은 규칙**으로 동작한다 — 소스 계약 (2026-09-01 신설)
+//
+// 이 토글은 두 벌 있다.
+//
+//     src/app/search/FavoriteButton.tsx        검색 결과 카드의 하트
+//     src/app/properties/[id]/page.tsx         상세 화면의 하트
+//
+// 합치지 않은 이유는 실제로 다른 것이 있기 때문이다 — 로그인 복귀 대상(검색은 쿼리스트링을
+// 통째로 보존, 상세는 고정 경로)과, 상세에만 있는 늦은 응답 가드(`idRef`, BUGS #225).
+// 카드는 `itemId` 가 prop 이라 그 가드가 필요 없다. 그래서 **데이터의 정본은 하나**
+// (`/api/v1/favorites` + 정수 `item_id`)이고, 갈라지는 것은 화면 사정뿐이다.
+//
+// 문제는 **갈라지면 안 되는 부분을 지키는 것이 주석뿐**이었다는 것이다. 두 파일 모두
+// "이미 원하는 상태(중복 등록 / 이미 삭제됨)는 실패가 아니다"를 Error Code 로 구분하는데,
+// 한쪽에서 그 분기가 빠지면 사용자는 **성공한 동작에 대해 빨간 문구**를 본다.
+// 오류도 로그도 없이 문구만 틀리는, 이 저장소가 반복해 겪은 모양이다.
+//
+// 값 자체가 서버와 어긋나는 것(`FAVORITE_NOT_FOUND` -> `FAVORITE_NOTFOUND` 같은 오타)은
+// `test_schema_hygiene.py` 의 ErrorCode 대조가 잡는다. 여기서는 **두 화면이 같은 규칙을
+// 쓰는가**만 본다.
+// ================================================================
+
+describe('즐겨찾기 토글이 두 화면에서 같은 규칙을 쓴다 (2026-09-01) — 소스 계약', () => {
+  const FILES = ['src/app/search/FavoriteButton.tsx', 'src/app/properties/[id]/page.tsx']
+  const read = async (p) => (await import('node:fs')).promises.readFile(p, 'utf8')
+
+  test('검사가 공허하지 않다 — 두 파일을 실제로 읽었고 토글이 들어 있다', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      assert.ok(code.length > 1000, `${f} 를 제대로 읽지 못했습니다 (${code.length}자)`)
+      assert.ok(code.includes('handleToggleFavorite'),
+        `${f} 에 즐겨찾기 토글이 없습니다 — 파일이 옮겨졌다면 이 목록을 고치십시오`)
+    }
+  })
+
+  test('★ 두 화면이 같은 엔드포인트와 같은 식별자를 쓴다 (정본이 하나다)', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      assert.ok(/postJSON<[^>]*>\('\/api\/v1\/favorites'/.test(code),
+        `${f} 의 등록이 /api/v1/favorites 가 아닙니다`)
+      assert.ok(/deleteJSON<[^>]*>\(`\/api\/v1\/favorites\/\$\{/.test(code),
+        `${f} 의 해제가 /api/v1/favorites/{id} 가 아닙니다`)
+      assert.ok(/\{\s*item_id:/.test(code),
+        `${f} 가 item_id 말고 다른 이름으로 물건을 지목합니다`)
+    }
+  })
+
+  test('★ 두 화면 모두 "이미 원하는 상태"를 실패로 보지 않는다', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      assert.ok(code.includes('ERROR_CODES.FAVORITE_NOT_FOUND'),
+        `${f} 가 이미 삭제된 관심물건을 실패로 표시합니다`)
+      assert.ok(code.includes('ERROR_CODES.FAVORITE_ALREADY_EXISTS'),
+        `${f} 가 이미 등록된 관심물건을 실패로 표시합니다`)
+    }
+  })
+
+  test('분기를 문구가 아니라 Error Code 로 한다', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      // 코드 값을 문자열로 직접 적으면 상수와 갈라진다 — 반드시 ERROR_CODES 를 거친다.
+      const literal = code.match(/'FAVORITE_[A-Z_]+'/g) || []
+      assert.deepEqual(literal, [],
+        `${f} 가 Error Code 를 문자열로 적었습니다(상수를 쓰십시오): ${literal.join(', ')}`)
+      assert.ok(/ERROR_CODES/.test(code) && /from '@\/lib\/api'/.test(code),
+        `${f} 가 공용 Error Code 상수를 import 하지 않습니다`)
+      // message 로 분기하면 문구가 바뀌는 순간 조용히 깨진다.
+      assert.ok(!/result\.message\s*===/.test(code),
+        `${f} 가 사용자 문구로 분기합니다`)
+    }
+  })
+
+  test('실패했을 때 하트를 뒤집지 않는다 (아이콘과 에러가 모순되지 않는다)', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      // setFavorited(true/false) 는 성공 판정 블록 안에서만 나온다 — 그 판정문이
+      // 사라지면 서버가 거절해도 하트가 뒤집힌다.
+      assert.ok(/if \(result\.success \|\| result\.error === ERROR_CODES\.FAVORITE_NOT_FOUND\)/.test(code),
+        `${f} 의 해제가 서버 판정 없이 상태를 바꿉니다`)
+      assert.ok(/if \(result\.success \|\| result\.error === ERROR_CODES\.FAVORITE_ALREADY_EXISTS\)/.test(code),
+        `${f} 의 등록이 서버 판정 없이 상태를 바꿉니다`)
+    }
+  })
+
+  test('로그인 만료(401/403)를 두 화면이 똑같이 다룬다', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      assert.ok(/err\.status === 401 \|\| err\.status === 403/.test(code),
+        `${f} 가 만료된 세션을 구분하지 않습니다`)
+      assert.ok(code.includes('로그인이 만료되었습니다'),
+        `${f} 의 만료 안내 문구가 다릅니다`)
+    }
+  })
+
+  test('재진입 가드가 양쪽에 있다 (연타로 중복 요청이 나가지 않는다)', async () => {
+    for (const f of FILES) {
+      const code = await read(f)
+      assert.ok(/if \(favBusy/.test(code), `${f} 에 연타 가드가 없습니다`)
+      assert.ok(code.includes('setFavBusy(true)'), `${f} 가 busy 를 세우지 않습니다`)
+    }
+  })
+})
+
+
+// ================================================================
+// 로그인 복귀 파라미터 이름이 한 벌인가 — 소스 계약 (2026-09-01 신설)
+//
+// 복귀 흐름은 **생산자 10곳 / 소비자 2곳**으로 갈라져 있다.
+//
+//     생산자  src/proxy.ts (서버 게이트) + 클라이언트 9곳
+//             (favorites / favorites/import / mypage / properties/recent /
+//              properties/[id] / search/FavoriteButton / search/SearchPresets)
+//     소비자  src/app/login/page.tsx (hidden input) -> login/actions.ts
+//
+// 기존 계약 검사는 **소비자 쪽만** 고정하고 있었다(§3.4). 그런데 생산자 하나가
+// 파라미터 이름을 바꾸면(`?next=` 같은) `formData.get('redirect')` 는 조용히 null 이
+// 되고, `sanitizeRedirectPath(null)` 이 기본값 '/' 을 돌려준다 — **오류 없이 첫 화면**
+// 으로 보내진다. 사용자는 보던 물건으로 못 돌아오는데 어디에도 실패가 남지 않는다.
+// §3.4 가 막으려던 바로 그 회귀를, 아직 아무도 안 보던 쪽에서 재현할 수 있었다.
+//
+// 이름을 세 벌 네 벌로 두지 않는다는 것만 본다 — 복귀 **대상**은 화면마다 다른 것이
+// 맞다(검색은 쿼리스트링 보존, 검색조건 저장은 입력 중이던 이름까지, 상세는 고정 경로).
+// ================================================================
+
+describe('로그인 복귀 파라미터 이름이 한 벌이다 (2026-09-01) — 소스 계약', () => {
+  const listSources = async () => {
+    const { promises: fs } = await import('node:fs')
+    const out = []
+    const walk = async (dir) => {
+      for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+        const p = `${dir}/${e.name}`
+        if (e.isDirectory()) await walk(p)
+        else if (/\.tsx?$/.test(e.name)) out.push(p)
+      }
+    }
+    await walk('src')
+    return out
+  }
+
+  // `/login?...` 로 보내는 자리. 쿼리 없는 `/login` 링크(헤더)는 대상이 아니다.
+  const LOGIN_NAV = /\/login\?/
+
+  test('검사가 공허하지 않다 — 생산자를 실제로 찾았다', async () => {
+    const { promises: fs } = await import('node:fs')
+    let producers = 0
+    for (const f of await listSources()) {
+      const code = await fs.readFile(f, 'utf8')
+      if (LOGIN_NAV.test(code)) producers++
+    }
+    assert.ok(producers >= 6, `로그인 복귀 생산자를 제대로 못 찾았습니다: ${producers}개`)
+  })
+
+  test('★ 모든 생산자가 `redirect` 라는 이름을 쓴다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const offenders = []
+    for (const f of await listSources()) {
+      const code = await fs.readFile(f, 'utf8')
+      for (const line of code.split('\n')) {
+        if (!LOGIN_NAV.test(line)) continue
+        // 같은 줄에 `redirect` 가 있으면 된다 — `?redirect=` 도,
+        // `new URLSearchParams({ redirect: target })` 도 여기서 걸러진다.
+        if (/\bredirect\b/.test(line)) continue
+        // 미리 만든 변수를 넘기는 형태는 그 변수의 정의를 아래 검사가 본다.
+        if (/loginParams/.test(line)) continue
+        offenders.push(`${f}: ${line.trim().slice(0, 90)}`)
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `로그인 복귀 파라미터 이름이 다른 자리가 있습니다(복귀가 조용히 '/' 로 떨어집니다):\n  ${offenders.join('\n  ')}`)
+  })
+
+  test('★ URLSearchParams 로 만드는 쪽도 키가 `redirect` 다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const built = ['src/app/properties/[id]/page.tsx',
+                   'src/app/search/FavoriteButton.tsx',
+                   'src/app/search/SearchPresets.tsx']
+    for (const f of built) {
+      const code = await fs.readFile(f, 'utf8')
+      // 두 형태가 실제로 쓰인다 — 생성자 인자로 넣거나 set() 으로 붙이거나.
+      assert.ok(/URLSearchParams\(\s*\{[^}]*\bredirect\b\s*:/.test(code)
+                || /\.set\(\s*'redirect'\s*,/.test(code),
+        `${f} 가 복귀 대상을 'redirect' 키로 싣지 않습니다`)
+    }
+  })
+
+  test('서버 게이트와 소비자가 같은 이름을 쓴다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const proxy = await fs.readFile('src/proxy.ts', 'utf8')
+    assert.ok(/searchParams\.set\('redirect'/.test(proxy),
+      'proxy.ts 가 redirect 파라미터를 붙이지 않습니다')
+    const page = await fs.readFile('src/app/login/page.tsx', 'utf8')
+    assert.ok(/searchParams\.get\('redirect'\)/.test(page),
+      '로그인 화면이 redirect 파라미터를 읽지 않습니다')
+    assert.ok(/name="redirect"/.test(page),
+      '로그인 폼이 redirect 를 hidden input 으로 싣지 않습니다')
+    const actions = await fs.readFile('src/app/login/actions.ts', 'utf8')
+    assert.ok(/formData\.get\('redirect'\)/.test(actions),
+      'loginAction 이 redirect 를 읽지 않습니다')
+  })
+})

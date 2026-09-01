@@ -312,18 +312,50 @@ export function todayInDisplayZone(now: Date = new Date()): string {
   }).format(now)
 }
 
+/** `YYYY-MM-DD` 를 UTC 자정 밀리초로. 형식이 다르면 null. */
+function parseYmdToUtcMs(ymd: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd)
+  if (!m) return null
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  return Number.isNaN(ms) ? null : ms
+}
+
 /** `YYYY-MM-DD` 두 개 사이의 일수. 시간대·서머타임의 영향을 받지 않는다. */
 function daysBetween(fromYmd: string, toYmd: string): number | null {
-  const parse = (ymd: string) => {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd)
-    if (!m) return null
-    const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
-    return Number.isNaN(ms) ? null : ms
-  }
-  const a = parse(fromYmd)
-  const b = parse(toYmd)
+  const a = parseYmdToUtcMs(fromYmd)
+  const b = parseYmdToUtcMs(toYmd)
   if (a === null || b === null) return null
   return Math.round((b - a) / 86400000)
+}
+
+/**
+ * `YYYY-MM-DD` 에서 `days` 일 뒤의 `YYYY-MM-DD`. 형식이 다르면 null.
+ *
+ * 날짜만 다룬다 — 시각을 끼우지 않으므로 시간대도 서머타임도 개입할 수 없다.
+ *
+ * ## 왜 필요한가 — `new Date()` + `toISOString()` 은 한국에서 **아침마다** 틀렸다
+ *
+ * 검색폼의 매각기일 퀵버튼(당일/+7/+14)이 `new Date().toISOString().slice(0, 10)`
+ * 으로 "오늘"을 만들고 있었다. `toISOString()` 은 **UTC** 로 바꾸므로
+ * KST 09:00 이전에는 하루 전 날짜가 나온다(2026-09-01 08:33 KST 실측:
+ * `2026-08-31`). 그래서 오전에 "당일"을 누르면 **어제 날짜로 검색**돼
+ * 오늘 매각되는 물건이 통째로 안 나왔고, "+7" 은 8일 범위가 됐다
+ * (시작은 UTC 로 밀리고 끝은 +7일 뒤라 경계를 다시 넘어간다).
+ *
+ * `formatDday()` 와 **같은 기준**을 쓴다 — 새 정책을 만드는 것이 아니라
+ * 이미 선언된 `DISPLAY_TIME_ZONE` 을 입력쪽에도 적용하는 것이다.
+ */
+export function ymdPlusDays(ymd: string, days: number): string | null {
+  const base = parseYmdToUtcMs(ymd)
+  if (base === null || !Number.isFinite(days)) return null
+  const d = new Date(base + Math.trunc(days) * 86400000)
+  // `toISOString().slice(0, 10)` 이 아니라 UTC 자릿수를 직접 조립한다.
+  // 여기서의 `d` 는 UTC 자정이라 둘이 같은 값을 주지만, 자르는 모양을
+  // 한 군데라도 남겨 두면 `tests/source-contract.test.mjs` 의 금지 규칙에
+  // **예외 목록**이 필요해진다. 이 저장소는 예외 목록이 곧 두 번째 규약이
+  // 된다는 것을 이미 한 번 치렀다(Sprint 118). 그래서 규칙을 절대로 둔다.
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`
 }
 
 /**

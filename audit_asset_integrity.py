@@ -413,10 +413,11 @@ def audit_queue_vs_status(conn):
         JOIN auction_item ai ON ai.case_id = ac.id AND ai.item_no = dq.item_no
         JOIN document_status ds ON ds.item_id = ai.id
                                AND ds.doc_type = UPPER(dq.doc_type)
-        WHERE (dq.status = 'done' AND ds.status NOT IN ('READY', 'NO_IMAGE'))
-           OR (dq.status IN ('pending', 'refresh') AND ds.status = 'READY')
+        WHERE (dq.status = ? AND ds.status NOT IN ('READY', 'NO_IMAGE'))
+           OR (dq.status IN (?, ?) AND ds.status = 'READY')
         GROUP BY dq.status, ds.status
-    """).fetchall()
+    """, (_db.QUEUE_STATUS_DONE, _db.QUEUE_STATUS_PENDING,
+          _db.QUEUE_STATUS_REFRESH)).fetchall()
 
     _head("[5] document_queue <-> document_status")
     if not rows:

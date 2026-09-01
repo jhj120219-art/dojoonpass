@@ -992,6 +992,103 @@ def test_plan_catalog_rejects_silent_money_errors():
                "-> 정의만 있고 호출이 없으면 잘못된 표가 그대로 배포된다")
 
 
+
+
+# 구독 상태를 바꿔도 되는 유일한 자리. 이 목록을 늘리려면 그 파일이 전이 검증을
+# 스스로 해야 한다(`assert_subscription_transition` + 조건부 UPDATE + rowcount 확인).
+SUBSCRIPTION_STATUS_WRITERS = {"api/v1/subscriptions.py"}
+
+
+def test_only_one_module_updates_subscription_status():
+    """구독 상태 UPDATE 가 상태머신을 우회하지 않는가 (2026-09-01 신설).
+
+    ## 왜 필요한가 - 지금 지키는 것이 관례뿐이다
+
+    구독 상태 전이는 `subscriptions.py:change_status()` 하나가 담당한다. 그 함수는
+    `assert_subscription_transition()` 으로 전이를 검증하고, **읽었던 상태를 WHERE 에
+    다시 걸어**(조건부 UPDATE + rowcount) 경합을 막고, 만료된 구독을 되살릴 때
+    새 `expires_at` 을 요구한다(`ReactivationRequiresNewExpiry`).
+
+    실측(2026-09-01) 결과 지금은 아무도 우회하지 않는다 -
+    `admin.py` 는 `change_status()` 를 부르고, `payments.py` 는 **INSERT 만** 한다
+    (새 구독 생성은 이전 상태가 없으므로 전이 검증 대상이 아니다).
+
+    그런데 그것을 지키는 검사가 없었다. 누가 다른 모듈에서
+
+        UPDATE subscriptions SET status='ACTIVE' WHERE id=?
+
+    를 한 줄 적으면 전이 검증도, 경합 가드도, 재활성화 시 만료일 요구도 **전부**
+    건너뛴다. 그리고 그것은 돈을 받는 쪽 상태라서, 틀려도 예외가 아니라
+    **잘못된 이용 권한**으로 나타난다.
+
+    ★ INSERT 는 대상이 아니다 - 생성에는 이전 상태가 없다. 여기서 보는 것은
+      **이미 있는 행의 status 를 바꾸는 UPDATE** 뿐이다.
+    """
+    import ast
+    import re
+    import subprocess as _sp
+
+    print("\n--- 구독 상태 UPDATE 가 한 모듈에만 있는가 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "*.py"], cwd=root,
+                      capture_output=True, text=True, timeout=30)
+    except (OSError, _sp.SubprocessError) as exc:
+        print("   [SKIP] git 을 실행할 수 없다 (%s)" % type(exc).__name__)
+        return
+    if out.returncode != 0:
+        print("   [SKIP] git 저장소가 아니다")
+        return
+
+    rels = [p for p in out.stdout.split()
+            if p.endswith(".py") and "-DESKTOP-" not in p
+            and not os.path.basename(p).startswith("test_")]
+    check_true("검사가 공허하지 않다(제품 .py 를 찾았다) - %d개" % len(rels), len(rels) >= 40)
+
+    # `UPDATE subscriptions ... SET ... status ...` 형태. 주석/독스트링은 제외한다.
+    upd = re.compile(r"UPDATE\s+subscriptions\b[^;]*?\bSET\b[^;]*?\bstatus\s*=", re.I | re.S)
+    offenders = []
+    for rel in rels:
+        if rel in SUBSCRIPTION_STATUS_WRITERS:
+            continue
+        try:
+            src = open(os.path.join(root, rel.replace("/", os.sep)),
+                       encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        # 문자열 상수만 본다 - 주석/설명문에 적힌 것은 결함이 아니다.
+        # AST 로 뽑으면 중쿠표 중첩을 걱정할 필요가 없다
+        # (정규식으로 리터럴을 직접 걱어내려다 한 번 틀렸다).
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant):
+                continue
+            if isinstance(node.value, str) and upd.search(node.value):
+                offenders.append("%s:%d" % (rel, node.lineno))
+                break
+    check("★ subscriptions.status 를 직접 UPDATE 하는 다른 모듈", sorted(offenders), [])
+    if offenders:
+        print("      -> change_status() 를 쓰라. 직접 UPDATE 하면 전이 검증/경합 가드/"
+              "재활성화 만료일 요구를 전부 건너뛴다")
+
+    # 정본이 실제로 그 UPDATE 를 갖고 있는가(있어야 위 검사가 의미를 갖는다).
+    owner = open(os.path.join(root, "api", "v1", "subscriptions.py"),
+                 encoding="utf-8-sig").read()
+    check_true("정본(subscriptions.py)이 status UPDATE 를 갖고 있다",
+               bool(upd.search(owner)))
+    check_true("정본이 전이 검증을 부른다",
+               "assert_subscription_transition" in owner)
+
+    # 자기 검증: 탐지기가 실제로 그 모양을 잡는가.
+    check_true("자기 검증: 직접 UPDATE 문자열을 잡는다",
+               bool(upd.search("UPDATE subscriptions SET status=?, updated_at=? WHERE id=?")))
+    check_true("자기 검증: INSERT 는 잡지 않는다",
+               not upd.search("INSERT INTO subscriptions (user_id, status) VALUES (?,?)"))
+
+
 def run():
     test_row_to_subscription_shapes_agree()
     test_plan_prices()
@@ -1007,6 +1104,7 @@ def run():
     test_entitlement_judgments_agree()
     test_renew_state_matrix()
     test_renew_concurrent_guard()
+    test_only_one_module_updates_subscription_status()
 
     print("\n" + "=" * 55)
     if failures:

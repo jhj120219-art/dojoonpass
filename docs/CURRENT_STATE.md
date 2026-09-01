@@ -10857,3 +10857,1072 @@ tsc 0 · eslint 0 · npm run build 성공
 
 세션 중 제 실수 둘도 검사가 잡아 고쳤다 — 출력 리터럴의 em-dash(cp949 콘솔에서
 프로세스가 죽는다)와 `docs/BUGS.md` 줄끝 뒤집힘.
+
+
+## 2026-09-01 Sprint 274 — 오전에만 틀리던 날짜 하나, 그리고 "초록인데 안 재고 있던" 감사 둘
+
+### 기준선 (세션 시작 시 실측)
+
+```
+branch master / HEAD 0536603 / working tree clean
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,745
+node     288건 / 284 pass / 0 fail / 4 skip        (서버 두 개를 띄운 뒤)
+tsc 0 · eslint 0 · npm run build 성공
+```
+
+**node 게이트는 서버가 없으면 62건이 cancelled 로 죽는다** — `frontend-contract` 가
+일부러 그렇게 설계돼 있다("백엔드 없이 통과한 결과를 게이트 통과로 오해하면 안 된다").
+그래서 이 세션은 FastAPI + Next 를 띄운 상태에서 쟀다.
+
+### 실패 4건의 원인을 각각 확인했다 — 하나는 그동안 잘못 묶여 있었다
+
+```
+test_bootstrap          마이그레이션 021~026 미적용   (이 머신의 DB 는 020)
+test_schema_hygiene     같은 원인
+test_auction_identity   025 미적용 -> building_area/land_area 없음. 스스로 [중단]
+test_pipeline_integrity ★ 마이그레이션과 무관하다 — BUGS #224 의 지역 데이터 백필
+                          (`backfill_region_normalize.py`)이 이 DB 에는 안 돌았다
+                          (드리프트 sido 4 / sigungu 207, 오염 1)
+```
+
+넷 다 환경이지 코드 결함이 아니다. 다만 **"전부 마이그레이션 지연"이라는 요약은
+틀렸다** — 넷째는 데이터 복구 미적용이다. 적용은 DB 쓰기라 승인 영역이므로 하지 않았다.
+
+### #270 검색폼 "당일" 이 어제를 검색하고 있었다 (실사용 결함)
+
+```ts
+const toISODate = (d: Date) => d.toISOString().slice(0, 10)   // toISOString 은 UTC
+```
+
+이 문장을 쓴 시각(2026-09-01 08:48 KST)에 실제로 재현했다.
+
+```
+고치기 전  "당일"   2026-08-31 ~ 2026-08-31   <- 어제. 오늘 매각 물건이 0건으로 나온다
+고치기 전  "+7"     2026-08-31 ~ 2026-09-07   <- 8일 범위
+고친 뒤    "당일"   2026-09-01 ~ 2026-09-01
+고친 뒤    "+7"     2026-09-01 ~ 2026-09-08
+```
+
+KST 09:00 **이전에만** 틀리므로 낮에 재현하면 멀쩡하다. 오류도 빈 화면도 아니고
+"그날은 물건이 없네"로 보인다. Sprint 273 이 `DISPLAY_TIME_ZONE` 으로 고친 것은
+**보여 주는 쪽**(D-day·로케일)이었고, 이것은 **입력을 만드는 쪽**이라 그물에 안 걸렸다.
+
+`src/lib/format.ts` 에 `ymdPlusDays()` 신설(날짜 문자열만 다룬다 — 시각을 끼우지 않아
+시간대도 서머타임도 개입할 자리가 없다). `daysBetween` 이 따로 들고 있던 파서도
+`parseYmdToUtcMs()` 하나로 합쳤다. CSV 파일명(`ExportButtons.tsx`)도 같은 결함이었다.
+
+**검사를 처음 쓸 때 공허했던 것도 같이 기록한다.** 탐지기를
+`new Date().toISOString().slice(` 로 잡았는데 실제 결함 코드는 `d.toISOString().slice(...)`
+로 **한 단계 건너서** 쓰고 있었다. 원래 코드를 되돌려 넣는 변이가 그것을 잡아,
+수신자를 가리지 않는 `\.toISOString\(\)\s*\.slice\(` 로 고쳤다. **자르는 행위만**
+금지하고 전체 ISO 직렬화는 허용한다. 예외 목록을 만들지 않으려고 `ymdPlusDays()`
+자신도 `toISOString()` 을 쓰지 않는다(Sprint 118: "예외 목록은 곧 두 번째 규약이 된다").
+
+### #271 `audit_viewport.py` 가 가장 복잡한 화면을 안 재고 초록을 찍고 있었다
+
+검색 화면을 `?sido=서울` 로 열었는데 이 DB 에서는 **0건**이다. 즉 재던 것은 카드가
+하나도 없는 빈 목록이고, 상세 표본도 거기서 뽑으므로 **상세는 통째로 건너뛰어졌다.**
+그러고도 종료코드는 0이었다. Sprint 240 이 좁은 폭에서 찾은 결함 3종 중 **둘이 바로
+그 카드**에 있었다.
+
+카드가 0장이면 `include_closed=true`(UI 에도 있는 정식 조건)로 한 번 더 시도해
+**카드가 나오는 조건으로 바꿔 재고**, 그래도 0장이면 **측정 불가(종료코드 2)** 로 센다.
+
+```
+고치기 전   /search 카드 0장 · 상세 건너뜀   정상 18 / 결함 0 / 측정불가  0   exit 0
+고친 뒤     /search 카드 20장 · 이미지 9장   정상 18 / 결함 0 / 측정불가  0   exit 0
+변이(없는 시/도)                            정상 18 / 결함 0 / 측정불가 12   exit 2
+```
+
+**결함 수는 그대로 0이지만 이제 그 0은 실제로 잰 0이다.**
+그래서 `docs/BETA_RELEASE_CHECKLIST.md` 의 *"모바일 실뷰포트 확인 — 확인 불가"* 는
+stale 이다(Sprint 223 기준이고, Sprint 242 가 도구를 만들었다). 320/360/390/430/900/1400px
+여섯 폭 실측으로 대체했다. 로그인이 필요한 네 화면은 여전히 `AUTH` 로 남는다 —
+통과로 세지 않으므로 숨겨지지는 않는다.
+
+### 오염 검출기가 감사 가드와 **다른 답**을 하고 있었다
+
+```
+detect_stale_region_contamination_dryrun.py   오염 의심 0건
+test_pipeline_integrity.py §12                오염 1건 (id=1768 `sigungu='갑구'`)
+```
+
+같은 질문에 두 도구가 다른 답을 했고 **감사 쪽이 틀렸다.** 그 스크립트만 판정을
+자기 안에 따로 적고 있었다(`stored in addr` — 대괄호까지 포함한 원문 전체와 대조).
+BUGS #224 가 남은 위험으로 정확히 그것을 적어 두었고("원문에 있으면 통과라 위 유형을
+여전히 못 잡는다"), 이 머신에서 실제로 갈렸다.
+
+정본(`backfill_region_normalize.is_stale_contamination`)을 불러 쓰도록 바꿨다.
+이제 셋(백필 / 가드 / 검출기)이 같은 함수 하나를 쓴다. 고친 뒤 검출기는
+`auction.id=1058` 과 `auction_item.id=1768` 을 찾는다 — **가드가 못 보던 `auction`
+테이블 쪽까지** 함께 드러났다. 되돌리는 변이로 0건 회귀를 재현했고 가드가 2/2 잡는다.
+
+### 프런트가 비교하는 Error Code 를 **값**까지 대조하게 했다
+
+`test_schema_hygiene.py` 는 프런트 `ERROR_CODES` 의 **키만** 보고 있었다. 런타임이
+비교하는 것은 값이다 — `FAVORITE_NOT_FOUND: 'FAVORITE_NOTFOUND'` 같은 오타면 그 분기는
+영원히 거짓이 되고, "이미 삭제된 관심물건"이 실패로 보인다. 키/값을 함께 뽑아
+셋(키=값 / 값이 실제 방출됨 / 값이 서버 enum 에 있음)을 확인한다. 변이 3/3 검출.
+
+### 즐겨찾기 토글 두 벌이 갈라지지 않게 고정했다
+
+`search/FavoriteButton.tsx` 와 `properties/[id]/page.tsx` 에 같은 토글이 두 벌 있다.
+합치지 않았다 — 실제로 다른 것이 있다(로그인 복귀 대상, 상세에만 필요한 `idRef`
+늦은 응답 가드). **데이터의 정본은 하나**(`/api/v1/favorites` + 정수 `item_id`)이고
+갈라지는 것은 화면 사정뿐인데, **갈라지면 안 되는 부분을 지키는 것이 주석뿐**이었다.
+소스 계약 7검사 신설(엔드포인트/식별자, "이미 원하는 상태"는 실패가 아님, 문구 아닌
+Error Code 로 분기, 실패 시 하트를 뒤집지 않음, 401/403, 재진입 가드). 변이 2/2 검출.
+
+### 확인만 하고 고치지 않은 것
+
+```
+빈 검색 결과 문구        조건 없는 0건은 "현재 공개된 경매 물건이 없습니다 /
+                        검색조건 때문이 아닙니다" 가 **실제로** 나온다(라이브 확인).
+                        문서 기록과 코드가 일치한다
+날짜 표시(관심물건/최근본/마이페이지)  `datetime.now().isoformat()` 이 만든 naive 문자열을
+                        브라우저가 로컬로 파싱하고 로컬로 찍는다 — 대칭이라 KST 달력
+                        날짜가 그대로 보인다. `timeZone` 을 붙이면 오히려 깨진다
+Number/Money            원/만/억 산술이 `src/lib/format.ts` 밖에 0곳
+audit_test_reality      의심 6건 전부 도구가 스스로 주석한 부류(드리프트 가드/subprocess)
+```
+
+### 승인이 필요해 건드리지 않은 것
+
+```
+마이그레이션 021~026 적용 / 지역 백필 --apply     운영·로컬 DB 쓰기
+대비 4.5:1 · 탭 타깃 44px (미달 81 / 44)          제품 결정
+#69 만료 물건 문서가 영원히 "수집중"               상태머신·문구 결정
+#13 KG이니시스 실 API                             외부 계정
+#190 운영 DB ANALYZE                              운영 DB 쓰기
+로그인 화면 4종 실뷰포트 측정                      실제 세션 쿠키 필요
+OneDrive 충돌 사본 8개 삭제                        어느 판본이 최신인지는 사람 판단(#253)
+```
+
+### 게이트 (세션 종료 시)
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,770  (10,745 -> 10,770)
+         실패 4건은 세션 전과 **동일**하고 원인을 각각 확인했다(위 참고)
+node     309건 / 305 pass / 0 fail / 4 skip        (288 -> 309)
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — Sprint 272 기록과 **같다**
+            (이 세션은 전부 읽기 전용 / dry-run 이다)
+```
+
+
+## 2026-09-01 Sprint 275 — timezone 결함의 "원인 구조"를 끝까지 따라가고, 같은 패턴을 전수로 분류했다
+
+Sprint 274 가 찾은 `#270`(검색폼 "당일"이 어제를 검색)을 한 줄 수정으로 닫지 않고,
+**같은 종류가 저장소 어디에 더 있는지** 전수로 셌다.
+
+### 전수 분류 — 파이썬 166개 / 프런트 43개, 한 곳도 빠뜨리지 않았다
+
+```
+파이썬 (제품)                        건수    판정
+  datetime.now()                      63    SAFE  naive 로컬. 저장 형식의 정본
+  date.today()                         3    SAFE  서버 로컬. 배포 결정(승인 영역)
+  datetime('now','localtime')          4    SAFE  _NOW_LOCAL 상수 하나
+  strftime/strptime                   25    SAFE  전부 %Y-%m-%d 날짜-only
+  fromisoformat                        6    SAFE  자기가 쓴 naive 문자열을 되읽는다
+  utcnow() / timezone.utc              0    ----  제품에 없다
+  CURRENT_TIMESTAMP                    0    ----  제품에 없다
+
+프런트 (src/**, 16곳)
+  DISPLAY_TIME_ZONE 경유               6    SAFE  format.ts 안에서만
+  new Date(값).toLocaleDateString      3    SAFE  ★ 아래 "대칭" 참고
+  new Date().toISOString()             1    SAFE  rightsAnalysis 의 generatedAt(전체 ISO)
+  toISOString().slice()                0    ----  #270 에서 제거, 소스 계약이 금지
+```
+
+### 왜 `toLocaleDateString('ko-KR')` 세 곳은 고치면 안 되는가 (대칭)
+
+관심물건/최근본/마이페이지의 날짜는 백엔드가 `datetime.now().isoformat()` 으로 남긴
+**naive 문자열**이다. 브라우저는 오프셋 없는 datetime 을 **로컬로 파싱**하고, 인자 없는
+`toLocaleDateString` 은 **로컬로 찍는다.** 들어갈 때와 나올 때가 같은 시간대라 상쇄되고,
+결과적으로 **어느 나라에서 봐도 한국 달력 날짜**가 그대로 보인다.
+
+여기에 `timeZone: 'Asia/Seoul'` 을 붙이면 **오히려 깨진다** — 이미 로컬로 해석된 값을
+한 번 더 옮기게 되어, 자정 근처 값이 하루 밀린다. "시간대를 명시하는 게 안전하다"는
+직관이 정확히 틀리는 자리라 근거를 남긴다.
+
+### 그 대칭을 지키는 것이 아무것도 없었다 — §9-b 신설
+
+`test_pipeline_integrity.py` §9 는 SQLite 쪽(`datetime('now')` -> UTC)만 봤다.
+**파이썬이 무엇을 문자열로 남기는가**는 아무도 안 지켰다. 깨지면 세 군데가 동시에,
+조용히 틀린다.
+
+```
+1. 문자열 비교가 무너진다   subscriptions.py: `row["expires_at"] <= now.isoformat()`
+                            한쪽만 +09:00 이 붙으면 사전순 비교가 뒤집힌다
+2. SQLite 비교와 어긋난다   §9 가 맞춰 놓은 localtime 기준과 다시 갈린다
+3. 화면 날짜가 하루 밀린다   위 대칭이 깨진다
+```
+
+§9-b `test_python_timestamps_are_naive_local()` 신설 — AST 로 `utcnow()` /
+`now(<tz>)` / `astimezone()` / `tzinfo=` 를 전부 잡는다. 제품 96개 파일 **위반 0건**.
+변이(`favorites.py` 를 `datetime.now(timezone.utc)` 로) **1/1 검출**.
+
+테스트의 tz-aware 4곳은 전부 JWT 의 `exp`(규격상 UTC)다. 이것을 **파일 이름 목록**으로
+두려다 멈췄다 — 처음엔 `test_auth_jwt.py` 만 적었는데 `test_api_regression.py` 가
+`timezone as _tz` 로 import 해 같은 일을 하고 있었다(grep 으로는 안 보이고 AST 라서
+잡혔다). 목록 대신 **이유**를 검사한다: `exp` 키를 가진 dict 안에서 만들어졌는가.
+
+### 시각·날짜 계약을 문서에 처음으로 적었다
+
+`docs/architecture.md` 에 절을 신설했다. 이 저장소에는 **의미가 다른 날짜가 네 종류**
+있는데(사건 발생일 / 수집일 / 행 생성·수정 시각 / 화면의 "오늘"), 그 구분이 코드 주석에만
+흩어져 있었다. 새 정책이 아니라 **실측한 현재 동작의 기록**이다.
+
+`crawl_date`(`datetime.today().strftime`, 수집일)와 `auction_date`(법원 값, 사건일)가
+섞이지 않는 것, `filed_date` / `demand_deadline` / `priority_date` 같은 사건 날짜가
+`new Date()` 를 한 번도 거치지 않고 **문자열 그대로** 화면에 찍히는 것도 확인했다.
+
+### 고치지 않은 불일치 하나 (제품 결정)
+
+```
+calc_priority()   `(자정 - datetime.now()).days` -> **달력 일수 - 1**
+                  같은 auction_date 에 대해 화면 배지(formatDday)는 달력 일수를 쓴다
+                  달력 4일 뒤: 배지 "입찰 4일전" / 큐 등급 days_left=3 -> 최우선(1)
+```
+
+BUGS #237 이 이미 이 오프셋을 재고 **"제품 동작은 그대로 둔다"** 고 결정했다. 그 결정은
+존중한다. 다만 당시 근거가 *"지금 코드가 스스로 일관되지 않다는 근거는 없다"* 였는데,
+Sprint 273 이 `formatDday()` 를 만들면서 **두 번째 정의가 생겨 그 전제가 무효**가 됐다.
+결정을 뒤집지 않고 **근거만 갱신**해 `test_document_queue.py` 주석에 남겼다 —
+3일/7일 등급의 경계를 옮기는 것은 "어떤 물건을 먼저 받는가"라는 정책이다.
+
+### Frankenstein — 프런트/데이터/테스트 축을 새로 훑었다
+
+```
+프런트 같은 이름 중복 정의   3건
+  fetchData x3        SAFE  화면마다 다른 엔드포인트를 부르는 지역 함수
+  handleToggleFavorite x2   Sprint 274 에서 계약으로 고정
+  redirectToLogin x2  ★ 아래
+동일 엔드포인트 중복 fetch   0건 (엔드포인트마다 정본이 하나)
+면적 두 구현의 경계          유지됨 — 화면은 displayArea() 만 부른다(parseArea 직접 호출 0)
+상세 화면의 세 번째 면적 구현 없음
+audit_asset_integrity 의 쓰기 전부 **스냅샷 사본**(selftest). "읽기 전용" 주장 유효
+auction_item 쓰기            migrate_execute.py 하나 + backfill(025 전용). 우회 경로 0
+```
+
+**로그인 복귀 생산자 10곳 / 소비자 2곳** — 소비자 쪽만 계약이 있었다(§3.4).
+생산자 하나가 파라미터 이름을 바꾸면 `formData.get('redirect')` 가 null 이 되고
+`sanitizeRedirectPath(null)` 이 기본값 `'/'` 을 돌려준다. **오류 없이 첫 화면**으로
+보내지고 어디에도 실패가 남지 않는다 — §3.4 가 막으려던 회귀를 아직 아무도 안 보던
+쪽에서 재현할 수 있었다. 소스 계약 4검사 신설, 변이 2/2 검출.
+
+### 상태 라벨표가 백엔드 enum 을 덮는가 — 경계를 못박았다
+
+화면은 `LABEL[v] ?? v` 로 그린다. 라벨이 없으면 **영문 코드가 그대로 사용자에게 보인다.**
+폴백 자체는 의도된 것이지만(`mypage` 주석: "임의로 뭉뚱그리면 새 상태를 오해한다"),
+**enum 에 이미 선언됐는데 라벨이 없는 값**은 다른 이야기다.
+
+```
+SUBSCRIPTION_LABEL      SubscriptionStatus       전부 덮음
+PAYMENT_TYPE_LABEL      PaymentType              전부 덮음
+REGISTRY_LABEL          RegistryRequestStatus    전부 덮음
+PAYMENT_LABEL           PaymentStatus            ★ CREATED / READY / REQUESTED 없음
+REGISTRY_STATUS_LABEL   RegistryRequestStatus    ★ PAYMENT_REQUIRED 없음
+```
+
+`REGISTRY_STATUS_LABEL` 쪽은 **의도된 것**이다 — 그 파일 주석이 "PAYMENT_REQUIRED 는
+JSX 에서 결제 버튼 분기로 따로 처리한다"고 적었고 실제로 그 분기가 폴백보다 앞에 있다.
+확인하고 고치지 않았다.
+
+`PAYMENT_LABEL` 의 셋은 **결제창 호출 전/중 상태**다. MockProvider 는 항상 즉시
+성공이라 지금은 도달하지 않지만, 실 PG 연동 후 사용자가 결제창을 닫으면 실제로 남고
+그때 화면에 `READY` 가 영문 그대로 보인다. **문구를 지어내지 않았다**(사용자 문구는
+제품 결정). 대신 `KNOWN_UNLABELED` 로 경계를 고정해, 새 상태가 생기면 붉어지게 했다.
+변이(enum 에 값 추가) **2/2 검출**.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,803  (10,770 -> 10,803)
+         실패 4건은 세션 전과 동일(원인은 Sprint 274 기록 참고)
+node     313건 / 309 pass / 0 fail / 4 skip        (309 -> 313)
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 여전히 무변경
+```
+
+
+## 2026-09-01 Sprint 276 — Frankenstein 잔여 축(데이터/사본)과 파이프라인 계약을 코드로 마무리
+
+Sprint 275 가 끝낸 시각 계약 위에서, 아직 안 훑은 축(스키마 컬럼 의미 / 산출물 폴더의
+사본 / 정규화기-저장 계약)을 봤다. **실데이터가 필요한 검증은 하나도 하지 않았다** —
+전부 소스·스키마·AST 대조이고, `auction.db` 는 이번에도 한 바이트도 바뀌지 않았다.
+
+### 죽은 배선 하나 — 세 필드가 계산돼서 버려지고 있었다
+
+```
+models/auction_item.py     has_spec_pdf / has_status_pdf / has_appraisal_pdf  (전부 기본값 False)
+crawler/                   이 셋에 값을 대입하는 곳 **0곳** (전수 확인)
+normalizer/normalizer.py   출력 dict 에 셋을 그대로 담는다
+storage/database.py        UPSERT_SQL 은 그 자리에 **리터럴 0 을 박는다**  VALUES (...,0,0,0,...)
+실제로 1 로 만드는 것       문서 수집 쪽(LEGACY_HAS_COLUMN)
+```
+
+지금 고장난 것은 없다. 문제는 **함정**이라는 것이다 — 출력 dict 의 다른 키는 전부
+upsert 로 흘러가므로 이 셋도 그럴 것처럼 읽힌다. 게다가 `has_status_pdf` 는
+**어떤 컬럼과도 이름이 맞지 않는다**(컬럼은 Step 9 에 `has_status_doc` 으로 개명됐고
+모델/정규화기만 옛 이름으로 남았다). 누가 "dict 를 그대로 upsert 에 넘기자"고 고치는
+날, 그 필드만 조용히 사라진다.
+
+**지우지 않았다.** 필드 제거는 `models`/`normalizer` 의 공개 형태를 바꾸는 일이고
+(docs/CLAUDE.md: 시그니처 유지 / 임의 삭제 금지) 지금 깨진 것이 없다. 대신
+`test_normalizer.py` 에 `run_normalized_keys_reach_storage()` 를 신설해 **경계를
+못박았다** — 대응 컬럼이 없는 키 / upsert 가 값을 안 싣는 키 / 크롤러가 대입하지
+않는다는 사실을 각각 고정한다. 변이(정규화기 키를 `has_status_doc` 으로 개명) 2/2 검출.
+
+### `logs/` 안에 파이프라인 진입점의 2026-08-03 판본이 있었다
+
+```
+logs/mvp_scraper.py       130줄   (정본 332줄)   RunLock 0곳 (정본 3곳)
+logs/doc_worker.py        111줄                  RunLock 0곳 (정본 4곳)
+logs/refresh_priority.py   30줄
+```
+
+**import 가 깨져 있지 않다** — `get_courts_by_region` 은 지금도 있다. 즉
+`python logs/mvp_scraper.py` 가 그대로 돌아 실제 크롤을 하고 실제 DB 에 upsert 하며,
+**락이 없으므로** 예약 크롤과 동시에 돈다. Sprint 246 이 "락 파일이 갈라지면 중복 실행
+방지가 조용히 무력화된다"고 실측해 둔 상황을, 락 자체가 없는 사본은 더 쉽게 만든다.
+
+### ★ 여기서 내가 먼저 Frankenstein 을 만들 뻔했다
+
+이 사본을 잡는 검사를 **새로 만들었다.** 그런데 변이를 넣어 보니 내 검사와 함께
+`★ 제품 이름을 가리는 사본이 늘지 않았다 (현재 4개, 상한 3개)` 가 같이 붉어졌다 —
+**같은 부채를 세는 검사가 이미 있었다**(BUGS #262). 내가 만든 것은 두 번째 판본이었다.
+
+지웠다. 대신 기존 검사에 **없던 근거만 보탰다** — #262 는 이 사본을 "sys.path 오염으로
+낡은 판본을 import 하게 되는 것"으로 설명하는데, 실측하니 위험은 import 만이 아니라
+**그냥 실행된다**는 것이었다. 사본 중 RunLock 이 빠진 것을 따로 고정했다.
+
+이번 세션의 목적이 "중복 구현보다 기존 Source of Truth 를 우선한다"인데 그것을
+검사에서 어길 뻔했다. **새 검사를 쓰기 전에 같은 것을 세는 검사가 있는지 먼저 찾는다.**
+
+### 문서수집상태 배지 — 넣었다가 **되돌렸다** (같은 규칙을 두 곳에서 세지 않는다)
+
+`LABEL_TABLES` 에 `DOC_STATUS_LABEL`(문서수집상태 배지)을 추가했다. 그런데 다시 찾아보니
+`test_queue_safety_invariants.py` 의 문서 상태 어휘 계약 (e) 가 **이미 같은 것을
+검사하고 있었다** — `DOCUMENT_STATUSES_IN_USE` 와 화면 라벨표를 대조한다.
+
+되돌렸다. 그 파일이 문서 상태 어휘의 정본을 지키는 자리이므로 라벨 검사도 거기 있는
+것이 맞다. `LABEL_TABLES` 에는 **왜 여기 없는지**를 주석으로 남겨, 다음 사람이 같은
+이유로 다시 추가하지 않게 했다.
+
+이 세션에서 이런 일이 **두 번** 있었다(사본 검사 / 이 라벨 검사). 둘 다 변이나 재탐색이
+잡아 줬다. 검사를 새로 쓰기 전에 **같은 것을 세는 검사가 이미 있는지 먼저 찾는다** —
+중복 검사는 중복 구현과 똑같이 한쪽만 고쳐지는 날을 만든다.
+
+### 파이프라인 계약 — 실제 코드로 답한 질문들
+
+```
+크롤러가 정규화기를 우회하는가        아니다. mvp_scraper -> normalize_batch -> upsert_batch
+정규화기와 스키마가 다른 의미를 쓰는가  ★ 한 곳(위 has_* 배선). 고정함
+저장 전/후가 달라지는가              UPSERT_COMPARE_COLUMNS 한 곳에서 SET/WHERE 를 만든다
+검색이 별도 source 를 쓰는가          아니다. auction_item 하나
+상세가 검색과 다른 식별자를 쓰는가     아니다. 같은 auction_item.id
+문서 파이프라인이 물건 정체성을 우회하나 아니다. 큐는 (법원,사건,물건), 상태/원본은 item_id 인데
+                                    `_document_status_item_id()` **한 함수**가 다리이고,
+                                    쓰기 두 경로 모두 못 찾으면 warning 을 남긴다
+                                    (읽기는 None 이 정상 답이라 로그 없음 — 맞다)
+분석이 원천을 덮어쓰는가             아니다. rights_summary 쓰기는 load_rights_data.py 하나
+auction_item 쓰기 경로               migrate_execute.py + 025 전용 backfill. 우회 0
+Morning Brief                       ★ **이 저장소에 존재하지 않는다** (코드·문서 0건.
+                                    `check_morning.py` 는 새벽 크롤 결과를 세는 진단
+                                    스크립트지 제품 기능이 아니다). 만들지 않았다 —
+                                    없는 단계를 계약에 넣으면 그때부터 문서가 거짓말한다
+```
+
+### P0/P1 기능 — 전부 이미 있다. 만들지 않고 계약만 확인했다
+
+```
+관심물건 목록 / 검색 카드 즐겨찾기   구현됨. Sprint 274 에서 두 토글의 계약을 고정
+이미지 갤러리                      구현됨. 대표 이미지 + 썸네일 줄 + 라이트박스 +
+                                   깨진 이미지 폴백 + 상태 4분기
+                                   `_images_status()` 가 낼 수 있는 값은 실제로
+                                   READY/COLLECTING/NO_IMAGE/FAILED 넷뿐이고
+                                   화면 4분기가 정확히 그것을 덮는다
+문서수집상태 배지                   구현됨. 위 라벨 계약에 편입
+권리분석 신뢰도/충돌 배지            구현됨. DIRECT_CONFLICT / AGGREGATION_DIFFERENCE,
+                                   HIGH/MEDIUM/LOW, 소스별 상태, generatedAt.
+                                   `tests/rights-analysis.test.mjs` 19검사 통과
+                                   ("대조 상대가 없는데 HIGH" 결함은 이미 고쳐져 있다)
+case 정보 / crawl_date             구현됨. 상세에 "최근 수집일", 정렬 옵션에도 있다
+Number/Money                       원/만/억 산술은 여전히 format.ts 밖 0곳
+```
+
+### 내 실수 하나 — 검사가 잡았다
+
+`test_normalizer.py` 출력 리터럴에 em-dash(U+2014)를 넣어 `test_console_encoding.py`
+가 붉어졌다(cp949 콘솔에서 프로세스가 죽는 문자다). 회귀 실패 4 -> 5 로 즉시 드러나
+고쳤다. **stale `.pyc` 함정**도 하나 겪었다 — 변이를 되돌린 뒤에도 검사가 계속 붉었는데,
+개명한 키가 **바이트 길이가 같아** 파이썬의 (mtime, size) 검증을 통과해 낡은 `.pyc` 가
+재사용되고 있었다. 소스만 되돌리고 결과를 믿으면 안 된다.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,816  (10,803 -> 10,816)
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 3개 세션 연속 무변경
+```
+
+
+## 2026-09-01 Sprint 277 — 직전 세션의 결론을 다시 재고, 내 기록 하나를 정정했다
+
+이번 세션의 지시는 "직전 작업 결과를 무조건 신뢰하지 말고 실제 코드로 재검증하라"였다.
+그래서 새 기능을 만들지 않고 **앞 세 스프린트가 남긴 주장부터 다시 쟀다.** 그 결과
+내 기록 하나가 불완전했고, 내 검사 하나가 중복이었다.
+
+### 제품 코드 변경 3개 재검증 — 유지
+
+`format.ts` / `SearchForm.tsx` / `ExportButtons.tsx`. 실제 모듈을 불러 경계에서 다시 쟀다.
+
+```
+KST 23:59:59 / 00:00:00 경계     정확
+해 경계(2026-12-31 -> 2027-01-01) 정확
+윤년(2028-02-28 -> 02-29)         정확
+#270 재현 시각(KST 08:33)          2026-09-01  (예전 계산은 2026-08-31)
+출력 형식 YYYY-MM-DD               항상
+```
+
+### ★ 내 기록 정정 — `auction.has_*` 컬럼에는 **읽는 쪽이 있다**
+
+Sprint 276 은 producer -> model -> normalizer -> storage 까지만 추적하고 "죽은 배선"이라고
+적었다. 이번에 **API/프런트 끝까지** 훑고 나서 더 중요한 것을 찾았다.
+
+```
+API 계층      has_* 참조 0곳
+프런트        has_* 참조 0곳
+쓰기          문서 수집(LEGACY_HAS_COLUMN) 이 1 로 만든다
+읽기          ★ migrate_execute.py:475
+                 status = "READY" if row[col] == 1 else "COLLECTING"
+```
+
+즉 이 컬럼은 `document_status` 행을 처음 만들 때 **씨앗으로 읽힌다.** 죽은 것은
+**모델/정규화기의 세 필드**이지 컬럼이 아니다. 앞 기록만 읽고 "아무도 안 읽으니 지우자"로
+가면 새로 옮겨진 물건의 문서 상태가 전부 COLLECTING 으로 시작한다.
+
+`test_normalizer.py` 에 그 사실을 **검사로** 넣었다(주석이 아니라) — 읽는 쪽이 사라지면
+붉어진다. 독스트링의 "죽은 배선" 서술에도 범위를 못박았다.
+
+### ★ 검사 중복 하나 제거
+
+`DOC_STATUS_LABEL` 을 `LABEL_TABLES` 에 넣었는데, `test_queue_safety_invariants.py` 의
+문서 상태 어휘 계약 (e) 가 이미 같은 대조를 하고 있었다. 되돌리고 교차 참조만 남겼다.
+**이 세션에서 두 번째다**(앞은 사본 검사 vs BUGS #262). 검사를 새로 쓰기 전에 같은 것을
+세는 검사가 있는지 먼저 찾는다.
+
+### logs/ 사본 재검증 — 앞 기록이 맞았고, 하나를 더 확인했다
+
+```
+구문 컴파일        3개 전부 성공
+import 해결        미해결 0건 (실행하지 않고 정적으로 확인)
+운영 경로 참조     .bat / .ps1 에서 참조 **0건** -> 사람이 직접 실행할 때만 돈다
+RunLock            사본 0곳 / 정본 mvp_scraper 3곳 · doc_worker 4곳
+```
+
+`.bat`/스케줄러가 이 사본을 부르지 않는다는 것이 새로 확인된 부분이다 — 위험은
+"자동으로 돈다"가 아니라 "사람이 열거나 실행하면 돈다"이다. BUGS #262 의 [2](사람이
+읽고 제품으로 오해한다)가 실제로 더 큰 쪽이다.
+
+### 중복 SQL 전수 — 결함 아님
+
+파일을 넘나드는 동일 SELECT 6건을 찾았는데 전부 **PK 단건 조회**이거나
+`sqlite_master` 조회다(`SELECT * FROM registry_requests WHERE id=?` 등).
+공유된 업무 규칙이 복제된 곳은 없다. SAFE.
+
+### P0/P1/P2 — 전부 이미 구현되어 있다(재확인)
+
+```
+관심물건 · 검색 카드 즐겨찾기   구현 · 계약 고정됨
+이미지 갤러리                  구현 · 상태 4분기가 `_images_status()` 출력 넷을 정확히 덮음
+문서수집상태 배지               구현 · 어휘 계약이 지킴
+권리분석 신뢰도/충돌            구현 · 19검사 통과
+case / crawl_date              구현 · 상세에 "최근 수집일", 정렬 옵션에도 있음
+Number/Money                   format.ts 밖 산술 0곳
+경쟁사 마이페이지 가져오기       구현 (favorite_import + preview/commit)
+등기부 신청이력                 구현 (4 엔드포인트 + 마이페이지 이력 UI + 오류 상태)
+```
+
+**새로 만든 기능은 없다.** 전부 있었고, 이번 세션이 한 일은 그것을 확인하고 계약을
+고정한 것이다.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,818
+node     313건 / 309 pass / 0 fail / 4 skip   (FastAPI + Next 를 띄운 상태)
+tsc 0 · eslint 0
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 4개 세션 연속 무변경
+```
+
+
+## 2026-09-01 Sprint 278 — 손으로 유지하던 사본 둘을 "코드에서 유도된 것"으로 바꿨다
+
+이번 세션의 지시는 *"Repository 를 더 크게 만드는 것이 아니라 Frankenstein 이 생기기
+어려운 Repository 로 만드는 것"* 이었다. 그래서 새 기능을 만들지 않고, **정본과 사본이
+갈라져도 아무도 모르는 자리**를 찾아 그 둘을 묶었다.
+
+### 1) `DOCUMENT_STATUSES_IN_USE` — 손으로 유지하던 집합이 낡아도 알 수 없었다
+
+앞 스프린트가 "다음 후보"로 적어 둔 것을 실제로 쟀다. 기존 검사
+(`test_queue_safety_invariants.py`)는 이미 **코드에서 방출 값을 유도**하고 있었는데
+(`_set_document_status(...)` / `done_status` / `DOC_STATUS_HAS_ARTIFACT` 를 훑어
+`written` 을 만든다), 그것을 **선언 집합과만** 대조했다(`written ⊆ declared`).
+
+그래서 다음 구멍이 남아 있었다 — 누가 `OCR` 을 방출하기 시작하면
+
+```
+(b) 통과   OCR 은 선언돼 있다
+(c) 통과   DB 값도 선언 안에 있다
+(e) 통과   라벨은 in_use 만 보는데 OCR 이 거기 없으니 검사 대상조차 아니다
+결과       화면에 영문 "OCR" 이 그대로 나가는데 **어떤 검사도 붉어지지 않는다**
+```
+
+`written` 과 `in_use` 를 **양방향으로** 맞대게 했다(방출하는데 집합에 없다 /
+집합은 쓴다는데 방출이 없다). 실측 결과 지금은 둘이 정확히 같다
+(`COLLECTING, FAILED, NO_IMAGE, READY`). 변이로 확인했다 —
+`doc_worker.py` 가 `NO_IMAGE` 대신 `OCR` 을 쓰게 하자 **1/1 검출**(고치기 전에는
+네 검사가 전부 통과했다).
+
+**새 검사를 만들지 않았다.** 그 함수가 이미 `written` 을 유도하고 `in_use` 를 읽고
+있어서, 같은 불변식을 다른 파일에 또 쓰면 한쪽만 고쳐지는 날이 온다.
+
+### 2) 법원 목록 — 사본이 정본과 갈라져도 지키는 것이 주석뿐이었다
+
+`SearchForm.tsx` 의 `COURT_LIST` 는 `config/courts.py:ALL_COURTS` 를 손으로 옮긴
+사본이고, 그 파일 주석이 스스로 *"두 곳에서 관리하므로 함께 갱신해야 한다"* 고 적어
+뒀다. 그런데 **그 문장을 지키는 검사가 0건이었다**(전수 확인).
+
+어긋나면 어떻게 보이는가 —
+
+```
+백엔드에만 있는 법원   드롭다운에 아예 없다 -> 그 법원 물건은 영원히 법원으로 못 찾는다
+프런트에만 있는 법원   고를 수는 있는데 LIKE 매칭 0건 -> "그 법원은 물건이 없네"
+```
+
+`docs/BUGS.md` #33(물건종류 60개가 항상 0건)이 정확히 이 모양이었다.
+
+실측: 지금은 **60/60 일치**(이름+지역 쌍으로 대조). 결함은 없고 보장이 없었을 뿐이다.
+`test_schema_hygiene.py` 에 대조 검사를 넣었다. 변이(백엔드에 법원 하나 추가) **검출**.
+
+**왜 사본을 없애지 않았나**: 프런트가 런타임에 법원 목록 API 를 부르게 바꾸는 것은
+화면 로딩 순서와 API 계약을 바꾸는 일이라 최소 변경이 아니다. 지금 필요한 것은
+"갈라지지 않는다"는 보장이고 검사로 충분하다.
+
+**왜 기존 `test_court_list_integrity()` 에 넣지 않았나**: 거기는 마스터 **내부**
+무결성(개수 60 / 중복 / code==name / region ⊆ SIDO_LIST)을 본다. 둘 다 필요하다 —
+마스터가 완벽해도 사본이 낡으면 화면이 틀리고, 사본이 같아도 마스터가 깨지면 크롤이
+틀린다. 그 경계를 주석으로 명시했다.
+
+같은 부류를 더 찾아봤더니 `SIDO_LIST` 는 **이미 대조 검사가 있었다**(1411행).
+법원만 빠져 있던 비대칭이었다. `property_type` 어휘도 이미 DB 대조 검사가 있다.
+
+### 3) PDF 상태 필드 — 계층별 reference graph 를 다시 그렸고, 앞 기록을 두 곳 정정했다
+
+git 추적 + 미추적 신규 전부(.py/.sql/.bat/.ps1/.ts/.tsx/.md)를 훑어 계층별로 갈랐다.
+
+```
+살아 있다 (건드리지 않는다)
+  auction.has_spec_pdf / has_status_doc / has_appraisal_pdf  (컬럼)
+    쓰기    storage/database.py  LEGACY_HAS_COLUMN (문서 수집)
+    읽기    migrate_execute.py:475  status = "READY" if row[col] == 1 else "COLLECTING"
+    스키마  storage/database.py CREATE + storage/migrations/012 (테이블 재생성)
+    건식주행 migrate_dryrun.py
+
+죽어 있다 (모델/정규화기 계층만)
+  AuctionItem.has_spec_pdf / has_status_pdf / has_appraisal_pdf
+    크롤러가 한 번도 대입하지 않는다(전부 기본값 False)
+    normalize_item() 이 dict 에 담지만 UPSERT_SQL 이 리터럴 0 을 박아 버린다
+
+호환용 (유지)
+  storage/database.py 의 has_status_pdf  — 옛 DB 를 위한 RENAME 블록
+```
+
+**앞 기록에서 두 가지를 정정했다.**
+
+```
+migrations/012          앞 세션은 못 봤다. 테이블 재생성 마이그레이션이 세 컬럼을 나른다
+                        -> 컬럼은 구조적으로 하중을 받고 있다. 드롭 후보가 아니다
+repair_document_status  "코드 참조"로 잡혔지만 실제로는 **독스트링 산문**이었다
+                        (내 분류기가 `#` 로 시작하지 않는 독스트링 줄을 코드로 셌다)
+```
+
+### 4) 중복 SQL / 프런트 중복 정의 재확인
+
+파일을 넘나드는 동일 SELECT 6건은 전부 PK 단건 조회이거나 `sqlite_master` 조회다.
+공유된 업무 규칙이 복제된 곳은 없다. 프런트 동명 정의 3건도 앞 세션 판정 그대로다
+(`fetchData` 는 화면마다 다른 엔드포인트를 부르는 지역 함수).
+
+### 이번 세션이 지킨 규칙
+
+검사를 새로 만들기 전에 **같은 것을 세는 검사가 있는지 먼저 찾았다.** 그 결과
+`DOCUMENT_STATUSES_IN_USE` 는 기존 검사 **확장**으로, `SIDO_LIST` 는 **이미 있어서
+아무것도 하지 않음**으로, 법원 목록만 **새 검사**로 갈렸다. 새로 만든 것은 하나뿐이고,
+왜 기존 검사로 해결할 수 없는지 코드 근거를 주석에 남겼다.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,824  (10,814 -> 10,824)
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 5개 세션 연속 무변경
+```
+
+
+## 2026-09-01 Sprint 279 — 앞 세션이 남긴 "다음 후보"를 재고, 그중 하나가 틀린 유추였음을 확인했다
+
+앞 세션은 `PAID_STATUSES` / `TERMINAL_PAYMENT_STATUSES` / `ENTITLED_SUBSCRIPTION_STATUSES`
+셋을 `DOCUMENT_STATUSES_IN_USE` 와 **같은 부류**로 보고 다음 후보로 적었다.
+실제로 재 보니 **셋이 서로 다른 성질**이었고, 그 유추는 절반만 맞았다.
+
+```
+DOCUMENT_STATUSES_IN_USE      "코드가 실제로 방출하는 값" — 코드에 대한 **사실 주장**
+                              -> 유도 가능. 앞 세션에 방출 지점에서 유도해 묶었다
+
+TERMINAL_PAYMENT_STATUSES     "나가는 전이가 없는 상태" — 전이표에 대한 **사실 주장**
+                              -> ★ 유도 가능. 이번에 묶었다
+
+PAID_STATUSES                 "이 상태는 돈을 받은 것인가"
+ENTITLED_SUBSCRIPTION_STATUSES "이 상태는 이용할 수 있는가"
+                              -> **유도 불가.** 전이 구조가 아니라 제품 판단이다.
+                                 방출 지점을 훑어도 "무슨 뜻인지"는 나오지 않는다.
+                                 억지로 유도 규칙을 만들면 우연을 규칙으로 굳히게 된다
+```
+
+`PAID ∩ TERMINAL = ∅` 이 현재 성립하지만 **불변식이 아니라 우연**이라 고정하지 않았다 —
+"완납 후 더 이상 전이가 없는 상태"는 개념적으로 둘 다일 수 있다.
+
+### TERMINAL 을 전이표에서 유도하게 묶었다 (기존 검사 확장)
+
+`PAYMENT_TRANSITIONS` 가 정본이고, 종결 = 나가는 전이가 없는 상태다. 실측 결과 선언과
+유도가 정확히 일치했다(`CANCELLED, EXPIRED, FAILED, REFUNDED`). 그런데 **둘이 갈라져도
+아무도 몰랐다.** 기존 `test_state_machines.py` §3 은 "지금 무엇이 종결인가"를 손으로
+나열해 고정할 뿐, 상수를 전이표에 묶지 않았다.
+
+변이 둘 다 검출했고, **기존 검사는 둘 다 놓쳤다**:
+
+```
+A. CANCELLED 에 나가는 전이 추가(더 이상 종결이 아님)
+   기존 §2 의 금지 전이 목록은 `(CANCELLED, PAID)` 한 쌍만 봐서 통과했다
+   -> 합법이 된 전이를 종결 가드가 계속 막게 된다
+B. 새 종결 상태를 넣고 TERMINAL 집합에 등록하지 않음
+   -> 막다른 상태를 "아직 진행 중"으로 취급하게 된다
+```
+
+전이표에 항목이 아예 없는 상태도 함께 막았다 — 빠지면 `.get()` 이 빈 집합이라
+**자동으로 종결처럼 보여서**, 위 대조만으로는 의도인지 누락인지 구별할 수 없다.
+
+### BUGS #272 — 두 문서가 인용하는 이중 차감 방지 근거가 아무것도 강제하지 않았다
+
+모듈 수준 컬렉션 상수 85개를 훑어 **검사에서 이름조차 언급되지 않는 32개**를 뽑았고,
+그중 하나에서 진짜 문제를 찾았다.
+
+`api/constants.py:ADJUSTMENT_REASONS` 는 016 마이그레이션 주석과 CHANGELOG 가 *"USAGE 를
+한도 계산에 넣으면 이중 차감"* 의 근거로 인용하는 상수인데, **코드에서 아무도 읽지
+않았다**(추적·미추적 전 파일형식 전수, `import *`·동적 접근 0건).
+
+게다가 서술 자체가 코드와 달랐다 — 합계(`get_credit_adjustment`)는 `reason_type` 으로
+**거르지 않고** 그 달 행을 전부 더하고, 실제 게이트는 `VALID_REASON_TYPES` 3종이다.
+즉 상수는 **존재하지 않는 필터**를, **들어올 수 없는 값(EVENT/REFUND)** 까지 포함해
+서술하고 있었다. `registry_credits.py` 주석은 정반대를 말해 둘이 모순이었다.
+
+진짜 위험은 안전이 게이트 하나에 걸려 있다는 것이다 — `VALID_REASON_TYPES` 에 USAGE 가
+더해지는 순간 이중 차감이 된다. **기존 27개 단언이 그 변이를 전부 통과했다**
+(기존 검사는 `log_credit_event` 경로만 봐서 `add_credit` 게이트 확대를 못 본다).
+
+상수를 지우지 않고 **검사가 읽게** 해서 두 문서의 인용이 참이 되게 했다.
+동작은 바꾸지 않았다 — 합계에 필터를 넣는 것은 과금 로직 변경(승인 영역)이다.
+
+### 나머지 31개 상수 — 판정
+
+```
+SAFE(유도할 정본이 없다)   점수 가중치 / 타임아웃 / 버튼 ID / 로그 패턴 / 이미지 종류 등
+SAFE(자기 완결 어휘)       payment_logs 의 VALID_LOG_STATUSES · VALID_WEBHOOK_STATUSES
+                          자기 테이블의 정본이고 게이트로 올바르게 쓰인다.
+                          SQL 리터럴 유출 0건(이미 test_state_machines 가 지킨다)
+보안(변경 안 함)           SENSITIVE_KEYS 22개. 재작(리스트/중첩/원본 불변)은
+                          test_api_regression 이 충분히 덮는다.
+                          **키를 정확 일치로 본다** — 실 PG 필드명을 모르는 상태에서
+                          부분 일치로 바꾸면 과다 재작 위험이 있어 손대지 않았다
+```
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,829 -> 10,836
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 6개 세션 연속 무변경
+제품 코드   이번 세션 변경 **0줄** (검사·문서만)
+```
+
+
+## 2026-09-01 Sprint 280 — 이름 패턴 전수 sweep, 그리고 상태머신을 우회할 수 있던 자리 하나
+
+이번엔 sweep 범위를 넓혔다. 앞 세션은 **파이썬 모듈 수준 상수만** 훑었는데, 이번에는
+`_IN_USE / _VALID / VALID_* / _TYPES / _STATUSES / _REASONS / _CODES / _LIST / _LABEL /
+_KEYS / _COLUMNS / _MAP / _ALIASES` 패턴을 **.py + .ts + .tsx 전부**에서 뽑았다(64개).
+
+### 이름만 보고 판단하지 않았다 — 3건이 오탐이었다
+
+```
+VALID_PAYMENT_TYPES   admin.py:56 / payments.py:32 에 **두 번** 정의  -> 중복 정본?
+  실제:   둘 다 `tuple(t.value for t in PaymentType)` — **같은 정본에서 각자 유도**한다.
+          손으로 적은 사본이 아니라 갈라질 수 없는 계산식이다. SAFE
+VALID_STATUSES (admin)  `tuple(s.value for s in RegistryRequestStatus)` — 유도. SAFE
+SIDO_LIST               config ↔ SearchForm 복제이지만 **이미 대조 검사가 있다**(1411행)
+```
+
+`ALL_STATUSES`/`COMMITTABLE`(mylist_import), `VALID_LOG_STATUSES`/`VALID_WEBHOOK_STATUSES`
+(payment_logs)는 **자기 테이블의 정본**이고 위에 정본이 없다. 억지로 유도하지 않았다.
+
+### DOC_TYPE_LABEL — 라벨 계약에 편입 (기존 검사 확장)
+
+`DocumentType`(SPEC/STATUS/APPRAISAL)과 정확히 일치하지만 대조가 없었다.
+`test_state_machines.py` 의 DocumentType 검사는 **SQL 리터럴** 검사라 성질이 다르다
+(확인 후 추가). `LABEL_TABLES` 에 한 줄 추가. 변이(새 문서 종류) 검출.
+
+### VALIDATION_STATUS_LABEL — 확인만 하고 두었다
+
+`{PASS, FAIL}` 인데 `AuctionItem` 의 기본값은 `PENDING` 이라 처음엔 구멍으로 보였다.
+추적해 보니 **PENDING 은 저장까지 갈 수 없다**:
+
+```
+mvp_scraper.py  validate_batch(218) -> normalize_batch(234) -> upsert_batch(245)
+validate_batch  [self.validate(item) for item in items]  — 건너뛰는 경로가 없다
+validate()      PASS/FAIL 을 무조건 대입한다
+DB 실측(어휘)   auction / auction_item 둘 다 PASS 1,864 · FAIL 12 · PENDING **0**
+영향 범위       validation_status 는 검색/마이그레이션 필터에 **쓰이지 않는다**(표시 전용)
+```
+
+즉 라벨표는 저장 가능한 값을 전부 덮는다. 잔여 위험은 "검증을 안 거치는 새 크롤 경로"
+뿐인데 그것은 라벨 문제가 아니라 배선 문제이고, 피해도 영문 배지 노출(표시)에 그친다.
+**검사를 늘리지 않았다** — 낮은 가치의 검사도 부채다.
+
+### ★ 숨은 writer 하나 — 구독 상태를 상태머신 없이 바꿀 수 있었다
+
+`payments / subscriptions / registry_* / payment_logs / payment_webhooks / audit_logs`
+등 13개 테이블의 writer 를 전수로 그렸다. 쓰기 파일이 여럿인 5개를 각각 확인했다.
+
+```
+payment_logs / payment_webhooks   payments.py 의 쓰기는 **payment_id 뒤채움**뿐이다.
+                                  페이로드를 쓰지 않으므로 재작(redaction) 우회 아님. SAFE
+subscriptions                     payments.py 는 **INSERT 만** 한다(새 구독 = 이전 상태가
+                                  없으므로 전이 검증 대상이 아니다). SAFE
+document_collect_failures         collect_documents + reset_failures(복구 도구). SAFE
+```
+
+그런데 **"상태 UPDATE 는 `change_status()` 만 한다"를 지키는 것이 관례뿐**이었다.
+그 함수는 전이 검증 + 조건부 UPDATE(경합) + 재활성화 시 새 만료일 요구를 한다.
+다른 모듈에서 `UPDATE subscriptions SET status=...` 한 줄을 적으면 **셋 다 건너뛴다.**
+돈을 받는 쪽 상태라 틀려도 예외가 아니라 **잘못된 이용 권한**으로 나타난다.
+
+`test_subscription_policy.py` 에 검사를 넣었다(INSERT 는 대상 아님 — 생성에는 이전
+상태가 없다). 변이(admin.py 에 직접 UPDATE 문자열 추가) **검출**.
+
+검사를 쓰다 한 번 틀렸다 — 정규식으로 문자열 리터럴을 직접 걷어내려다 중첩 따옴표에
+걸렸다. **AST 로 문자열 상수만 뽑는 방식**으로 바꿨다(주석에 적힌 SQL 은 자연히 빠진다).
+
+### #272 후속 — 결론 유지, 정책은 건드리지 않았다
+
+`ADJUSTMENT_REASONS` / `VALID_REASON_TYPES` 재확인. 앞 세션 결론 그대로다.
+`get_credit_adjustment` 의 `reason_type` 필터 추가와 EVENT/REFUND 의미 결정은
+과금 정책이라 **하지 않았다.** 두 상수의 서술 모순도 그대로 남는다(기록만).
+
+### SENSITIVE_KEYS — 구조만 확인, 변경 없음
+
+재작은 `mask_sensitive()` 한 곳이 담당하고 `_dump`/`audit_dump` 가 그것을 거친다.
+`test_api_regression.py` 가 리스트/중첩 dict/원본 불변까지 덮는다. 키를 **정확 일치**로
+보므로 `user_card_no` 같은 변형은 안 걸리지만, **실 PG 필드 스펙이 없는 상태에서**
+부분 일치로 바꾸면 과다 재작(운영자가 봐야 할 값이 가려짐) 위험이 있다. 지시대로 SKIP.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,836 -> 10,846
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 7개 세션 연속 무변경
+제품 코드   이번 세션 변경 **0줄** (검사·문서만. src/ 3파일은 앞 세션 #270 수정분)
+```
+
+
+## 2026-09-01 Sprint 281 — 내가 만든 첫 검사가 공허했고, 변이가 그것을 잡았다
+
+앞 세션이 남긴 후보("같은 hidden writer 검사를 `payments.status` 에도")에서 재개했다.
+결론부터: **writer 수를 세는 방식으로는 이 위험을 못 막는다**는 것을 변이로 확인했다.
+
+### payments.status writer 전수 (AST 문자열 상수 기준)
+
+앞 세션은 원문 정규식으로 훑었는데, 이번엔 AST 로 **문자열 상수만** 뽑아 다시 셌다
+(이어붙인 SQL·주석 오탐을 피하려고).
+
+```
+제품 코드   api/v1/payments.py  :383 INSERT / :694 UPDATE status / :845 UPDATE status
+            -> 제품 writer 는 이 파일 **하나**뿐이다 (앞 세션 결론과 같다)
+테스트      test_api_regression / test_race_conditions / test_admin_failure_injection
+            -> fixture 준비용 직접 쓰기. 정당하다
+```
+
+세 곳 모두 정당하다:
+
+```
+:383 INSERT   생성 — 이전 상태가 없으므로 전이 검증 대상이 아니다
+:694 환불     :672 에서 assert_payment_transition + 조건부 UPDATE(경합)
+:845 웹훅     :839 에서 assert_payment_transition + 조건부 UPDATE(경합)
+```
+
+### ★ 그런데 진짜 구멍은 "누가 쓰는가"가 아니라 "쓸 때 검증하는가"였다
+
+`test_subscription_policy.py` 의 hidden-writer 검사는 **정본 파일을 통째로 예외**로 둔다.
+그래서 **정본 모듈 안에** 검증 없는 상태 UPDATE 를 한 줄 더하는 변경은 그 검사의 사각이다.
+기존 §1/§2 는 `assert_payment_transition()` 이 올바로 동작하는지만 보므로, 아무도 그
+함수를 안 불러도 전부 통과한다.
+
+실측했다 — `api/v1/payments.py` 에 검증 없는 UPDATE 함수를 하나 추가하고:
+
+```
+test_state_machines.py        통과
+test_subscription_policy.py   통과 (exit 0)
+test_api_regression.py        통과 (exit 0)
+-> 저장소의 **어떤 검사에도 걸리지 않았다**
+```
+
+### ★★ 그리고 내가 처음 만든 검사도 그 변이를 놓쳤다
+
+함수 단위로 보되 *"같은 모듈 어디서든 검증을 부르면 통과"* 라는 폴백을 뒀는데,
+정본 모듈은 이미 다른 함수에서 검증을 부르므로 **새 함수는 그냥 통과**했다.
+즉 가장 중요한 자리를 못 보는 공허한 검사였다.
+
+변이가 그것을 잡아 고쳤다 — **같은 함수**를 기본으로 하고, 헬퍼로 빼는 리팩터링만
+허용하도록 호출 그래프를 **2단계까지만** 따라간다. 고친 뒤 변이 2/2 검출:
+
+```
+A. 정본 모듈에 검증 없는 UPDATE 함수 추가   -> 검출 (고치기 전에는 놓쳤다)
+B. refund_payment 의 검증 호출 제거          -> 검출
+```
+
+`test_state_machines.py` 에 넣었다(전이 기계를 소유한 파일). `payments` 와
+`subscriptions` 를 함께 본다 — 두 검사는 **보는 각도가 다르다**:
+
+```
+test_subscription_policy   어느 **모듈**이 상태를 쓰는가   (정본 파일은 예외)
+test_state_machines(신설)  쓰는 **함수**가 검증을 거치는가 (정본 파일 안까지 본다)
+```
+
+### 이번 세션이 남기는 교훈
+
+*"현재 값이 맞다"* 와 *"앞으로 틀어지지 않도록 보호된다"* 의 차이를 이번에 두 번 겪었다.
+첫 번째는 제품 코드에서(검증 호출이 관례로만 지켜지고 있었다), 두 번째는 **내 검사에서**
+(폴백 때문에 가장 중요한 변이를 놓쳤다). **변이를 넣어 보지 않았다면 둘 다 초록이었다.**
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,846 -> 10,851
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 8개 세션 연속 무변경
+제품 코드   이번 세션 변경 **0줄** (검사·문서만)
+```
+
+
+## 2026-09-01 Sprint 282 — registry_requests.status: canonical 이 **없다는 것**을 확인하고, 공통 근거만 고정했다
+
+앞 세션이 남긴 후보에서 재개했다. 결론부터 — *"ALLOWED_TRANSITIONS 가 canonical 인가"*
+의 답은 **아니오**였고, 그것이 결함이 아니라 **문서화된 설계**였다.
+
+### writer 전수 (AST 문자열 상수 + 함수 귀속)
+
+```
+제품
+  api/v1/admin.py:update_registry_request_status()   UPDATE status x3 (분기)
+  api/v1/payments.py:create_payment()                UPDATE status x1  <-- ★
+  api/v1/registry.py:create_registry_request()       INSERT x2 (생성)
+테스트  5개 파일 (fixture 준비용 직접 쓰기)
+```
+
+앞 세션이 "admin / registry / payments 세 파일"이라고 적었는데, 그중
+**`payments.py` 쪽은 registry 도메인 밖에서 registry 상태를 바꾸는 교차 writer** 다.
+파일 수만 세면 그 성격이 보이지 않는다.
+
+### ALLOWED_TRANSITIONS 는 canonical 이 아니다 — 관리자 경로 전용이다
+
+```
+admin.py:ALLOWED_TRANSITIONS = {"PENDING": {...}, "PROCESSING": {...}}
+  -> PAYMENT_REQUIRED 키가 **아예 없다**
+payments.py 는 PAYMENT_REQUIRED -> PENDING 을 실제로 수행한다
+```
+
+모순처럼 보였지만 `docs/STATE_MACHINES.md` §3 이 정확히 그렇게 적어 두었다 —
+*"`PAYMENT_REQUIRED` 는 **관리자 전이 대상이 아니다** — 결제 성공으로만 `PENDING` 이 된다"*.
+즉 키가 없는 것이 **유료 관문**이고, `test_api_regression.py:1865` 가 이미 그 사실을
+회귀로 고정하고 있다("PAYMENT_REQUIRED -> COMPLETED 는 거부").
+
+그래서 이 테이블에는 단일 canonical 전이표가 없고 두 경로가 각자 정당하다.
+**없는 canonical 함수를 발명하지 않았다**(제품 정책 결정이다).
+
+### 대신 두 경로의 **공통 근거**만 고정했다 — 조건부 UPDATE
+
+```
+admin.py     ALLOWED_TRANSITIONS 조회 + WHERE id=? AND status=?
+payments.py  WHERE id=? AND payment_id IS NULL AND status=PAYMENT_REQUIRED
+```
+
+둘 다 **출발 상태를 WHERE 에 다시 건다**(Sprint 39 가 TOCTOU 때문에 넣은 조건).
+이것이 없으면 (1) 전이 검증이 사라지고 (2) 다른 요청의 결과를 덮어쓴다.
+`test_state_machines.py` 의 기존 검사에 registry 규칙을 **확장**했다(새 파일 없음).
+
+### Mutation A/B/C — 무엇을 누가 잡는지 실제로 갈랐다
+
+```
+A. admin 의 ALLOWED_TRANSITIONS 검증 무력화
+   내 검사        통과(못 잡음)
+   test_api_regression  **exit=1 / [FAIL] 5줄** -> 기존 검사가 이미 지킨다
+   -> 중복 검사를 만들지 않았다. 이 자리는 이미 보호돼 있다
+
+B. 새 함수에 `UPDATE registry_requests SET status=? WHERE id=?` (출발 상태 조건 없음)
+   내 검사        **검출**
+   test_api_regression  exit=0 (못 잡음 — 아무 엔드포인트도 그 함수를 안 부른다)
+   -> 이 검사가 닫은 실제 구멍
+
+C. 기존 writer(payments)의 `AND status=?` 제거
+   C1(인자 개수 불일치)  기존 검사가 exit=1 이지만 [FAIL] 0줄 —
+                        sqlite 바인딩 오류로 **죽은 것**이지 계약을 잡은 것이 아니다
+   C2(인자 개수 맞춤)    내 검사 **검출** /
+                        test_race_conditions **exit=0** / test_api_regression **exit=0**
+   -> 결제가 **어떤 상태의 신청이든** PENDING 으로 되돌릴 수 있게 되는데
+      (이미 COMPLETED/FAILED 된 건 포함) 기존 검사는 전부 초록이었다
+```
+
+C1 을 "잡았다"로 셀 뻔했다. 종료코드만 보면 붉지만 **판정문이 0줄**이었다 —
+크래시와 검출을 구분하지 않으면 보호장치를 과대평가하게 된다.
+
+### 현재 정상 / 보호됨 구분
+
+```
+현재 정상이고 **보호됨**
+  admin 경로 전이 규칙          test_api_regression (변이 A 로 확인)
+  PAYMENT_REQUIRED 관문         test_api_regression:1865
+  출발 상태 조건부 UPDATE        ★ 이번에 추가 (변이 B·C2 로 확인)
+  결제/구독 상태 전이 검증       Sprint 281
+현재 정상이나 **보호 없음**
+  ADJUSTMENT_REASONS 서술 모순   과금 정책 (승인 영역)
+  SENSITIVE_KEYS 정확일치        실 PG 스펙 필요
+  logs/ 실행 가능한 사본          삭제는 승인 영역
+```
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,851 -> 10,852
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 9개 세션 연속 무변경
+제품 코드   이번 세션 변경 **0줄** (검사·문서만)
+```
+
+
+## 2026-09-01 Sprint 283 — document_queue.status: 계약은 있었지만 **범위가 좁았다**
+
+### 먼저 찾은 것: 전이표는 없고 어휘만 있다
+
+`grep QUEUE_TRANSITION` **0건**. 있는 것은 `storage/database.py:QUEUE_STATUSES`(8종)와
+그 어휘를 지키는 `test_queue_safety_invariants.py` (a)~(e) 다.
+**없는 전이표를 만들지 않았다** — 어떤 전이가 허용되는지는 제품 정책이다(STEP 10).
+
+### writer 전수 — 탐지기를 두 번 고쳤다
+
+처음 만든 WHERE 탐지기가 **모든 writer 를 "가드 없음"으로** 찍었다. 원인은
+`(?:=|IN)\b` 의 후행 `\b` — `=` 다음이 `?` 라 단어 경계가 성립할 수 없다. 정규식이
+틀렸는데 결과는 그럴듯해서, 그대로 믿었으면 "15곳 전부 무방비"라고 보고할 뻔했다.
+
+고친 뒤의 실제 그림 (제품 15곳, 전부 가드 있음):
+
+```
+(1) 출발 상태 CAS  WHERE ... status=?              10곳
+    enqueue_documents / claim_next_queue_item / claim_next_item_rows /
+    requeue_changed_documents x2 / reset_stale_queue x3 / release_queue_rows /
+    repair_empty_status_capture.py
+(2) 클레임 소유권   _claim_is_still_ours()          5곳
+    mark_queue_done / mark_queue_failed x2 /
+    mark_queue_skipped_expired / mark_queue_unsupported
+```
+
+(2) 가 (1) 과 다른 것은 결함이 아니다 — 워커가 이미 그 행을 **점유한 채** 종결하므로
+출발 상태가 아니라 "아직 내 것인가"를 물어야 한다(`mark_queue_done` 주석: 회수된 뒤
+덮으면 방금 성공한 문서가 'failed' 로 뒤집힌다). 한 가지 모양으로 강제하지 않았다.
+
+### ★ 진짜 발견 — 어휘 검사의 대상 파일이 손으로 적힌 4개였다
+
+`test_queue_safety_invariants.py` (c) 는 *"SQL 에 상태값 리터럴이 박혀 있지 않다"* 를
+지키는 강력한 검사인데, 훑는 파일이 **하드코딩된 4개**였다
+(`storage/database.py` / `doc_worker.py` / `api/v1/doc_stats.py` / `refresh_priority.py`).
+
+git 전체로 다시 재니 **범위 밖에 3곳**이 있었다.
+
+```
+repair_empty_status_capture.py:138   UPDATE ... SET status='pending' ... AND status='done'
+                                     -> 실제 writer 다. 오타가 0행 매치가 되면
+                                        되돌림이 조용히 안 된다
+audit_schedule_health.py:247         WHERE status='pending'
+audit_asset_integrity.py:408         dq.status='done' / IN ('pending','refresh')
+                                     -> 감사기가 **거짓 초록**을 낸다(BUGS #271 과 같은 모양)
+```
+
+범위가 좁다는 사실 자체가 "여기만 리터럴이어도 된다"는 두 번째 규약이다
+(Sprint 118 이 시간대 검사에서 낸 결론과 같다). **대상 목록을 git 에게 묻도록 바꿨다**
+(4개 -> 96개). 그리고 세 파일을 상수 바인딩으로 고쳤다 — 값은 그대로다.
+
+고치면서 **selftest 가 통과했는데 실제 실행은 죽는** 경우를 만났다.
+`audit_schedule_health.py` 에 `dbmod` 를 쓰는데 그 import 가 다른 함수 안에 있어
+`NameError` 가 났고, selftest 는 그 경로를 지나지 않아 초록이었다. 도구를 **실제로
+돌려** 보고서야 드러났다(실행 결과가 코드보다 위다). 고친 뒤 두 감사기 모두 실행 확인 —
+출력이 이전과 동일하다(`[5] 어긋남 없음`, `pending 2753 / moot 2750`).
+
+### Mutation — 무엇을 누가 잡는지
+
+```
+A. writer 를 리터럴로 되돌림(고치기 전 상태)
+   옛 4파일 범위   [] -> **통과**(스캔 대상이 아니라 잡을 수 없다)
+   넓힌 범위       **검출** repair_empty_status_capture.py:138
+
+B. 옛 범위 밖 파일(collect_documents.py)에 리터럴 writer 추가
+   넓힌 범위       **검출**
+
+C. 바인딩 + 가드 없음  `UPDATE document_queue SET status=? WHERE id=?`
+   test_queue_safety_invariants / test_document_queue / test_worker_batching
+                   전부 exit=0 -> **아무도 못 잡았다**
+   -> 리터럴 금지는 이 조합을 못 본다. `test_state_machines.py` 의 기존 검사를
+      확장해 닫았다(CAS 또는 소유권 확인 중 **하나는** 있어야 한다). **검출**
+   오탐 확인: 소유권 가드만 있는 합법 형태는 잡지 않는다
+
+D. 잘못된 terminal 전이 — **수행하지 않았다.** 전이표가 없으므로 무엇이 "잘못"인지
+   판정할 근거가 없다. 만들면 그것이 정책 발명이다(SKIP / APPROVAL REQUIRED)
+```
+
+`test_state_machines.py` 의 기존 검사에 **확장**했다(새 파일 없음). 이제 그 검사는
+payments / subscriptions(검증 함수 호출), registry_requests(CAS),
+document_queue(CAS 또는 소유권) 를 각 도메인의 **실제 근거 모양대로** 본다.
+
+### 정적 분석의 한계 (기록)
+
+소유권 판정은 `_claim_is_still_ours` / `claim_token` 이 **같은 함수 본문에 나타나는가**로
+본다. 그 호출이 실제로 이 UPDATE 를 감싸는지까지는 보지 않는다 — 흐름 분석이 필요하고,
+거기서부터는 오탐이 늘어 검사가 신뢰를 잃는다. 지금 잡으려는 것은 "가드가 통째로
+없는 새 writer" 이고 그 목적에는 충분하다.
+
+### 게이트
+
+```
+python   통과 62 | 실패 4 | 건너뜀 3 | 판정없음 1   단언 10,852 -> 10,854
+node     313건 / 309 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · npm run build 성공
+auction.db  md5 d721a36f24a0fdc130a71d8dbe3c4023 — 10개 세션 연속 무변경
+제품 코드   3파일 변경(리터럴 -> 상수 바인딩). 값·동작 동일, 실행으로 확인
+```

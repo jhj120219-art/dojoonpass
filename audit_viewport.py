@@ -72,10 +72,27 @@ import sys
 BASE_DEFAULT = "http://localhost:3000"
 WIDTHS_DEFAULT = [320, 360, 390, 430, 900, 1400]
 
+# 검색 화면의 기본 조건. **결과 카드가 실제로 그려져야** 의미가 있는 화면이다.
+SEARCH_PATH = "/search?sido=%EC%84%9C%EC%9A%B8"
+
+# 카드가 0장일 때 한 번 더 시도할 조건.
+#
+# ★ 왜 필요한가 — 이 도구가 "결함 0"이라고 말하면서 **가장 복잡한 화면을 아예 안 재고**
+#   있었다(2026-09-01 실측). 기일이 지난 물건만 남은 DB(개발/QA 머신이 그렇다)에서는
+#   기본 검색이 0건이라, 재는 것은 **카드가 하나도 없는 빈 목록**이다. 빈 목록은
+#   당연히 넘치지 않는다. Sprint 240 이 좁은 폭에서 찾아낸 결함 3종 중 **둘이 바로
+#   그 카드**(목록 카드 grid 트랙 / 물건종류 배지)에 있었는데, 그 화면을 안 재고
+#   초록을 찍고 있었던 셈이다. 상세 화면도 표본 id 를 검색 결과에서 뽑으므로
+#   **통째로 건너뛰어졌다** — 그런데도 종료코드는 0이었다.
+#
+#   `include_closed=true` 는 UI 에도 있는 정식 검색 조건이다(SearchForm 의
+#   "종결 포함"). 데이터를 만들어 넣지 않고, 있는 데이터를 보이게만 한다.
+SEARCH_PATH_WITH_CLOSED = SEARCH_PATH + "&include_closed=true"
+
 # (경로, 최소 노드 수) — 최소 노드 수는 "화면이 실제로 그려졌는가"의 하한이다.
 SCREENS = [
     ("/", 200),
-    ("/search?sido=%EC%84%9C%EC%9A%B8", 200),
+    (SEARCH_PATH, 200),
     ("/favorites", 30),
     ("/properties/recent", 30),
     ("/mypage", 20),
@@ -655,22 +672,41 @@ def main() -> int:
 
     results, fails, unusable, auth = [], 0, 0, 0
     try:
+        # ── 검색 결과 카드가 실제로 그려지는 조건을 찾는다 ──────────────────────
+        #
+        # 카드가 0장인 목록을 재고 "넘침 0"이라고 말하면 그것은 측정이 아니다.
+        # 기본 조건 -> 종결 포함 순으로 시도하고, **카드가 나온 조건으로 검색 화면을
+        # 바꿔 잰다.** 어느 쪽에서도 카드가 없으면 정상으로 세지 않고 측정 불가로 센다.
+        no_cards = False
         if DETAIL_FROM_SEARCH:
-            try:
-                driver.get(args.base + "/search?sido=%EC%84%9C%EC%9A%B8")
-                import time as _t
-                _t.sleep(3)
-                href = driver.execute_script(
-                    "const a=[...document.querySelectorAll('a')]"
-                    ".find(x=>/^\\/properties\\/\\d+/.test(x.getAttribute('href')||''));"
-                    "return a?a.getAttribute('href').split('?')[0]:null;")
-                if href:
-                    screens.append((href, 60))
-                    print("상세 표본: %s" % href)
-                else:
-                    print("상세 표본을 찾지 못했다(검색 결과 0건?) - 상세는 건너뛴다")
-            except Exception as e:
-                print("상세 표본 수집 실패: %s" % str(e)[:80])
+            hrefs, used = [], None
+            for cand in (SEARCH_PATH, SEARCH_PATH_WITH_CLOSED):
+                try:
+                    driver.get(args.base + cand)
+                    import time as _t
+                    _t.sleep(3)
+                    hrefs = driver.execute_script(
+                        "return [...document.querySelectorAll('a')]"
+                        ".map(x=>x.getAttribute('href')||'')"
+                        ".filter(h=>/^\\/properties\\/\\d+/.test(h))"
+                        ".map(h=>h.split('?')[0]);") or []
+                except Exception as e:
+                    print("검색 표본 수집 실패(%s): %s" % (cand, str(e)[:60]))
+                    hrefs = []
+                if hrefs:
+                    used = cand
+                    break
+            if used and used != SEARCH_PATH:
+                screens = [(used, 200) if p == SEARCH_PATH else (p, n) for p, n in screens]
+                print("검색 결과가 0건이라 `include_closed=true` 로 바꿔 잰다"
+                      " (카드 %d장) - 이 DB 는 기일이 남은 물건이 없다" % len(hrefs))
+            if hrefs:
+                screens.append((hrefs[0], 60))
+                print("상세 표본: %s (카드 %d장)" % (hrefs[0], len(hrefs)))
+            else:
+                no_cards = True
+                print("★ 결과 카드가 어느 조건에서도 0장이다"
+                      " - 목록 카드와 상세를 **재지 못했다**(측정 불가로 센다)")
 
         print("=" * 86)
         print(" 실제 뷰포트 레이아웃/접근성 감사  base=%s" % args.base)
@@ -707,6 +743,10 @@ def main() -> int:
 
     print()
     print("=" * 86)
+    if no_cards:
+        # 재지 못한 화면을 집계에서 생략하면 합계가 "결함 0"으로 읽힌다.
+        # 목록 카드와 상세 둘 다 폭마다 못 재으므로 그만큼을 측정 불가로 센다.
+        unusable += 2 * len(widths)
     ok = sum(1 for r in results if r["status"] == "OK")
     print(" 정상 %d / 결함 %d / 로그인필요(측정안함) %d / 측정불가 %d"
           % (ok, fails, auth, unusable))

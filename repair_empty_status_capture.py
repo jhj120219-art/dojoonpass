@@ -36,7 +36,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from storage.database import get_connection
+from storage.database import (get_connection,
+                              QUEUE_STATUS_PENDING, QUEUE_STATUS_DONE)
 # ★ `get_doc_dir()`이 아니라 `_doc_dir_path()`를 쓴다 (2026-08-17 Sprint 153, BUGS #111).
 #
 # `get_doc_dir()`은 `os.makedirs()`를 부른다. 아래 `find_empty_captures()`는 **읽기 전용
@@ -135,10 +136,13 @@ def repair(apply: bool) -> int:
             # `auction_item.court_name`은 같은 60종 어휘를 쓴다(차집합 0, 실측 확인).
             # 같은 계열의 사고가 BUGS #18 / #14 / #103으로 반복됐다.
             requeued += conn.execute(
-                "UPDATE document_queue SET status='pending', retry_count=0, last_attempt_at=NULL "
+                # 상태값을 리터럴로 박지 않는다 - 오타가 예외가 아니라 **0행 매치**로
+                # 조용히 끝나기 때문이다(storage/database.py 의 어휘 주석과 같은 이유).
+                "UPDATE document_queue SET status=?, retry_count=0, last_attempt_at=NULL "
                 "WHERE court_code=? AND case_no=? AND item_no=? "
-                "AND doc_type='status' AND status='done'",
-                (e["court_name"], e["case_no"], e["item_no"])).rowcount
+                "AND doc_type='status' AND status=?",
+                (QUEUE_STATUS_PENDING, e["court_name"], e["case_no"], e["item_no"],
+                 QUEUE_STATUS_DONE)).rowcount
         conn.commit()
 
         print("\n적용 완료")

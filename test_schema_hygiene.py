@@ -318,6 +318,191 @@ def _error_code_names(root):
     return []
 
 
+
+# ---------------------------------------------------------------------------
+# 프런트 상태 라벨표가 백엔드 enum 을 덮는가 (2026-09-01 신설)
+#
+# 화면은 백엔드 상태값에 한국어 라벨을 붙여 보여 준다. 라벨표에 없는 값이 오면
+# **원본 영문 코드가 그대로 사용자에게 보인다** (`LABEL[v] ?? v`). 이 폴백 자체는
+# 의도된 것이다 — `mypage/page.tsx` 가 *"임의로 뭉뚱그리면 운영 중 새로 생긴 상태를
+# 사용자가 오해한다"* 고 적어 뒀고, 그 판단이 맞다.
+#
+# 문제는 **enum 에 이미 선언돼 있는데 라벨이 없는 값**이다. 그건 "새로 생긴 상태"가
+# 아니라 처음부터 빠뜨린 것이고, 지금 안 보이는 이유는 그 상태에 도달하는 경로가
+# 아직 없기 때문일 뿐이다(결제는 MockProvider 라 항상 성공한다).
+#
+# 그래서 **덮지 못한 값을 결함으로 세지 않고 목록으로 못박는다.** 지금의 경계를
+# 고정하는 것이 목적이다 — 새 상태가 생기면 이 검사가 붉어지고, 그때 라벨을 쓸지
+# (사용자 문구는 제품 결정) 판단하면 된다. `special_conditions` 를 다룬 방식과 같다.
+# ---------------------------------------------------------------------------
+
+# 라벨이 없는 채로 남아 있는 값과 그 이유. **줄어드는 것도 늘어나는 것도 붉어진다.**
+KNOWN_UNLABELED = {
+    # 결제창 호출 전/중 상태. MockProvider 는 항상 즉시 성공이라 지금은 도달하지
+    # 않는다. 실 PG(KG이니시스) 연동 시 사용자가 결제창을 닫으면 실제로 남는다.
+    # 그때 어떤 문구를 보여 줄지는 제품 결정이라 여기서 정하지 않는다.
+    ("PAYMENT_LABEL", "PaymentStatus"): {"CREATED", "READY", "REQUESTED"},
+    # 상세 화면은 PAYMENT_REQUIRED 를 라벨이 아니라 **결제 버튼 분기**로 그린다
+    # (그 파일의 주석이 그렇게 적어 뒀고, JSX 에 실제 분기가 있다).
+    ("REGISTRY_STATUS_LABEL", "RegistryRequestStatus"): {"PAYMENT_REQUIRED"},
+}
+
+# (프런트 상수 이름, 파일, 백엔드 enum 이름)
+LABEL_TABLES = [
+    ("SUBSCRIPTION_LABEL", "src/app/mypage/page.tsx", "SubscriptionStatus"),
+    ("PAYMENT_LABEL", "src/app/mypage/page.tsx", "PaymentStatus"),
+    ("PAYMENT_TYPE_LABEL", "src/app/mypage/page.tsx", "PaymentType"),
+    ("REGISTRY_LABEL", "src/app/mypage/page.tsx", "RegistryRequestStatus"),
+    ("REGISTRY_STATUS_LABEL", "src/app/properties/[id]/page.tsx", "RegistryRequestStatus"),
+    ("DOC_TYPE_LABEL", "src/app/properties/[id]/page.tsx", "DocumentType"),
+    # ★ `DOC_STATUS_LABEL`(문서수집상태 배지)은 여기 없다 - 중복이 아니라 **자리**의
+    #   문제다. `test_queue_safety_invariants.py` 의 문서 상태 어휘 계약 (e) 가
+    #   이미 `DOCUMENT_STATUSES_IN_USE` 와 대조하고 있고, 그 파일이 그 어휘의
+    #   정본을 지키는 자리다. 같은 규칙을 두 곳에서 세면 한쪽만 고쳐지는 날이 온다.
+]
+
+
+def _enum_values(root, name):
+    """api/constants.py 의 StrEnum 값들. 이름이 아니라 **값**을 본다."""
+    import ast
+
+    path = os.path.join(root, "api", "constants.py")
+    with open(path, encoding="utf-8-sig") as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            out = set()
+            for st in node.body:
+                if (isinstance(st, ast.Assign) and isinstance(st.value, ast.Constant)
+                        and isinstance(st.value.value, str)):
+                    out.add(st.value.value)
+            return out
+    return set()
+
+
+def _label_keys(root, rel, const):
+    """`const NAME: Record<string, string> = { A: '..', B: '..' }` 의 키들."""
+    import re
+
+    path = os.path.join(root, rel.replace("/", os.sep))
+    with open(path, encoding="utf-8-sig") as fh:
+        src = fh.read()
+    m = re.search(r"const\s+%s\s*:\s*Record<[^>]*>\s*=\s*\{(.*?)\n\}" % re.escape(const),
+                  src, re.S)
+    if not m:
+        return None
+    return set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)\s*:", m.group(1), re.M))
+
+
+
+
+# ---------------------------------------------------------------------------
+# 프런트 법원 목록이 백엔드 마스터와 같은가 (2026-09-01 신설)
+#
+# `src/app/search/SearchForm.tsx` 의 `COURT_LIST` 는 **`config/courts.py:ALL_COURTS`
+# 를 손으로 옮겨 적은 사본**이다. 그 파일의 주석이 스스로 그렇게 적어 뒀다 —
+#
+#     "config/courts.py(ALL_COURTS)의 실제 법원 마스터 데이터를 그대로 옮겼다 —
+#      같은 목록을 두 곳에서 관리하므로, config/courts.py가 바뀌면 이 목록도 함께 갱신해야 한다"
+#
+# 그런데 **"함께 갱신해야 한다"를 지키는 것이 그 주석뿐이었다**(2026-09-01 전수 확인:
+# 두 목록을 대조하는 검사 0건). 어긋나면 어떻게 보이는가 —
+#
+#   백엔드에만 있는 법원   화면 드롭다운에 아예 안 나온다. 그 법원 물건은 **영원히
+#                         법원으로 검색할 수 없다.** 오류도 빈 결과도 아니고 선택지가 없다
+#   프런트에만 있는 법원   고를 수는 있는데 `court_name` LIKE 매칭이 0건이다.
+#                         "그 법원은 물건이 없네"로 보인다
+#
+# `docs/BUGS.md` #33(물건종류 69개 중 60개가 항상 0건)이 정확히 이 모양이었고,
+# 발견까지 오래 걸린 이유도 같다. 그래서 어휘 표를 DB 와 대조하는 검사를 만든 것처럼
+# (`test_property_type_vocabulary.py`) 이 사본도 정본과 대조한다.
+#
+# ★ 사본을 없애지 않는 이유: 프런트가 런타임에 법원 목록 API 를 부르게 바꾸는 것은
+#   화면 로딩 순서와 API 계약을 바꾸는 일이라 최소 변경이 아니다. 지금 필요한 것은
+#   "사본이 정본과 갈라지지 않는다"는 보장이고, 그것은 검사로 충분하다.
+# ---------------------------------------------------------------------------
+# ★ `test_court_list_integrity()`(위 §9) 와 겹치지 않는다 — 거기는 마스터 자체의
+#   **내부** 무결성(개수 60 / 중복 / 빈 값 / code==name / region ⊆ SIDO_LIST)을 보고,
+#   여기는 **사본과의 대조**를 본다. 둘 다 필요하다 — 마스터가 완벽해도 사본이
+#   낡으면 화면은 틀리고, 사본이 같아도 마스터가 깨지면 크롤이 틀린다.
+
+def test_frontend_court_list_matches_backend_master():
+    print("\n--- 프런트 법원 목록 <-> config/courts.py 마스터 ---")
+    import re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        from config.courts import ALL_COURTS
+    except ImportError as exc:
+        check_true("config.courts 를 불러왔다", False, str(exc))
+        return
+
+    back_pairs = {(c.name, c.region) for c in ALL_COURTS}
+    check_true("검사가 공허하지 않다(백엔드 마스터를 읽었다) - %d개" % len(back_pairs),
+               len(back_pairs) >= 40, len(back_pairs))
+
+    form = os.path.join(root, "src", "app", "search", "SearchForm.tsx")
+    check_true("SearchForm.tsx 가 있다", os.path.exists(form), form)
+    if not os.path.exists(form):
+        return
+    with open(form, encoding="utf-8-sig") as fh:
+        src = fh.read()
+
+    m = re.search(r"const COURT_LIST: CourtInfo\[\] = \[(.*?)\n\]", src, re.S)
+    check_true("COURT_LIST 를 찾았다", m is not None,
+               "-> 상수 이름이나 타입이 바뀌었다면 이 검사도 함께 고쳐야 한다")
+    if not m:
+        return
+    front_pairs = set(re.findall(r"name:\s*'([^']+)'\s*,\s*region:\s*'([^']+)'", m.group(1)))
+    check_true("검사가 공허하지 않다(프런트 목록을 읽었다) - %d개" % len(front_pairs),
+               len(front_pairs) >= 40, len(front_pairs))
+
+    # 이름+지역을 쌍으로 본다. 이름만 맞고 지역이 틀리면 드롭다운의 **다른 지역 밑에**
+    # 들어가 사용자가 찾지 못한다(있는데 없는 것과 같다).
+    check("★ 화면에서 고를 수 없는 법원(백엔드에만 있다)",
+          sorted("%s(%s)" % p for p in (back_pairs - front_pairs)), [])
+    check("★ 고를 수는 있는데 백엔드에 없는 법원(검색이 항상 0건)",
+          sorted("%s(%s)" % p for p in (front_pairs - back_pairs)), [])
+
+    # 자기 검증: 대조가 실제로 동작하는가.
+    check_true("자기 검증: 가짜 항목은 차집합에 잡힌다",
+               ("QA가짜지원", "QA") in ((front_pairs | {("QA가짜지원", "QA")}) - back_pairs))
+    check_true("자기 검증: 실제 항목은 안 잡힌다",
+               len(back_pairs & front_pairs) >= 40, len(back_pairs & front_pairs))
+
+def test_frontend_labels_cover_backend_enums():
+    print("\n--- 프런트 상태 라벨표 <-> 백엔드 enum ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    check_true("검사가 공허하지 않다(라벨표 목록이 있다)", len(LABEL_TABLES) >= 4, LABEL_TABLES)
+    for const, rel, enum_name in LABEL_TABLES:
+        values = _enum_values(root, enum_name)
+        check_true("%s 를 읽었다(값 %d개)" % (enum_name, len(values)), len(values) >= 2, sorted(values))
+        keys = _label_keys(root, rel, const)
+        check_true("%s 를 %s 에서 찾았다" % (const, rel), keys is not None, rel)
+        if keys is None or not values:
+            continue
+
+        # (1) 라벨표에 백엔드에 없는 값이 있으면 죽은 항목이다(오타이거나 사라진 상태).
+        check("%s: 백엔드에 없는 값을 라벨링하지 않는다" % const, sorted(keys - values), [])
+
+        # (2) 덮지 못한 값은 **고정된 목록과 정확히 같아야** 한다.
+        expected = sorted(KNOWN_UNLABELED.get((const, enum_name), set()))
+        check("★ %s: 라벨이 없는 값" % const, sorted(values - keys), expected)
+
+    print("      -> 라벨이 없으면 사용자에게 영문 코드가 그대로 보인다(`LABEL[v] ?? v`)."
+          " 폴백은 의도된 것이고, 여기서 고정하는 것은 **그 경계**다")
+
+    # 자기 검증: 두 헬퍼가 실제로 값을 읽는가(빈 집합끼리 비교하면 무엇이든 통과한다).
+    check_true("자기 검증: enum 값을 실제로 읽는다",
+               "COMPLETED" in _enum_values(root, "RegistryRequestStatus"))
+    check_true("자기 검증: 없는 enum 은 빈 집합이다",
+               _enum_values(root, "QaNoSuchEnum") == set())
+    check_true("자기 검증: 라벨 키를 실제로 읽는다",
+               "ACTIVE" in (_label_keys(root, "src/app/mypage/page.tsx", "SUBSCRIPTION_LABEL") or set()))
+    check_true("자기 검증: 없는 상수는 None 이다",
+               _label_keys(root, "src/app/mypage/page.tsx", "QA_NO_SUCH_LABEL") is None)
+
 def test_error_codes_defined_documented_emitted():
     print("\n--- 5. ErrorCode 정의/문서/방출 대조 ---")
     import re
@@ -362,15 +547,37 @@ def test_error_codes_defined_documented_emitted():
     check("방출 집합이 고정된 목록과 같다(사라진 방출)", sorted(EMITTED_ERROR_CODES - emitted), [])
 
     # 프런트가 분기에 쓰는 코드는 반드시 실제로 방출돼야 한다 — 아니면 죽은 분기다.
+    #
+    # ★ 2026-09-01: 예전에는 **키만** 봤다. 그런데 런타임이 비교하는 것은 **값**이다.
+    #
+    #     result.error === ERROR_CODES.FAVORITE_NOT_FOUND
+    #
+    #   키가 맞아도 값에 오타가 있으면(`FAVORITE_NOT_FOUND: 'FAVORITE_NOTFOUND'`)
+    #   이 분기는 **영원히 거짓**이 되고, "이미 삭제된 관심물건"이 실패로 보인다.
+    #   오류도 로그도 없이 문구만 틀리는, 이 저장소가 반복해 겪은 모양이다.
+    #   그래서 키/값을 함께 뽑아 **셋을 모두** 확인한다.
     api_ts = os.path.join(root, "src", "lib", "api.ts")
+    check("프런트 api.ts 가 있다", os.path.exists(api_ts), True)
     if os.path.exists(api_ts):
         with open(api_ts, encoding="utf-8-sig") as fh:
             ts = fh.read()
         block = re.search(r"ERROR_CODES\s*=\s*\{(.*?)\}", ts, re.S)
-        front_codes = set(re.findall(r"([A-Z][A-Z0-9_]{3,})\s*:", block.group(1))) if block else set()
-        check("프런트가 분기하는 코드가 실제로 방출된다",
-              sorted(front_codes - emitted), [])
-        print("   프런트 분기 코드 %d개" % len(front_codes))
+        check("ERROR_CODES 블록을 찾았다", block is not None, True)
+        pairs = re.findall(r"([A-Z][A-Z0-9_]{3,})\s*:\s*'([A-Z0-9_]+)'",
+                           block.group(1)) if block else []
+        # 이 검사가 공허해지는 유일한 길은 "하나도 못 찾는 것"이다. 먼저 막는다.
+        check("검사가 공허하지 않다(프런트 분기 코드를 실제로 찾았다)", len(pairs) >= 3, True)
+
+        front_keys = {k for k, _ in pairs}
+        front_values = {v for _, v in pairs}
+        check("★ 프런트 상수의 키와 값이 같다(오타 방지)",
+              sorted(k for k, v in pairs if k != v), [])
+        check("프런트가 분기하는 코드가 실제로 방출된다", sorted(front_keys - emitted), [])
+        check("★ 프런트가 비교하는 **값**이 실제로 방출된다",
+              sorted(front_values - emitted), [])
+        check("프런트가 비교하는 값이 서버 enum 에 정의돼 있다",
+              sorted(front_values - defined_set), [])
+        print("   프런트 분기 코드 %d개 (키/값 일치)" % len(pairs))
 
     print("   정의 %d / 문서 %d / 실제 방출 %d (미방출 %d ― 의도된 상태, 위 주석 참고)"
           % (len(defined_set), len(defined_set & doc_codes), len(emitted),
@@ -4466,6 +4673,8 @@ def run():
     test_migration_history_complete()
     test_requirements_covers_all_imports()
     test_error_codes_defined_documented_emitted()
+    test_frontend_labels_cover_backend_enums()
+    test_frontend_court_list_matches_backend_master()
     test_storage_sources_are_tracked()
     test_tracked_sources_do_not_import_untracked()
     test_no_new_duplicate_indexes()
@@ -4917,6 +5126,39 @@ def test_product_module_names_are_not_shadowed_by_stale_copies():
         print("      -> 정리는 사람이 한다(파일 삭제는 승인 영역). 위험한 이유는"
               " 진단 스크립트 다수가 sys.path 에 cwd 를 넣기 때문이다 -"
               " 그 폴더에서 실행하면 낡은 판본을 import 한다.")
+
+    # ── 2026-09-01 추가: 위험이 import 만이 아니다 — **그냥 실행된다** ──────────
+    #
+    #   #262 는 이 사본들을 "sys.path 오염으로 낡은 판본을 import 하게 되는 것"으로
+    #   설명한다. 맞지만 절반이다. 실측하니 `logs/mvp_scraper.py` 는 import 가 깨져
+    #   있지 않다(`get_courts_by_region` 은 지금도 있다). 즉 `python logs/mvp_scraper.py`
+    #   가 **그대로 돌아 실제 크롤을 하고 실제 DB 에 upsert 한다.**
+    #
+    #   그리고 그 사본들에는 **RunLock 이 없다**(2026-08-03 판본. 락은 그 뒤에 붙었다).
+    #   Sprint 246 이 "락 파일이 갈라지면 중복 실행 방지가 조용히 무력화된다"고 실측해
+    #   둔 상황을, 락 자체가 없는 사본은 더 쉽게 만든다 — 예약 크롤과 동시에 돈다.
+    #
+    #   그래서 "몇 개인가" 옆에 **"얼마나 낡았는가"** 를 함께 못박는다. 누가 사본을
+    #   최신 내용으로 덮어쓰면 이 항목의 성격이 달라지므로 그때 다시 판단해야 한다.
+    stale_evidence = []
+    for sfile in sorted(shadows):
+        base = os.path.basename(sfile)
+        origin = os.path.join(root, base)
+        if not os.path.exists(origin):
+            continue
+        try:
+            copy_src = open(os.path.join(root, sfile.replace("/", os.sep)),
+                            encoding="utf-8", errors="replace").read()
+            orig_src = open(origin, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "RunLock" in orig_src and "RunLock" not in copy_src:
+            stale_evidence.append(sfile)
+    check("★ 사본 중 RunLock 이 빠진 것(중복 실행 방지가 없는 판본)",
+          stale_evidence, ["logs/doc_worker.py", "logs/mvp_scraper.py"])
+    if stale_evidence:
+        print("      -> 이 사본들은 **실행 가능하고 락이 없다.** 예약 크롤과 동시에"
+              " 돌 수 있다. 지우는 것은 사람의 판단이다(#253 과 같은 이유)")
 
 
 if __name__ == "__main__":

@@ -624,6 +624,134 @@ def run_bracket_exclusion():
     return failures
 
 
+def run_normalized_keys_reach_storage():
+    """`normalize_item()` 이 만든 키가 실제로 `auction` 에 도달하는가 (2026-09-01 신설).
+
+    ## 왜 — 세 키가 계산돼서 **버려지고 있다**
+
+    `normalize_item()` 은 `has_spec_pdf` / `has_status_pdf` / `has_appraisal_pdf`
+    를 출력 dict 에 담는다. 그런데 `UPSERT_SQL` 은 그 자리에 **리터럴 0 을 박아 넣는다**:
+
+        has_spec_pdf, has_status_doc, has_appraisal_pdf, ...
+        VALUES (?,?,...,?, 0,0,0, ?,?)
+
+    즉 dict 의 값은 한 번도 쓰이지 않는다. 갱신에서도 `_UPSERT_SET` 에 없어 보존만 된다.
+    실제로 이 컬럼을 1 로 만드는 것은 문서 수집 쪽(`LEGACY_HAS_COLUMN`)이다.
+    그리고 `AuctionItem` 의 세 필드는 **크롤러가 한 번도 대입하지 않는다**(전부 기본값
+    `False`, 2026-09-01 `crawler/` 전수 확인). 즉 죽은 배선이다.
+
+    지금은 무해하지만 **함정**이다. 출력 dict 의 다른 키는 전부 upsert 로 흘러가므로,
+    이 셋도 그럴 것처럼 읽힌다. 게다가 `has_status_pdf` 는 **어떤 컬럼과도 이름이 맞지
+    않는다** — 컬럼은 Step 9 에 `has_status_doc` 으로 개명됐는데 모델/정규화기만 옛
+    이름으로 남았다. 누가 "dict 를 그대로 upsert 에 넘기자"고 고치는 날, 그 필드만
+    조용히 사라진다.
+
+    ★ 단, **죽은 것은 모델/정규화기의 세 필드이지 컴럼이 아니다.**
+      `auction.has_*` 는 `migrate_execute.py` 가 `document_status` 씨앗으로
+      읽는다(아래 (4) 검사). 컬럼을 드롭하면 새로 옮겨진 물건의 문서
+      상태가 전부 COLLECTING 으로 시작한다.
+
+    ★ 지우지 않는다. 필드 제거는 `models`/`normalizer` 의 공개 형태를 바꾸는 일이고
+      (docs/CLAUDE.md: Mock 함수 시그니처 유지 / 임의 삭제 금지), 지금 고장난 것은
+      없다. 대신 **경계를 못박는다** — 도달하지 않는 키가 늘거나 줄면 붉어진다.
+    """
+    failures = []
+    print()
+    print("--- normalize_item() 의 키가 auction 에 도달하는가 ---")
+
+    from models.auction_item import AuctionItem
+    from normalizer.normalizer import normalize_item
+    import storage.database as dbmod
+
+    item = AuctionItem(
+        case_no="2026타경1", item_no="1", address="서울특별시 강남구 역삼동 736-1",
+        property_type="아파트", appraisal_price="100000000",
+        minimum_bid_price="80000000", auction_date="2026-09-30",
+        status="유찰 1회", court_code="서울중앙지방법원",
+        court_name="서울중앙지방법원", crawl_date="2026-09-01",
+    )
+    keys = set(normalize_item(item).keys())
+
+    def check(name, got, expected):
+        ok = got == expected
+        print("[%s] %s: %r" % ("PASS" if ok else "FAIL", name, got))
+        if not ok:
+            print("     expected %r" % (expected,))
+            failures.append(name)
+
+    print("     normalize_item() 키 %d개" % len(keys))
+    if len(keys) < 10:
+        failures.append("normalize_item 키를 제대로 못 읽었다")
+        print("[FAIL] 검사가 공허하다 - 키가 %d개뿐이다" % len(keys))
+        return failures
+
+    # (1) `auction` 테이블에 **이름이 아예 없는** 키.
+    #     `has_status_pdf` 는 컬럼명이 `has_status_doc` 으로 개명된 잔재다.
+    create_sql = dbmod.CREATE_AUCTION_SQL if hasattr(dbmod, "CREATE_AUCTION_SQL") else None
+    import re
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "storage", "database.py"), encoding="utf-8-sig").read()
+    m = re.search(r"CREATE TABLE IF NOT EXISTS auction\s*\((.*?)\n\s*\)", src, re.S)
+    cols = set()
+    if m:
+        for line in m.group(1).split("\n"):
+            mm = re.match(r"\s*([a-z_]+)\s+(INTEGER|TEXT|REAL)", line)
+            if mm:
+                cols.add(mm.group(1))
+    check("전제: auction 컬럼을 실제로 읽었다(개수>10)", len(cols) > 10, True)
+    check("★ auction 에 대응 컬럼이 없는 키", sorted(keys - cols), ["has_status_pdf"])
+
+    # (2) 컬럼은 있는데 **upsert 가 값을 싣지 않는** 키(리터럴 0 이 박혀 있다).
+    upsert = dbmod.UPSERT_SQL
+    values_part = upsert.split("VALUES", 1)[1] if "VALUES" in upsert else ""
+    check("전제: UPSERT_SQL 을 읽었다", "INSERT INTO auction" in upsert, True)
+    check("★ upsert 가 리터럴 0 을 박는 자리가 있다(값이 버려진다)",
+          "0,0,0" in values_part.replace(" ", ""), True)
+    carried = keys & cols
+    not_carried = sorted(k for k in carried
+                         if k in ("has_spec_pdf", "has_appraisal_pdf", "has_status_doc"))
+    check("★ 컬럼은 있지만 upsert 가 값을 안 싣는 키",
+          not_carried, ["has_appraisal_pdf", "has_spec_pdf"])
+
+    # (3) 크롤러가 그 필드를 정말 채우지 않는가 — 죽은 배선이라는 근거.
+    root = os.path.dirname(os.path.abspath(__file__))
+    assigns = []
+    for dp, dn, fn in os.walk(os.path.join(root, "crawler")):
+        dn[:] = [d for d in dn if d != "__pycache__"]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            text = open(os.path.join(dp, f), encoding="utf-8-sig", errors="replace").read()
+            for field_ in ("has_spec_pdf", "has_status_pdf", "has_appraisal_pdf"):
+                if re.search(r"\b%s\s*=" % field_, text):
+                    assigns.append("%s:%s" % (f, field_))
+    check("★ 크롤러가 has_* 필드에 값을 대입하지 않는다(죽은 배선)", sorted(assigns), [])
+
+    # (4) 이 컬럼을 **읽는 쪽**이 있는가 — "아무도 안 읽으니 지우자"를 막는다.
+    #
+    #     2026-09-01 재검증에서 확인했다. `auction.has_*` 는 쓰기만 하는 컬럼이 아니다.
+    #     `migrate_execute.py` 가 `document_status` 행을 처음 만들 때 **씨앗으로 읽는다**:
+    #
+    #         status = "READY" if row[col] == 1 else "COLLECTING"
+    #
+    #     즉 쓰기는 문서 수집(LEGACY_HAS_COLUMN), 읽기는 migrate_execute 하나다.
+    #     죽은 것은 **모델/정규화기의 세 필드**이지 컬럼이 아니다. 이 구분을 놓치고
+    #     컬럼을 드롭하면 새로 옮겨진 물건의 문서 상태가 전부 COLLECTING 으로 시작한다.
+    import migrate_execute as _me
+    mapped = dict(_me.MIGRATED_DOC_TYPE_COLUMNS)
+    check("★ migrate_execute 가 읽는 레거시 컬럼", sorted(mapped.values()),
+          ["has_appraisal_pdf", "has_spec_pdf", "has_status_doc"])
+    me_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "migrate_execute.py"), encoding="utf-8-sig").read()
+    check("★ 그 컬럼이 document_status 씨앗으로 실제로 읽힌다",
+          'row[col] == 1' in me_src, True)
+
+    # 자기 검증: 비교가 공허하지 않은가.
+    check("자기 검증: 없는 키는 잡힌다", "qa_bogus" in ({"qa_bogus"} | keys) - cols, True)
+    check("자기 검증: 실제 키는 컬럼에 있다", "case_no" in carried, True)
+    return failures
+
+
 def run():
     failures = []
 
@@ -672,6 +800,7 @@ def run():
     failures += run_bracket_preservation()
     failures += run_area_extraction()
     failures += run_bracket_exclusion()
+    failures += run_normalized_keys_reach_storage()
 
     print()
     if failures:

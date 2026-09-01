@@ -8,7 +8,7 @@ import PriceRangeSelect from '@/components/PriceRangeSelect'
 import RangeSelect from '@/components/RangeSelect'
 import SearchAccordionSection from '@/components/SearchAccordionSection'
 import PropertyTypeTree from '@/components/PropertyTypeTree'
-import { formatNumber } from '@/lib/format'
+import { formatNumber, todayInDisplayZone, ymdPlusDays } from '@/lib/format'
 
 const SIDO_LIST = [
   '서울', '부산', '대구', '인천', '광주', '대전', '울산', '세종',
@@ -325,11 +325,13 @@ function SearchFormInner({ searchParams }: { searchParams: SearchParamsLike }) {
       setForm((prev) => ({ ...prev, auctionDateFrom: '', auctionDateTo: '' }))
       return
     }
-    const toISODate = (d: Date) => d.toISOString().slice(0, 10)
-    const today = new Date()
-    const end = new Date(today)
-    end.setDate(end.getDate() + days)
-    setForm((prev) => ({ ...prev, auctionDateFrom: toISODate(today), auctionDateTo: toISODate(end) }))
+    // "오늘"은 **한국 시각** 기준이다(`todayInDisplayZone`). 예전에는
+    // `new Date().toISOString().slice(0, 10)` 을 썼는데, 그것은 UTC 라
+    // KST 09:00 이전에 누르면 하루 전 날짜로 검색됐다 — 상세한 경위는
+    // `src/lib/format.ts` 의 `ymdPlusDays()` 주석에 적어 두었다.
+    const from = todayInDisplayZone()
+    const to = ymdPlusDays(from, days) ?? from
+    setForm((prev) => ({ ...prev, auctionDateFrom: from, auctionDateTo: to }))
   }
 
   // Tank Auction의 btnRest("다 시")와 동일한 전체 초기화. 검색은 실행하지 않고

@@ -165,6 +165,16 @@ describe('빈 목록과 파일 이름', () => {
     assert.equal(name, '관심물건_2026-08-20.csv')
     assert.ok(!/[:*?"<>|/\\]/.test(name), name)
   })
+
+  test('날짜만 받아도 같다 — 호출부가 `todayInDisplayZone()` 로 바뀜다 (2026-09-01)', () => {
+    // `ExportButtons.tsx` 는 예전에 `new Date().toISOString()` 을 넘겼는데,
+    // 그것은 UTC 라 KST 09:00 이전에 내려받으면 파일명에 **어제 날짜**가 붙었다.
+    assert.equal(exportFileName('관심물건', '2026-09-01'), '관심물건_2026-09-01.csv')
+  })
+
+  test('빈 날짜는 unknown — 날짜를 지어내지 않는다', () => {
+    assert.equal(exportFileName('관심물건', ''), '관심물건_unknown.csv')
+  })
 })
 
 describe('클립보드용 TSV', () => {

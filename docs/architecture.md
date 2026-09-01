@@ -130,3 +130,76 @@ registry_credits (조정 원장 — 잔액 컬럼 없음)
 ↓ 유효 한도 = 플랜 월 한도 + 이번 달 조정 합계
 
 api/v1/registry.py : get_user_free_limit()
+
+---
+
+시각·날짜 계약 (2026-09-01 전수 실측으로 작성 — 새 정책이 아니라 **이미 그렇게 돌고 있는 것**의 기록)
+
+이 저장소에는 의미가 다른 날짜가 네 종류 있고, **섞으면 조용히 틀린다.**
+
+```
+① 사건이 일어난 날짜   auction_date / filed_date / demand_deadline / priority_date
+                      move_in_date / fixed_date / demand_date
+                      법원 페이지의 값을 그대로 저장한다. 날짜-only(YYYY-MM-DD).
+                      화면에 **가공 없이** 찍는다 (`{property.case.filed_date || '-'}`).
+
+② 우리가 수집한 날짜   crawl_date
+                      `datetime.today().strftime("%Y-%m-%d")` — 서버 로컬 날짜.
+                      ①과 절대 같은 것으로 취급하지 않는다.
+
+③ DB 행의 생성/수정    created_at / updated_at / viewed_at / favorited_at
+                      started_at / expires_at / requested_at / enqueued_at ...
+                      전부 `datetime.now().isoformat()` = **naive 로컬(KST) 시각**.
+
+④ 화면의 "오늘"        `src/lib/format.ts` 의 DISPLAY_TIME_ZONE = 'Asia/Seoul'
+                      `todayInDisplayZone()` / `ymdPlusDays()` / `formatDday()`
+```
+
+계층별 기준
+
+```
+DB 저장            naive 로컬 문자열. 오프셋도 Z 도 붙이지 않는다
+                   -> test_pipeline_integrity.py §9-b 가 tz-aware 생성 0건을 고정
+
+SQLite 시각 비교    반드시 `datetime('now','localtime')`
+                   storage/database.py 의 `_NOW_LOCAL` 하나만 쓴다
+                   -> §9 가 `now` 를 쓰면서 localtime 을 빠뜨린 자리 0건을 고정
+
+Backend 계산       서버 로컬. `date.today()` (api/v1/search.py 의 기본 기일 필터)
+                   서버가 어느 시간대에서 도는가는 **배포 결정(승인 영역)**이다
+
+API serialization  변환하지 않는다. DB 문자열을 그대로 싣는다
+
+Frontend 표시      ③ 은 `new Date(값).toLocaleDateString('ko-KR')`
+                   -> naive 문자열이라 **로컬로 파싱되고 로컬로 찍혀 대칭**이다.
+                      그래서 어느 나라에서 봐도 한국 달력 날짜가 그대로 보인다.
+                      ★ 여기에 `timeZone: 'Asia/Seoul'` 을 붙이면 **오히려 깨진다**
+                        (이미 로컬로 해석된 값을 한 번 더 옮기게 된다)
+                   ① 은 문자열 그대로 찍는다
+                   ④ 만 DISPLAY_TIME_ZONE 을 쓴다
+```
+
+왜 ④만 시간대를 고정하나 — ①②③은 **이미 확정된 값**을 보여 줄 뿐이지만, "오늘"은
+보는 사람의 시계에서 계산된다. 그래서 브라우저 시간대가 개입할 수 있는 유일한 자리다.
+
+자정 경계
+
+```
+날짜-only 값끼리의 뺄셈은 **문자열을 날짜로 파싱해 날짜끼리** 뺀다
+  (format.ts 의 parseYmdToUtcMs / daysBetween / ymdPlusDays — 시각을 끼우지 않으므로
+   시간대도 서머타임도 개입할 자리가 없다)
+`toISOString().slice(0, 10)` 로 "오늘"을 만들지 않는다 — UTC 날짜라 KST 09:00
+  이전에 하루 당긴다. 실제 결함이었다(docs/BUGS.md #270)
+  -> tests/source-contract.test.mjs 가 src 전체에서 이 모양을 금지한다
+```
+
+알려진 불일치 (고치지 않았다 — 제품 결정)
+
+```
+storage/database.py:calc_priority()
+  `(자정 - datetime.now()).days` 라 **달력 일수 - 1** 이다.
+  같은 auction_date 에 대해 화면 배지(formatDday)는 달력 일수를 쓴다.
+  달력 4일 뒤 물건: 배지 "입찰 4일전" / 큐 등급 days_left=3 -> 최우선(1)
+  경계를 옮기는 것은 "어떤 물건을 먼저 받는가"라는 정책이다.
+  경위와 근거는 test_document_queue.py 의 calc_priority 경계 검사 주석 참고.
+```

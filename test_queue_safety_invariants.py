@@ -447,9 +447,38 @@ def test_queue_status_vocabulary_is_declared_in_one_place():
                 yield getattr(node, "lineno", 0), node.value
 
     offenders = []
-    for rel in ("storage/database.py", "doc_worker.py", "api/v1/doc_stats.py",
-                "refresh_priority.py"):
-        path = os.path.join(root, rel)
+    # ★ 대상 파일을 **손으로 적지 않는다** (2026-09-01 확장).
+    #
+    #   예전에는 네 파일만 훑었다 - storage/database.py / doc_worker.py /
+    #   api/v1/doc_stats.py / refresh_priority.py. 그런데 큐 상태를 **쓰는**
+    #   코드가 그 밖에도 있었다(실측 2026-09-01):
+    #
+    #       repair_empty_status_capture.py  UPDATE document_queue SET status='pending'
+    #                                       ... AND status='done'   <- 실제 writer
+    #       audit_schedule_health.py        WHERE status='pending'  <- 감사 질의
+    #       audit_asset_integrity.py        dq.status = 'done' 등    <- 감사 질의
+    #
+    #   셋 다 리터럴이라 오타가 나면 예외가 아니라 0행 매치다. writer 쪽은 되돌림이
+    #   조용히 안 되고, 감사 쪽은 **감사기가 거짓으로 초록**을 낸다(BUGS #271 과 같은 모양).
+    #
+    #   범위가 좁다는 사실 자체가 "여기만 리터럴이어도 된다"는 두 번째 규약이다
+    #   (Sprint 118 이 시간대 검사에서 같은 결론을 냈다). 그래서 git 에게 묻는다.
+    import subprocess as _sp
+    try:
+        _out = _sp.run(["git", "ls-files", "*.py"], cwd=root,
+                       capture_output=True, text=True, timeout=30)
+        _tracked = [x for x in _out.stdout.split()
+                    if x.endswith(".py") and "-DESKTOP-" not in x
+                    and not os.path.basename(x).startswith("test_")] if _out.returncode == 0 else []
+    except (OSError, _sp.SubprocessError):
+        _tracked = []
+    if len(_tracked) < 20:
+        # git 이 없는 배포본 - 예전 목록으로 되돌린다(범위는 좁지만 0보다 낫다).
+        _tracked = ["storage/database.py", "doc_worker.py",
+                    "api/v1/doc_stats.py", "refresh_priority.py"]
+    check_true("검사 대상 파일을 실제로 모았다 - %d개" % len(_tracked), len(_tracked) >= 4)
+    for rel in _tracked:
+        path = os.path.join(root, rel.replace("/", os.sep))
         if not os.path.exists(path):
             continue
         for lineno, text in code_strings(path):
@@ -553,6 +582,28 @@ def test_document_status_vocabulary_is_declared_in_one_place():
     check_true("코드가 쓰는 값을 실제로 찾았다", len(written) >= 3, sorted(written))
     check("코드가 쓰는 값이 전부 선언돼 있다", sorted(written - declared), [])
     print("   코드가 쓰는 값: %s" % ", ".join(sorted(written)))
+
+    # (b-2) ★ `DOCUMENT_STATUSES_IN_USE` 가 **코드에서 유도된 값과 같은가** (2026-09-01).
+    #
+    #   위 (b) 는 `written ⊆ declared` 만 본다. 그래서 다음 구멍이 남아 있었다 —
+    #   누가 `OCR` 을 실제로 방출하기 시작해도
+    #     (b) 통과: OCR 은 선언돼 있다
+    #     (c) 통과: DB 값도 선언 안에 있다
+    #     (e) 통과: 라벨은 `in_use` 만 보는데 OCR 이 거기 없으니 아예 검사 대상이 아니다
+    #   즉 **화면에 영문 코드가 그대로 나가는데 어떤 검사도 붉어지지 않는다.**
+    #
+    #   `DOCUMENT_STATUSES_IN_USE` 는 손으로 유지하는 집합인데, 그 집합이 낡아도
+    #   알 방법이 없었다. 위에서 이미 **코드로부터 방출 값을 유도**해 두었으므로
+    #   (`written`), 그 둘을 맞대면 집합이 유도값과 어긋나는 순간 붉어진다.
+    #
+    #   양방향으로 본다 —
+    #     written - in_use : 방출하는데 집합에 없다 (라벨/감사가 못 본다)
+    #     in_use - written : 집합은 쓴다는데 방출하는 코드가 없다 (집합이 낡았다)
+    #
+    #   ★ 새 검사를 만들지 않고 여기 붙인 이유: 이 함수가 이미 `written` 을 유도하고
+    #     `in_use` 를 읽는다. 같은 불변식을 다른 파일에서 또 세면 한쪽만 고쳐지는 날이 온다.
+    check("★ IN_USE 에 없는데 코드가 방출하는 값", sorted(written - in_use), [])
+    check("★ 코드가 방출하지 않는데 IN_USE 에 있는 값", sorted(in_use - written), [])
 
     # (c) 실제 DB 에 선언 밖의 값이 없다.
     db_path = os.path.join(root, "auction.db")
