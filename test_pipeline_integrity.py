@@ -2232,7 +2232,24 @@ def test_stored_normalization_matches_code():
     #   0으로 내리면 그때 붉어지는 것은 회귀가 아니라 오탐이다.
     #   (같은 세션에 조인 상한들은 성격이 다르다 — sido 5->4, 차량 역방향 5->3 은
     #    어떤 측정에도 근거가 없던 여유였다.)
-    SYNC_MISMATCH_CEILING = {"sigungu": 1}
+    #
+    # ★ 2026-09-03 — `auction_date` 1건 추가. **다른 원인이다.**
+    #
+    #   위 sigungu 는 '나쁜 값이 영구 보존되는' 병리인데, 이쪽은 그 반대로
+    #   **보호 규칙이 제대로 동작한 결과**다:
+    #
+    #       auction.auction_date       ''            <- 오늘 크롤이 날짜를 못 읽었다
+    #       auction_item.auction_date  '2026-09-08'  <- 어제까지의 정상값을 지키고 있다
+    #
+    #   `migrate_execute` 가 '크롤 값이 비면 기존 정상값을 지우지 않는다'를
+    #   지켰기 때문에 생긴 차이다. 지웠다면 사용자 화면의 매각기일이 사라졌을
+    #   것이므로 이 동작 자체는 옳다.
+    #
+    #   왜 못 읽었나 — 그 물건이 **병합사건 순서 뒤집힘**으로 두 행이 됐다
+    #   (상주지원 2024타경995 외 4건, 아래 §병합사건 순서 검사 참고).
+    #   근본 원인은 그쪽이고 여기는 증상이다. 순서 문제가 해소되면 이 1건도
+    #   사라지므로, 그때 이 항목을 지운다.
+    SYNC_MISMATCH_CEILING = {"sigungu": 1, "auction_date": 1}
     FIELDS = ["property_type", "sido", "sigungu", "dong", "lot_number", "full_address",
               "appraisal_price", "minimum_bid_price", "auction_date", "status",
               "validation_status", "crawl_date"]
@@ -2564,6 +2581,10 @@ def run():
     test_empty_sido_is_explained_by_the_address()
     test_failed_registry_requests_value_report()
     test_columns_with_no_producer()
+    test_merged_case_component_order_does_not_split_identity()
+    test_core_field_chains_are_wired_end_to_end()
+    test_api_timestamps_are_naive_local_iso()
+    test_non_nullable_numeric_columns_are_never_null()
 
     print("\n" + "=" * 55)
     if failures:
@@ -2610,9 +2631,21 @@ def run():
 # ---------------------------------------------------------------------------
 PRODUCERLESS_COLUMNS = {
     # (표, 컬럼): 왜 비어 있는가
-    ("auction_case", "case_type"):        "migrate_execute 가 리터럴 NULL - 크롤러에 생산자 없음",
-    ("auction_case", "filed_date"):       "위와 같음. 상세화면 '접수일' 이 영원히 '-'",
-    ("auction_case", "demand_deadline"):  "위와 같음. 상세화면 '배당요구종기일' 이 영원히 '-'",
+    # ★ `auction_case` 의 사건 정보 3종은 2026-09-03 에 **전부 여기서 빠졌다** —
+    #   셋 다 생산자가 생겼다. 어디서 오는지는 서로 다르다:
+    #
+    #     filed_date       크롤 상세페이지 `basic_info['사건접수']`
+    #                      -> normalize_item -> auction.filed_date
+    #                      -> migrate_execute -> auction_case
+    #                      지킴: test_migrate_incremental.py §14
+    #
+    #     case_type        이미 받아 둔 `spec.pdf` 1쪽 (load_spec_data.py)
+    #     demand_deadline  -> auction_case 에 직접 COALESCE 갱신
+    #                      지킴: test_rights_data_load.py 의 사건 정보 2종
+    #
+    #   실측(2026-09-03): 보유 spec.pdf 466개에서 사건종류 98.1% / 배당요구종기
+    #   95.3% 를 읽었고, 사본 DB 적재로 case_type 370->411, demand_deadline
+    #   360->399 를 확인했다(재실행 멱등). 접수일은 인천 10사건으로 확인했다.
     ("rights_summary", "priority_right"):        "load_rights_data 가 리터럴 NULL",
     ("rights_summary", "priority_date"):         "load_rights_data 가 리터럴 NULL",
     ("rights_summary", "dangerous_tenant_count"): "load_rights_data 가 리터럴 NULL",
@@ -2625,6 +2658,32 @@ PRODUCERLESS_COLUMNS = {
     ("rights_summary", "risk_reason"):       "위와 같음",
     ("rights_summary", "analysis_explanation"): "위와 같음",
 }
+
+
+def _recent_fill(conn, table, col):
+    """(채워진 수, 센 수) — **가장 최근에 만들어진 행들**만 본다.
+
+    `created_at` 의 서로 다른 날짜 중 최신 3일을 쓴다. 하루만 보면 그날 새 행이
+    0건일 수 있고(사건이 매일 새로 생기지는 않는다), 넓게 보면 옛 생산자의 값이
+    다시 섞인다. 3일은 그 사이다.
+
+    `created_at` 이 없는 표는 판정하지 않는다 — 없는 근거로 단언하지 않는다.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+    if "created_at" not in cols:
+        return (0, 0)
+    days = [r[0] for r in conn.execute(
+        "SELECT DISTINCT substr(created_at,1,10) d FROM %s "
+        "WHERE created_at IS NOT NULL ORDER BY d DESC LIMIT 3" % table)]
+    if not days:
+        return (0, 0)
+    marks = ",".join("?" * len(days))
+    n = conn.execute("SELECT COUNT(*) FROM %s WHERE substr(created_at,1,10) IN (%s)"
+                     % (table, marks), days).fetchone()[0]
+    f = conn.execute(
+        "SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL "
+        "AND substr(created_at,1,10) IN (%s)" % (table, col, marks), days).fetchone()[0]
+    return (f, n)
 
 
 def test_columns_with_no_producer():
@@ -2650,15 +2709,34 @@ def test_columns_with_no_producer():
                 continue          # 행이 없으면 판정할 수 없다
             filled = conn.execute(
                 "SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL" % (table, col)).fetchone()[0]
-            measured[(table, col)] = (filled, total)
+            # ★ 판정은 **최근에 만들어진 행**으로 한다 (2026-09-03).
+            #
+            #   묻는 것은 "이 컬럼에 값이 있는 행이 하나라도 있는가"가 아니라
+            #   **"지금 도는 파이프라인이 이것을 채우는가"** 다. 둘은 다르다 —
+            #   생산자가 죽어도 그 전에 쌓아 둔 값은 표에 남기 때문이다.
+            #
+            #   실제로 그것 때문에 이 검사가 기계마다 다른 답을 냈다:
+            #       매장 PC(2026-08-12 이후 크롤 없는 낡은 DB)  filed 0 -> 통과
+            #       홈 PC(매일 크롤)                           filed 217 -> 실패
+            #   같은 코드가 DB 나이에 따라 뒤집히면 게이트가 아니라 소음이다.
+            #
+            #   `auction_case` 로 실측한 근거(2026-09-02):
+            #       08-30 생성 21행  filed 21 / type 5     <- 생산자가 살아 있던 날
+            #       09-01 생성 29행  filed 0  / type 0     <- 죽은 뒤
+            #       09-02 생성 53행  filed 0  / type 0
+            #   전체로 세면 둘 다 "값이 있다"로 보이지만, 최근 행으로 보면
+            #   **지금 무엇이 채워지고 무엇이 안 채워지는지**가 그대로 드러난다.
+            recent = _recent_fill(conn, table, col)
+            measured[(table, col)] = (filled, total, recent)
     finally:
         conn.close()
 
     check_true("검사 대상 컬럼을 실제로 쟀다 - %d개" % len(measured), len(measured) > 0, len(measured))
 
     # (a) 목록에 있는데 **채워지기 시작한** 컬럼 -> 좋은 소식이지만 목록을 고쳐야 한다.
-    now_produced = sorted("%s.%s (%d/%d)" % (t, c, f, n)
-                          for (t, c), (f, n) in measured.items() if f > 0)
+    now_produced = sorted(
+        "%s.%s (최근 %d/%d 행, 누적 %d/%d)" % (t, c, r[0], r[1], f, n)
+        for (t, c), (f, n, r) in measured.items() if r[1] and r[0] > 0)
     check("생산자가 생긴 컬럼은 목록에서 지운다", now_produced, [])
     if now_produced:
         print("      -> 채워지기 시작했다. PRODUCERLESS_COLUMNS 에서 지우고,"
@@ -2690,7 +2768,445 @@ def test_columns_with_no_producer():
     if newly:
         print("      -> 이 컬럼을 쓰는 화면이 있으면 지금 빈 채로 나가고 있다.")
 
-    print("    producerless 로 알려진 컬럼 %d개 (전부 여전히 0)" % len(measured))
+    for (t, c), (f, n, r) in sorted(measured.items()):
+        print("      %s.%s  최근 %d/%d  누적 %d/%d%s"
+              % (t, c, r[0], r[1], f, n,
+                 "   <- 누적에는 옛 코드가 남긴 값이 있다" if f and not r[0] else ""))
+    print("    producerless 로 알려진 컬럼 %d개 (최근 행 기준 전부 0)" % len(measured))
+
+
+# ---------------------------------------------------------------------------
+# 병합사건 **구성요소 순서**가 식별자를 가르지 않는가 (2026-09-03, P0-2)
+#
+# ## 무엇이 일어났나 (실측)
+#
+# 법원은 관련 사건을 묶어 한 줄로 공고한다. 크롤러는 그 줄에서 사건번호를 찾아
+# `" / ".join(case_nos)` 로 **문자열 하나**를 만들고, 그 문자열이 식별키의 일부가 된다
+# (`auction` 의 UNIQUE(court_code, case_no, item_no)).
+#
+# 그런데 **순서는 법원 페이지가 정한다.** 2026-09-03 크롤에서 같은 물건이 어제와
+# 다른 순서로 나왔고, 그 결과 같은 물건이 두 행이 됐다:
+#
+#     auction 178   '2024타경995 / 2024타경1417 / 2025타경5447 / 2025타경5476 / 2025타경5483'
+#     auction 1564  '2024타경995 / 2024타경1417 / 2025타경5447 / 2025타경5483 / 2025타경5476'
+#                                                    ^^^^ 5476 과 5483 이 뒤바뀌었다
+#
+# `auction_case` / `auction_item` 에도 그대로 두 벌이 생긴다(실측 확인). 사용자에게는
+# **검색 결과에 같은 물건이 두 번** 나오고, 문서 큐도 두 벌 쌓인다.
+#
+# ## 기존 탐지기가 못 잡는 변종이다
+#
+# `detect_merged_case_duplicates_dryrun.py` 는 *"조각이 단독 행으로도 존재하는가"*
+# (병합 전/후)를 본다. 이 순서 뒤집힘은 **조각 집합이 완전히 같아서** 그 검사에
+# 걸리지 않는다.
+#
+# ## 왜 여기서 고치지 않나
+#
+# 고치려면 `case_no` 를 정규 순서로 만들어야 하는데, 그러면 **이미 저장된 병합사건
+# 638행(auction 기준)의 식별키가 전부 바뀐다.** 다음 크롤이 옛 순서 행을 못 찾아
+# 새 행을 또 만들어 중복이 오히려 늘어난다. 즉 producer 수정만으로는 안 되고
+# **기존 행 재키잉(데이터 마이그레이션)이 함께 가야 한다** — 승인 영역이다
+# (docs/CLAUDE.md: DB 스키마/데이터 변경은 승인 후).
+#
+# 그래서 지금은 **현재 개수를 못박는다.** 늘면 실패한다.
+# ---------------------------------------------------------------------------
+MERGED_ORDER_DUPLICATE_CEILING = 1
+
+
+def _canon_case(case_no):
+    """병합사건 문자열 -> 순서 무관 정규형(조각 집합)."""
+    return tuple(sorted(p.strip() for p in (case_no or "").split("/") if p.strip()))
+
+
+def test_merged_case_component_order_does_not_split_identity():
+    print("\n--- 병합사건 구성요소 순서가 식별자를 가르지 않는가 (P0-2) ---")
+    if not os.path.exists(DB):
+        print("    (auction.db 없음 - 재지 못했다)")
+        return
+    import collections as _c
+
+    conn = connect()
+    try:
+        merged = conn.execute(
+            "SELECT COUNT(*) FROM auction WHERE case_no LIKE '%/%'").fetchone()[0]
+        # `connect()` 는 row_factory 를 두지 않는다 - 인덱스로 읽는다.
+        groups = _c.defaultdict(list)
+        for rid, court, case_no, item_no in conn.execute(
+                "SELECT id, court_code, case_no, item_no FROM auction"):
+            groups[(court, _canon_case(case_no), item_no)].append((rid, case_no))
+        item_groups = _c.defaultdict(list)
+        for rid, court, case_no, item_no in conn.execute(
+                "SELECT ai.id, ac.court_code, ai.case_no, ai.item_no FROM auction_item ai"
+                " JOIN auction_case ac ON ai.case_id = ac.id"):
+            item_groups[(court, _canon_case(case_no), item_no)].append((rid, case_no))
+    finally:
+        conn.close()
+
+    check_true("검사가 공허하지 않다 - 병합사건 행이 실제로 있다 (%d행)" % merged,
+               merged > 0, merged)
+
+    # ★ 자기 검증 — 정규형이 **실제로 순서를 지운다.**
+    #   이것이 없으면 `_canon_case()` 가 망가졌을 때 그룹이 0 이 되어 검사가
+    #   **조용히 초록**이 된다(2026-09-03 변이 H2 로 확인). 세는 도구가 죽으면
+    #   "0건"은 "깨끗하다"가 아니라 "재지 못했다"이다.
+    a = _canon_case("2024타경995 / 2025타경5476 / 2025타경5483")
+    b = _canon_case("2024타경995 / 2025타경5483 / 2025타경5476")
+    check("자기 검증: 순서가 달라도 같은 정규형", a, b)
+    check_true("자기 검증: 조각을 실제로 분해한다(3개)", len(a) == 3, a)
+    check_true("자기 검증: 조각 집합이 다르면 다른 정규형",
+               _canon_case("2024타경1") != _canon_case("2024타경2"), True)
+
+    def split_groups(g):
+        # 조각 집합은 같은데 **저장된 문자열이 다른** 그룹만 센다.
+        out = []
+        for key, rows in g.items():
+            if len(rows) > 1 and len({cn for _, cn in rows}) > 1:
+                out.append((key[0], key[2], [r[0] for r in rows]))
+        return sorted(out)
+
+    a_split = split_groups(groups)
+    i_split = split_groups(item_groups)
+    print("    auction 갈라진 그룹 %d / auction_item %d" % (len(a_split), len(i_split)))
+    for g in a_split[:5]:
+        print("      %s item %s -> auction id %s" % g)
+
+    check_true(
+        "★ 순서 뒤집힘으로 갈라진 물건이 늘지 않았다 (상한 %d)"
+        % MERGED_ORDER_DUPLICATE_CEILING,
+        len(a_split) <= MERGED_ORDER_DUPLICATE_CEILING,
+        "-> %d건. 같은 물건이 검색 결과에 두 번 나온다. 근본 수정은 case_no 정규화 + "
+        "기존 행 재키잉(승인 영역)이다." % len(a_split))
+    check_true(
+        "★ auction_item 도 같은 상한을 지킨다",
+        len(i_split) <= MERGED_ORDER_DUPLICATE_CEILING,
+        "-> %d건" % len(i_split))
+
+
+# ---------------------------------------------------------------------------
+# 핵심 필드 **끝에서 끝까지** 배선 계약 (2026-09-03, P0-2)
+#
+# ## 왜 또 만드나 — 조각 검사는 이미 넷이 있다
+#
+#   normalize_item -> auction        test_normalizer.py:run_normalized_keys_reach_storage
+#   auction -> auction_item          이 파일 §13 (두 표 값 대조)
+#   DB -> API                        이 파일 §15 (생산자 없는 컬럼)
+#   API -> TypeScript                tests/frontend-contract.test.mjs
+#
+# 넷 다 자기 구간만 본다. 그래서 **구간과 구간 사이가 끊겨도** 넷 다 초록일 수 있다.
+# 실제로 이번 세션이 그 모양을 두 번 만났다:
+#
+#   * `filed_date` — 컬럼도 API 도 화면도 있는데 **생산자만** 없었다(BUGS #285).
+#     각 조각 검사는 전부 통과했다. 아무도 "그래서 값이 오는가"를 묻지 않았다.
+#   * `load_item()` 이 사건 정보 호출을 잃어도 파서/갱신자 검사는 둘 다 통과했다
+#     (변이 N4).
+#
+# 이 검사는 **한 필드가 소스에서 화면까지 가는 이음매를 전부** 본다. 값이 아니라
+# **배선**을 본다(값은 §13/§15 가 실데이터로 본다).
+#
+# 한 줄이라도 끊기면 어느 이음매인지 이름을 대고 실패한다.
+# ---------------------------------------------------------------------------
+#  필드: (정규화기가 싣는가, auction 컬럼, auction_item/auction_case 컬럼,
+#         API 가 내보내는가, TS 가 선언하는가)
+FIELD_CHAIN = {
+    # 크롤 -> normalize -> auction -> auction_item -> API -> 화면
+    "appraisal_price":   ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "minimum_bid_price": ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "auction_date":      ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "status":            ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "case_no":           ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "item_no":           ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "crawl_date":        ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "full_address":      ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "property_type":     ("normalizer", "auction", "auction_item", "search+item", "both"),
+    # 파생 — 정규화기가 아니라 migrate_execute 가 계산한다
+    "bid_rate":          ("derived",    None,     "auction_item", "search+item", "both"),
+    "fail_count":        ("derived",    None,     "auction_item", "search+item", "both"),
+    # 사건 정보 — 이번 세션에 배선했다 (BUGS #285)
+    "filed_date":        ("normalizer", "auction", "auction_case", "item", "case"),
+    "case_type":         ("spec_pdf",   None,     "auction_case", "item", "case"),
+    "demand_deadline":   ("spec_pdf",   None,     "auction_case", "item", "case"),
+}
+
+
+def test_core_field_chains_are_wired_end_to_end():
+    print("\n--- 핵심 필드 끝에서 끝까지 배선 (P0-2) ---")
+    import re as _re
+    import io as _io
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def read(rel):
+        try:
+            return _io.open(os.path.join(root, rel), encoding="utf-8-sig").read()
+        except OSError:
+            return ""
+
+    norm_src = read("normalizer/normalizer.py")
+    spec_src = read("load_spec_data.py")
+    mig_src = read("migrate_execute.py")
+    ts_detail = read("src/app/properties/[id]/page.tsx")
+    ts_search = read("src/app/search/types.ts")
+
+    check_true("검사가 공허하지 않다 - 소스를 실제로 읽었다",
+               all(len(s) > 500 for s in (norm_src, spec_src, mig_src,
+                                          ts_detail, ts_search)),
+               [len(norm_src), len(spec_src), len(mig_src),
+                len(ts_detail), len(ts_search)])
+
+    conn = connect()
+    try:
+        cols = {}
+        for t in ("auction", "auction_item", "auction_case"):
+            cols[t] = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}
+        row = conn.execute(
+            "SELECT ai.id FROM auction_item ai JOIN auction_case ac ON ai.case_id=ac.id"
+            " WHERE ac.filed_date IS NOT NULL AND ac.case_type IS NOT NULL"
+            " ORDER BY ai.id DESC LIMIT 1").fetchone()
+        probe_id = row[0] if row else conn.execute(
+            "SELECT id FROM auction_item ORDER BY id DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+    # ── API 는 **실제 응답**으로 본다 (소스 grep 은 주석에 걸린다) ──────────
+    #    grep 판본에서는 `bid_rate` 를 API 에서 지워도 주석에 그 단어가 남아
+    #    검사가 통과했다(2026-09-03 변이 C3).
+    detail_json, search_json = {}, {}
+    try:
+        from fastapi.testclient import TestClient
+        import api_server
+        _client = TestClient(api_server.app)
+        r = _client.get("/api/v1/item/%d" % probe_id)
+        if r.status_code == 200:
+            detail_json = r.json()
+        r2 = _client.get("/api/v1/search?size=1&include_closed=true")
+        if r2.status_code == 200:
+            items = (r2.json() or {}).get("items") or []
+            search_json = items[0] if items else {}
+    except Exception as exc:                    # noqa: BLE001
+        print("    (API 를 띄우지 못했다: %s) - API 이음매는 재지 못했다" % type(exc).__name__)
+
+    check_true("검사가 공허하지 않다 - 실제 API 응답을 받았다",
+               bool(detail_json) and bool(search_json),
+               [len(detail_json), len(search_json)])
+
+    def ts_declares(src, field):
+        """인터페이스 본문의 **선언 줄**로만 인정한다 (`min_fail_count` 오인 방지)."""
+        return _re.search(r"^\s*%s\??\s*:" % _re.escape(field), src, _re.M) is not None
+
+    broken = []
+    for field, (producer, raw_tab, out_tab, api_where, ts_where) in sorted(FIELD_CHAIN.items()):
+        # (1) 생산자 — 출력 dict 의 **키**로 본다
+        if producer == "normalizer":
+            ok = _re.search(r'"%s"\s*:' % field, norm_src) is not None
+        elif producer == "spec_pdf":
+            ok = (_re.search(r'out\["%s"\]' % field, spec_src) is not None
+                  and _re.search(r"\b%s\s*=\s*COALESCE" % field, spec_src) is not None)
+        else:                                   # derived (migrate_execute 가 계산)
+            ok = _re.search(r'"%s"' % field, mig_src) is not None
+        if not ok:
+            broken.append("%s: 생산자(%s) 없음" % (field, producer))
+
+        # (2)(3) 표 컬럼
+        if raw_tab and field not in cols.get(raw_tab, set()):
+            broken.append("%s: %s 컬럼 없음" % (field, raw_tab))
+        if out_tab and field not in cols.get(out_tab, set()):
+            broken.append("%s: %s 컬럼 없음" % (field, out_tab))
+
+        # (4) API 응답에 **키가 실제로 있는가**
+        if detail_json:
+            if ts_where == "case":
+                present = isinstance(detail_json.get("case"), dict) and \
+                    field in detail_json["case"]
+            else:
+                present = field in detail_json
+            if "item" in api_where and not present:
+                broken.append("%s: /api/v1/item 응답에 없음" % field)
+        if search_json and "search" in api_where and field not in search_json:
+            broken.append("%s: /api/v1/search 응답에 없음" % field)
+
+        # (5) 프런트 선언
+        if ts_where in ("both", "case") and not ts_declares(ts_detail, field):
+            broken.append("%s: 상세 화면 타입에 선언 없음" % field)
+        if ts_where == "both" and not ts_declares(ts_search, field):
+            broken.append("%s: 검색 타입에 선언 없음" % field)
+
+    check("★ 끊긴 이음매 없음", sorted(broken), [])
+    print("    검사한 필드 %d개 x 5이음매" % len(FIELD_CHAIN))
+
+
+# ---------------------------------------------------------------------------
+# API 시각 문자열 표기 계약 (2026-09-03, P0-3 Timezone)
+#
+# ## 왜 필요한가 — 프런트가 이 표기에 **의존하고 있다**
+#
+# 관심물건/최근본/마이페이지 세 화면이 서버 시각을 이렇게 그린다:
+#
+#     new Date(item.favorited_at).toLocaleDateString('ko-KR')
+#
+# 이것이 지금 옳은 이유는 서버가 **오프셋 없는 naive ISO** 를 주기 때문이다.
+# ECMAScript 는 오프셋 없는 date-time 을 **로컬 시각**으로 파싱하므로, 파싱도
+# 표시도 같은 시간대를 써서 **문자열에 적힌 날짜가 그대로** 나온다(브라우저가
+# 어느 시간대든 같다).
+#
+# 그 전제가 깨지는 순간 화면이 하루 밀린다:
+#
+#     '2026-09-03T05:12:15'   naive  -> 어느 브라우저에서도 9/3   (지금)
+#     '2026-09-03T05:12:15Z'  UTC    -> KST 브라우저에서 9/3 14:12, 미국에서는 **9/2**
+#     '2026-09-03 05:12:15'   공백   -> 파싱이 구현 정의(브라우저마다 다르다)
+#
+# 파이썬 쪽은 `datetime.now().isoformat()` 하나로 고정돼 있고 §9-b 가 그것을
+# 지킨다. 그런데 **응답 표기 자체**를 보는 검사는 없었다 — 직렬화가 바뀌거나
+# (예: `response_model` 에 `datetime` 타입을 쓰면 FastAPI 가 오프셋을 붙일 수 있다)
+# SQL 이 값을 만들면(`datetime('now','localtime')` 은 공백 구분) 조용히 깨진다.
+#
+# 그래서 **실제 응답 JSON 을 훑어** 날짜꼴 문자열을 전부 검사한다.
+# 실측(2026-09-03): 195개 전부 통과.
+# ---------------------------------------------------------------------------
+_NAIVE_ISO = _RE_DT = None      # 아래에서 컴파일한다(모듈 최상위 import 를 늘리지 않는다)
+
+
+def test_api_timestamps_are_naive_local_iso():
+    print("\n--- API 시각 표기 계약: naive ISO 인가 (P0-3) ---")
+    import re as _re
+    if not os.path.exists(DB):
+        print("    (auction.db 없음 - 재지 못했다)")
+        return
+
+    NAIVE = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$")
+    DATEONLY = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    LOOKS_DATE = _re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+    # 자기 검증 — 깨진 표기를 실제로 잡는가. 이것이 없으면 아래 "0건"은
+    # "규칙이 없다"와 구별되지 않는다.
+    def ok(v):
+        return bool(NAIVE.match(v) or DATEONLY.match(v))
+    check_true("자기 검증: naive ISO 를 통과시킨다", ok("2026-09-03T05:12:15.356967"))
+    check_true("자기 검증: 날짜만도 통과시킨다", ok("2026-09-03"))
+    check_true("자기 검증: Z(UTC) 를 잡는다", not ok("2026-09-03T05:12:15Z"))
+    check_true("자기 검증: 오프셋을 잡는다", not ok("2026-09-03T05:12:15+09:00"))
+    check_true("자기 검증: 공백 구분을 잡는다", not ok("2026-09-03 05:12:15"))
+
+    try:
+        from fastapi.testclient import TestClient
+        import api_server
+        client = TestClient(api_server.app)
+    except Exception as exc:                    # noqa: BLE001
+        print("    (API 를 띄우지 못했다: %s)" % type(exc).__name__)
+        return
+
+    bad, seen = [], 0
+
+    def walk(o, path=""):
+        nonlocal seen
+        if isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, path + "." + k)
+        elif isinstance(o, list):
+            for v in o[:3]:
+                walk(v, path + "[]")
+        elif isinstance(o, str) and LOOKS_DATE.match(o):
+            seen += 1
+            if not ok(o):
+                bad.append((path, o))
+
+    conn = connect()
+    try:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM auction_item ORDER BY RANDOM() LIMIT 30")]
+    finally:
+        conn.close()
+    for i in ids:
+        r = client.get("/api/v1/item/%d" % i)
+        if r.status_code == 200:
+            walk(r.json())
+    for ep in ("/api/v1/search?size=40&include_closed=true",
+               "/api/v1/stats", "/api/v1/document-stats", "/api/v1/plans"):
+        r = client.get(ep)
+        if r.status_code == 200:
+            walk(r.json())
+
+    check_true("검사가 공허하지 않다 - 날짜꼴 문자열을 실제로 봤다 (%d개)" % seen,
+               seen >= 50, seen)
+    check("★ 오프셋/Z/공백 표기가 섞이지 않았다", sorted(bad)[:10], [])
+    if bad:
+        print("      -> 프런트가 `new Date(값)` 으로 파싱한다. 표기가 바뀌면 "
+              "관심물건/최근본 화면의 날짜가 하루 밀린다.")
+
+
+# ---------------------------------------------------------------------------
+# 프런트가 **non-nullable 로 선언한** 숫자 컬럼의 DB 불변식 (2026-09-03, P0-5)
+#
+# ## 왜 DB 쪽에도 두는가 — 표본 검사만으로는 못 잡는다
+#
+# `tests/frontend-contract.test.mjs` 가 실제 응답과 TS 선언의 nullability 를 대조한다.
+# 그런데 그것은 **표본**(검색 40건 + 상세 12건)이다. 표본 밖의 행 하나가 NULL 이면
+# 그 검사는 초록이고 사용자만 깨진 화면을 본다 — 실제로 그 구멍을 확인했다
+# (2026-09-03: `auction_item.id=1` 에 NULL 을 주입했더니 표본에 안 들어가 통과했다).
+#
+# 그래서 **모든 행**을 보는 불변식을 여기 둔다. 둘은 짝이다:
+#
+#     프런트 계약 검사   응답 표기가 선언과 맞는가      (표본, 살아 있는 API)
+#     이 검사            애초에 NULL 이 될 수 있는가    (전수, DB)
+#
+# ## 왜 스키마로 막지 못하나
+#
+# 컬럼이 `INTEGER DEFAULT 0` 이고 `NOT NULL` 이 아니다. `NOT NULL` 을 붙이려면
+# 테이블 재작성 마이그레이션이 필요하고 그것은 승인 영역이다(docs/CLAUDE.md).
+# 지금은 **사실을 고정**해 두고, 깨지면 즉시 알린다.
+#
+# 선언 목록은 손으로 적지 않는다 — `src/app/search/types.ts` 에서 읽는다. 프런트가
+# 선언을 `number | null` 로 바꾸면 이 검사도 저절로 그 컬럼을 놓아 준다.
+# ---------------------------------------------------------------------------
+def test_non_nullable_numeric_columns_are_never_null():
+    print("\n--- 프런트가 non-null 로 선언한 숫자 컬럼의 전수 불변식 (P0-5) ---")
+    import re as _re
+    import io as _io
+    if not os.path.exists(DB):
+        print("    (auction.db 없음 - 재지 못했다)")
+        return
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    ts_path = os.path.join(root, "src", "app", "search", "types.ts")
+    try:
+        ts = _io.open(ts_path, encoding="utf-8").read()
+    except OSError:
+        print("    (types.ts 를 읽지 못했다)")
+        return
+
+    body = ts[ts.index("SearchResultItem"):]
+    body = body[:body.index("\n}")]
+    # `이름: number` 이고 `| null` 도 `?` 도 없는 것만
+    non_null_numbers = []
+    for line in body.split("\n"):
+        code = line.split("//")[0].strip()
+        m = _re.match(r"^([a-z_]+)\s*:\s*number\s*$", code)
+        if m:
+            non_null_numbers.append(m.group(1))
+
+    check_true("선언을 실제로 읽었다 (non-null number %d개: %s)"
+               % (len(non_null_numbers), ", ".join(non_null_numbers)),
+               len(non_null_numbers) >= 3, non_null_numbers)
+
+    conn = connect()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)")}
+        total = conn.execute("SELECT COUNT(*) FROM auction_item").fetchone()[0]
+        offenders = {}
+        for c in non_null_numbers:
+            if c not in cols:
+                continue
+            n = conn.execute(
+                "SELECT COUNT(*) FROM auction_item WHERE %s IS NULL" % c).fetchone()[0]
+            if n:
+                offenders[c] = n
+    finally:
+        conn.close()
+
+    check_true("검사가 공허하지 않다 - 물건 %d행을 봤다" % total, total > 0, total)
+    check("★ non-null 로 선언한 숫자 컬럼에 NULL 인 행이 없다", offenders, {})
+    if offenders:
+        print("      -> 프런트는 이 값을 `number` 로 믿는다. null 이 가면 그 카드만"
+              " 런타임에 깨지거나 '-' 로 조용히 비어 보인다."
+              " 값을 채우거나 TS 선언을 `number | null` 로 바꿔라.")
 
 
 if __name__ == "__main__":

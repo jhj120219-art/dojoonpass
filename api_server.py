@@ -178,6 +178,25 @@ app.include_router(subscriptions_router, prefix="/api/v1", tags=["subscriptions"
 def root():
     return {"success": True, "data": {"status": "ok", "version": "1.0.0"}, "message": None}
 
+# 프런트(:3000)와 API 는 다른 호스트라 robots.txt 도 각각 필요하다. 이건 API 쪽이다.
+from fastapi.responses import PlainTextResponse
+
+_ROBOTS_TXT = """User-agent: *
+Disallow: /api/v1/item/*/documents/
+Disallow: /api/v1/item/*/images/
+Disallow: /docs
+Disallow: /redoc
+Disallow: /openapi.json
+"""
+
+
+# ★ `include_in_schema=False` 로 숨기지 않는다. 그러면 인가 전수 검사가
+#   이 라우트를 못 보고 지나간다 - `test_api_regression` 이 정확히 그것을
+#   잡았다. 공개인 것은 맞지만, **감사를 통과한 공개**여야 한다.
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    return PlainTextResponse(_ROBOTS_TXT)
+
 @app.get("/api/v1/stats")
 def stats():
     from storage.database import get_connection

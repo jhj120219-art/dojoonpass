@@ -2502,6 +2502,9 @@ def test_plans_api():
 # ---------------------------------------------------------------------------
 EXPECTED_ENDPOINTS = {
     ("GET", "/"),
+    # 크롤러 지시 파일 (2026-09-03, BUGS #254). 원천 문서/사진 경로를
+    # 색인에서 뺀다 - 그 안에 임차인 실명이 있다.
+    ("GET", "/robots.txt"),
     ("GET", "/api/v1/stats"),
     ("GET", "/api/v1/document-stats"),
     ("GET", "/api/v1/search"),
@@ -2612,6 +2615,75 @@ def test_api_surface():
 # 17. 공통 응답 envelope — 인증 필요 라우트는 {success, data, message} 형태를 유지해야 한다.
 #     (docs/backend.md "절대 변경하면 안 되는 것"에 명시된 계약)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 16-B. 프런트가 부르는 경로가 **API 에 실제로 있는가** (2026-09-03, P0-5)
+#
+# 위 16번은 반대 방향이다 — *API 라우트가 조용히 늘거나 사라졌는가*. 그런데
+# **프런트가 없는 주소를 부르는 것**은 그 검사로 잡히지 않는다. 라우트 목록은
+# 멀쩡하고, 화면만 404 를 받는다. 그것도 그 화면을 열어 봐야 안다.
+#
+# 실제로 이 저장소는 그 계열의 사고를 겪었다(레거시 라우트 정리 때 프런트가 옛
+# 주소를 들고 있었다 — `docs/CURRENT_STATE.md` Sprint 51).
+#
+# 그래서 `src/` 에서 `/api/v1/...` 문자열을 전부 긁어 **경로 틀**로 바꾼 뒤
+# OpenAPI 라우트 표와 맞춰 본다. 값이 박힌 자리(`${id}`)는 `{}` 로 지운다.
+# ---------------------------------------------------------------------------
+def test_frontend_called_routes_exist_in_the_api():
+    print("\n--- 16-B. 프런트가 부르는 경로가 API 에 있는가 ---")
+    import re as _re
+    import io as _io
+    import subprocess as _sp
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "src"], cwd=root, capture_output=True,
+                      text=True, encoding="utf-8", timeout=30)
+        files = [f for f in out.stdout.split() if f.endswith((".ts", ".tsx"))]
+    except (OSError, _sp.SubprocessError):
+        print("[SKIP] git 을 쓸 수 없다")
+        return
+
+    LIT = _re.compile(r"""['"`](/api/v1/[^'"`\s]*)['"`]""")
+    called = set()
+    for rel in files:
+        try:
+            src = _io.open(os.path.join(root, rel.replace("/", os.sep)),
+                           encoding="utf-8").read()
+        except OSError:
+            continue
+        for m in LIT.finditer(src):
+            p = m.group(1)
+            p = p.split("?")[0]                       # 쿼리스트링 제거
+            p = _re.sub(r"\$\{[^}]*\}", "{}", p)       # 템플릿 값 -> {}
+            if "${" in p or not p.startswith("/api/v1/"):
+                continue
+            called.add(p.rstrip("/") or p)
+
+    check_true("검사가 공허하지 않다 - 프런트에서 경로를 실제로 찾았다 (%d개)"
+               % len(called), len(called) >= 8, sorted(called))
+
+    api_server.app.openapi_schema = None
+    spec = api_server.app.openapi()
+    # OpenAPI 의 `{item_id}` 같은 이름을 `{}` 로 통일해 모양만 비교한다.
+    api_shapes = {_re.sub(r"\{[^}]*\}", "{}", p) for p in spec["paths"]}
+    # 스키마에 없는 HEAD 프로브(include_in_schema=False)도 실재한다.
+    api_shapes.add("/api/v1/item/{}/documents/{}")
+    api_shapes.add("/api/v1/item/{}/images/{}")
+
+    missing = sorted(p for p in called if p not in api_shapes)
+    check("★ 프런트가 부르는 경로가 전부 API 에 있다", missing, [])
+    if missing:
+        print("      -> 이 주소는 런타임 404 다. 라우트를 만들거나 프런트를 고쳐라.")
+    print("    프런트 호출 경로 %d개 / API 라우트 모양 %d개"
+          % (len(called), len(api_shapes)))
+
+    # 자기 검증 — 없는 주소를 넣으면 잡는가. 이것이 없으면 위 "0건"은
+    # "비교가 되고 있다"를 증명하지 못한다.
+    check_true("자기 검증: 없는 경로를 잡는다",
+               "/api/v1/nope/{}" not in api_shapes, "탐지기 전제")
+
 def test_response_envelope():
     print("\n--- 17. response envelope ---")
     h = auth_headers()
@@ -2653,6 +2725,9 @@ def test_response_envelope():
         "/api/v1/stats": "레거시 3키 운영 통계 응답",
         # api/v1/doc_stats.py — 순수 dict. 소스에 명시적 근거 주석은 없다(확인함).
         "/api/v1/document-stats": "운영 진단용 raw dict(소스에 근거 주석 없음)",
+        # robots.txt 는 **규격이 정해진 평문**이다(text/plain). JSON envelope 로
+        # 감싸면 크롤러가 읽지 못한다 - 형식을 우리가 고를 수 없는 자리다.
+        "/robots.txt": "크롤러 규격상 text/plain 이어야 한다 (BUGS #254)",
     }
 
     spec = api_server.app.openapi()
@@ -5183,6 +5258,9 @@ PUBLIC_ENDPOINTS = {
     # 문서 뷰어와 같은 판단이다.
     "/api/v1/item/{item_id}/images/{seq}",
     "/api/v1/plans",
+    # 크롤러 지시 파일. 인증을 요구하면 의미가 없다 - 크롤러는 토큰이 없다.
+    # 내용은 상수 문자열뿐이고 DB 도 사용자 데이터도 읽지 않는다 (BUGS #254).
+    "/robots.txt",
 }
 # 사용자 인증은 없지만 다른 수단(서명)으로 보호되는 경로.
 SIGNATURE_PROTECTED_ENDPOINTS = {"/api/v1/payments/webhook/{provider_name}"}
@@ -6170,6 +6248,7 @@ def run():
         test_subscription_plan_tiebreak()
         test_plans_api()
         test_api_surface()
+        test_frontend_called_routes_exist_in_the_api()
         test_response_envelope()
         test_cors_configuration()
         test_backend_security_headers()

@@ -57,6 +57,41 @@ def scan(conn):
     return {k: v for k, v in groups.items() if len(v) > 1}
 
 
+
+def canon_case(case_no):
+    """병합사건 문자열 -> **순서 무관** 정규형(조각 집합).
+
+    `" / "` 로 이어 붙인 순서는 법원 페이지가 정한다. 우리가 그 문자열을 식별키에
+    쓰므로, 순서가 바뀌면 **같은 물건이 새 행**이 된다.
+    """
+    return tuple(sorted(p.strip() for p in (case_no or "").split("/") if p.strip()))
+
+
+def scan_order_split(conn):
+    """조각 집합은 같은데 **저장된 문자열이 다른** 묶음.
+
+    ## 위 scan() 이 못 잡는 변종이다 (2026-09-03 실측)
+
+    `scan()` 은 *"조각이 단독 행으로도 있는가"*(병합 전/후)를 본다. 이쪽은 조각
+    집합이 **완전히 같고 순서만** 달라서 그 검사에 걸리지 않는다.
+
+        auction 178   '... / 2025타경5476 / 2025타경5483'
+        auction 1564  '... / 2025타경5483 / 2025타경5476'
+
+    같은 물건이 검색 결과에 두 번 나오고 문서 큐도 두 벌 쌓인다.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in conn.execute(
+            "SELECT ai.id, ac.court_code, ai.case_no, ai.item_no, ai.full_address,"
+            "       ai.auction_date, ai.minimum_bid_price, ai.crawl_date"
+            "  FROM auction_item ai JOIN auction_case ac ON ai.case_id = ac.id"
+            " WHERE ai.case_no LIKE '%/%'"):
+        groups[(r["court_code"], canon_case(r["case_no"]), r["item_no"])].append(r)
+    return {k: v for k, v in groups.items()
+            if len(v) > 1 and len({r["case_no"] for r in v}) > 1}
+
+
 def main() -> int:
     if not os.path.exists(DB_PATH):
         print("auction.db 가 없다: %s" % DB_PATH)
@@ -89,8 +124,22 @@ def main() -> int:
             else:
                 print("      -> 기일 또는 최저가가 다르다. 주소만 같은 별개 물건일 수 있다.")
 
+        # ── 변종: 조각은 같은데 **순서만** 다른 묶음 (2026-09-03) ──────────
+        splits = scan_order_split(conn)
         print()
-        print("[DRY-RUN] 총 %d건. 아무것도 쓰지 않았다." % len(dups))
+        print("== 조각 집합은 같은데 **순서만** 다른 묶음: %d건" % len(splits))
+        for (court, parts, item_no), rows in splits.items():
+            print()
+            print("   %s | 물건 %s | 조각 %d개" % (court, item_no, len(parts)))
+            for r in rows:
+                print("      id=%-7s case_no=%-52s 기일=%s 수집일=%s"
+                      % (r["id"], r["case_no"], r["auction_date"], r["crawl_date"]))
+            print("      -> 같은 물건이다(조각 집합이 동일). 근본 수정은 case_no "
+                  "정규화 + 기존 행 재키잉이며 **승인 영역**이다.")
+
+        print()
+        print("[DRY-RUN] 총 %d건(+ 순서 변종 %d건). 아무것도 쓰지 않았다."
+              % (len(dups), len(splits)))
         print("--apply 없음 - 어느 행을 남길지는 제품 판단(PM 승인) 영역이다.")
         return 0
     finally:

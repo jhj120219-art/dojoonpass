@@ -595,6 +595,20 @@ export default function PropertyDetailPage() {
 
   async function handleToggleFavorite() {
     if (favBusy || !property) return
+    // ★ busy 는 **await 이전에 동기적으로** 세운다 (2026-09-03, P0-7).
+    //
+    //   예전에는 아래 `getSession()` 을 기다린 **뒤에** 세웠다. 토큰이 아직
+    //   캐시되지 않은 첫 조작에서는 그 await 동안 favBusy 가 여전히 false 라,
+    //   빠른 두 번째 클릭이 위 가드를 그대로 통과해 요청이 두 번 나갔다.
+    //   `search/FavoriteButton.tsx` 는 이미 이 순서를 지키고 있었다 — 같은
+    //   화면 두 곳이 서로 다른 연타 규칙을 갖고 있던 것이다.
+    //
+    //   백엔드는 UNIQUE(user_id, item_id) 로 이미 안전하므로 데이터가 깨지지는
+    //   않았다. 고치는 것은 **불필요한 중복 요청**과 두 화면의 규칙 불일치다.
+    //
+    //   되돌아가는 길목(로그인 리다이렉트)에서는 반드시 다시 풀어 준다 —
+    //   안 풀면 하트가 영영 눌리지 않는다.
+    setFavBusy(true)
     const requestId = id
     let token = accessToken
     if (!token) {
@@ -604,10 +618,10 @@ export default function PropertyDetailPage() {
       if (idRef.current === requestId) setAccessToken(token)
     }
     if (!token) {
+      if (idRef.current === requestId) setFavBusy(false)
       router.push(loginRedirectUrl())
       return
     }
-    setFavBusy(true)
     setFavError(null)
     try {
       // 서버가 실패를 반환했는데도 하트를 뒤집으면 아이콘과 에러 메시지가 서로 모순된다.

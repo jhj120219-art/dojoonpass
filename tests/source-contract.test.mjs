@@ -2126,3 +2126,149 @@ describe('로그인 복귀 파라미터 이름이 한 벌이다 (2026-09-01) —
       'loginAction 이 redirect 를 읽지 않습니다')
   })
 })
+
+
+// ---------------------------------------------------------------------------
+// 프런트 중복 심볼 래칫 (2026-09-03, P0-1 Frankenstein)
+//
+// ## 왜 생겼나 — 파이썬에만 있고 프런트에는 없었다
+//
+// `test_schema_hygiene.py:test_no_new_duplicate_product_symbols()` 가 **제품 .py**
+// 의 같은 이름 최상위 심볼을 래칫으로 막고 있다(허용목록 10건, 각각 사유 기재).
+// 그런데 **프런트에는 같은 검사가 없었다.**
+//
+// 이 저장소는 실제로 그 사고를 겪었다 — `formatPrice()` 가 목록 화면과 상세 화면에
+// **글자 단위로 똑같이 복사**돼 있었고(2026-08-10 Sprint 48 이 발견해 `lib/format.ts`
+// 로 합쳤다), `formatWon()` 도 상세 페이지 5곳이 `.toLocaleString() + '원'` 으로
+// 손으로 다시 적고 있었다(2026-08-31). 둘 다 "고친 뒤"에는 조용해지지만, **다시
+// 생기는 것을 막는 장치는 없었다.**
+//
+// ## 무엇을 보나
+//
+// 들여쓰기 없는 = **모듈 최상위** 선언만 본다. 함수 안의 지역 변수(`const params`,
+// `const router` 등)까지 세면 수십 건이 잡혀 검사가 소음이 된다(실제로 처음 판본이
+// 그랬다 — `router` 가 11파일에서 잡혔다).
+//
+// 개수에 상한을 두지 않는다. **"지금 아는 목록"과 실측이 어긋나면** 실패한다.
+// 새 중복이 생기면 붉어지고, 중복이 해소되면 목록에서 지우라고 붉어진다.
+// ---------------------------------------------------------------------------
+describe('프런트 중복 심볼 래칫 (P0-1)', () => {
+  // 이름 -> 왜 남아 있는가. **값이 같아도** 여기 적기 전에는 통과하지 않는다.
+  //
+  // ★ **파일 목록까지 적는다** — 이름만 적으면 허용된 중복이 몇 파일로 번져도
+  //   조용하다. 실제로 첫 판본이 그랬다: `CARD` 를 세 번째 파일에 복사하는 변이가
+  //   **살아남았다**(2026-09-03 변이 F1). 이름은 그대로인데 사본이 늘어나는 것이
+  //   정확히 이 검사가 막으려던 일이라, 목록이 곧 계약이 되도록 바꿨다.
+  const KNOWN_FRONTEND_DUPLICATES = {
+    // 같은 이름이지만 **값이 다르다** — 화면마다 자기 복귀 주소를 갖는다.
+    // 합치면 오히려 틀린다(마이페이지가 가져오기 화면으로 돌아가게 된다).
+    LOGIN_REDIRECT: {
+      why: '화면별 복귀 주소. 값이 서로 다르다',
+      files: ['src/app/favorites/import/page.tsx', 'src/app/mypage/page.tsx'],
+    },
+    // 값이 **똑같은** Tailwind 클래스 문자열이다(카드/섹션 제목 스타일).
+    // 공용 모듈로 합치는 것은 표시 리팩터링이라 시각 회귀 위험이 있고,
+    // 지금 고장난 것은 없다(docs/CLAUDE.md: 최소 변경 / 임의 삭제 금지).
+    // 여기 적어 **더 번지는 것만** 막는다 — 세 번째 파일이 생기면 이 검사가 운다.
+    CARD: {
+      why: '카드 컨테이너 Tailwind 문자열. 2파일 동일값 — 통합은 표시 결정',
+      files: ['src/app/favorites/import/page.tsx', 'src/app/mypage/page.tsx'],
+    },
+    SECTION_TITLE: {
+      why: '섹션 제목 Tailwind 문자열. 위와 같음',
+      files: ['src/app/favorites/import/page.tsx', 'src/app/mypage/page.tsx'],
+    },
+  }
+
+  test('같은 이름의 최상위 선언이 새로 생기지 않았다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const { execFileSync } = await import('node:child_process')
+
+    const tracked = execFileSync('git', ['ls-files', 'src'], { encoding: 'utf8' })
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.endsWith('.ts') || s.endsWith('.tsx'))
+
+    assert.ok(tracked.length >= 20,
+      `프런트 소스를 제대로 모으지 못했습니다 (${tracked.length}개)`)
+
+    // 들여쓰기 없는 선언만 = 모듈 최상위
+    const DECL = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|let|class|type|interface|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/
+
+    const seen = new Map()
+    for (const file of tracked) {
+      const src = await fs.readFile(file, 'utf8')
+      src.split('\n').forEach((line, i) => {
+        const code = line.split('//')[0]
+        const m = DECL.exec(code)
+        if (!m) return
+        const name = m[1]
+        if (!seen.has(name)) seen.set(name, [])
+        seen.get(name).push(`${file}:${i + 1}`)
+      })
+    }
+
+    assert.ok(seen.size >= 100,
+      `탐지기가 심볼을 거의 못 모았습니다 (${seen.size}개) — 검사가 공허합니다`)
+
+    const dupes = {}
+    for (const [name, locs] of seen) {
+      const files = new Set(locs.map((l) => l.split(':')[0]))
+      if (files.size > 1) dupes[name] = locs
+    }
+
+    const unexpected = Object.keys(dupes)
+      .filter((n) => !(n in KNOWN_FRONTEND_DUPLICATES))
+      .sort()
+    assert.deepEqual(unexpected, [],
+      `같은 이름의 최상위 선언이 새로 생겼습니다: ${JSON.stringify(dupes, null, 2)}\n` +
+      '정본을 한 곳에 두거나, 합칠 수 없는 이유를 KNOWN_FRONTEND_DUPLICATES 에 적으십시오.')
+
+    // 죽은 예외: 해소된 중복을 목록이 붙들고 있으면 위 검사가 눈감는다.
+    const stale = Object.keys(KNOWN_FRONTEND_DUPLICATES)
+      .filter((n) => !(n in dupes))
+      .sort()
+    assert.deepEqual(stale, [],
+      `중복이 해소됐습니다 — KNOWN_FRONTEND_DUPLICATES 에서 지우십시오: ${stale}`)
+
+    // ★ 허용된 중복이 **더 번지지 않았는가**. 이름만 보면 사본이 2개든 5개든 같아
+    //   보인다 — 파일 목록을 계약으로 고정해 확산을 잡는다(변이 F1).
+    for (const [name, spec] of Object.entries(KNOWN_FRONTEND_DUPLICATES)) {
+      if (!(name in dupes)) continue
+      const actual = [...new Set(dupes[name].map((l) => l.split(':')[0]))].sort()
+      assert.deepEqual(actual, [...spec.files].sort(),
+        `'${name}' 의 사본 위치가 달라졌습니다. 늘었다면 정본을 한 곳에 두십시오. ` +
+        `사유: ${spec.why}`)
+    }
+  })
+
+  // 금액/숫자 표기는 `src/lib/format.ts` **하나**가 정본이다. 화면이 그것을 손으로
+  // 다시 적는 것이 이 저장소가 두 번 겪은 사고다(Sprint 48 / 2026-08-31).
+  test('화면이 금액 표기를 손으로 다시 적지 않는다', async () => {
+    const { promises: fs } = await import('node:fs')
+    const { execFileSync } = await import('node:child_process')
+    const files = execFileSync('git', ['ls-files', 'src/app', 'src/components'],
+      { encoding: 'utf8' })
+      .split('\n').map((s) => s.trim())
+      .filter((s) => s.endsWith('.tsx') || s.endsWith('.ts'))
+
+    const offenders = []
+    for (const file of files) {
+      const src = await fs.readFile(file, 'utf8')
+      src.split('\n').forEach((line, i) => {
+        const code = line.split('//')[0]
+        // `.toLocaleString()` 뒤에 원화 기호가 곧바로 붙는 모양 = formatWon 재구현
+        if (/toLocaleString\(\s*\)\s*\+\s*['"]\s*원/.test(code)) {
+          offenders.push(`${file}:${i + 1}`)
+        }
+        // 억/만 축약을 손으로 계산하는 모양 = formatPrice 재구현
+        if (/\/\s*100000000\s*\)\s*\.toFixed/.test(code)) {
+          offenders.push(`${file}:${i + 1}`)
+        }
+      })
+    }
+    assert.deepEqual(offenders, [],
+      `금액 표기를 화면에서 다시 구현했습니다. src/lib/format.ts 의 ` +
+      `formatWon() / formatPrice() / formatPriceEok() 를 쓰십시오: ${offenders}`)
+  })
+})

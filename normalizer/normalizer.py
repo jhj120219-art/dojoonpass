@@ -364,6 +364,12 @@ def normalize_item(item: AuctionItem) -> dict:
         "validation_status":  item.validation_status,
         "validation_reasons": " | ".join(item.validation_reasons),
         "crawl_date":         item.crawl_date,
+        # ★ 접수일 (2026-08-30, BUGS #285). `basic_info` 는 상세페이지의 표를
+        #   통째로 들고 있는데 예전에는 여기서 아무것도 꺼내지 않아 **매일 받아
+        #   놓고 버리고 있었다.** 새 크롤 경로가 필요한 것이 아니라 이미 파싱된
+        #   값을 배관에 태우기만 하면 된다(2026-09-03 실크롤 재확인: 서울중앙·
+        #   수원 4물건 4/4 에 '사건접수' 가 있었다).
+        "filed_date":         normalize_date((item.basic_info or {}).get("사건접수")),
         "has_spec_pdf":       item.has_spec_pdf,
         "has_status_pdf":     item.has_status_pdf,
         "has_appraisal_pdf":  item.has_appraisal_pdf,

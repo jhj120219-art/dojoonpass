@@ -402,3 +402,15 @@ def to_nfc(value: str) -> str:
     if not value:
         return ""
     return unicodedata.normalize("NFC", str(value))
+
+
+# 원천 문서/사진 응답에 붙이는 색인 차단 헤더 (2026-08-30, BUGS #254).
+#
+# 이 응답들은 **인증 없이** 나간다 - 프런트가 `<iframe src>` / `<a href>` 로 쓰기
+# 때문에 Authorization 헤더를 실을 수 없고, 원천(법원 사이트)도 이미 공개다.
+# 그런데 그 안에는 임차인 실명이 들어 있다(실측: 공개 spec.pdf 371개 중 약 92개).
+#
+# 원천이 공개인 것과 **우리 도메인에서 검색 가능해지는 것**은 다르다. 사람 이름으로
+# 검색했을 때 우리 사이트가 뜨는 일을 막는다. 브라우저는 이 헤더를 무시하므로
+# 뷰어와 다운로드 동작은 그대로다.
+NOINDEX_HEADERS = {"X-Robots-Tag": "noindex, nofollow, noarchive"}

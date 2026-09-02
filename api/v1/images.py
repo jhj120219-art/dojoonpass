@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from storage.database import get_connection
-from api.constants import is_sqlite_int
+from api.constants import is_sqlite_int, NOINDEX_HEADERS
 from api.http_cache import not_modified
 from crawler.image_assets import IMAGE_MEDIA_TYPES, MIN_IMAGE_BYTES
 
@@ -112,6 +112,8 @@ def get_item_image(item_id: int, seq: int, request: Request):
         #   검증자를 아직 못 봐서 **항상 200이 나간다**(2026-08-17 실측으로 확인).
         #   여기서 넘겨 주면 생성 시점에 헤더가 채워지고, 파일을 두 번 stat하지도 않는다.
         stat_result=os.stat(real_path),
+        # 색인 차단 - 사진에도 주소/현장이 드러난다 (BUGS #254).
+        headers=dict(NOINDEX_HEADERS),
     )
     # 검색 목록이 이 엔드포인트를 카드마다 부른다(썸네일). 조건부 요청을 해석하지 않으면
     # 같은 사진을 페이지를 넘길 때마다 통째로 다시 받는다 — 실측 1페이지 약 2MB

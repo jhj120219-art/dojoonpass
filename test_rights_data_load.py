@@ -19,6 +19,7 @@ Sprint 61에 의존성이 설치되면서 비로소 검증 가능해졌다).
 """
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -353,6 +354,9 @@ def run():
     test_safety_guard_no_mass_wipe()
     test_no_extractable_data_is_not_purged()
     test_idempotent()
+    test_case_info_parser()
+    test_case_info_write_is_idempotent_and_preserving()
+    test_load_item_actually_calls_case_info()
     test_spec_orphan_purge()
     test_spec_safety_guard()
 
@@ -362,6 +366,184 @@ def run():
         return 1
     print("ALL TESTS PASSED")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 사건 정보(배당요구종기 / 사건종류) — 이미 받아 둔 spec.pdf 에서 채운다
+#
+# `auction_case.case_type` / `filed_date` / `demand_deadline` 은 컬럼도 있고
+# `api/v1/item.py:_CASE_FIELDS` 가 내보내고 상세 화면이 표시까지 하는데
+# **채우는 코드가 없어** 1,960 사건 전부 NULL 이었다(화면에 늘 `-`).
+#
+# 사본 실측(2026-08-30): case_type 0 -> 347 / demand_deadline 0 -> 337.
+# spec.pdf 를 가진 사건 기준으로는 약 95% 다.
+# ---------------------------------------------------------------------------
+REAL_SPEC_TEXT = (
+    "천지방법원 강릉지원 매각물건명세서 2021타경30541 부동산강제경매 매각 작성 "
+    "담임법관 사건 1 2026. 8. 6. 전인권 전자서명완료 2021타경31865(병합) 물건번호 "
+    "일자 (사법보좌관) 목록1. 2009.06.29. 부동산 및 감정평가액 최선순위 가압류 "
+    "별지 기재와 같음 배당요구종기 2021. 5. 26. 최저매각가격의 표시 설정"
+)
+
+
+def test_case_info_parser():
+    """순수 파서 — 운영 문서 원문에서 두 값을 읽는다."""
+    print("\n--- 사건 정보 파서 ---")
+    import load_spec_data as spec
+
+    got = spec.parse_case_info(REAL_SPEC_TEXT)
+    check("★ 운영 원문에서 배당요구종기를 읽는다", got["demand_deadline"], "2021-05-26")
+    check("★ 운영 원문에서 사건종류를 읽는다", got["case_type"], "부동산강제경매")
+
+    # 표기 흔들림 — 실제 문서가 점/공백을 제각각 쓴다
+    for text, want in (
+        ("배당요구종기 2024. 2. 22.", "2024-02-22"),
+        ("배당요구종기일 2025.01.06", "2025-01-06"),
+        ("배당요구종기: 2023-07-11", "2023-07-11"),
+        ("배당요구종기 2024/11/14", "2024-11-14"),
+    ):
+        check("표기 변형을 흡수한다 (%s)" % text[:18],
+              spec.parse_case_info(text)["demand_deadline"], want)
+
+    check("2024타경1000 부동산임의경매 -> 임의경매",
+          spec.parse_case_info("사건 2024타경1000 부동산임의경매 1")["case_type"],
+          "부동산임의경매")
+
+    # 없으면 **없다고 말한다** (추측하지 않는다)
+    for empty in ("", None, "임차인현황 표만 있는 본문"):
+        got = spec.parse_case_info(empty)
+        check_true("못 읽으면 None (%r)" % (empty if empty else "빈 값"),
+                   got["demand_deadline"] is None and got["case_type"] is None, got)
+
+    # ★ 날짜처럼 보이는 다른 값을 배당요구종기로 착각하지 않는다
+    other = "작성일자 2026. 8. 6. 최선순위 설정 2009.06.29."
+    check("★ 다른 날짜를 배당요구종기로 착각하지 않는다",
+          spec.parse_case_info(other)["demand_deadline"], None)
+
+
+def test_case_info_write_is_idempotent_and_preserving():
+    """DB 쓰기 — 같은 값이면 쓰지 않고, 못 읽은 필드는 지우지 않는다."""
+    print("\n--- 사건 정보 쓰기 ---")
+    import load_spec_data as spec
+
+    d, conn = _case_scratch()
+    try:
+        info = {"case_type": "부동산강제경매", "demand_deadline": "2021-05-26"}
+        wrote = spec.update_case_info(conn, "서울중앙지방법원", "2026타경1", info)
+        conn.commit()
+        check_true("처음에는 쓴다", wrote, wrote)
+        row = conn.execute(
+            "SELECT case_type, demand_deadline FROM auction_case").fetchone()
+        check("사건종류가 들어갔다", row[0], "부동산강제경매")
+        check("배당요구종기가 들어갔다", row[1], "2021-05-26")
+
+        # ★ 같은 값 재투입 -> 쓰지 않는다 (이 저장소의 unchanged-skip 규약)
+        again = spec.update_case_info(conn, "서울중앙지방법원", "2026타경1", info)
+        conn.commit()
+        check("★ 같은 값이면 쓰지 않는다", again, False)
+
+        # ★ 못 읽은 필드(None)는 기존 값을 지우지 않는다
+        #
+        #   ★ 둘 다 None 으로 보내면 **조기 반환되어 UPDATE 자체가 안 돌다** - 그러면 COALESCE 가
+        #     실행되지 않아 검사가 공허해진다(변이 M1 이 그렇게 생존했다).
+        #     실제로 일어나는 것은 **한쪽만 읽히는** 경우다
+        #     (실측: 사건종류 363 vs 배당요구종기 352).
+        partial = {"case_type": None, "demand_deadline": "2099-12-31"}
+        spec.update_case_info(conn, "서울중앙지방법원", "2026타경1", partial)
+        conn.commit()
+        row2 = conn.execute(
+            "SELECT case_type, demand_deadline FROM auction_case").fetchone()
+        check("★ None 이 기존 사건종류를 지우지 않는다", row2[0], "부동산강제경매")
+        check("같이 보낸 값은 갱신된다(대조군)", row2[1], "2099-12-31")
+
+        # 값이 실제로 바뀌면 쓴다
+        newer = {"case_type": "부동산임의경매", "demand_deadline": "2099-12-31"}
+        changed = spec.update_case_info(conn, "서울중앙지방법원", "2026타경1", newer)
+        conn.commit()
+        check_true("값이 바뀌면 쓴다", changed, changed)
+        check("바뀐 값이 반영됐다",
+              conn.execute("SELECT case_type FROM auction_case").fetchone()[0],
+              "부동산임의경매")
+
+        # 다른 사건은 건드리지 않는다
+        check("다른 사건은 그대로다",
+              conn.execute("SELECT case_type FROM auction_case"
+                           " WHERE case_no='2026타경2'").fetchone()[0], None)
+    finally:
+        conn.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _case_scratch():
+    """auction_case 두 행짜리 스크래치."""
+    d = tempfile.mkdtemp(prefix="caseinfo_")
+    conn = sqlite3.connect(os.path.join(d, "t.db"))
+    conn.executescript("""
+        CREATE TABLE auction_case (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            court_code TEXT, case_no TEXT, court_name TEXT,
+            case_type TEXT, filed_date TEXT, demand_deadline TEXT,
+            created_at TEXT, updated_at TEXT);
+        INSERT INTO auction_case (court_code, case_no, court_name)
+            VALUES ('서울중앙지방법원','2026타경1','서울중앙지방법원'),
+                   ('서울중앙지방법원','2026타경2','서울중앙지방법원');
+    """)
+    conn.commit()
+    return d, conn
+
+
+def test_load_item_actually_calls_case_info():
+    """★ 배선 검사 — `load_item()` 이 사건 정보를 **실제로** 채우는가.
+
+    왜 따로 필요한가: 파서 검사와 갱신자 검사는 각 조각을 직접 부른다. 그래서
+    `load_item()` 안의 호출 한 줄을 지워도 **둘 다 통과한다**(2026-09-03 변이 N4 로
+    확인). 사건 정보가 화면까지 가려면 그 한 줄이 있어야 하므로 여기서 태운다.
+
+    실제 PDF 는 쓰지 않는다 — `extract_case_info()` 는 위에서 이미 실물로 검증했고,
+    여기서 보려는 것은 **파싱이 아니라 배선**이다. 그래서 그 함수만 갈아 끼우고
+    `load_item()` 을 통째로 돌린다.
+
+    임차인 경로는 이 가짜 파일에서 반드시 실패한다(진짜 PDF 가 아니다). 그것이
+    오히려 이 검사의 핵심이다 — **임차인 적재가 실패해도 사건 정보는 들어가야 한다**
+    (load_item 이 사건 정보를 먼저 부르는 이유이고, 실측 139건이 그 경우다).
+    """
+    print("\n--- 배선: load_item() 이 사건 정보를 채우는가 ---")
+    import load_spec_data as spec       # 이 파일의 다른 검사와 같은 방식
+    d, conn = _case_scratch()
+    doc_dir = os.path.join(d, "docs")
+    os.makedirs(doc_dir, exist_ok=True)
+    with open(os.path.join(doc_dir, "spec.pdf"), "wb") as f:
+        f.write(b"not a real pdf")          # 임차인 파싱은 실패한다(의도적)
+
+    orig_extract = spec.extract_case_info
+    orig_docdir = spec.get_doc_dir
+    calls = []
+
+    def fake_extract(path):
+        calls.append(path)
+        return {"case_type": "부동산임의경매", "demand_deadline": "2030-01-02"}
+
+    try:
+        spec.extract_case_info = fake_extract
+        spec.get_doc_dir = lambda court, case, item: doc_dir
+        result = spec.load_item(conn, 1, "서울중앙지방법원", "2026타경1", "1")
+        conn.commit()
+    finally:
+        spec.extract_case_info = orig_extract
+        spec.get_doc_dir = orig_docdir
+
+    check_true("전제: spec.pdf 를 찾았다(파일 부재로 조기 반환하지 않았다)",
+               result != "no_spec_file", result)
+    check("★ load_item 이 사건 정보 추출을 호출한다", len(calls), 1)
+    row = conn.execute(
+        "SELECT case_type, demand_deadline FROM auction_case WHERE case_no='2026타경1'"
+    ).fetchone()
+    check("★ 그 값이 auction_case 에 실제로 들어간다", tuple(row),
+          ("부동산임의경매", "2030-01-02"))
+    check_true("★ 임차인 적재가 실패해도 사건 정보는 남는다 (result=%s)" % result,
+               row[0] == "부동산임의경매", row)
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

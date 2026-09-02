@@ -260,6 +260,10 @@ UPSERT_COMPARE_COLUMNS = (
     "court_name", "property_type", "sido", "sigungu", "dong", "lot_number",
     "full_address", "appraisal_price", "minimum_bid_price", "auction_date",
     "status", "validation_status", "validation_reasons", "crawl_date",
+    # ★ 접수일 (BUGS #285). 사건이 접수된 날은 **한 번 정해지면 안 바뀐다** —
+    #   그래서 비교 대상에 넣어도 첫 수집 때 한 번만 쓰기가 일어난다.
+    #   빼면 나중에 값이 채워져도 UPDATE 가 안 나가 영영 NULL 로 남는다.
+    "filed_date",
 )
 
 # `court_code` 는 식별키의 일부라 비교 대상이 아니지만(같지 않으면 애초에 다른 행이다)
@@ -274,20 +278,57 @@ _UPSERT_WHERE = " OR ".join(
 
 # ★ `created_at` / `has_*` 는 SET 에 **없다.** 그래서 갱신에서 보존된다 —
 #   예전 구현이 UPDATE 문에 그 컬럼들을 안 넣어 둔 것과 같은 효과다.
-UPSERT_SQL = """
-    INSERT INTO auction (
-        court_code, court_name, case_no, item_no,
-        property_type, sido, sigungu, dong, lot_number,
-        full_address, appraisal_price, minimum_bid_price,
-        auction_date, status, validation_status,
-        validation_reasons, crawl_date,
-        has_spec_pdf, has_status_doc, has_appraisal_pdf,
-        created_at, updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?)
-    ON CONFLICT(court_code, case_no, item_no) DO UPDATE SET
-""" + _UPSERT_SET + """
-    WHERE """ + _UPSERT_WHERE + """
-"""
+#
+# ★★ 접수일(`filed_date`)은 **있을 수도 없을 수도 있다** (2026-08-30, BUGS #285).
+#
+#   028 이 그 컬럼을 만드는데, 마이그레이션이 아직 안 돈 DB 가 존재한다 —
+#   운영 스키마를 스냅샷한 스크래치, 예전 클론, 마이그레이션 전 수동 실행.
+#   무조건 쓰면 그런 DB 에서 **모든 행이 `no such column` 으로 실패한다**
+#   (실제로 스위트가 68/1 -> 62/7 로 무너졌다).
+#
+#   그래서 문장을 두 벌 만들어 두고 실행 시점에 고른다. 두 벌 모두 **같은
+#   컬럼 목록에서** 만들어지므로 한쪽만 낡을 수 없다.
+def _build_upsert_sql(with_filed_date):
+    cols = ["court_code", "court_name", "case_no", "item_no",
+            "property_type", "sido", "sigungu", "dong", "lot_number",
+            "full_address", "appraisal_price", "minimum_bid_price",
+            "auction_date", "status", "validation_status",
+            "validation_reasons", "crawl_date"]
+    if with_filed_date:
+        cols.append("filed_date")
+    compare = [c for c in UPSERT_COMPARE_COLUMNS
+               if with_filed_date or c != "filed_date"]
+    set_sql = ", ".join("%s=excluded.%s" % (c, c)
+                        for c in ["court_code"] + compare) + \
+        ", updated_at=excluded.updated_at"
+    where_sql = " OR ".join("auction.%s IS NOT excluded.%s" % (c, c)
+                            for c in compare)
+    placeholders = ",".join(["?"] * len(cols))
+    return (
+        "INSERT INTO auction (\n        " + ", ".join(cols) +
+        ",\n        has_spec_pdf, has_status_doc, has_appraisal_pdf,"
+        "\n        created_at, updated_at\n    ) VALUES (" +
+        placeholders + ",0,0,0,?,?)\n"
+        "    ON CONFLICT(court_code, case_no, item_no) DO UPDATE SET\n" +
+        set_sql + "\n    WHERE " + where_sql + "\n")
+
+
+UPSERT_SQL = _build_upsert_sql(True)
+UPSERT_SQL_NO_FILED_DATE = _build_upsert_sql(False)
+
+
+def auction_has_filed_date(conn) -> bool:
+    """`auction.filed_date` 가 있는가 (028 적용 여부).
+
+    배치 한 번에 한 번만 묻는다 — 행마다 물으면 #247/#249 가 없앤 그 부류가 된다.
+    """
+    try:
+        return any(r[1] == "filed_date"
+                   for r in conn.execute("PRAGMA table_info(auction)"))
+    except Exception:                       # noqa: BLE001
+        return False
+
+
 
 
 def upsert_batch(rows: List[Dict]) -> Dict:
@@ -364,11 +405,17 @@ def upsert_batch(rows: List[Dict]) -> Dict:
         #   없다(2026-08-27 전수 확인). 그 전제가 깨지면 아래 자기 검사가 시끄럽게 운다.
         before_rows = conn.execute("SELECT COUNT(*) FROM auction").fetchone()[0]
         before_changes = conn.total_changes
+        # 028 이 돌았는가. **배치당 한 번만** 묻는다.
+        _has_filed = auction_has_filed_date(conn)
+        _sql = UPSERT_SQL if _has_filed else UPSERT_SQL_NO_FILED_DATE
+        if not _has_filed:
+            logger.info("auction.filed_date 가 없다 - 접수일 없이 upsert 한다 "
+                        "(마이그레이션 028 미적용)")
 
         for row in rows:
             try:
                 now = datetime.now().isoformat()
-                conn.execute(UPSERT_SQL, (
+                _values = (
                     row.get("court_code", ""),
                     row.get("court_name", ""),
                     row.get("case_no", ""),
@@ -386,9 +433,13 @@ def upsert_batch(rows: List[Dict]) -> Dict:
                     row.get("validation_status", ""),
                     row.get("validation_reasons", ""),
                     row.get("crawl_date", ""),
-                    now,
-                    now,
-                ))
+                ) + (
+                    # 못 읽었으면 빈 문자열이 아니라 NULL 로 둔다 — "아직 모른다"와
+                    # "값이 없다"를 구분해야 migrate_execute 의 `IS NULL` 보충이
+                    # 성립한다. `''` 를 넣으면 그 사건은 영영 안 채워진다.
+                    (row.get("filed_date") or None,) if _has_filed else ()
+                ) + (now, now)
+                conn.execute(_sql, _values)
                 processed += 1
             except Exception as e:
                 logger.warning("upsert 실패 [%s]: %s", row.get("case_no", ""), str(e))
@@ -792,16 +843,42 @@ def requeue_changed_documents(changes: List[Dict],
     if not changes:
         return {"items": 0, "refreshed": 0, "revived_expired": 0, "skipped_over_cap": 0}
 
-    cap = REFRESH_MAX_ITEMS_PER_RUN if max_items is None else max_items
+    # ★★ 2026-08-30 (BUGS #278) — **상한을 여기서 걷어냈다.**
+    #
+    #   예전에는 `changes[:60]` 으로 잘랐다. 그런데 잘린 물건도 `auction_item` 은
+    #   이번 실행에서 이미 갱신되므로 다음 실행의 `changes` 에 **다시 들어오지 않는다.**
+    #   미룬 것이 아니라 잃은 것이었다(사본 실측: 200물건 중 140물건 영구 유실).
+    #   게다가 `SELECT * FROM auction` 순서라 매번 같은 앞쪽 물건만 뽑혔다.
+    #
+    #   상한 60 의 근거는 **워커가 하룻밤에 처리할 수 있는 양**이다(창 7,200초 /
+    #   물건당 최악 4행 x 24초 -> 69물건). 그건 **소비**의 한계인데 **생산**
+    #   (큐에 적는 일) 쪽에 걸려 있었다. 큐는 할 일을 담으려고 있는 것이라,
+    #   담기 전에 자르면 큐가 존재하는 이유가 없어진다.
+    #
+    #   소비 쪽은 이미 스스로 제한한다.
+    #       doc_worker  02:00~04:00 창(`is_time_up()`) - 시간이 되면 멈춘다
+    #       claim       ORDER BY priority ASC, auction_date ASC - 긴급도 순
+    #   전부 적어 두면 오늘 밤은 급한 것부터 하고 나머지는 큐에 남는다. 다음 밤에
+    #   이어서 한다. 기일이 지나면 `SKIPPED_EXPIRED` 가 정리한다.
+    #
+    #   `max_items` 를 **명시적으로** 넘기면 여전히 조인다 - 검사와 운영자 수동
+    #   실행을 위해 남긴다. 바뀐 것은 기본값뿐이다.
+    cap = max_items
     over_cap = 0
     if cap is not None and cap >= 0 and len(changes) > cap:
         over_cap = len(changes) - cap
-        # ★ 조용히 자르지 않는다. 잘린 건수를 로그에 남겨야 "전부 처리됐다"로 오독되지 않는다.
         logger.warning(
-            "재수집 대상 %d건 중 상한(%d)을 넘는 %d건은 이번 실행에서 미룬다"
-            "(큐에 그대로 남아 다음 실행에서 다시 후보가 된다)",
-            len(changes), cap, over_cap)
+            "재수집 대상 %d건 중 상한(%d)을 넘는 %d건을 이번 호출에서 제외한다 "
+            "- `max_items` 를 **명시적으로** 넘겼기 때문이다. 기본 실행은 상한이 "
+            "없다(BUGS #278)", len(changes), cap, over_cap)
         changes = changes[:cap]
+    elif len(changes) > REFRESH_MAX_ITEMS_PER_RUN:
+        # 자르지는 않는다. 다만 하룻밤 처리량을 넘는다는 사실은 알린다 -
+        # 큐에 남아 다음 밤으로 넘어간다는 뜻이다(유실이 아니다).
+        logger.info(
+            "재수집 대상 %d건은 하룻밤 처리량(%d)을 넘는다 - 전부 큐에 적고 "
+            "긴급도 순으로 여러 밤에 나눠 처리한다(유실 아님)",
+            len(changes), REFRESH_MAX_ITEMS_PER_RUN)
 
     conn = get_connection()
     refreshed = 0
@@ -1567,6 +1644,14 @@ REFRESH_DOC_TYPES_BY_FIELD = {
 # **최악 기준**으로 잡는다 — 어느 필드가 바뀔지 미리 알 수 없으므로, 평균이 아니라
 # 최악에서 안전해야 상한이 상한 노릇을 한다. 69 에서 여유를 두고 60 으로 정한다.
 # (`test_refresh_trigger.py` 가 이 산술을 상수로 검증한다 — 창이나 소요가 바뀌면 실패한다.)
+# 워커가 **하룻밤에 처리할 수 있는 물건 수**의 추정치 (창 7,200초 / 물건당 최악
+# 4행 x 24초 -> 69물건, 여유를 둬 60).
+#
+# ★ 2026-08-30 (BUGS #278): 이 값으로 `changes` 를 **자르지 않는다.** 예전에는
+#   잘랐고, 잘린 물건은 `auction_item` 이 이미 갱신돼 다음 실행 후보가 되지 못해
+#   영구히 잃었다. 지금은 전부 큐에 적고 긴급도 순으로 여러 밤에 나눠 처리한다.
+#   이 상수는 이제 **보고용**이다 - "오늘 적은 양이 하룻밤 처리량을 넘는가"를
+#   알려 준다. 자르는 것은 `max_items` 를 명시적으로 넘겼을 때뿐이다.
 REFRESH_MAX_ITEMS_PER_RUN = 60
 
 

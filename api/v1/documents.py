@@ -2,7 +2,7 @@ import os
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from storage.database import get_connection
-from api.constants import is_sqlite_int
+from api.constants import is_sqlite_int, NOINDEX_HEADERS
 from api.http_cache import not_modified
 
 router = APIRouter()
@@ -122,6 +122,8 @@ def get_document(item_id: int, doc_type: str, request: Request):
         # 넘기지 않으면 Starlette가 전송 시점에 stat하므로 아래 조건부 검사가
         # 검증자를 보지 못해 항상 200이 된다(images.py의 같은 주석 참고).
         stat_result=os.stat(real_file_path),
+        # 색인 차단 - 이 문서에는 임차인 실명이 들어 있다 (BUGS #254).
+        headers=dict(NOINDEX_HEADERS),
     )
     # 브라우저가 되보낸 검증자가 현재 파일의 것과 같으면 본문을 다시 보내지 않는다
     # (2026-08-17 Sprint 146). `FileResponse`는 etag/last-modified를 붙여 주지만

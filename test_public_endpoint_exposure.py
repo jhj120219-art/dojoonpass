@@ -189,10 +189,104 @@ def test_pii_on_a_public_route_is_recorded_not_forgotten():
                     not bad, bad[:2])
 
 
+def test_source_files_are_not_indexable():
+    """원천 문서/사진이 **검색엔진에 색인되지 않는가** (2026-08-30, BUGS #254).
+
+    ## 전수 확인에서 나온 구멍
+
+    JSON 응답의 임차인 정보는 가렸는데, **같은 물건의 PDF 는 인증 없이 그대로**
+    나가고 있었다.
+
+        GET /api/v1/item/53/documents/SPEC   200  application/pdf  402,328B
+        본문에 임차인 실명 '김미화' '안지은' 이 그대로 있다
+        그 PDF 첫 줄에 법원이 직접 "개인정보유출주의" 라고 적어 두었다
+
+    실측: 공개 `spec.pdf` 371개 중 **약 92개(25%)** 에 임차인 실명이 있다(표본 40).
+
+    ## 왜 인증으로 막지 않는가
+
+    프런트가 이 주소를 `<iframe src>` / `<a href>` 로 쓴다 — 브라우저의 그 요청에는
+    Authorization 헤더를 실을 수 없다. 토큰을 요구하면 뷰어와 다운로드가 깨진다.
+    그리고 원천이 이미 공개다(법원 사이트가 로그인 없이 같은 문서를 준다).
+
+    ## 그래서 **증폭**을 막는다
+
+    원천이 공개인 것과 우리 도메인에서 **검색 가능해지는 것**은 다르다. 사람 이름을
+    검색했을 때 우리 사이트가 뜨는 일을 막는다. 브라우저는 이 헤더를 무시하므로
+    뷰어 동작은 그대로다.
+
+    `robots.txt` 는 **받기 전에** 막고 헤더는 **받은 뒤에** 막는다 — 짝이다.
+    """
+    print("\n--- 4. 원천 자료 색인 차단 (BUGS #254) ---")
+    import contextlib
+    import io as _io
+
+    conn = dbmod.get_connection()
+    try:
+        doc = conn.execute(
+            "SELECT ai.id FROM auction_item ai JOIN doc_raw dr ON dr.item_id = ai.id"
+            # ★ `doc_raw.doc_type` 은 **대문자**다(SPEC/STATUS/APPRAISAL).
+            #   소문자로 물으면 0건이라 이 검사가 조용히 건너뛴다.
+            " WHERE dr.doc_type='SPEC' LIMIT 1").fetchone()
+        img = conn.execute("SELECT item_id, seq FROM auction_image LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        doc = img = None
+    finally:
+        conn.close()
+
+    from fastapi.testclient import TestClient
+    import api_server
+    with contextlib.redirect_stderr(_io.StringIO()):
+        client = TestClient(api_server.app)
+
+    # robots.txt 가 원천 경로를 막는가.
+    r = client.get("/robots.txt")
+    _check_true("robots.txt 가 있다", r.status_code == 200, r.status_code)
+    body = r.text if r.status_code == 200 else ""
+    for rule in ("/api/v1/item/*/documents/", "/api/v1/item/*/images/"):
+        _check_true("robots.txt 가 %s 를 막는다" % rule,
+                    ("Disallow: " + rule) in body, body[:120])
+    # ★ 개인정보가 없는 공개 지표까지 막지는 않는다(과잉 차단 방지).
+    _check_true("검색/통계는 막지 않는다",
+                "Disallow: /api/v1/search" not in body, body[:160])
+
+    want = "noindex"
+    checked = 0
+
+    if doc is not None:
+        rr = client.get("/api/v1/item/%d/documents/SPEC" % doc["id"])
+        if rr.status_code == 200:
+            checked += 1
+            _check_true("★ 문서 응답에 X-Robots-Tag 가 붙는다",
+                        want in (rr.headers.get("x-robots-tag") or ""),
+                        rr.headers.get("x-robots-tag"))
+            # 계약이 깨지지 않았는지 - 여전히 PDF 를 준다.
+            _check_true("문서는 그대로 나간다(막은 것은 색인뿐)",
+                        rr.content[:4] == b"%PDF", rr.headers.get("content-type"))
+
+    if img is not None:
+        rr = client.get("/api/v1/item/%d/images/%d" % (img["item_id"], img["seq"]))
+        if rr.status_code == 200:
+            checked += 1
+            _check_true("★ 사진 응답에 X-Robots-Tag 가 붙는다",
+                        want in (rr.headers.get("x-robots-tag") or ""),
+                        rr.headers.get("x-robots-tag"))
+
+    _check_true("검사가 공허하지 않다(원천 응답을 실제로 받았다)", checked >= 1, checked)
+
+    # 대조군 - 개인정보가 없는 응답까지 막지는 않는다.
+    rr = client.get("/api/v1/search?page=1")
+    if rr.status_code == 200:
+        _check_true("검색 응답에는 색인 차단을 붙이지 않는다",
+                    not (rr.headers.get("x-robots-tag") or ""),
+                    rr.headers.get("x-robots-tag"))
+
+
 def run():
     test_whitelist_matches_the_actual_schema()
     test_item_detail_does_not_dump_whole_rows()
     test_pii_on_a_public_route_is_recorded_not_forgotten()
+    test_source_files_are_not_indexable()
     print("\n%s  (실패 %d)" % ("모두 통과" if not failures else "실패: %s" % failures,
                                len(failures)))
     return 1 if failures else 0

@@ -2052,14 +2052,26 @@ ALLOWED_SQL_CONCAT_OPERANDS = {
     #   `placeholders` 는 `", ".join("?" * len(saved_seqs))` 로 **`?` 반복만**
     #   담는다. seq 값 자체는 SQL 문자열에 들어가지 않고 전부 바인딩된다.
     ("storage/database.py", "placeholders"),
-    # 2026-08-27 BUGS #256: `upsert_batch()` 가 한 문장 upsert 로 바뀌면서 생겼다.
-    #   둘 다 **모듈 상수 `UPSERT_COMPARE_COLUMNS`(리터럴 튜플)로만** 조립된다:
-    #       _UPSERT_SET   = ", ".join("%s=excluded.%s" % (c, c) for c in ...)
-    #       _UPSERT_WHERE = " OR ".join("auction.%s IS NOT excluded.%s" % (c, c) for c in ...)
-    #   값은 하나도 들어가지 않는다(전부 `?` 바인딩). 컬럼 이름을 세 곳에 손으로 적지
-    #   않으려고 한 곳에서 만든 것이라, 오히려 SET/WHERE 가 갈라지는 결함을 막는다.
-    ("storage/database.py", "_UPSERT_SET"),
-    ("storage/database.py", "_UPSERT_WHERE"),
+    # 2026-08-27 BUGS #256 / 2026-09-03 BUGS #285: `upsert_batch()` 의 한 문장 upsert.
+    #
+    #   ★ 2026-09-03 — 옛 `_UPSERT_SET` / `_UPSERT_WHERE` 모듈 상수는 **없어졌다.**
+    #     028(`auction.filed_date`)이 적용되지 않은 DB 도 수집이 멈추면 안 되므로,
+    #     문장을 두 벌(`UPSERT_SQL` / `UPSERT_SQL_NO_FILED_DATE`) 만들어 실행
+    #     시점에 고른다. 그 조립이 `_build_upsert_sql()` 안으로 들어가면서
+    #     이름이 지역 변수 셋으로 바뀌었다.
+    #
+    #   세 조각 모두 **컬럼 이름 리터럴로만** 만들어진다. 사용자 입력이 닿는 자리가
+    #   없고 값은 전부 `?` 바인딩이다:
+    #
+    #       cols       = ["court_code", ...] 리터럴 리스트 (+ "filed_date")
+    #       set_sql    = ", ".join("%s=excluded.%s" % (c, c) for c in ...)
+    #       where_sql  = " OR ".join("auction.%s IS NOT excluded.%s" % (c, c) for c in ...)
+    #
+    #   `compare` 는 모듈 상수 `UPSERT_COMPARE_COLUMNS`(리터럴 튜플)에서만 온다.
+    #   두 벌이 **같은 목록에서** 만들어지므로 한쪽만 낡을 수 없다.
+    ("storage/database.py", "', '.join(cols)"),
+    ("storage/database.py", "set_sql"),
+    ("storage/database.py", "where_sql"),
     # `filter/` 는 어디에도 배선되지 않은 죽은 코드지만(docs/CLAUDE.md), 조각은 상수다.
     ("filter/filter_engine.py", "where"),
     ("filter/filter_engine.py", "' AND '.join(conditions)"),
@@ -2289,6 +2301,12 @@ SQL_PLACEHOLDER_SITES = {
     # 입력이 **모듈 상수 튜플**(문서 종류 3 / 상태 2)이라 요청이 크기를 정하지 못한다.
     ("api/v1/doc_stats.py", "len(values)"):
         "모듈 상수 튜플(_STAT_DOC_TYPES 3개 / _STAT_STATUSES 2개). 요청이 크기를 정하지 못한다.",
+    # 2026-09-03 BUGS #285. `_build_upsert_sql()` 의 VALUES 자리다 — `IN (...)` 이
+    #   아니라 **한 행의 컬럼 수**이고, `cols` 는 함수 안의 리터럴 리스트다
+    #   (17개 + 028 적용 시 filed_date = 18). 행 수가 아니라 컬럼 수라 데이터가
+    #   아무리 늘어도 커지지 않는다. 나눌 대상이 아니다.
+    ("storage/database.py", "len(cols)"):
+        "_build_upsert_sql(): 한 행의 컬럼 수(리터럴 목록 17~18개). 입력 크기와 무관하므로 상한에 닿지 않는다.",
 }
 
 
@@ -3389,6 +3407,20 @@ def test_no_cwd_relative_paths_in_product_code():
         v = node.value
         if not v or v in (".", "..", "-") or "\n" in v or " " in v:
             return None                      # 여러 줄/공백 = SQL 등. 경로가 아니다.
+        if not v.strip("/\\"):
+            # ★ **구분자만으로 이루어진 문자열은 경로가 아니다** (2026-09-02).
+            #
+            #   실제 오탐: `api/constants.py:LIKE_ESCAPE_CHAR = "\\"`
+            #   (SQL LIKE 의 ESCAPE 문자, Sprint 284 신설)을 아래
+            #   `"\\" in v` 갈래가 상대경로로 집어서, 이 검사가 **거짓
+            #   빨강**이 됐다(2026-09-02 실측: 이 파일의 유일한 실패 1건).
+            #   게이트가 이유 없이 붉으면 다음 사람이 그것을 무시하기 시작한다.
+            #
+            #   구분자뿐인 문자열은 이름 성분이 하나도 없어
+            #   (`os.path.basename("\\") == ""`) 어떤 파일도 가리키지 못한다.
+            #   진짜 상대경로는 구분자가 아닌 글자를 반드시 하나 이상 갖는다 —
+            #   그래서 이 줄은 탐지력을 전혀 깎지 않는다(아래 자기 검증이 고정한다).
+            return None
         if os.path.isabs(v) or v.startswith(("~", "http://", "https://", ":memory:", "/")):
             # ★ 맨 앞 "/" 는 `os.path.isabs()` 만으로는 못 잡는다 - `ntpath.isabs()`는
             #   드라이브 문자가 없으면 "/api/..." 를 **상대경로로 오판**한다(Windows 전용
@@ -3515,6 +3547,11 @@ def test_no_cwd_relative_paths_in_product_code():
         # 경로 키워드에 **변수**를 넘기는 정상 호출 - 오탐하면 안 된다.
         'e = Engine(log_path=QA_LOG_PATH)\n'
         'f = Engine(log_path=os.path.join(_HERE, "logs", "v.jsonl"))\n'
+        # 구분자 하나짜리 상수 — `api/constants.py:LIKE_ESCAPE_CHAR` 의 실물
+        # 모양이다. SQL LIKE 의 ESCAPE 문자이지 경로가 아니므로 오탐하면 안 된다
+        # (2026-09-02: 이것을 잡아 이 검사가 거짓 빨강이 된 적이 있다).
+        'LIKE_ESCAPE_CHAR = "\\\\"\n'
+        'SEP = "/"\n'
     )
     bad_hits = scan(KNOWN_BAD)
     check_true("자기 검증: 알려진 결함 5종을 전부 잡는다",
@@ -3704,6 +3741,26 @@ def test_root_scripts_do_not_write_db_without_apply():
                 t = ast.dump(node.test)
                 if "__main__" in t or "__name__" in t:
                     continue          # `if __name__ == "__main__":` 은 실행 진입점이다
+            # ★ **호출이 없으면 아무것도 실행되지 않는다** (2026-09-03).
+            #
+            #   SQL 은 `conn.execute(...)` 같은 **호출**로만 돈다. 호출이 하나도
+            #   없는 최상위 노드(예: SQL 문자열을 담는 모듈 상수)는 import 만
+            #   해도, 실행해도 DB 를 건드리지 못한다.
+            #
+            #   실제 오탐: `migrate_execute.py:FILL_FILED_DATE_SQL` -
+            #       FILL_FILED_DATE_SQL = (
+            #           "UPDATE auction_case SET filed_date = ?, updated_at = ?"
+            #           " WHERE court_code = ? AND case_no = ? AND filed_date IS NULL")
+            #   문장을 상수로 둔 것은 **검사가 그 문장을 그대로 태우게** 하려는
+            #   의도다(베껴 쓰면 소스를 고쳐도 검사는 옛 문장을 태운다). 그 좋은
+            #   습관에 이 가드가 벌을 주고 있었다.
+            #
+            #   탐지력은 깎이지 않는다 - 이 가드가 잡으려던 두 파일
+            #   (`fix_validator.py` / `add_test_queue.py`)은 최상위에서 실제로
+            #   `conn.execute(...)` / `enqueue_documents(...)` 를 **호출**한다.
+            #   아래 자기 검증이 그 둘의 모양과 상수 모양을 함께 고정한다.
+            if not any(isinstance(n, ast.Call) for n in ast.walk(node)):
+                continue
             seg = ast.get_source_segment(src, node) or ""
             if WRITE_SQL.search(seg):
                 return True
@@ -3729,6 +3786,28 @@ def test_root_scripts_do_not_write_db_without_apply():
     check_true("자기 검증: SQL 로 쓰는 모양을 잡는다", module_level_writes(BAD2) is True)
     check_true("자기 검증: 함수/__main__ 안의 쓰기는 오탐하지 않는다",
                module_level_writes(GOOD) is False)
+    # SQL 을 **상수로만** 들고 있는 모양 - 실행되지 않으므로 쓰기가 아니다
+    # (migrate_execute.py:FILL_FILED_DATE_SQL 의 실물 모양).
+    CONST_ONLY = (
+        'FILL_SQL = ("UPDATE auction_case SET filed_date = ?, updated_at = ?"\n'
+        '            " WHERE court_code = ? AND filed_date IS NULL")\n'
+        'DEL_SQL = "DELETE FROM document_queue WHERE id = ?"\n')
+    check_true("자기 검증: 실행되지 않는 SQL 상수는 오탐하지 않는다",
+               module_level_writes(CONST_ONLY) is False,
+               "-> 상수 선언은 DB 를 건드리지 못한다")
+    # 그래도 최상위에서 **실제로 쓰면** 잡아야 한다(위 완화가 지나치지 않았는지).
+    CONST_THEN_RUN = CONST_ONLY + (
+        'conn.execute("DELETE FROM auction")\n'
+        'conn.commit()\n')
+    check_true("자기 검증: 상수를 둔 파일이라도 최상위에서 쓰면 잡는다",
+               module_level_writes(CONST_THEN_RUN) is True)
+    # ★ 알려진 사각 — SQL 을 **변수로 넘기면**(`conn.execute(FILL_SQL, ())`)
+    #   문장 텍스트가 그 노드에 없어 `WRITE_SQL` 이 보지 못한다. 이것은 이번
+    #   완화가 만든 구멍이 아니라 **처음부터 있던 한계**다(완화 전에도 못 잡았다).
+    #   실질적으로는 `WRITE_CALLS` 의 `commit` 이 그 자리를 메운다 — 최상위에서
+    #   쓴 것은 결국 커밋해야 남기 때문이다. 여기서 더 넓히려면 변수 추적이
+    #   필요하고, 거기서부터는 오탐이 늘어 검사가 신뢰를 잃는다
+    #   (Sprint 283 이 큐 소유권 판정에서 내린 결론과 같다).
 
     # --- 본 검사 --------------------------------------------------------------
     offenders = []
@@ -4767,6 +4846,7 @@ def run():
     test_onedrive_conflict_copies_do_not_grow()
     test_product_module_names_are_not_shadowed_by_stale_copies()
     test_no_new_duplicate_product_symbols()
+    test_unreachable_product_modules_are_known()
     test_rights_badges_do_not_render_unknown_as_zero()
 
     print("\n" + "=" * 55)
@@ -5454,6 +5534,144 @@ def test_rights_badges_do_not_render_unknown_as_zero():
                ("!= null" not in bad_line) and ("== null" not in bad_line))
     good_line = "{property.rights_summary.total_tenant_count != null ? 'x' : 'y'}"
     check_true("탐지기 자기검증: `!= null` 은 가드로 인정한다", "!= null" in good_line)
+
+
+# ---------------------------------------------------------------------------
+# 진입점에서 **도달 불가**한 제품 모듈 래칫 (2026-09-03, P0-1 Frankenstein)
+#
+# ## 왜 생겼나
+#
+# 이 저장소에는 "죽은 코드"가 실제로 있다(`filter/` 3개 모듈, 368줄 — `docs/CLAUDE.md`
+# 가 죽었다고 적어 두었다). 문제는 그것을 **아는 방법이 문서뿐**이라는 것이다.
+# 새 모듈이 배선되지 않은 채 들어와도, 배선돼 있던 모듈이 배선을 잃어도 아무도 울지
+# 않는다. grep 으로는 알 수 없다 — import 는 되는데 그 import 를 하는 파일이 다시
+# 아무 진입점에서도 안 불릴 수 있기 때문이다.
+#
+# 그래서 **실제 import 그래프**를 만든다. 진입점은 손으로 적지 않고
+# `.bat` 에서 읽는다(스케줄러가 실제로 실행하는 것) + `api_server.py`.
+#
+# ## 반대 방향도 중요하다
+#
+# `storage/migrate_v4_1.py` 는 이 목록에 있지만 **죽은 코드가 아니다.** fresh clone
+# 을 세울 때 사람이 한 번 돌리는 부트스트랩이다(매일 돌 이유가 없어 배치에 없다).
+# 실측으로 확인했다(2026-09-03): 그 단계를 빼고 `run_migrations` 를 돌리면
+#
+#     [중단] 선행 스키마가 없습니다: auction, auction_case, auction_item
+#     1) init_db  2) python storage/migrate_v4_1.py  3) run_migrations
+#
+# 로 **소리내어 멈춘다**(조용히 반쯤 만들지 않는다). 즉 "배치에 없다"가 "지워도
+# 된다"는 뜻이 아니다 — 지우면 새 배포가 세워지지 않는다. 그 사실을 여기 적어 둔다.
+# ---------------------------------------------------------------------------
+KNOWN_UNREACHABLE_MODULES = {
+    "filter/filter_engine.py":
+        "죽은 코드. 어떤 진입점도 부르지 않는 진단/점수 경로 (docs/CLAUDE.md). "
+        "삭제는 승인 영역이라 남겨 두고 배선되지 않았다는 사실만 고정한다.",
+    "filter/report_generator.py":  "위와 같음 (filter/ 묶음)",
+    "filter/scoring_engine.py":    "위와 같음 (filter/ 묶음)",
+    "storage/migrate_v4_1.py":
+        "★ 죽은 코드가 아니다. fresh clone 1회 부트스트랩이라 배치에 없을 뿐이다. "
+        "빼면 run_migrations 가 '선행 스키마가 없습니다'로 멈춘다(2026-09-03 실측). "
+        "지우면 새 배포를 세울 수 없다.",
+    "migrate_check.py":
+        "스키마를 찍어 보는 진단 스크립트(38줄). 쓰기 없음, 사람이 손으로 돌린다.",
+}
+
+
+def test_unreachable_product_modules_are_known():
+    """진입점에서 도달 불가한 제품 모듈이 **새로 생기지 않았는가**."""
+    print("\n--- 진입점 import 그래프: 도달 불가 제품 모듈 ---")
+    import ast as _ast
+    import re as _re
+    import subprocess as _sp
+
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        try:
+            out = _sp.run(["git"] + list(args), cwd=root, capture_output=True,
+                          text=True, encoding="utf-8", timeout=30)
+            return out.stdout.split() if out.returncode == 0 else []
+        except (OSError, _sp.SubprocessError):
+            return []
+
+    tracked = [f for f in git("ls-files", "*.py")
+               if f.endswith(".py") and "-DESKTOP-" not in f]
+    if not tracked:
+        print("[SKIP] git 을 쓸 수 없다")
+        return
+
+    # 진입점 — **손으로 적지 않는다.** 스케줄러가 부르는 .bat 에서 읽는다.
+    entry = {"api_server.py"}
+    for b in git("ls-files", "*.bat", "*.ps1"):
+        try:
+            txt = codecs.open(os.path.join(root, b), encoding="utf-8",
+                              errors="replace").read()
+        except OSError:
+            continue
+        for m in _re.finditer(r'"?%PY%"?\s+(?:-m\s+([\w.]+)|([\w/\\.]+\.py))', txt):
+            entry.add((m.group(1).replace(".", "/") + ".py") if m.group(1)
+                      else m.group(2).replace("\\", "/"))
+    entry = {e for e in entry if e in tracked}
+    check_true("배치에서 진입점을 실제로 읽었다 - %d개" % len(entry), len(entry) >= 5, sorted(entry))
+
+    by_mod = {}
+    for f in tracked:
+        by_mod[f[:-3].replace("/", ".")] = f
+        if f.endswith("/__init__.py"):
+            by_mod[f[:-len("/__init__.py")].replace("/", ".")] = f
+
+    def imports_of(rel):
+        try:
+            tree = _ast.parse(codecs.open(os.path.join(root, rel),
+                                          encoding="utf-8-sig", errors="replace").read())
+        except (SyntaxError, OSError):
+            return []
+        names = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                names += [a.name for a in node.names]
+            elif isinstance(node, _ast.ImportFrom) and node.module and node.level == 0:
+                names.append(node.module)
+        return names
+
+    reach, queue = set(), list(entry)
+    while queue:
+        cur = queue.pop()
+        if cur in reach:
+            continue
+        reach.add(cur)
+        for mod in imports_of(cur):
+            f = by_mod.get(mod)
+            if f and f not in reach:
+                queue.append(f)
+
+    check_true("그래프가 공허하지 않다 - 도달 %d개" % len(reach), len(reach) >= 25, len(reach))
+
+    SCRIPT_PREFIX = ("test_", "step", "check_", "patch_", "analyze_", "audit_",
+                     "debug_", "verify_", "detect_", "backfill_", "repair_",
+                     "cleanup_", "measure_", "reset_", "unlock_", "fix_",
+                     "add_test_queue", "migrate_dryrun", "empty_doc_dirs",
+                     "manual_test", "revalidate", "run_python_tests",
+                     "collect_documents", "refresh_priority", "load_")
+
+    unreached = sorted(
+        f for f in tracked
+        if f not in reach
+        and not os.path.basename(f).startswith(SCRIPT_PREFIX)
+        # 패키지 표식(`__init__.py`)은 import 대상이지 배선 대상이 아니다.
+        and not f.endswith("__init__.py"))
+
+    unexpected = [f for f in unreached if f not in KNOWN_UNREACHABLE_MODULES]
+    check("배선되지 않은 제품 모듈이 새로 생기지 않았다", unexpected, [])
+    if unexpected:
+        print("      -> 진입점에서 아무도 부르지 않는다. 배선하거나, 왜 부르지 "
+              "않아도 되는지 KNOWN_UNREACHABLE_MODULES 에 적으십시오.")
+
+    # 죽은 예외: 배선된 모듈을 목록이 붙들고 있으면 위 검사가 눈감는다.
+    stale = sorted(f for f in KNOWN_UNREACHABLE_MODULES
+                   if f in reach or f not in tracked)
+    check("목록에 죽은 항목이 없다(배선됐거나 사라진 파일)", stale, [])
+    print("    도달 불가로 **알려진** 제품 모듈 %d개" % len(unreached))
 
 
 if __name__ == "__main__":

@@ -582,6 +582,340 @@ def test_failure_rolls_back_everything():
     check("document_status 90건", one(path, "SELECT COUNT(*) FROM document_status"), 90)
 
 
+# ---------------------------------------------------------------------------
+# 14. 접수일이 크롤에서 auction_case 까지 **끊기지 않고** 간다 (BUGS #285)
+#
+# #285 는 접수일이 1,960 사건 전부 NULL 인 이유를 "명세서에 없고 사건 요약 화면에만
+# 있어 새 크롤 경로가 필요하다"로 적었다. 실측이 그것을 뒤집었다 — 상세페이지에
+# `사건접수` 로 있고 `parse_basic_info()` 가 **이미 잡고 있었다**(3/3). 다만
+# `basic_info` 가 어디에도 저장되지 않아 매일 받아서 매일 버렸다.
+#
+# 그래서 고친 것은 파서가 아니라 **배관**이다. 이 검사는 그 배관의 각 이음매가
+# 아니라 **끝에서 끝까지**를 본다 - 중간 어느 한 곳이 끊겨도 여기서 붉어진다.
+# ---------------------------------------------------------------------------
+def test_filed_date_flows_from_crawl_to_auction_case():
+    print("\n--- 14. 접수일: 크롤 -> auction -> auction_case ---")
+    scratch_db()
+    me = fresh_migrate()
+
+    # (1) 정규화가 basic_info 의 `사건접수` 를 행에 싣는가 - 새 파서 없이.
+    from normalizer.normalizer import normalize_item
+    from models.auction_item import AuctionItem
+
+    item = AuctionItem(
+        case_no="2026타경900001", item_no="1",
+        address="서울특별시 강남구 역삼동 1-1 [집합건물 철근콘크리트조 84.5㎡]",
+        property_type="아파트", appraisal_price="100,000,000원",
+        minimum_bid_price="80,000,000원", auction_date="2026.12.01",
+        status="유찰", court_code="B100000", court_name="테스트법원0",
+        basic_info={"사건접수": "2024.02.14", "물건종류": "아파트"},
+        crawl_date="2026-08-30")
+    nrow = normalize_item(item)
+    check("정규화가 접수일을 싣는다", nrow.get("filed_date"), "2024-02-14")
+    check_true("★ 기존 날짜 정규화를 그대로 쓴다(점 -> 하이픈)",
+               nrow.get("filed_date") == "2024-02-14", nrow.get("filed_date"))
+
+    # basic_info 가 비어도 죽지 않는다 - 옛 크롤 결과/재수집 실패 대비.
+    bare = AuctionItem(
+        case_no="2026타경900002", item_no="1", address="서울특별시 강남구 역삼동 2-1",
+        property_type="아파트", appraisal_price="0", minimum_bid_price="0",
+        auction_date="2026.12.01", status="신건", court_code="B100000",
+        court_name="테스트법원0", crawl_date="2026-08-30")
+    check("basic_info 가 없으면 빈 값", normalize_item(bare).get("filed_date"), "")
+
+    # (2) upsert 가 원시 테이블에 넣는가. 빈 값은 NULL 이어야 한다.
+    dbmod.upsert_batch([nrow, normalize_item(bare)])
+    conn = dbmod.get_connection()
+    try:
+        got = {r["case_no"]: r["filed_date"] for r in conn.execute(
+            "SELECT case_no, filed_date FROM auction")}
+    finally:
+        conn.close()
+    check("원시 테이블에 접수일이 들어간다", got.get("2026타경900001"), "2024-02-14")
+    check("★ 못 읽은 접수일은 빈 문자열이 아니라 NULL",
+          got.get("2026타경900002"), None)
+
+    # (3) migrate 가 auction_case 로 옮기는가 - **신규 사건도 처음부터**.
+    me.execute()
+    conn = dbmod.get_connection()
+    try:
+        cases = {r["case_no"]: r["filed_date"] for r in conn.execute(
+            "SELECT case_no, filed_date FROM auction_case")}
+    finally:
+        conn.close()
+    check("★ auction_case 에 접수일이 닿는다", cases.get("2026타경900001"), "2024-02-14")
+    check("모르는 사건은 NULL 로 남는다", cases.get("2026타경900002"), None)
+
+    # (4) 나중에 값을 알게 되면 **채워진다**(NULL 이던 사건).
+    later = dict(normalize_item(bare))
+    later["filed_date"] = "2025-01-09"
+    dbmod.upsert_batch([later])
+    me.execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경900002",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★ 뒤늦게 읽은 접수일이 NULL 을 채운다", v, "2025-01-09")
+
+    # (5) 이미 있는 값은 **덮지 않는다**. 접수일은 사건이 접수된 날이라 바뀌지
+    #     않는다 - 원천이 흔들려도 우리 쪽에서 값이 요동치면 안 된다.
+    wrong = dict(nrow)
+    wrong["filed_date"] = "1999-01-01"
+    dbmod.upsert_batch([wrong])
+    me.execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경900001",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★ 이미 있는 접수일은 덮이지 않는다", v, "2024-02-14")
+
+    conn = dbmod.get_connection()
+    try:
+        rows_with = conn.execute(
+            "SELECT COUNT(*) FROM auction_case WHERE filed_date IS NOT NULL").fetchone()[0]
+    finally:
+        conn.close()
+    check("두 사건 모두 접수일을 갖고 있다", rows_with, 2)
+
+    # (6) ★ 신규 사건은 **INSERT 한 방으로** 접수일을 갖고 태어난다.
+    #
+    #     보충 UPDATE 가 어차피 채우므로 값만 보면 두 구현이 구별되지 않는다
+    #     (변이 M3 가 그래서 살아남았다). 구별되는 것은 **문장 수**다 -
+    #     새 사건마다 UPDATE 가 하나씩 더 나가면 #247 이 없앤 그 낭비가
+    #     조용히 돌아온다. 그래서 auction_case 로 가는 UPDATE 를 직접 센다.
+    seen = []
+    orig_get = dbmod.get_connection
+
+    def _traced(*a, **kw):
+        c = orig_get(*a, **kw)
+        c.set_trace_callback(lambda s: seen.append(s))
+        return c
+
+    fresh_rows = []
+    for i in range(3):
+        it = AuctionItem(
+            case_no="2026타경91000%d" % i, item_no="1",
+            address="서울특별시 강남구 역삼동 %d-9" % i, property_type="아파트",
+            appraisal_price="0", minimum_bid_price="0",
+            auction_date="2026.12.01", status="신건",
+            court_code="B100000", court_name="테스트법원0",
+            basic_info={"사건접수": "2023.03.0%d" % (i + 1)},
+            crawl_date="2026-08-30")
+        fresh_rows.append(normalize_item(it))
+    dbmod.upsert_batch(fresh_rows)
+
+    dbmod.get_connection = _traced
+    try:
+        me2 = fresh_migrate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            me2.execute()
+    finally:
+        dbmod.get_connection = orig_get
+
+    filed_updates = [s for s in seen
+                     if "UPDATE auction_case" in " ".join(s.split())
+                     and "filed_date" in s]
+    check("★ 새 사건 3건에 접수일 보충 UPDATE 가 나가지 않는다",
+          len(filed_updates), 0)
+
+    conn = dbmod.get_connection()
+    try:
+        got3 = {r["case_no"]: r["filed_date"] for r in conn.execute(
+            "SELECT case_no, filed_date FROM auction_case WHERE case_no LIKE '2026타경91000%'")}
+    finally:
+        conn.close()
+    check("★ 그래도 세 건 모두 접수일을 갖는다",
+          sorted(v for v in got3.values() if v),
+          ["2023-03-01", "2023-03-02", "2023-03-03"])
+
+    # (7) ★ 보충 UPDATE 문장 자체가 **이미 있는 값을 안 덮는다**.
+    #
+    #     파이썬 쪽 필터가 먼저 걸러서 평소에는 이 문장이 그 상황을 만나지 않는다.
+    #     그래서 변이 M4 가 살아남았다. 하지만 이 가드는 **동시 실행** 대비의
+    #     두 번째 겹이다 - 다른 실행이 그 사이에 값을 채웠을 수 있다
+    #     (이 파일이 `INSERT OR IGNORE` 를 남겨 둔 것과 똑같은 이유).
+    #     그러니 그 겹을 직접 태운다: 문장을 그대로 한 번 더 보낸다.
+    conn = dbmod.get_connection()
+    try:
+        # ★ 문장을 **소스에서 가져온다**. 여기 베껴 쓰면 소스의 가드를 지워도
+        #   검사는 옛 문장을 태우므로 아무것도 안 지킨다(변이 M4 가 그랬다).
+        cur = conn.execute(
+            me.FILL_FILED_DATE_SQL,
+            ("1999-01-01", "2026-08-30T00:00:00", "B100000", "2026타경900001"))
+        conn.commit()
+        check("★ 보충 UPDATE 는 채워진 행을 건드리지 않는다", cur.rowcount, 0)
+        still = conn.execute(
+            "SELECT filed_date FROM auction_case WHERE case_no=?",
+            ("2026타경900001",)).fetchone()[0]
+        check("★ 값도 그대로다", still, "2024-02-14")
+    finally:
+        conn.close()
+
+    # (8) ★ 원시 행에 **빈 문자열**이 들어 있어도 사건이 갇히지 않는다.
+    #
+    #     `''` 를 그대로 쓰면 `filed_date IS NULL` 가드에 걸려 **다시는 진짜
+    #     값으로 갱신되지 않는다.** 지금 upsert 는 `''` 를 NULL 로 바꾸지만,
+    #     028 이전에 만들어진 행이나 다른 경로가 넣은 값이 그럴 수 있다.
+    #     그래서 원시 테이블에 직접 `''` 를 심어 그 상황을 만든다.
+    conn = dbmod.get_connection()
+    try:
+        conn.execute("UPDATE auction SET filed_date = '' WHERE case_no = ?",
+                     ("2026타경910000",))
+        conn.execute("UPDATE auction_case SET filed_date = NULL WHERE case_no = ?",
+                     ("2026타경910000",))
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        fresh_migrate().execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경910000",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★ 원시의 빈 문자열은 NULL 로 남는다(갇히지 않는다)", v, None)
+
+    conn = dbmod.get_connection()
+    try:
+        conn.execute("UPDATE auction SET filed_date = '2023-03-01' WHERE case_no = ?",
+                     ("2026타경910000",))
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        fresh_migrate().execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경910000",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★ 그 뒤 진짜 값이 오면 채워진다", v, "2023-03-01")
+
+    # (9) ★★ **처음 등장하는 사건**의 원시 값이 빈 문자열일 때가 진짜 함정이다.
+    #
+    #     그 사건은 INSERT 로 태어난다. 거기에 `''` 가 그대로 실리면
+    #     `filed_date IS NULL` 가드에 영영 걸려 **다시는 채워지지 않는다.**
+    #     (8) 은 이미 존재하는 사건이라 INSERT 경로를 타지 않아 이 차이를
+    #     드러내지 못했다 — 변이 M6 이 그래서 살아남았다.
+    conn = dbmod.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO auction (court_code, court_name, case_no, item_no,"
+            " property_type, full_address, appraisal_price, minimum_bid_price,"
+            " auction_date, status, validation_status, validation_reasons,"
+            " crawl_date, filed_date, created_at, updated_at)"
+            " VALUES ('B100000','테스트법원0','2026타경920001','1','아파트',"
+            "         '서울특별시 강남구 역삼동 5-5',0,0,'2026-12-01','신건',"
+            "         'OK','','2026-08-30','', '2026-08-30','2026-08-30')")
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        fresh_migrate().execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경920001",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★★ 새 사건도 빈 문자열이 아니라 NULL 로 태어난다", v, None)
+
+    conn = dbmod.get_connection()
+    try:
+        conn.execute("UPDATE auction SET filed_date='2022-07-07' WHERE case_no=?",
+                     ("2026타경920001",))
+        conn.commit()
+    finally:
+        conn.close()
+    with contextlib.redirect_stdout(io.StringIO()):
+        fresh_migrate().execute()
+    conn = dbmod.get_connection()
+    try:
+        v = conn.execute("SELECT filed_date FROM auction_case WHERE case_no=?",
+                         ("2026타경920001",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★★ 그래서 나중에 값이 오면 채워진다(갇히지 않았다)", v, "2022-07-07")
+
+    # (10) ★★ 028 이 **아직 안 돈 DB** 에서도 수집이 멈추지 않는다.
+    #
+    #      접수일을 넣자마자 스위트가 68/1 -> 62/7 로 무너졌다. `upsert_batch()` 가
+    #      없는 컬럼에 쓰려다 **행마다** 실패했기 때문이다. 운영 배치는 마이그레이션을
+    #      먼저 돌리지만(§7), 스냅샷 스크래치/예전 클론/수동 실행은 그렇지 않다.
+    #      그래서 컬럼이 없으면 그 열만 빼고 쓴다 - 이 검사가 그 길을 태운다.
+    conn = dbmod.get_connection()
+    try:
+        cols_before = [r[1] for r in conn.execute("PRAGMA table_info(auction)")]
+        check_true("지금 DB 에는 filed_date 가 있다", "filed_date" in cols_before)
+        # 028 **이전 스키마**를 재현한다.
+        #
+        # DDL 텍스트를 잘라 쓰지 않는다 - `ALTER TABLE ADD COLUMN` 은 저장된
+        # DDL 의 **마지막 괄호 앞**에 컬럼을 끼워 넣어서, "filed_date 가 든 줄을
+        # 지운다"가 UNIQUE 제약이나 닫는 괄호까지 함께 지운다(실제로 그렇게
+        # 깨졌다). 그래서 표를 그대로 적어 만든다.
+        #
+        # ★ 그러면 이 목록이 실제 스키마와 어긋날 수 있다 - 그것부터 검사한다.
+        keep = [c for c in cols_before if c != "filed_date"]
+        expected = ["id", "court_code", "court_name", "case_no", "item_no",
+                    "property_type", "sido", "sigungu", "dong", "lot_number",
+                    "full_address", "appraisal_price", "minimum_bid_price",
+                    "auction_date", "status", "validation_status",
+                    "validation_reasons", "crawl_date", "created_at",
+                    "updated_at", "has_spec_pdf", "has_status_doc",
+                    "has_appraisal_pdf"]
+        check_true("★ 028 이전 컬럼 목록이 실제 스키마와 같다",
+                   set(keep) == set(expected),
+                   sorted(set(keep) ^ set(expected)))
+        conn.execute(
+            "CREATE TABLE auction_old ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " court_code TEXT, court_name TEXT, case_no TEXT NOT NULL,"
+            " item_no TEXT, property_type TEXT, sido TEXT, sigungu TEXT,"
+            " dong TEXT, lot_number TEXT, full_address TEXT,"
+            " appraisal_price INTEGER, minimum_bid_price INTEGER,"
+            " auction_date TEXT, status TEXT, validation_status TEXT,"
+            " validation_reasons TEXT, crawl_date TEXT,"
+            " created_at TEXT, updated_at TEXT,"
+            " has_spec_pdf INTEGER DEFAULT 0,"
+            " has_status_doc INTEGER DEFAULT 0,"
+            " has_appraisal_pdf INTEGER DEFAULT 0,"
+            " UNIQUE(court_code, case_no, item_no))")
+        conn.execute("INSERT INTO auction_old (%s) SELECT %s FROM auction"
+                     % (", ".join(keep), ", ".join(keep)))
+        conn.execute("DROP TABLE auction")
+        conn.execute("ALTER TABLE auction_old RENAME TO auction")
+        conn.commit()
+        check_true("★ filed_date 없는 표를 만들었다",
+                   "filed_date" not in [r[1] for r in
+                                        conn.execute("PRAGMA table_info(auction)")])
+    finally:
+        conn.close()
+
+    legacy = AuctionItem(
+        case_no="2026타경930001", item_no="1",
+        address="서울특별시 강남구 역삼동 7-7", property_type="아파트",
+        appraisal_price="0", minimum_bid_price="0", auction_date="2026.12.01",
+        status="신건", court_code="B100000", court_name="테스트법원0",
+        basic_info={"사건접수": "2020.05.05"}, crawl_date="2026-08-30")
+    res = dbmod.upsert_batch([normalize_item(legacy)])
+    check("★★ 컬럼이 없어도 수집이 실패하지 않는다", res["failed"], 0)
+    check("★★ 그리고 실제로 저장된다", res["inserted"], 1)
+
+    conn = dbmod.get_connection()
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM auction WHERE case_no=?",
+                         ("2026타경930001",)).fetchone()[0]
+    finally:
+        conn.close()
+    check("★★ 행이 실재한다", n, 1)
+
+
 if __name__ == "__main__":
     try:
         test_noop_rerun_is_cheap_and_identical()
@@ -594,6 +928,7 @@ if __name__ == "__main__":
         test_existing_document_status_preserved()
         test_idempotent_across_runs()
         test_failure_rolls_back_everything()
+        test_filed_date_flows_from_crawl_to_auction_case()
     finally:
         for d in _TMP:
             shutil.rmtree(d, ignore_errors=True)

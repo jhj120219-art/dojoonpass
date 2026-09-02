@@ -406,6 +406,64 @@ def test_batch_candidates_are_non_interactive():
                    "DB를 쓰기 시작했다면 파이프라인 문서를 갱신하십시오")
 
 
+def test_daily_batch_migrates_before_it_crawls():
+    """마이그레이션이 **크롤보다 먼저** 돌고, 실패하면 크롤을 하지 않는가.
+
+    ## 왜 이제 이것을 고정하는가 (2026-08-30, BUGS #285)
+
+    접수일을 받으면서 `upsert_batch()` 가 `auction.filed_date` 에 쓴다. 그 컬럼은
+    마이그레이션 028 이 만든다. 즉 **크롤이 마이그레이션보다 먼저 돌면 그날 수집이
+    통째로 실패한다**(행마다 `no such column` 으로 떨어져 `failed` 만 쌓인다).
+
+    배치는 이미 옳은 순서로 돼 있고 주석까지 그 이유를 적어 두었다 —
+    *"On failure we stop - not writing crawl data beats writing it into a wrong
+    schema."* 그런데 그 순서를 지키는 검사는 없었다. 컬럼을 추가하는 마이그레이션이
+    앞으로도 계속 생길 것이므로 **순서 자체**를 고정한다.
+
+    errorlevel 검사가 붙어 있는지는 6번이 이미 본다. 여기서는 **순서**와
+    **중단**만 본다.
+    """
+    print("\n--- 7. 일일 배치: 마이그레이션 -> 크롤 순서 ---")
+    src = io.open(os.path.join(ROOT, "run_daily.bat"), encoding="utf-8-sig").read()
+    body = "\n".join(ln for ln in src.splitlines()
+                     if not ln.strip().upper().startswith("REM"))
+    lines = body.splitlines()
+
+    def index_of(pattern):
+        for i, ln in enumerate(lines):
+            if re.search(pattern, ln):
+                return i
+        return -1
+
+    i_mig = index_of(r'"%PY%"\s+-m\s+storage\.migrations\.run_migrations')
+    i_crawl = index_of(r'"%PY%"\s+mvp_scraper\.py')
+    i_exec = index_of(r'"%PY%"\s+migrate_execute\.py')
+
+    check_true("마이그레이션 실행 줄이 있다", i_mig >= 0, i_mig)
+    check_true("크롤 실행 줄이 있다", i_crawl >= 0, i_crawl)
+    check_true("적재(migrate_execute) 실행 줄이 있다", i_exec >= 0, i_exec)
+    if min(i_mig, i_crawl, i_exec) < 0:
+        return
+
+    check_true("★ 스키마 마이그레이션이 크롤보다 **먼저** 돈다",
+               i_mig < i_crawl,
+               "크롤이 먼저면 새 컬럼이 없는 스키마에 쓰다가 그날 수집이 통째로 "
+               "실패한다 (BUGS #285: auction.filed_date)")
+    check_true("★ 크롤이 적재보다 먼저 돈다", i_crawl < i_exec,
+               "적재는 크롤이 채운 원시 테이블을 읽는다")
+
+    # 마이그레이션이 실패하면 **거기서 멈춰야** 한다 - 다음 줄로 흘러가면
+    # 잘못된 스키마에 크롤 결과를 쓴다.
+    tail = [ln.strip() for ln in lines[i_mig + 1:i_mig + 8] if ln.strip()]
+    guard = tail[0] if tail else ""
+    check_true("마이그레이션 뒤에 errorlevel 검사가 붙어 있다",
+               guard.startswith("if errorlevel 1"), guard[:60])
+    block = " ".join(tail[:6])
+    check_true("★ 마이그레이션이 실패하면 배치를 **중단**한다",
+               "exit /b" in block,
+               "실패를 기록만 하고 크롤로 넘어가면 안 된다 -> %r" % block[:80])
+
+
 def run():
     test_the_actual_2026_08_02_run()
     test_success_cases()
@@ -417,6 +475,7 @@ def run():
     test_batches_check_errorlevel()
     test_live_crawl_scripts_are_guarded()
     test_batch_candidates_are_non_interactive()
+    test_daily_batch_migrates_before_it_crawls()
 
     print("\n" + "=" * 55)
     if failures:

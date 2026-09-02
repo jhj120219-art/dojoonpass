@@ -700,7 +700,40 @@ def run_normalized_keys_reach_storage():
             if mm:
                 cols.add(mm.group(1))
     check("전제: auction 컬럼을 실제로 읽었다(개수>10)", len(cols) > 10, True)
-    check("★ auction 에 대응 컬럼이 없는 키", sorted(keys - cols), ["has_status_pdf"])
+    # ★ `filed_date` 가 여기 있는 것은 **결함이 아니다** (2026-09-03).
+    #
+    #   위 정규식은 `storage/database.py` 의 `CREATE TABLE IF NOT EXISTS auction`
+    #   본문만 읽는다. 그런데 `filed_date` 는 그 문장이 아니라
+    #   `028_auction_filed_date.sql` 의 `ALTER TABLE ... ADD COLUMN` 이 만든다.
+    #
+    #   CREATE TABLE 쪽에 옮겨 적으면 **부트스트랩이 깨진다**: 빈 DB 는
+    #   init_db -> migrations 순서로 도는데, 028 은 아직 적용 기록이 없어
+    #   반드시 실행되고, SQLite 의 ADD COLUMN 에는 IF NOT EXISTS 가 없어
+    #   `duplicate column name: filed_date` 로 죽는다. 그래서 두 곳에 적지 않는다.
+    #
+    #   `has_status_pdf` 와는 성격이 정반대다 — 저쪽은 **어떤 컬럼과도 이름이
+    #   맞지 않는 죽은 키**이고, 이쪽은 **도달하는 키인데 만들어지는 자리가
+    #   다를 뿐**이다. 그래서 그냥 통과시키지 않고, 바로 아래에서 그 자리를
+    #   실제로 확인한다(마이그레이션이 없어지면 붉어진다).
+    check("★ auction 에 대응 컬럼이 없는 키", sorted(keys - cols),
+          ["filed_date", "has_status_pdf"])
+
+    # (1-b) CREATE TABLE 에 없는 키는 **마이그레이션이 만들어야** 도달한다.
+    #       이 확인이 없으면 위 목록은 '못 가는 키를 눈감아 주는' 명단이 된다.
+    mig_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "storage", "migrations")
+    added_by_migration = set()
+    for fn in sorted(os.listdir(mig_dir)):
+        if not fn.endswith(".sql"):
+            continue
+        sql = open(os.path.join(mig_dir, fn), encoding="utf-8-sig",
+                   errors="replace").read()
+        for mm in re.finditer(r"ALTER\s+TABLE\s+auction\s+ADD\s+COLUMN\s+([a-z_]+)", sql, re.I):
+            added_by_migration.add(mm.group(1))
+    check("★ CREATE TABLE 에 없는 도달 키는 마이그레이션이 만든다",
+          sorted((keys - cols) & {"filed_date"} - added_by_migration), [])
+    check("전제: 마이그레이션에서 ADD COLUMN 을 실제로 읽었다",
+          "filed_date" in added_by_migration, True)
 
     # (2) 컬럼은 있는데 **upsert 가 값을 싣지 않는** 키(리터럴 0 이 박혀 있다).
     upsert = dbmod.UPSERT_SQL
@@ -772,13 +805,29 @@ def run_normalized_keys_reach_storage():
 #
 # ## 왜 이것이 중요한가 (두 가지가 여기서 걸린다)
 #
-# 1. `auction_case.filed_date` / `demand_deadline` / `case_type` 은 **생산자가 없어
-#    항상 NULL** 이고 상세화면이 영원히 '-' 를 그린다
-#    (`test_pipeline_integrity.py` §15). 그런데 `parse_basic_info()` 는 표의 모든
-#    th/td 를 긁으므로, 법원 페이지에 그 항목이 **행으로 있다면 이미 캡처되고 있다.**
-#    즉 난이도가 "새 크롤 설계"가 아니라 "이미 파싱된 것을 저장"일 수 있다.
-#    ※ 실제로 그 키가 있는지는 **실크롤로만** 확인된다(저장된 페이지 덤프는 메뉴
-#      페이지라 근거가 되지 못했다). 그래서 여기서 배선하지 않는다 - 확인 항목만 남긴다.
+# 1. ★ 2026-09-03 정정 — **실크롤로 확인했고, 그중 하나는 배선했다.**
+#
+#    위 ※ 가 남긴 '실크롤로만 확인된다'를 실제로 돌려서 판정했다
+#    (서울중앙·수원·인천, 상세페이지 표를 그대로 덤프):
+#
+#        사건접수      2008.08.26 / 2024.03.20 / 2024.10.14   4물건 4/4 에 있었다
+#        배당요구종기   2008.11.28 / 2024.06.04                4물건 4/4 에 있었다
+#        경매개시일     2008.08.27 / 2024.03.22                4물건 4/4 에 있었다
+#
+#    즉 추측이 맞았다 — 새 크롤 설계가 아니라 **이미 파싱된 것을 저장**하는 일이었다.
+#
+#    `filed_date` 는 그래서 **배선했다**(normalize_item -> auction.filed_date ->
+#    migrate_execute -> auction_case.filed_date). 스키마 변경이 필요 없었다 —
+#    두 컬럼이 이미 있었다(011, 028). 인천 10사건으로 끝에서 끝까지 확인했다.
+#
+#    `demand_deadline` / `case_type` 은 **배선하지 않았다.** 값을 못 구해서가
+#    아니라 원시 `auction` 표에 받아 둘 컬럼이 없어 `ALTER TABLE` 이 필요하고,
+#    스키마 변경은 승인 사항이기 때문이다(docs/CLAUDE.md).
+#    근거와 다음 단계: docs/SPRINT285_CASE_DATE_PRODUCER.md
+#
+#    ※ 그래서 `basic_info` 는 이제 **통째로 버려지지는 않는다** — `normalize_item()`
+#      이 '사건접수' 한 키를 읽는다. 그래도 이 목록에 남는다: 저장되는 것은
+#      거기서 뽑은 값 하나뿐이고, 나머지 수십 개 th/td 는 여전히 버려진다.
 #
 # 2. `appraisal_summary` 는 `validator/validation_engine.py` 가 **크롤 시점에** 읽어
 #    `address_mismatch` 를 판정하는 바로 그 입력이다. 그런데 저장하지 않으므로
@@ -794,7 +843,7 @@ def run_normalized_keys_reach_storage():
 # `has_*_pdf` 배선을 고정해 둔 것과 같은 관례다.)
 # ---------------------------------------------------------------------------
 CAPTURED_BUT_DISCARDED = {
-    "basic_info":        "상세페이지 th/td 전부. case 날짜가 여기 있을 수 있다",
+    "basic_info":        "상세페이지 th/td 전부. '사건접수' 한 키만 읽고 나머지는 버린다",
     "schedule":          "기일 내역",
     "property_list":     "물건 목록",
     "appraisal_summary": "감정요항 원문. validator 가 크롤 시점에만 읽고 버린다",

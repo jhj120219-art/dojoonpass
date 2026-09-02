@@ -147,11 +147,101 @@ def extract_tenants(pdf_path):
         return tenants
 
 
+# ---------------------------------------------------------------------------
+# 사건 정보(배당요구종기 / 사건종류) — 매각물건명세서 1쪽에 있다
+#
+# `auction_case` 에 `case_type` / `filed_date` / `demand_deadline` 컬럼이 있고
+# `api/v1/item.py:_CASE_FIELDS` 가 그대로 내보내며 상세 화면이 표시까지 한다.
+# 그런데 **채우는 코드가 없었다** — 실측 2026-08-30 기준 1,960 사건 전부 NULL 이라
+# 화면에는 늘 `-` 만 나왔다(수집만 빠진 상태).
+#
+# 이미 받아 둔 `spec.pdf` 1쪽에 그 값이 있다. 새로 크롤하지 않는다.
+#
+#   "... 사건 2021타경30541 부동산강제경매 ... 배당요구종기 2021. 5. 26. ..."
+#
+# 실측 추출률(보유 spec.pdf 371개):
+#
+#     배당요구종기  352건 (94.9%)
+#     사건종류      363건 (97.8%)
+#     열기 실패       0건
+#     사건종류 분포  부동산임의경매 215 / 부동산강제경매 148
+#
+# ★ 1쪽만 읽는다. 전 쪽을 훑어도 결과가 **똑같았고**(352 대 352) spec.pdf 는 최대
+#   30쪽짜리도 있어 비용만 커진다.
+#
+# ★ `filed_date`(접수일)는 이 문서에 없다. 사건 요약 화면에만 있어 크롤이 필요하다
+#   -> 여기서는 건드리지 않는다(그 컬럼은 계속 NULL).
+# ---------------------------------------------------------------------------
+CASE_DEADLINE_RE = re.compile(
+    r"배당요구종기(?:일)?\s*[:：]?\s*"
+    r"(\d{4})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})")
+CASE_TYPE_RE = re.compile(r"\d{4}타경\d+\s*(부동산[가-힣]{2,10}경매)")
+
+
+def parse_case_info(text):
+    """명세서 본문 -> {"demand_deadline", "case_type"}. 못 읽으면 None 을 담는다.
+
+    **순수 함수**다 — 파일도 DB 도 건드리지 않아 검사가 직접 태울 수 있다
+    (`crawler/doc_paths.py` 나 `crawler/resume.py` 와 같은 방식).
+    """
+    out = {"demand_deadline": None, "case_type": None}
+    m = CASE_DEADLINE_RE.search(text or "")
+    if m:
+        out["demand_deadline"] = "%04d-%02d-%02d" % (
+            int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m2 = CASE_TYPE_RE.search(text or "")
+    if m2:
+        out["case_type"] = m2.group(1)
+    return out
+
+
+def extract_case_info(pdf_path):
+    """spec.pdf **1쪽**에서 사건 정보를 읽는다."""
+    with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            return {"demand_deadline": None, "case_type": None}
+        return parse_case_info(pdf.pages[0].extract_text() or "")
+
+
+def update_case_info(conn, court_name: str, case_no: str, info) -> bool:
+    """`auction_case` 의 사건 정보를 채운다. **값이 같으면 쓰지 않는다.**
+
+    돌려주는 값: 실제로 행을 바꿨으면 True.
+
+    읽은 값이 없는 필드(None)는 기존 값을 지우지 않는다 — 이 문서에서 못 읽었다는
+    뜻이지 "값이 없다"는 뜻이 아니다(`COALESCE` 로 보존한다).
+    """
+    if not info or not any(info.values()):
+        return False
+    cur = conn.execute(
+        "UPDATE auction_case"
+        "   SET case_type       = COALESCE(?, case_type),"
+        "       demand_deadline = COALESCE(?, demand_deadline),"
+        "       updated_at      = ?"
+        " WHERE court_code = ? AND case_no = ?"
+        "   AND (IFNULL(case_type,'')       <> IFNULL(COALESCE(?, case_type),'')"
+        "     OR IFNULL(demand_deadline,'') <> IFNULL(COALESCE(?, demand_deadline),''))",
+        (info.get("case_type"), info.get("demand_deadline"),
+         datetime.now().isoformat(), court_name, case_no,
+         info.get("case_type"), info.get("demand_deadline")))
+    return bool(cur.rowcount)
+
+
 def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -> str:
     doc_dir = get_doc_dir(court_name, case_no, item_no)
     spec_path = os.path.join(doc_dir, "spec.pdf")
     if not os.path.exists(spec_path):
         return "no_spec_file"
+
+    # ★ 사건 정보는 임차인 표와 **독립**이다. 아래 임차인 경로는 표를 못 찾으면
+    #   조기 반환하는데(`no_tenant_table` / `table_found_no_rows`, 실측 139건),
+    #   그 물건들도 사건 정보는 정상적으로 들어 있다. 그래서 **먼저** 채운다.
+    #   사건 정보 실패가 임차인 적재를 막지 않는다(반대도 마찬가지다).
+    try:
+        update_case_info(conn, court_name, case_no, extract_case_info(spec_path))
+        conn.commit()
+    except Exception:                       # noqa: BLE001 - 부가 정보가 본 경로를 죽이지 않는다
+        print("  [warn] 사건 정보 읽기 실패: %s %s" % (court_name, case_no))
 
     try:
         tenants = extract_tenants(spec_path)

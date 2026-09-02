@@ -1135,3 +1135,152 @@ const KNOWN_UNDECLARED = {
       `응답에 더 이상 없는 키가 예외 목록에 남아 있습니다 — 목록에서 빼십시오: ${dead.join(', ')}`)
   })
 })
+
+
+// ---------------------------------------------------------------------------
+// 타입과 응답의 **nullability / 타입** 일치 (2026-09-03, P0-5)
+//
+// ## 위 검사와 무엇이 다른가
+//
+// 바로 위 세 검사는 **키 이름**만 본다(선언/미선언/유령). 값이 `number` 인지
+// `null` 인지는 아무도 보지 않았다. 그래서 이런 것이 조용히 지나간다:
+//
+//     TypeScript   appraisal_price: number      // null 이 올 수 없다고 선언
+//     실제 응답     "appraisal_price": null      // 그런데 온다
+//
+// 화면 코드는 선언을 믿고 `price.toLocaleString()` 같은 것을 쓸 수 있고, 그러면
+// 그 카드만 런타임에 터진다. 이 저장소가 반복해서 잡아 온 "조용한 오답"의 한 갈래다.
+//
+// ## 실측으로 확인한 것 (2026-09-03)
+//
+// 검색 600건 + 상세 305건을 훑어 **위반 0건**이었다. 즉 지금은 맞다. 이 검사는
+// 그 상태를 **고정**한다 — DB 컬럼이 `INTEGER DEFAULT 0`(NOT NULL 아님)이라
+// 구조적으로는 NULL 이 들어갈 수 있고, 실제로 NULL 을 주입하면 API 가 그대로
+// null 을 내보낸다(사본 DB 로 확인). 지금 0건인 것은 데이터가 그럴 뿐이다.
+//
+// 여러 물건을 표본으로 본다 — 한 건만 보면 그 한 건이 우연히 멀쩡할 수 있다.
+// ---------------------------------------------------------------------------
+describe('API 응답 ↔ 프런트 타입: nullability/타입 (2026-09-03)', () => {
+  // 선언에서 (nullable, 원문타입) 을 뽑는다. 위 tsKeys 와 같은 파서를 쓰되
+  // 타입 문자열까지 남긴다.
+  async function tsTypes(file, name) {
+    const { promises: fs } = await import('node:fs')
+    const src = await fs.readFile(file, 'utf8')
+    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
+    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
+    let depth = 1
+    let i = m.index + m[0].length
+    const start = i
+    while (i < src.length && depth > 0) {
+      if (src[i] === '{') depth++
+      else if (src[i] === '}') depth--
+      i++
+    }
+    let body = src.slice(start, i - 1)
+    for (;;) {
+      const next = body.replace(/\{[^{}]*\}/g, '')
+      if (next === body) break
+      body = next
+    }
+    const out = new Map()
+    for (const line of body.split('\n')) {
+      const code = line.split('//')[0].trim()
+      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:\s*(.+?),?$/.exec(code)
+      if (!km) continue
+      const declared = km[3].trim().replace(/,$/, '')
+      out.set(km[1], {
+        nullable: km[2] === '?' || /\bnull\b|\bundefined\b/.test(declared),
+        declared,
+      })
+    }
+    return out
+  }
+
+  function violations(label, obj, types, id) {
+    const bad = []
+    for (const [field, spec] of types) {
+      if (!(field in obj)) continue          // 키 부재는 위 검사가 본다
+      const v = obj[field]
+      if (v === null) {
+        if (!spec.nullable) bad.push(`${label}.${field} (item ${id}) = null, 선언 ${spec.declared}`)
+        continue
+      }
+      if (/^number(\s*\|\s*null)?$/.test(spec.declared) && typeof v !== 'number') {
+        bad.push(`${label}.${field} (item ${id}) = ${typeof v}, 선언 ${spec.declared}`)
+      }
+      if (/^string(\s*\|\s*null)?$/.test(spec.declared) && typeof v !== 'string') {
+        bad.push(`${label}.${field} (item ${id}) = ${typeof v}, 선언 ${spec.declared}`)
+      }
+      if (/^boolean(\s*\|\s*null)?$/.test(spec.declared) && typeof v !== 'boolean') {
+        bad.push(`${label}.${field} (item ${id}) = ${typeof v}, 선언 ${spec.declared}`)
+      }
+    }
+    return bad
+  }
+
+  let cards = []
+  let details = []
+
+  before(async () => {
+    const res = await fetch(`${API_BASE}/api/v1/search?size=40&include_closed=true`,
+      { cache: 'no-store' })
+    if (res.status === 200) cards = (await res.json()).items ?? []
+    for (const c of cards.slice(0, 12)) {
+      const r = await fetch(`${API_BASE}/api/v1/item/${c.id}`, { cache: 'no-store' })
+      if (r.status === 200) details.push(await r.json())
+    }
+  })
+
+  test('검사가 공허하지 않다 — 여러 건을 실제로 받았다', () => {
+    assert.ok(cards.length >= 10, `검색 표본이 부족합니다 (${cards.length})`)
+    assert.ok(details.length >= 5, `상세 표본이 부족합니다 (${details.length})`)
+  })
+
+  test('자기 검증 — 선언 위반을 실제로 잡는다', async () => {
+    const types = await tsTypes('src/app/search/types.ts', 'SearchResultItem')
+    // 일부러 깨뜨린 응답을 넣어 본다. 이것이 통과하면 아래 "0건"은 의미가 없다.
+    const broken = { ...cards[0], appraisal_price: null, fail_count: 'many' }
+    const bad = violations('items[]', broken, types, 'SELF')
+    assert.ok(bad.some((s) => s.includes('appraisal_price')),
+      `null 주입을 못 잡았습니다: ${JSON.stringify(bad)}`)
+    assert.ok(bad.some((s) => s.includes('fail_count')),
+      `타입 불일치를 못 잡았습니다: ${JSON.stringify(bad)}`)
+  })
+
+  test('★ 검색 items[] 의 값이 선언한 타입/nullability 와 맞는다', async () => {
+    const types = await tsTypes('src/app/search/types.ts', 'SearchResultItem')
+    const bad = []
+    for (const c of cards) bad.push(...violations('items[]', c, types, c.id))
+    assert.deepEqual(bad, [],
+      `타입 선언과 실제 응답이 다릅니다 (표본 ${cards.length}건):\n${bad.join('\n')}`)
+  })
+
+  test('★ 상세 응답의 값이 선언한 타입/nullability 와 맞는다', async () => {
+    const types = await tsTypes('src/app/properties/[id]/page.tsx', 'AuctionItemDetail')
+    const bad = []
+    for (const d of details) bad.push(...violations('item', d, types, d.id))
+    assert.deepEqual(bad, [],
+      `타입 선언과 실제 응답이 다릅니다 (표본 ${details.length}건):\n${bad.join('\n')}`)
+  })
+
+  test('★ 중첩 블록(case / rights_summary)도 선언과 맞는다', async () => {
+    const caseTypes = await tsTypes('src/app/properties/[id]/page.tsx', 'CaseInfo')
+    const rightsTypes = await tsTypes('src/app/properties/[id]/page.tsx', 'RightsSummary')
+    const bad = []
+    let sawCase = 0
+    let sawRights = 0
+    for (const d of details) {
+      if (d.case && typeof d.case === 'object') {
+        sawCase++
+        bad.push(...violations('case', d.case, caseTypes, d.id))
+      }
+      if (d.rights_summary && typeof d.rights_summary === 'object') {
+        sawRights++
+        bad.push(...violations('rights_summary', d.rights_summary, rightsTypes, d.id))
+      }
+    }
+    assert.ok(sawCase >= 1, '중첩 case 블록을 한 건도 보지 못했습니다(검사가 공허합니다)')
+    assert.deepEqual(bad, [],
+      `중첩 블록의 타입 선언과 실제 응답이 다릅니다 (case ${sawCase} / rights ${sawRights}):\n${bad.join('\n')}`)
+  })
+})

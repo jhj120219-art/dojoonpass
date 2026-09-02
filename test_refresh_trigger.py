@@ -504,6 +504,121 @@ def test_cap_is_loud_not_silent():
 # doc_worker 배선 검증용 공통 대역
 # ---------------------------------------------------------------------------
 
+def test_cap_no_longer_drops_changed_items():
+    """상한이 **의도 기록**에서 사라졌다 - 바뀐 물건은 전부 예약된다 (BUGS #278).
+
+    ## 방향이 뒤집혔다
+
+    이 자리는 원래 정반대를 고정하고 있었다 — *"잘린 물건은 끝내 예약되지 않는다
+    (유실이다)"*. 그 검사는 고쳐지는 날 실패하도록 일부러 그렇게 썼고, 그 날이 왔다.
+
+    ## 무엇이 달라졌나
+
+    상한 60 의 근거는 **워커가 하룻밤에 처리할 수 있는 양**이다. 그건 소비의 한계인데
+    생산(큐에 적는 일) 쪽에 걸려 있었다. 잘린 물건은 `auction_item` 이 이미 갱신돼
+    다음 실행의 `changes` 에 들어오지 못했다 — 미룬 것이 아니라 잃은 것이었다.
+
+    이제 전부 적는다. 소비 쪽은 이미 스스로 제한한다(워커 창 + 긴급도 순 claim).
+
+    ## 그래도 상한이 필요한 곳은 남는다
+
+    `max_items` 를 **명시적으로** 넘기면 여전히 조인다 — 운영자 수동 실행과 검사용이다.
+    그 경로가 살아 있는지도 함께 건다(§8 과 짝).
+    """
+    print("\n--- 8-B. 바뀐 물건은 상한과 무관하게 전부 예약된다 (#278) ---")
+    import contextlib
+    import io as _io
+    import storage.database as db
+
+    ITEMS = 5
+    CAP = 3
+
+    with ScratchDB() as s:
+        cases = ["2024타경%d" % (i + 1) for i in range(ITEMS)]
+        for case_no in cases:
+            s.seed_item(case_no=case_no)
+            s.queue_row("B000210", case_no, "1", "spec", "done")
+
+        import importlib
+        import migrate_execute as me
+        importlib.reload(me)
+        me.get_connection = s.conn
+
+        def run_pipeline():
+            with contextlib.redirect_stdout(_io.StringIO()):
+                me.execute()
+
+        def refresh_rows():
+            c = s.conn()
+            try:
+                return c.execute(
+                    "SELECT COUNT(*) FROM document_queue WHERE status='refresh'"
+                ).fetchone()[0]
+            finally:
+                c.close()
+
+        def refreshed_cases():
+            c = s.conn()
+            try:
+                return sorted(r[0] for r in c.execute(
+                    "SELECT DISTINCT case_no FROM document_queue WHERE status='refresh'"))
+            finally:
+                c.close()
+
+        def bump_price(value):
+            c = s.conn()
+            try:
+                c.execute("UPDATE auction SET minimum_bid_price=?", (value,))
+                c.commit()
+            finally:
+                c.close()
+
+        saved_cap = db.REFRESH_MAX_ITEMS_PER_RUN
+        db.REFRESH_MAX_ITEMS_PER_RUN = CAP      # 하룻밤 처리량 추정치를 낮춰 둔다
+        try:
+            run_pipeline()
+            check("시작 시점 refresh 행", refresh_rows(), 0)
+
+            bump_price(50000000)
+            run_pipeline()
+            check("★★ 하룻밤 처리량(%d)을 넘어도 **전부** 예약된다" % CAP,
+                  refresh_rows(), ITEMS)
+            check("★★ 특정 물건만 뽑히지 않는다 - 바뀐 물건 전부다",
+                  refreshed_cases(), sorted(cases))
+
+            # 처리량을 넘는다는 사실은 **로그로** 알린다(자르지 않고).
+            # 값이 그대로면 다시 예약하지 않는다 - 멱등하다.
+            before = refresh_rows()
+            run_pipeline()
+            check("값이 그대로면 예약이 늘지 않는다(멱등)", refresh_rows(), before)
+
+            # ★ 명시적 상한은 **여전히 동작한다** - 운영자 수동 실행용 경로다.
+            c = s.conn()
+            try:
+                c.execute("UPDATE document_queue SET status='done'")
+                c.commit()
+            finally:
+                c.close()
+            changes = [{"court_code": "B000210", "case_no": cn, "item_no": "1",
+                        "fields": ["auction_date"]} for cn in cases]
+            out = db.requeue_changed_documents(changes, max_items=2)
+            check("★ max_items 를 넘기면 그만큼만 예약한다", out["items"], 2)
+            check("★ 제외된 건수를 반환값에 남긴다", out["skipped_over_cap"], ITEMS - 2)
+
+            # 기본 실행(=인자 없음)은 **자르지 않는다.**
+            c = s.conn()
+            try:
+                c.execute("UPDATE document_queue SET status='done'")
+                c.commit()
+            finally:
+                c.close()
+            out2 = db.requeue_changed_documents(changes)
+            check("★★ 기본 실행은 자르지 않는다", out2["items"], ITEMS)
+            check("★★ 그래서 제외 건수가 0 이다", out2["skipped_over_cap"], 0)
+        finally:
+            db.REFRESH_MAX_ITEMS_PER_RUN = saved_cap
+
+
 class _FakeDriver:
     def quit(self):
         pass
@@ -1688,6 +1803,7 @@ def main():
     test_refresh_failure_does_not_destroy_what_we_already_show()
     test_priority_refresh_covers_refresh_rows()
     test_cap_is_loud_not_silent()
+    test_cap_no_longer_drops_changed_items()
     test_overwrite_reaches_the_collector()
     test_refresh_skips_sibling_shortcut()
     test_queue_status_vocabulary_is_single_sourced()

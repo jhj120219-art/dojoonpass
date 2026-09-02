@@ -76,6 +76,35 @@ REQUIRED_ITEM_COLUMNS = {
 }
 
 
+# 접수일 보충 UPDATE (BUGS #285). **상수로 둔다** — 검사가 이 문장을 그대로
+# 태워야 가드가 진짜 지켜지는지 알 수 있다. 문장을 검사 쪽에 베껴 쓰면 소스를
+# 고쳐도 검사는 옛 문장을 태우므로 아무것도 안 지킨다(변이 M4 가 그렇게 살아남았다).
+#
+# `filed_date IS NULL` 은 **두 번째 겹**이다. 파이썬 쪽에서 이미 걸러 보내지만,
+# 그 판단은 조회 시점의 스냅샷이라 다른 실행이 그 사이에 채웠을 수 있다 —
+# 이 파일이 `INSERT OR IGNORE` 를 남겨 둔 것과 똑같은 이유다.
+FILL_FILED_DATE_SQL = (
+    "UPDATE auction_case SET filed_date = ?, updated_at = ?"
+    " WHERE court_code = ? AND case_no = ? AND filed_date IS NULL"
+)
+
+
+def _raw_filed_date(row):
+    """원시 `auction` 행에서 접수일을 꺼낸다. 없거나 빈 값이면 None.
+
+    028 이전에 만들어진 DB 에는 컬럼 자체가 없을 수 있다 — 그때도 죽지 않는다
+    (`sqlite3.Row` 는 없는 키에 IndexError 를 낸다).
+
+    빈 문자열을 None 으로 바꾸는 것이 핵심이다. `''` 를 그대로 쓰면 "채웠다"가
+    되어 **다시는 진짜 값으로 갱신되지 않는다** — 위 UPDATE 가 `IS NULL` 만
+    보기 때문이다.
+    """
+    try:
+        return (row["filed_date"] or None) if row["filed_date"] is not None else None
+    except (IndexError, KeyError):
+        return None
+
+
 def _preflight(conn):
     """스키마가 이 스크립트보다 뒤처져 있으면 **알아볼 수 있는 말로** 막는다.
 
@@ -143,6 +172,7 @@ def execute():
         # 결과는 `INSERT OR IGNORE` 와 동일하다: 있으면 그대로 두고, 없으면 만든다.
         case_keys = list(case_map.keys())
         case_id_by_key = {}
+        filed_now = {}          # (court_code, case_no) -> 현재 auction_case.filed_date
 
         def _load_case_ids(keys):
             """(court_code, case_no) 목록의 id 를 `case_id_by_key` 에 채운다.
@@ -167,11 +197,16 @@ def execute():
                 placeholders = ",".join(["(?,?)"] * len(key_chunk))
                 params = [v for pair in key_chunk for v in pair]
                 for cc_row in conn.execute(
-                    f"SELECT id, court_code, case_no FROM auction_case "
+                    f"SELECT id, court_code, case_no, filed_date FROM auction_case "
                     f"WHERE (court_code, case_no) IN ({placeholders})",
                     params,
                 ).fetchall():
-                    case_id_by_key[(cc_row["court_code"], cc_row["case_no"])] = cc_row["id"]
+                    key = (cc_row["court_code"], cc_row["case_no"])
+                    case_id_by_key[key] = cc_row["id"]
+                    # ★ 같은 조회에서 접수일도 들고 온다 (BUGS #285). 컬럼 하나를
+                    #   더 읽는 것은 공짜지만, 따로 물으면 질의가 한 벌 늘어난다 —
+                    #   이 파일이 #243/#247 에서 없앤 것과 같은 부류다.
+                    filed_now[key] = cc_row["filed_date"]
 
         _load_case_ids(case_keys)
         missing_cases = [k for k in case_keys if k not in case_id_by_key]
@@ -182,12 +217,35 @@ def execute():
             conn.executemany("""
                 INSERT OR IGNORE INTO auction_case
                 (case_no, court_code, court_name, case_type, filed_date, demand_deadline, created_at, updated_at)
-                VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, NULL, ?, NULL, ?, ?)
             """, [(case_no, court_code, case_map[(court_code, case_no)]["court_name"],
+                   # ★ 접수일을 처음부터 넣는다 (BUGS #285). 아래 보충 UPDATE 가
+                   #   어차피 채우지만, 새 사건까지 UPDATE 로 미루면 **매일 새로
+                   #   등장하는 사건 수만큼** 쓸데없는 문장이 하나씩 더 나간다.
+                   _raw_filed_date(case_map[(court_code, case_no)]),
                    case_map[(court_code, case_no)]["created_at"] or now,
                    case_map[(court_code, case_no)]["updated_at"] or now)
                   for (court_code, case_no) in missing_cases])
             _load_case_ids(missing_cases)
+
+        # ── 이미 있던 사건의 접수일을 **비어 있을 때만** 채운다 (BUGS #285) ──
+        #
+        # 접수일은 사건이 접수된 날이라 **한 번 정해지면 바뀌지 않는다.** 그래서
+        # `COALESCE` 가 아니라 아예 `filed_date IS NULL` 인 행만 건드린다 -
+        # 값이 이미 있으면 문장 자체를 만들지 않는다(#247 의 교훈: no-op 문장도
+        # 누적 행수를 따라 비용을 낸다).
+        #
+        # 현재 값은 위 `_load_case_ids()` 가 같은 조회에서 이미 들고 왔다.
+        filed_updates = []
+        for key in case_keys:
+            if filed_now.get(key):
+                continue                      # 이미 있다 - 손대지 않는다
+            got = _raw_filed_date(case_map[key])
+            if got:
+                filed_updates.append((got, now, key[0], key[1]))
+        if filed_updates:
+            conn.executemany(FILL_FILED_DATE_SQL, filed_updates)
+            logger.info("auction_case 접수일 채움: %d건", len(filed_updates))
 
         logger.info("auction_case 완료: %d건 (신규 %d건, 기존 %d건)",
                     len(case_map), len(missing_cases), len(case_map) - len(missing_cases))
