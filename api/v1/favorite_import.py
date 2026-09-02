@@ -42,7 +42,7 @@ from pydantic import BaseModel
 
 from storage.database import get_connection, chunked_for_sql
 from api.auth import get_current_user, success, error_response
-from api.constants import ErrorCode, is_sqlite_int
+from api.constants import ErrorCode, is_sqlite_int, escape_like
 from normalizer.mylist_import import (
     MAX_LINES, MAX_MEMO_LENGTH, MAX_SOURCE_LENGTH,
     STATUS_ALREADY, STATUS_AMBIGUOUS, STATUS_DUPLICATE_INPUT,
@@ -143,10 +143,10 @@ def fetch_candidates(conn, parts: List[str]) -> List[dict]:
 
     remaining = [p for p in parts if p not in matched_parts]
     for chunk in chunked_for_sql(remaining, vars_per_item=1, conn=conn):
-        where = " OR ".join(["case_no LIKE ?"] * len(chunk))
+        where = " OR ".join(["case_no LIKE ? ESCAPE '\\'"] * len(chunk))
         rows = conn.execute(
             "SELECT %s FROM auction_item WHERE %s" % (_ITEM_COLUMNS, where),
-            tuple("%" + p + "%" for p in chunk),
+            tuple("%" + escape_like(p) + "%" for p in chunk),
         ).fetchall()
         for row in rows:
             found[row["id"]] = dict(row)

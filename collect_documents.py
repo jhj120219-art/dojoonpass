@@ -107,9 +107,10 @@ def build_driver(download_dir: str) -> webdriver.Chrome:
     opts.add_experimental_option("prefs", prefs)
     # ★ 드라이버 해석은 `crawler.base_crawler` 한 곳에 있다 (2026-08-25, BUGS #196).
     #   `ChromeDriverManager().install()` 직접 호출은 이 PC 에서 실제로 깨져 있다.
-    from crawler.base_crawler import resolve_chrome_driver
+    #   페이지 로드 상한도 같은 곳에서 가져온다 - 여기 30 을 다시 적으면 상한이 두 벌이 된다.
+    from crawler.base_crawler import resolve_chrome_driver, PAGE_LOAD_TIMEOUT
     driver = resolve_chrome_driver(opts)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
 
 def wait_loading(driver):

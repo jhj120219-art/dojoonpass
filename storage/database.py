@@ -4,6 +4,11 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional
 
+# LIKE 와일드카드 이스케이프의 **정본은 한 곳**이다(api/constants.py).
+# `api.constants` 는 표준 `enum` 만 의존하는 잎 모듈이라 storage -> api 순환이 생기지
+# 않는다. 같은 규칙을 여기 다시 적으면 한쪽만 고쳐지는 날이 온다.
+from api.constants import escape_like
+
 logger = logging.getLogger(__name__)
 
 # `auction_image.storage_path` 는 프로젝트 루트 기준 상대경로다
@@ -442,8 +447,8 @@ def query(
             conditions.append("auction_date = ?")
             params.append(auction_date)
         if property_type:
-            conditions.append("property_type LIKE ?")
-            params.append("%" + property_type + "%")
+            conditions.append("property_type LIKE ? ESCAPE '\\'")
+            params.append("%" + escape_like(property_type) + "%")
         if validation_status:
             conditions.append("validation_status = ?")
             params.append(validation_status)

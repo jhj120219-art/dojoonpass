@@ -2264,6 +2264,46 @@ def test_stored_normalization_matches_code():
         print("    어긋난 필드(알려진 상한 포함): %s (상한 %s)"
               % (mismatched, SYNC_MISMATCH_CEILING))
     print("    짝지은 행 %d개 x %d필드 대조" % (paired, len(FIELDS)))
+
+    # ★ 위 `FIELDS` 는 **손으로 적은 목록**이다 (2026-09-02 추가).
+    #
+    #   두 표가 같은 값을 들고 있는지 보는 검사인데, 비교할 컬럼을 사람이 적어 두면
+    #   **나중에 공유 컬럼이 하나 늘어도 조용히 비교 대상에서 빠진다.** 그러면 그
+    #   컬럼만 두 표가 갈라져도 이 검사는 초록이다 — 이 저장소가 상한 검사마다
+    #   경계해 온 "실측보다 헐거운 목록"과 같은 모양이다.
+    #
+    #   그래서 목록을 스스로 검사하게 한다: **두 표에 함께 있는 컬럼은 전부**
+    #   비교되거나, 아래 두 부류로 명시적으로 제외되어야 한다.
+    #
+    #       JOIN_KEYS  짝짓기에 쓰는 키다. 정의상 같으므로 비교할 것이 없다.
+    #       META_COLS  행마다 다른 것이 정상이다(자동 증가 id, 생성/수정 시각).
+    #
+    #   실측(2026-09-02): 마이그레이션 29개를 모두 적용한 새 DB 에서도 누락 0개다.
+    #   `auction` 에만 있는 것(court_code/filed_date/validation_reasons/has_*)과
+    #   `auction_item` 에만 있는 것(bid_rate/fail_count/building_area/land_area/case_id)은
+    #   공유가 아니므로 여기 대상이 아니다.
+    JOIN_KEYS = {"case_no", "item_no", "court_name", "court_code"}
+    META_COLS = {"id", "case_id", "created_at", "updated_at"}
+    conn = connect()
+    try:
+        a_cols = {r[1] for r in conn.execute("PRAGMA table_info(auction)")}
+        i_cols = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)")}
+    finally:
+        conn.close()
+    check_true("전제: 두 표의 컬럼을 실제로 읽었다",
+               len(a_cols) > 10 and len(i_cols) > 10, (len(a_cols), len(i_cols)))
+    shared = a_cols & i_cols
+    uncompared = sorted(shared - set(FIELDS) - JOIN_KEYS - META_COLS)
+    check("★ 두 표에 함께 있는 컬럼이 전부 비교되거나 명시적으로 제외된다", uncompared, [])
+    if uncompared:
+        print("      -> 위 컬럼은 두 표가 갈라져도 아무도 모른다."
+              " FIELDS 에 넣거나, 왜 비교하지 않는지 JOIN_KEYS/META_COLS 로 밝혀라.")
+    # 목록이 실제 컬럼과 어긋나 있지 않은지도 본다(오타/삭제된 컬럼이 남아 있는 경우).
+    phantom = sorted(f for f in FIELDS if f not in shared)
+    check("FIELDS 에 두 표에 없는 컬럼이 적혀 있지 않다", phantom, [])
+    print("    공유 컬럼 %d개 / 비교 %d개 / 제외 %d개"
+          % (len(shared), len(set(FIELDS) & shared),
+             len(shared & (JOIN_KEYS | META_COLS))))
     # 화면이 읽는 표에는 사유가 없다 ― "왜 검증실패인지"를 API로는 알 수 없다는 사실을
     # 여기 고정해 둔다(사유는 레거시 `auction` 테이블에만 있다). 스키마가 바뀌면
     # 이 검사가 먼저 알려 준다.
@@ -2523,6 +2563,7 @@ def run():
     test_stale_region_contamination_detector()
     test_empty_sido_is_explained_by_the_address()
     test_failed_registry_requests_value_report()
+    test_columns_with_no_producer()
 
     print("\n" + "=" * 55)
     if failures:
@@ -2530,6 +2571,126 @@ def run():
         return 1
     print("ALL TESTS PASSED")
     return 0
+
+
+
+# ---------------------------------------------------------------------------
+# 15. API 가 내려보내는데 **아무도 채우지 않는** 컬럼 (2026-09-02 신설)
+#
+# ## 왜 — 두 번 같은 모양을 만났다
+#
+# 스키마도 있고 API 도 내려보내고 화면도 그리는데 **파이프라인에 생산자가 없는**
+# 필드가 있다. 화면에는 영원히 `-` 나 빈 배지가 뜬다. 오류가 아니라서 아무도 모르고,
+# 코드만 읽으면 "구현되어 있다"고 읽힌다.
+#
+# 실측(2026-09-02, 이 머신 auction.db):
+#
+#     auction_case.filed_date / demand_deadline / case_type      0 / 1,384 행
+#         -> migrate_execute.py:184 가 `VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)`
+#            크롤러/모델에 '접수일'·'배당요구' 참조가 **0건**이다. 생산자가 아예 없다.
+#            그런데 api/v1/item.py 는 내려보내고 상세화면은 접수일/배당요구종기일을 그린다.
+#
+#     rights_summary.risk_level / risk_reason / analysis_explanation …  0 / 161 행
+#         -> load_rights_data.py:97 이 21개 중 11개를 리터럴 NULL 로 넣는다.
+#            "권리분석 위험도 배지"가 쓰는 바로 그 필드다. 위험도 판정 엔진이 없다.
+#            (`idx_rs_risk` 는 **항상 NULL 인 컬럼에 걸린 인덱스**이기도 하다.)
+#
+# ## 무엇을 고정하나
+#
+# 개수에 상한을 두지 않는다. **"지금 아는 목록"과 실측이 어긋나면** 실패한다.
+#
+#     새 컬럼이 producerless 가 되면      -> 붉어진다 (기능이 조용히 빈 채로 나가는 것을 막는다)
+#     생산자가 생겨 채워지기 시작하면      -> 붉어진다 (목록에서 지우라는 신호다. 좋은 실패다)
+#
+# 생산자를 만드는 것은 제품 결정이다(위험도 판정 기준·수집 범위). 그래서 이 검사는
+# **고치라고 하지 않는다** — 상태가 바뀌면 알려 줄 뿐이다.
+#
+# ※ 이 저장소가 `normalize_item()` 의 죽은 세 필드를 `test_normalizer.py` 로 고정한 것과
+#   같은 관례다. 죽은 배선은 지우거나 채우기 전까지 **적어 두어야** 다음 사람이 속지 않는다.
+# ---------------------------------------------------------------------------
+PRODUCERLESS_COLUMNS = {
+    # (표, 컬럼): 왜 비어 있는가
+    ("auction_case", "case_type"):        "migrate_execute 가 리터럴 NULL - 크롤러에 생산자 없음",
+    ("auction_case", "filed_date"):       "위와 같음. 상세화면 '접수일' 이 영원히 '-'",
+    ("auction_case", "demand_deadline"):  "위와 같음. 상세화면 '배당요구종기일' 이 영원히 '-'",
+    ("rights_summary", "priority_right"):        "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "priority_date"):         "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "dangerous_tenant_count"): "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "total_deposit"):          "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "estimated_inheritance"):  "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "lien_exists"):            "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "superficies_exists"):     "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "foreclosure_note"):       "load_rights_data 가 리터럴 NULL",
+    ("rights_summary", "risk_level"):        "위험도 판정 엔진이 없다 - 배지가 안 뜬다",
+    ("rights_summary", "risk_reason"):       "위와 같음",
+    ("rights_summary", "analysis_explanation"): "위와 같음",
+}
+
+
+def test_columns_with_no_producer():
+    print("\n--- 15. API 가 내려보내는데 아무도 채우지 않는 컬럼 ---")
+    if not os.path.exists(DB):
+        # 조용히 건너뛰지 않는다 - 무엇을 못 봤는지 남긴다.
+        print("    (auction.db 없음 - 이번 실행에서는 재지 못했다)")
+        return
+
+    conn = connect()
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        measured = {}
+        for (table, col) in sorted(PRODUCERLESS_COLUMNS):
+            if table not in tables:
+                continue
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+            if col not in cols:
+                continue
+            total = conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+            if not total:
+                continue          # 행이 없으면 판정할 수 없다
+            filled = conn.execute(
+                "SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL" % (table, col)).fetchone()[0]
+            measured[(table, col)] = (filled, total)
+    finally:
+        conn.close()
+
+    check_true("검사 대상 컬럼을 실제로 쟀다 - %d개" % len(measured), len(measured) > 0, len(measured))
+
+    # (a) 목록에 있는데 **채워지기 시작한** 컬럼 -> 좋은 소식이지만 목록을 고쳐야 한다.
+    now_produced = sorted("%s.%s (%d/%d)" % (t, c, f, n)
+                          for (t, c), (f, n) in measured.items() if f > 0)
+    check("생산자가 생긴 컬럼은 목록에서 지운다", now_produced, [])
+    if now_produced:
+        print("      -> 채워지기 시작했다. PRODUCERLESS_COLUMNS 에서 지우고,"
+              " 그 값이 화면까지 옳게 가는지 검사를 추가하라.")
+
+    # (b) 목록에 **없는데** producerless 인 컬럼이 새로 생겼는가.
+    #     대상은 화면/API 가 실제로 쓰는 두 표로 한정한다(전 컬럼을 훑으면 잡음이 커진다).
+    WATCHED = ("auction_case", "rights_summary")
+    conn = connect()
+    try:
+        newly = []
+        for table in WATCHED:
+            total = conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+            if not total:
+                continue
+            for r in conn.execute("PRAGMA table_info(%s)" % table):
+                col = r[1]
+                if col in ("id", "item_id", "created_at", "updated_at"):
+                    continue
+                if (table, col) in PRODUCERLESS_COLUMNS:
+                    continue
+                filled = conn.execute(
+                    "SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL" % (table, col)).fetchone()[0]
+                if filled == 0:
+                    newly.append("%s.%s (0/%d)" % (table, col, total))
+    finally:
+        conn.close()
+    check("새로 생산자를 잃은 컬럼 없음", sorted(newly), [])
+    if newly:
+        print("      -> 이 컬럼을 쓰는 화면이 있으면 지금 빈 채로 나가고 있다.")
+
+    print("    producerless 로 알려진 컬럼 %d개 (전부 여전히 0)" % len(measured))
 
 
 if __name__ == "__main__":

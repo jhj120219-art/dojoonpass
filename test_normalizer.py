@@ -10,6 +10,7 @@ normalizer.normalize_address() 단위 테스트.
 실행: python test_normalizer.py
 """
 import sys
+import io
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -752,6 +753,209 @@ def run_normalized_keys_reach_storage():
     return failures
 
 
+# ---------------------------------------------------------------------------
+# 크롤러가 **채웠는데 저장되지 않는** AuctionItem 필드 (2026-09-02 신설)
+#
+# ## 왜
+#
+# `AuctionItem` 은 크롤러가 상세페이지에서 긁은 것을 담는 그릇이다. 그런데 그중
+# 다섯 개는 **채워지기만 하고 DB 로 가지 않는다.** 코드만 읽으면 "수집한다"고 읽히고,
+# 실제로 수집도 하는데, 저장을 안 하니 화면에서는 존재하지 않는다.
+#
+# 실측(2026-09-02, `crawler/` 전수 + `normalize_item()` + `auction` 컬럼 대조):
+#
+#     basic_info         상세페이지의 **모든 th/td** 를 통째로 담는다   -> 버려진다
+#     schedule           기일 내역                                    -> 버려진다
+#     property_list      물건 목록                                    -> 버려진다
+#     appraisal_summary  감정요항 원문                                 -> 버려진다
+#     nearby_cases       인근 사건                                    -> 버려진다
+#
+# ## 왜 이것이 중요한가 (두 가지가 여기서 걸린다)
+#
+# 1. `auction_case.filed_date` / `demand_deadline` / `case_type` 은 **생산자가 없어
+#    항상 NULL** 이고 상세화면이 영원히 '-' 를 그린다
+#    (`test_pipeline_integrity.py` §15). 그런데 `parse_basic_info()` 는 표의 모든
+#    th/td 를 긁으므로, 법원 페이지에 그 항목이 **행으로 있다면 이미 캡처되고 있다.**
+#    즉 난이도가 "새 크롤 설계"가 아니라 "이미 파싱된 것을 저장"일 수 있다.
+#    ※ 실제로 그 키가 있는지는 **실크롤로만** 확인된다(저장된 페이지 덤프는 메뉴
+#      페이지라 근거가 되지 못했다). 그래서 여기서 배선하지 않는다 - 확인 항목만 남긴다.
+#
+# 2. `appraisal_summary` 는 `validator/validation_engine.py` 가 **크롤 시점에** 읽어
+#    `address_mismatch` 를 판정하는 바로 그 입력이다. 그런데 저장하지 않으므로
+#    **왜 검증실패인지 사후에 재현할 수 없다.** 실제로 이 저장소의
+#    `validation_reasons` 에 남은 `addr=부산 appraisal=서울` 같은 판정을 지금은
+#    아무도 검증할 수 없다(같은 건물 4세대가 한 감정서를 공유하는 실측 패턴이 있다).
+#
+# ## 무엇을 고정하나
+#
+# 저장할지 말지는 스키마 변경이고 수집 범위 결정이라 **여기서 하지 않는다.**
+# 대신 **지금 버려진다는 사실**을 고정한다. 목록이 바뀌면 - 배선되든 필드가 사라지든 -
+# 이 검사가 먼저 알려 준다. (`run_normalized_keys_reach_storage()` 가 죽은
+# `has_*_pdf` 배선을 고정해 둔 것과 같은 관례다.)
+# ---------------------------------------------------------------------------
+CAPTURED_BUT_DISCARDED = {
+    "basic_info":        "상세페이지 th/td 전부. case 날짜가 여기 있을 수 있다",
+    "schedule":          "기일 내역",
+    "property_list":     "물건 목록",
+    "appraisal_summary": "감정요항 원문. validator 가 크롤 시점에만 읽고 버린다",
+    "nearby_cases":      "인근 사건",
+}
+
+
+def run_captured_but_discarded_fields():
+    import dataclasses
+    from models.auction_item import AuctionItem
+    from normalizer.normalizer import normalize_item
+    import storage.database as dbmod
+
+    failures = []
+
+    def check(name, got, expected):
+        ok = got == expected
+        print("[%s] %s: %r" % ("PASS" if ok else "FAIL", name, got))
+        if not ok:
+            print("     expected %r" % (expected,))
+            failures.append(name)
+
+    print()
+    print("--- 크롤러가 채웠는데 저장되지 않는 필드 ---")
+
+    item = AuctionItem(
+        case_no="2026타경1", item_no="1", address="서울특별시 강남구 역삼동 736-1",
+        property_type="아파트", appraisal_price="100000000",
+        minimum_bid_price="80000000", auction_date="2026-09-30",
+        status="유찰 1회", court_code="서울중앙지방법원",
+        court_name="서울중앙지방법원", crawl_date="2026-09-01",
+    )
+    norm_keys = set(normalize_item(item).keys())
+    model_fields = {f.name for f in dataclasses.fields(AuctionItem)}
+
+    # auction 컬럼 (이 파일의 다른 검사와 같은 방식으로 소스에서 읽는다)
+    import re
+    root = os.path.dirname(os.path.abspath(__file__))
+    src = io.open(os.path.join(root, "storage", "database.py"),
+                  encoding="utf-8-sig").read()
+    m = re.search(r"CREATE TABLE IF NOT EXISTS auction\s*\((.*?)\n\s*\)", src, re.S)
+    cols = set()
+    if m:
+        for line in m.group(1).split("\n"):
+            mm = re.match(r"\s*([a-z_]+)\s+(INTEGER|TEXT|REAL)", line)
+            if mm:
+                cols.add(mm.group(1))
+    check("전제: auction 컬럼을 읽었다(개수>10)", len(cols) > 10, True)
+    check("전제: 모델 필드를 읽었다(개수>10)", len(model_fields) > 10, True)
+
+    # (1) 목록의 필드가 **정말 모델에 있고**, 정규화/컬럼 어디에도 없다.
+    for field, why in sorted(CAPTURED_BUT_DISCARDED.items()):
+        check("모델에 %s 가 있다 (%s)" % (field, why), field in model_fields, True)
+        check("★ %s 는 normalize_item 출력에 없다" % field, field in norm_keys, False)
+        check("★ %s 는 auction 컬럼에도 없다" % field, field in cols, False)
+
+    # (2) 크롤러가 **실제로 그 필드를 채운다** — 죽은 필드가 아니라 '버려지는' 필드라는 근거.
+    crawl_src = ""
+    for dp, dn, fn in os.walk(os.path.join(root, "crawler")):
+        dn[:] = [x for x in dn if x != "__pycache__"]
+        for fl in fn:
+            if fl.endswith(".py"):
+                crawl_src += io.open(os.path.join(dp, fl), encoding="utf-8-sig").read()
+    check("전제: crawler 소스를 읽었다", len(crawl_src) > 1000, True)
+    not_filled = sorted(f for f in CAPTURED_BUT_DISCARDED if ("%s=" % f) not in crawl_src)
+    check("★★ 목록의 필드를 크롤러가 실제로 채운다(버려지는 것이 맞다)", not_filled, [])
+
+    # (3) 목록 **밖에서** 새로 버려지기 시작한 필드가 없는가.
+    #     `address` 는 제외한다 - 버려지는 것이 아니라 normalize_address() 가
+    #     full_address/sido/sigungu/dong 으로 **분해해서** 저장한다.
+    #     `has_status_pdf` 는 이미 run_normalized_keys_reach_storage() 가 고정한다.
+    KNOWN_ELSEWHERE = {"address", "has_status_pdf"}
+    newly = sorted(f for f in model_fields
+                   if f not in norm_keys and f not in cols
+                   and f not in CAPTURED_BUT_DISCARDED and f not in KNOWN_ELSEWHERE)
+    check("새로 버려지기 시작한 필드 없음", newly, [])
+
+    return failures
+
+
+def run_case_no_two_implementations():
+    """이름이 같은 `normalize_case_no()` 두 판본의 계약을 고정한다 (2026-09-02 신설).
+
+    ## 왜
+
+    Frankenstein 전수 감사에서 나왔다. **같은 패키지에 같은 이름**이 둘 있다.
+
+        normalizer/normalizer.py     크롤 원천을 믿는다. 양끝 공백만 턴다.
+        normalizer/mylist_import.py  사람이 붙여 넣은 잡음에서 사건번호를 뽑아낸다.
+
+    같은 이름이라 잘못 가져다 쓰기 쉽고, 그러면 **같은 물건이 다른 식별자로 저장된다.**
+    그런데 합쳐서도 안 된다 - 크롤 쪽을 가져오기 쪽으로 위임하면 `타채` 같은 다른
+    사건부호가 통째로 빈 문자열이 된다(아래 표가 그것을 고정한다).
+
+    ## 무엇을 고정하나
+
+    (a) **정상 표기에서는 반드시 같은 답** - 여기가 갈라지면 식별자가 갈라진다.
+    (b) **의도된 차이** - 어느 한쪽이 조용히 상대에게 흡수되면 (b)가 먼저 운다.
+
+    실측(2026-09-02, 이 머신 auction.db): distinct case_no 1,381개 전부 두 함수 결과가
+    동일했다. 지금 갈라져 있지는 않다 - 이 검사는 **앞으로 갈라지는 것**을 막는다.
+    """
+    from normalizer.normalizer import normalize_case_no as crawl_norm
+    from normalizer.mylist_import import normalize_case_no as import_norm
+
+    failures = []
+
+    def check(name, actual, expected):
+        ok = actual == expected
+        print("[%s] %s: %r (expected %r)" % ("PASS" if ok else "FAIL", name, actual, expected))
+        if not ok:
+            failures.append(name)
+
+    print()
+    print("--- normalize_case_no 두 판본의 계약 ---")
+
+    # 전제: 정말 서로 다른 함수다(같은 객체면 아래가 공허하다).
+    check("전제: 두 판본이 서로 다른 함수다", crawl_norm is import_norm, False)
+
+    # (a) 정상 표기 - 반드시 같은 답. 여기가 이 검사의 핵심이다.
+    for value in ("2024타경1009",
+                  "  2024타경1009  ",
+                  "2008타경25092 / 2015타경19958",
+                  ""):
+        check("★ 정상 표기는 두 판본이 같은 답 (%r)" % value,
+              crawl_norm(value), import_norm(value))
+
+    # (b) 의도된 차이 - 합쳐지면 여기가 운다.
+    #     왼쪽이 크롤 판본, 오른쪽이 가져오기 판본의 **정답**이다.
+    for value, want_crawl, want_import in (
+            ("2024타채1009",    "2024타채1009",    ""),
+            ("2024타경1009-1",  "2024타경1009-1",  "2024타경1009"),
+            ("사건번호 없음",     "사건번호 없음",     ""),
+            ("2024 타경 1009",  "2024 타경 1009",  "2024타경1009"),
+    ):
+        check("의도된 차이(크롤은 원천 보존): %r" % value, crawl_norm(value), want_crawl)
+        check("의도된 차이(가져오기는 추출): %r" % value, import_norm(value), want_import)
+
+    # 크롤 판본이 **원천을 버리지 않는다** - 위임 사고를 정면으로 막는다.
+    check("★★ 크롤 판본은 타경이 아닌 사건부호를 버리지 않는다",
+          crawl_norm("2024타채1009") != "", True)
+
+    # 두 판본이 한 파일에 합쳐지지 않았는지(정본 위치)도 함께 본다.
+    import normalizer.normalizer as n_mod
+    import normalizer.mylist_import as m_mod
+    check("크롤 판본은 normalizer.py 에 있다",
+          n_mod.normalize_case_no.__module__, "normalizer.normalizer")
+    check("가져오기 판본은 mylist_import.py 에 있다",
+          m_mod.normalize_case_no.__module__, "normalizer.mylist_import")
+
+    # 이 구분이 왜 있는지가 코드에 적혀 있는가 - 주석이 지워지면 다음 사람이 또 합친다.
+    src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "normalizer", "normalizer.py"),
+                  encoding="utf-8-sig").read()
+    body = src.split("def normalize_case_no(")[1].split("\ndef ")[0]
+    check("크롤 판본에 '왜 합치면 안 되는가'가 적혀 있다",
+          "mylist_import" in body and "타채" in body, True)
+
+    return failures
+
+
 def run():
     failures = []
 
@@ -801,6 +1005,8 @@ def run():
     failures += run_area_extraction()
     failures += run_bracket_exclusion()
     failures += run_normalized_keys_reach_storage()
+    failures += run_case_no_two_implementations()
+    failures += run_captured_but_discarded_fields()
 
     print()
     if failures:

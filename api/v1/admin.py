@@ -13,7 +13,7 @@ from api.auth import success
 from api.constants import (
     AuditAction, AuditTargetType, RegistryRequestStatus,
     PaymentStatus, PaymentType, SubscriptionStatus,
-    is_sqlite_int,
+    is_sqlite_int, escape_like,
 )
 from api.v1.audit import record_audit, get_audit_logs
 
@@ -348,8 +348,8 @@ def list_registry_requests(
             conditions.append("rr.item_id = ?")
             params.append(item_id)
         if case_no:
-            conditions.append("ai.case_no LIKE ?")
-            params.append(f"%{case_no}%")
+            conditions.append("ai.case_no LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(case_no)}%")
 
         where = " AND ".join(conditions)
         # ★ LEFT JOIN이어야 한다 (2026-08-13 Sprint 97).
@@ -712,8 +712,8 @@ def admin_list_users(
     """
     conn = get_connection()
     try:
-        like = "%" + q + "%" if q else None
-        where = "WHERE user_id LIKE ?" if like else ""
+        like = "%" + escape_like(q) + "%" if q else None
+        where = "WHERE user_id LIKE ? ESCAPE '\\'" if like else ""
         params = [like] if like else []
 
         base = """

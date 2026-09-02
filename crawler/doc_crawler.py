@@ -177,7 +177,9 @@ def build_download_driver():
     #
     # 예외는 삼키지 않고 그대로 올린다 — 기동 실패는 호출자(doc_worker)가 인지해야 한다.
     try:
-        driver.set_page_load_timeout(30)
+        # 상한은 `base_crawler` 한 곳에서 가져온다(여기 30 을 다시 적으면 두 벌이 된다).
+        from crawler.base_crawler import PAGE_LOAD_TIMEOUT
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     except Exception:
         try:
             driver.quit()

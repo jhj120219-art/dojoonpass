@@ -1495,6 +1495,9 @@ def run():
     check_sort_and_injection_are_bounded()
     check_area_filter_survives_missing_migration_025()
     check_area_families_are_a_union_not_a_pair()
+    check_like_wildcards_are_literal_text()
+    check_hangul_normalization_is_uniform()
+    check_surrounding_whitespace_is_ignored()
 
     print()
     if FAILURES:
@@ -1825,6 +1828,421 @@ def check_area_families_are_a_union_not_a_pair():
         dbmod.DB_PATH = orig_db
         shutil.rmtree(workdir, ignore_errors=True)
 
+
+
+# ---------------------------------------------------------------------------
+# 사용자가 친 `%` / `_` 가 **와일드카드로 살아나지 않는가** (2026-09-02 신설)
+#
+# 검색 필터는 전부 `f"%{값}%"` 를 `LIKE ?` 에 **바인딩**한다. 바인딩이라 SQL 주입은
+# 아니다. 그런데 `%` 와 `_` 는 LIKE 문법의 와일드카드라 **바인딩되어도 그대로 산다.**
+# 즉 좁히라고 준 글자가 넓히는 지시가 된다.
+#
+# 실측(2026-09-02, 이 저장소의 실 DB auction_item 1,876행 / 수정 전):
+#
+#     address_detail=아파트   ->   94행   (정상)
+#     address_detail=아_트    ->   94행   <- '_' 가 아무 글자 하나와 맞아 '아파트'를 집는다
+#     address_detail=아%트    ->  187행   <- '%' 가 아무 글자나와 맞는다
+#     address_detail=%       -> 1876행   <- **필터가 전부를 돌려준다**
+#     court_name / status / case_no / sigungu 도 전부 같았다
+#
+# 오류도 빈 화면도 아니다. 사용자는 자기가 친 글자로 좁혀진 결과를 보고 있다고 믿는데
+# 실제로는 남의 물건이 섞여 있다 — 이 저장소가 반복해서 잡아 온 "조용한 실패"다.
+#
+# ## 왜 실 DB 가 아니라 씨앗으로 재는가
+#
+# 이 검사가 확인할 것은 두 가지인데, 실 DB 에는 이름에 `%` 나 `_` 가 든 물건이
+# **한 행도 없어서** 둘째를 잴 수 없다.
+#
+#     (a) 와일드카드로 **번지지 않는다**       -> 실 DB 로도 잴 수 있다(0건이면 통과)
+#     (b) 그 글자를 **글자 그대로 찾아낸다**   -> 그런 행이 있어야만 잴 수 있다
+#
+# (a) 만 재면 `escape_like()` 가 입력을 통째로 버려도(예: 항상 "") 통과한다.
+# 그래서 `%`/`_` 가 실제로 든 행을 심고 **정확히 그 행만** 나오는지까지 본다.
+#
+# 정본은 `api/constants.py:escape_like()` 한 곳이고, 호출부는 `ESCAPE '\'` 를 함께
+# 적어야 한다(SQLite 는 ESCAPE 절이 없으면 역슬래시를 특별 취급하지 않는다).
+# 그 배선이 빠진 자리가 생기면 아래 (b) 가 먼저 운다.
+# ---------------------------------------------------------------------------
+def check_like_wildcards_are_literal_text():
+    import contextlib, io as _io, shutil, tempfile
+    from fastapi.testclient import TestClient
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    print()
+    print("--- LIKE 와일드카드가 글자 그대로 취급되는가 ---")
+
+    orig_db = dbmod.DB_PATH
+    workdir = tempfile.mkdtemp(prefix="qa_like_")
+    try:
+        dbmod.DB_PATH = os.path.join(workdir, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        import api_server
+        client = TestClient(api_server.app)
+
+        # 1/2 번은 평범한 행, 3/4 번은 이름에 와일드카드 글자가 **실제로** 든 행.
+        rows = [
+            (1, "2024타경901", "아파트", "서울 강남구 역삼동 1 [아파트]",   "강남구"),
+            (2, "2024타경902", "아파트", "서울 강남구 역삼동 2 [아무트]",   "강남구"),
+            (3, "2024타경903", "아파트", "서울 강남구 역삼동 3 [아_트]",    "강남_구"),
+            (4, "2024타경904", "아파트", "서울 강남구 역삼동 4 [아%트]",    "강남%구"),
+        ]
+        c = dbmod.get_connection()
+        try:
+            for item_id, case_no, ptype, addr, sgg in rows:
+                case_id = c.execute(
+                    "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                    ("서울중앙지방법원", case_no)).lastrowid
+                c.execute(
+                    "INSERT INTO auction_item"
+                    " (id, case_id, case_no, item_no, court_name, property_type,"
+                    "  sido, sigungu, full_address, auction_date)"
+                    " VALUES (?,?,?,'1','서울중앙지방법원',?,'서울',?,?,'2099-01-01')",
+                    (item_id, case_id, case_no, ptype, sgg, addr))
+            c.commit()
+        finally:
+            c.close()
+
+        def ids(**params):
+            r = client.get("/api/v1/search", params={"size": 100, **params})
+            assert r.status_code == 200, (r.status_code, r.text[:200])
+            return sorted(i["id"] for i in r.json()["items"])
+
+        check("전제: 씨앗 4건이 기본 검색에 보인다", ids() == [1, 2, 3, 4], ids())
+
+        # (a) 와일드카드가 번지지 않는다 -------------------------------------
+        WILD = "%"
+        ONE = "_"
+        check("★ address_detail='%' 는 전부를 돌려주지 않는다",
+              ids(address_detail=WILD) == [4], ids(address_detail=WILD))
+        check("★ address_detail='_' 는 전부를 돌려주지 않는다",
+              ids(address_detail=ONE) == [3], ids(address_detail=ONE))
+        check("★ '아_트' 가 '아파트'/'아무트' 를 집지 않는다",
+              ids(address_detail="아" + ONE + "트") == [3],
+              ids(address_detail="아" + ONE + "트"))
+        check("★ '아%트' 가 아무 글자나를 건너뛰지 않는다",
+              ids(address_detail="아" + WILD + "트") == [4],
+              ids(address_detail="아" + WILD + "트"))
+        check("★ sigungu='_' 가 전부를 돌려주지 않는다",
+              ids(sigungu=ONE) == [3], ids(sigungu=ONE))
+        check("★ case_no='%' 가 전부를 돌려주지 않는다",
+              ids(case_no=WILD) == [], ids(case_no=WILD))
+        check("★ court_name='%' 가 전부를 돌려주지 않는다",
+              ids(court_name=WILD) == [], ids(court_name=WILD))
+        check("★ status='%' 가 전부를 돌려주지 않는다",
+              ids(status=WILD) == [], ids(status=WILD))
+
+        # (b) 글자 그대로 찾아낸다 (이스케이프가 입력을 버리면 여기서 운다) ----
+        check("★★ '아_트' 는 정말 '아_트' 인 행을 찾아낸다",
+              ids(address_detail="아" + ONE + "트") == [3], "3번이 나와야 한다")
+        check("★★ '아%트' 는 정말 '아%트' 인 행을 찾아낸다",
+              ids(address_detail="아" + WILD + "트") == [4], "4번이 나와야 한다")
+        check("★★ sigungu='강남_구' 는 그 글자를 가진 행만 찾는다",
+              ids(sigungu="강남" + ONE + "구") == [3],
+              ids(sigungu="강남" + ONE + "구"))
+
+        # (c) 평범한 검색은 그대로다 (수정이 기존 동작을 줄이지 않았다) --------
+        check("일반 검색은 그대로다('아파트' 는 1번만)",
+              ids(address_detail="아파트") == [1], ids(address_detail="아파트"))
+        check("일반 검색은 그대로다(sigungu='강남구' 는 1·2번)",
+              ids(sigungu="강남구") == [1, 2], ids(sigungu="강남구"))
+
+        # (d) 규칙이 한 곳에만 있는가 — 호출부가 ESCAPE 를 빠뜨리면 잡는다 ----
+        root = os.path.dirname(os.path.abspath(__file__))
+        scanned = 0
+        unescaped = []
+        for rel in ["api/v1/search.py", "api/v1/admin.py",
+                    "api/v1/favorite_import.py", "storage/database.py",
+                    "filter/filter_engine.py"]:
+            src = _io.open(os.path.join(root, rel.replace("/", os.sep)),
+                           encoding="utf-8-sig").read()
+            for line_no, line in enumerate(src.splitlines(), 1):
+                if "LIKE ?" not in line:
+                    continue
+                scanned += 1
+                if "ESCAPE" not in line:
+                    unescaped.append("%s:%d" % (rel, line_no))
+        # 스캔이 죽어 **공허하게 통과**하지 않도록 하한을 함께 둔다
+        # (이 파일의 다른 전수 검사와 같은 규약).
+        check("전제: `LIKE ?` 자리를 실제로 찾았다 - %d곳" % scanned, scanned >= 15, scanned)
+        check("모든 `LIKE ?` 에 ESCAPE 절이 붙어 있다", not unescaped, unescaped)
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+
+# ---------------------------------------------------------------------------
+# 같은 글자를 다른 유니코드 표현으로 쳐도 같은 결과가 나오는가 (2026-09-02 신설)
+#
+# '강' 은 유니코드에서 두 가지로 적힌다.
+#
+#     NFC  U+AC15                    (완성형 한 글자)
+#     NFD  U+1100 U+1161 U+11BC      (자모 세 글자)
+#
+# 화면에는 똑같이 보이는데 바이트가 달라 `LIKE`/`=` 가 하나도 맞지 않는다.
+# macOS 는 파일 이름을 NFD 로 보관하므로 **거기서 복사해 붙여 넣으면 NFD 가 들어온다.**
+# 사용자는 "분명히 있는 물건인데 0건"을 보게 된다 - 오류도 아니고 빈 화면이라
+# 원인을 짐작할 수도 없다.
+#
+# 실측(2026-09-02, 실 DB / 수정 전):
+#
+#     address_detail=아파트   NFC ->  94건 / NFD -> **0건**
+#     sido=서울              NFC -> 275건 / NFD -> **0건**
+#     sigungu / court_name / case_no / status 도 전부 같았다
+#
+# 고친 방식은 **입구에서 한 번 NFC 로 맞추는 것**이다(`api/constants.py:to_nfc`).
+# 이 검사는 두 축을 함께 지킨다.
+#
+#     (a) 질의를 NFD 로 줘도 NFC 와 같은 답이 나온다
+#     (b) DB 쪽이 정말 NFC 다  <- (a) 의 전제. 크롤러가 NFD 를 넣기 시작하면
+#                                 질의만 NFC 로 맞춰서는 못 찾으므로 여기서 먼저 운다.
+#
+# (b) 를 빼면 이 방어는 "지금 우연히 맞는" 상태가 된다. 전제를 검사로 묶어 둔다.
+# ---------------------------------------------------------------------------
+def check_hangul_normalization_is_uniform():
+    import contextlib, io as _io, shutil, tempfile, unicodedata, sqlite3
+    from fastapi.testclient import TestClient
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    print()
+    print("--- 한글 정규화(NFC/NFD) 가 검색 결과를 가르지 않는가 ---")
+
+    NFC = lambda s: unicodedata.normalize("NFC", s)
+    NFD = lambda s: unicodedata.normalize("NFD", s)
+
+    # 전제: 이 두 표현이 실제로 다른 바이트다(같으면 아래 검사가 공허하다).
+    check("전제: NFC 와 NFD 가 서로 다른 문자열이다",
+          NFC("강남구") != NFD("강남구"), True)
+
+    orig_db = dbmod.DB_PATH
+    workdir = tempfile.mkdtemp(prefix="qa_nfc_")
+    try:
+        dbmod.DB_PATH = os.path.join(workdir, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        import api_server
+        client = TestClient(api_server.app)
+
+        rows = [
+            (1, "2024타경911", "아파트", "서울 강남구 역삼동 1 [아파트]", "강남구", "역삼동"),
+            (2, "2024타경912", "아파트", "서울 강남구 역삼동 2 [아파트]", "강남구", "역삼동"),
+        ]
+        c = dbmod.get_connection()
+        try:
+            for item_id, case_no, ptype, addr, sgg, dong in rows:
+                case_id = c.execute(
+                    "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                    ("서울중앙지방법원", case_no)).lastrowid
+                c.execute(
+                    "INSERT INTO auction_item"
+                    " (id, case_id, case_no, item_no, court_name, property_type,"
+                    "  sido, sigungu, dong, full_address, auction_date)"
+                    " VALUES (?,?,?,'1','서울중앙지방법원',?,'서울',?,?,?,'2099-01-01')",
+                    (item_id, case_id, case_no, ptype, sgg, dong, addr))
+            c.commit()
+        finally:
+            c.close()
+
+        def ids(**params):
+            r = client.get("/api/v1/search", params={"size": 100, **params})
+            assert r.status_code == 200, (r.status_code, r.text[:200])
+            return sorted(i["id"] for i in r.json()["items"])
+
+        check("전제: 씨앗 2건이 기본 검색에 보인다", ids() == [1, 2], ids())
+
+        # (a) 같은 글자면 표현이 달라도 같은 답 -----------------------------
+        for label, param, term in (
+            ("address_detail", "address_detail", "아파트"),
+            ("sigungu",        "sigungu",        "강남구"),
+            ("dong",           "dong",           "역삼동"),
+            ("court_name",     "court_name",     "서울중앙지방법원"),
+            ("property_type",  "property_type",  "아파트"),
+            ("case_no",        "case_no",        "2024타경911"),
+        ):
+            a = ids(**{param: NFC(term)})
+            b = ids(**{param: NFD(term)})
+            check("★ %s: NFD 입력이 NFC 와 같은 결과다 (%r)" % (label, term),
+                  a == b and a != [], "NFC=%s NFD=%s" % (a, b))
+
+        # sido 는 = 비교라 별도로 본다(LIKE 가 아니다).
+        check("★ sido: NFD 입력이 NFC 와 같은 결과다",
+              ids(sido=NFC("서울")) == ids(sido=NFD("서울")) == [1, 2],
+              "NFC=%s NFD=%s" % (ids(sido=NFC("서울")), ids(sido=NFD("서울"))))
+
+        # (b) 전제 - 실 DB 가 NFC 인가 -------------------------------------
+        real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auction.db")
+        if os.path.exists(real):
+            conn = sqlite3.connect("file:%s?mode=ro" % real.replace("\\", "/"), uri=True)
+            try:
+                cols = ["full_address", "sido", "sigungu", "dong",
+                        "court_name", "property_type", "status", "case_no"]
+                seen = 0
+                bad = []
+                for row in conn.execute("SELECT %s FROM auction_item" % ",".join(cols)):
+                    for i, v in enumerate(row):
+                        if not isinstance(v, str) or not v:
+                            continue
+                        seen += 1
+                        if v != NFC(v):
+                            bad.append((cols[i], v[:40]))
+            finally:
+                conn.close()
+            check("전제: 실 DB 문자열을 실제로 훑었다 - %d개" % seen, seen > 0, seen)
+            check("★★ 실 DB 의 문자열이 전부 NFC 다(질의만 NFC 로 맞추면 되는 근거)",
+                  not bad, bad[:5])
+        else:
+            # 조용히 건너뛰지 않는다 - 무엇을 못 봤는지 남긴다.
+            print("   (auction.db 없음 - DB 정규형 대조는 이번 실행에서 하지 못했다)")
+
+        # (c) 입구 배선 - 정리 함수가 실제로 NFC 를 적용하는가 ----------------
+        #
+        # "파라미터 여덟 개가 `_clean_param()` 을 지나는가" 는 공백 쪽 검사가 이미
+        # 본다(`check_surrounding_whitespace_is_ignored`). 같은 것을 두 벌 세지 않는다.
+        # 여기서 지킬 것은 **그 정리 함수가 NFC 를 빠뜨리지 않는가** 하나다 —
+        # 배선이 남아 있어도 함수 안에서 NFC 가 빠지면 이 축만 조용히 죽는다.
+        src = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "api", "v1", "search.py"),
+                       encoding="utf-8-sig").read()
+        body = src.split("def _clean_param(")[1].split("\ndef ")[0]
+        check("전제: 정리 함수를 실제로 찾았다", len(body) > 0, len(body))
+        check("정리 함수가 NFC 정규화를 적용한다", "to_nfc(" in body, body[-200:])
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 붙여넣기가 달고 온 **양끝 공백**이 결과를 0건으로 만들지 않는가 (2026-09-02 신설)
+#
+# 검색 값은 `f"%{값}%"` 로 감싸여 `LIKE` 에 들어간다. 값에 앞뒤 공백이 붙어 있으면
+# 패턴이 `'% 아파트 %'` 가 되므로 **문자열 앞이나 끝에 있는 말은 영원히 못 찾는다.**
+# 복사·붙여넣기는 공백을 자주 달고 오고, 사용자는 자기가 붙여 넣은 글자가 화면에
+# 그대로 보이니 왜 0건인지 알 수 없다.
+#
+# 실측(2026-09-02, 실 DB 1,876행 / 수정 전):
+#
+#     address_detail='아파트'    ->   94건
+#     address_detail='  아파트'  ->  **0건**
+#     sigungu=' 강남구 '         ->  **0건**   (공백 없이는 3건)
+#     court_name=' 고양 '        ->  **0건**   (공백 없이는 61건)
+#     case_no=' 2024타경 '       ->  **0건**   (공백 없이는 1,140건)
+#
+# ★ 이것이 정책이 아니라 **누락**이라는 근거: 같은 함수의 `property_type` 은 예전부터
+#   `t.strip()` 으로 공백을 털고 있었다. 여덟 파라미터 중 하나만 털고 있었던 것이다.
+#   (`sido` 만 우연히 멀쩡했다 - `extract_sido()` 가 문자열 **안**에서 찾기 때문이라
+#    공백이 있어도 지역명을 집어낸다. 즉 방어가 아니라 우연이었다.)
+#
+# 안쪽 공백은 건드리지 않는다 - `'서울 강남구'` 의 공백은 뜻이 있다. 그 사실도 함께 고정한다.
+# ---------------------------------------------------------------------------
+def check_surrounding_whitespace_is_ignored():
+    import contextlib, io as _io, shutil, tempfile
+    from fastapi.testclient import TestClient
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as mig
+    import storage.migrations.run_migrations as runmig
+
+    print()
+    print("--- 양끝 공백이 검색을 0건으로 만들지 않는가 ---")
+
+    orig_db = dbmod.DB_PATH
+    workdir = tempfile.mkdtemp(prefix="qa_ws_")
+    try:
+        dbmod.DB_PATH = os.path.join(workdir, "t.db")
+        with contextlib.redirect_stdout(_io.StringIO()):
+            dbmod.init_db()
+            mig.migrate()
+            runmig.run()
+
+        import api_server
+        client = TestClient(api_server.app)
+
+        # 1번 주소는 '아파트' 로 **끝난다** - 뒤에 공백이 붙은 패턴('%아파트 %')으로는
+        # 절대 못 찾는 모양이라, 이 결함을 정확히 드러낸다.
+        rows = [
+            (1, "2024타경921", "아파트", "서울 강남구 역삼동 1 아파트", "강남구", "역삼동"),
+            (2, "2024타경922", "아파트", "서울 강남구 역삼동 2 [아파트]", "강남구", "역삼동"),
+        ]
+        c = dbmod.get_connection()
+        try:
+            for item_id, case_no, ptype, addr, sgg, dong in rows:
+                case_id = c.execute(
+                    "INSERT INTO auction_case (court_code, case_no) VALUES (?,?)",
+                    ("서울중앙지방법원", case_no)).lastrowid
+                c.execute(
+                    "INSERT INTO auction_item"
+                    " (id, case_id, case_no, item_no, court_name, property_type,"
+                    "  sido, sigungu, dong, full_address, auction_date)"
+                    " VALUES (?,?,?,'1','서울중앙지방법원',?,'서울',?,?,?,'2099-01-01')",
+                    (item_id, case_id, case_no, ptype, sgg, dong, addr))
+            c.commit()
+        finally:
+            c.close()
+
+        def ids(**params):
+            r = client.get("/api/v1/search", params={"size": 100, **params})
+            assert r.status_code == 200, (r.status_code, r.text[:200])
+            return sorted(i["id"] for i in r.json()["items"])
+
+        check("전제: 씨앗 2건이 기본 검색에 보인다", ids() == [1, 2], ids())
+
+        # 파라미터마다 "공백 없음" 과 "공백 있음" 이 같은 답을 내야 한다.
+        for label, param, term in (
+            ("address_detail", "address_detail", "아파트"),
+            ("sigungu",        "sigungu",        "강남구"),
+            ("dong",           "dong",           "역삼동"),
+            ("court_name",     "court_name",     "서울중앙지방법원"),
+            ("property_type",  "property_type",  "아파트"),
+            ("case_no",        "case_no",        "2024타경921"),
+            ("sido",           "sido",           "서울"),
+        ):
+            plain = ids(**{param: term})
+            for pad_label, padded in (("앞", "  " + term),
+                                      ("뒤", term + "  "),
+                                      ("양쪽", "  " + term + "  ")):
+                got = ids(**{param: padded})
+                check("★ %s: %s 공백이 붙어도 같은 결과 (%r)" % (label, pad_label, term),
+                      got == plain and plain != [],
+                      "공백없음=%s 공백있음=%s" % (plain, got))
+
+        # 문자열 **끝**에 있는 말도 찾는다 - '%아파트 %' 로는 못 찾던 모양.
+        check("★★ 주소 맨 끝의 말도 공백 붙은 입력으로 찾힌다",
+              ids(address_detail="아파트  ") == [1, 2],
+              ids(address_detail="아파트  "))
+
+        # 안쪽 공백은 뜻이 있으므로 **그대로 둔다**.
+        check("안쪽 공백은 유지된다('서울 강남구' 가 여전히 맞는다)",
+              ids(address_detail="서울 강남구") == [1, 2],
+              ids(address_detail="서울 강남구"))
+        check("안쪽 공백을 지우지 않는다('서울강남구' 는 안 맞는다)",
+              ids(address_detail="서울강남구") == [],
+              ids(address_detail="서울강남구"))
+
+        # 공백만 친 것은 필터가 아니다(빈 문자열과 같은 취급).
+        check("공백만 친 입력은 필터로 치지 않는다(전체가 나온다)",
+              ids(address_detail="   ") == [1, 2], ids(address_detail="   "))
+
+        # 배선 - 텍스트 파라미터가 전부 `_clean_param()` 을 지나는가.
+        src = _io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "api", "v1", "search.py"),
+                       encoding="utf-8-sig").read()
+        missing = [q for q in ("case_no", "sido", "sigungu", "dong", "address_detail",
+                               "property_type", "court_name", "status")
+                   if ("%s = _clean_param(%s)" % (q, q)) not in src]
+        check("모든 텍스트 검색 파라미터가 입구에서 정리된다", not missing, missing)
+    finally:
+        dbmod.DB_PATH = orig_db
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

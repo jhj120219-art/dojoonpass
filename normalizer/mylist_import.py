@@ -34,6 +34,10 @@
 import re
 from typing import List, Optional, Sequence
 
+# 한글 정규화 규칙의 정본은 한 곳이다(`api/constants.py`). 그 모듈은 표준 라이브러리만
+# 의존하는 잎 모듈이라 normalizer -> api 순환이 생기지 않는다.
+from api.constants import to_nfc
+
 # ---------------------------------------------------------------------------
 # 입력 한도. 정상 사용을 막지 않을 만큼 넉넉하되 상한은 둔다
 # (`api/v1/search_presets.py` 가 같은 이유로 두는 것과 같은 성격의 방어다).
@@ -312,7 +316,20 @@ def parse_mylist_text(text: Optional[str]) -> dict:
     빈 줄은 건너뛰되 `line_no` 는 **원문 줄 번호**를 유지한다 -- 화면이 "3번째 줄이
     이상하다"고 말할 때 사용자가 세는 줄과 같아야 한다.
     """
-    source = (text or "")[:MAX_TEXT_LENGTH]
+    # 줄바꿈과 **한글 표현**을 같은 자리에서 한 번에 맞춘다 (2026-09-02).
+    #
+    # macOS 는 파일 이름을 NFD(자모 분해)로 보관한다. 거기서 복사한 목록을 붙여 넣으면
+    # '타경' 이 NFD 로 들어오고, `CASE_NO_RE` 의 `타경` 은 NFC 라 **정규식이 아예 맞지
+    # 않는다.** 실측(2026-09-02, 수정 전):
+    #
+    #     CASE_NO_RE.search(NFC("2024타경1009"))  -> 맞음
+    #     CASE_NO_RE.search(NFD("2024타경1009"))  -> **안 맞음**
+    #
+    # 결과는 조용하다 — 오류도 없이 "가져올 항목 0건"이 되고, 사용자는 자기가 붙여 넣은
+    # 목록이 왜 비었는지 알 수 없다. 여기서 한 번 맞추면 사건번호·법원명·주소·메모·태그가
+    # 전부 같은 표현을 쓴다(필드마다 흩어 두면 한 곳이 빠지는 날이 온다).
+    # 정본은 `api/constants.py:to_nfc` 한 곳이다.
+    source = to_nfc((text or "")[:MAX_TEXT_LENGTH])
     lines = source.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     mapping: dict = {}

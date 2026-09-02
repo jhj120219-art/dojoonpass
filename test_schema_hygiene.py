@@ -4766,6 +4766,8 @@ def run():
     test_secret_comparisons_are_constant_time()
     test_onedrive_conflict_copies_do_not_grow()
     test_product_module_names_are_not_shadowed_by_stale_copies()
+    test_no_new_duplicate_product_symbols()
+    test_rights_badges_do_not_render_unknown_as_zero()
 
     print("\n" + "=" * 55)
     if failures:
@@ -5256,6 +5258,202 @@ def test_product_module_names_are_not_shadowed_by_stale_copies():
     if stale_evidence:
         print("      -> 이 사본들은 **실행 가능하고 락이 없다.** 예약 크롤과 동시에"
               " 돌 수 있다. 지우는 것은 사람의 판단이다(#253 과 같은 이유)")
+
+
+
+# ---------------------------------------------------------------------------
+# 제품 코드에 **같은 이름의 최상위 심볼**이 새로 생기지 않는가 (2026-09-02 신설)
+#
+# Frankenstein 전수 감사에서 나왔다. 같은 이름의 함수가 여러 제품 모듈에 있으면
+# **잘못 가져다 쓰기 쉽고, 그러면 같은 개념이 경로마다 다르게 계산된다.**
+# 이 저장소가 반복해서 겪은 모양이다:
+#
+#     normalize_case_no   normalizer.py(크롤: 원천 보존) vs mylist_import.py(가져오기: 추출)
+#                         -> 잘못 합치면 '2024타채1009' 가 **빈 문자열**이 된다
+#     get_doc_dir         doc_paths.py(만든다) vs api/v1/documents.py(조회만)
+#                         -> 잘못 합치면 조회가 디렉터리를 만든다(실제로 겪었다, 빈 폴더 1,675개)
+#     row_to_subscription payments.py(기본 9필드) vs subscriptions.py(+파생 3)
+#                         -> 한쪽만 필드가 늘면 같은 엔티티가 두 모양으로 나간다
+#
+# 셋 다 **지금은 정당한 이유가 있어 남겨 둔** 것이고, 각각 별도 검사가 계약을 고정하고
+# 있다(`test_normalizer.py` / `test_doc_path_safety.py` / `test_subscription_policy.py`).
+# 그래서 여기서는 지우라고 하지 않는다 — **새로 늘어나는 것만** 막는다.
+#
+# 2026-09-02 실측: 제품 모듈 69개에서 중복 이름 11건. 그중 `main` 은 스크립트마다
+# 하나씩 있는 진입점이라 세지 않는다.
+#
+# ★ 이 검사가 붉어졌을 때 할 일은 "허용목록에 추가"가 **아니다.** 먼저 물어야 한다:
+#     - 같은 개념인가? -> 한쪽으로 합친다(정본은 한 곳).
+#     - 다른 개념인가? -> **이름을 다르게 짓는다.**
+#   그래도 이름이 같아야 할 이유가 있으면, 그 이유와 **계약을 고정하는 검사**를
+#   함께 만든 뒤에 아래 목록에 넣는다. 위 셋이 전부 그렇게 되어 있다.
+# ---------------------------------------------------------------------------
+KNOWN_DUPLICATE_SYMBOLS = {
+    # 이름                 : 왜 남아 있는가 / 계약을 고정하는 검사
+    "normalize_case_no":    "크롤은 원천 보존 / 가져오기는 추출 - test_normalizer.py 가 고정",
+    "get_doc_dir":          "쓰기는 만든다 / 조회는 계산만 - test_doc_path_safety.py 가 고정",
+    "row_to_subscription":  "기본 9필드 동일 + 파생 3 - test_subscription_policy.py 가 고정",
+    "build_driver":         "옵션만 다르고 드라이버 해석은 base_crawler 한 곳 - 바로 위 검사가 고정",
+    "wait_loading":         "수동 진입점(collect_documents)과 크롤러의 별개 대기 규칙",
+    "select_court":         "수동 진입점(collect_documents)과 크롤러의 별개 선택 규칙",
+    "attach_file_log":      "진입점마다 로그 파일이 다르다 - test_entrypoints_... 가 고정",
+    "extract_fail_count":   "filter_engine 은 어떤 진입점도 부르지 않는 진단 경로",
+    "load_item":            "권리/명세 로더가 각자 다른 표를 읽는다",
+    "purge_orphans":        "권리/명세 로더가 각자 다른 표를 지운다",
+}
+
+
+def test_no_new_duplicate_product_symbols():
+    print("\n--- 제품 코드에 같은 이름의 최상위 심볼이 새로 생겼는가 ---")
+    import ast as _ast
+    import subprocess as _sp
+    import collections as _collections
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "*.py"], cwd=root,
+                      capture_output=True, text=True, encoding="utf-8", timeout=30)
+        tracked = [f for f in out.stdout.split() if f.endswith(".py")] if out.returncode == 0 else []
+    except (OSError, _sp.SubprocessError):
+        tracked = []
+
+    # 제품 코드만 본다. 테스트/일회성 진단 스크립트는 이름이 겹쳐도 해가 없다.
+    SCRIPT_PREFIXES = ("test_", "step", "check_", "patch_", "analyze_", "audit_",
+                       "debug_", "verify_", "detect_", "backfill_", "repair_",
+                       "cleanup_", "measure_", "reset_", "unlock_", "fix_",
+                       "migrate_dryrun", "empty_doc_dirs", "add_test_queue",
+                       "collect_documents" if False else "\0")
+
+    def is_product(rel):
+        base = os.path.basename(rel)
+        if "-DESKTOP-" in rel:
+            return False
+        return not base.startswith(SCRIPT_PREFIXES)
+
+    product = [f for f in tracked if is_product(f)]
+    check_true("제품 모듈을 실제로 모았다 - %d개" % len(product), len(product) >= 30, len(product))
+
+    seen = _collections.defaultdict(list)
+    for rel in product:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.exists(path):
+            continue
+        try:
+            tree = _ast.parse(codecs.open(path, encoding="utf-8-sig").read())
+        except SyntaxError:
+            continue
+        for node in tree.body:              # 모듈 최상위만 - 메서드는 클래스가 갈라 준다
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                if node.name.startswith("_") or node.name == "main":
+                    continue                # main 은 스크립트마다 있는 진입점이다
+                seen[node.name].append(rel)
+
+    dupes = {n: locs for n, locs in seen.items() if len(locs) > 1}
+    check_true("탐지기가 실제로 심볼을 모았다 - %d개" % len(seen), len(seen) >= 100, len(seen))
+
+    unexpected = {n: locs for n, locs in dupes.items() if n not in KNOWN_DUPLICATE_SYMBOLS}
+    check("새로 생긴 중복 심볼 없음", sorted(unexpected), [])
+    if unexpected:
+        for n, locs in sorted(unexpected.items()):
+            print("      %s -> %s" % (n, " | ".join(locs)))
+        print("      -> 합치거나 이름을 다르게 짓는다. 그래도 같아야 하면 계약 검사를"
+              " 먼저 만들고 KNOWN_DUPLICATE_SYMBOLS 에 사유와 함께 넣는다.")
+
+    # 허용목록이 **실측보다 헐거우면** 새 중복 하나가 조용히 들어와도 통과한다
+    # (이 저장소가 상한 검사마다 지켜 온 규약).
+    stale = sorted(n for n in KNOWN_DUPLICATE_SYMBOLS if n not in dupes)
+    check("허용목록에 이미 해소된 이름이 남아 있지 않다", stale, [])
+    if stale:
+        print("      -> 위 이름은 더 이상 중복이 아니다. 목록에서 지워라.")
+
+    print("    중복 %d건 (허용목록 %d건)" % (len(dupes), len(KNOWN_DUPLICATE_SYMBOLS)))
+
+
+
+# ---------------------------------------------------------------------------
+# 권리분석 배지가 **"모른다"를 "0"으로 말하지 않는가** (2026-09-02 신설)
+#
+# ## 왜 — 여기서 틀리면 사용자가 손해를 본다
+#
+# `rights_summary` 의 숫자 필드는 대부분 **생산자가 없어 항상 NULL** 이다
+# (`test_pipeline_integrity.py` §15 가 목록을 고정한다). 화면이 그 NULL 을
+# 숫자로 그리면 **"위험 임차인 0명" / "예상 인수금액 0원"** 처럼 보인다.
+#
+#     실제 뜻: "아직 판정하지 않았다"
+#     화면의 뜻: "위험이 없다"
+#
+# 경매 물건의 권리관계에서 이 차이는 **사용자가 돈을 잃는 방향**이다. 오류도 빈
+# 화면도 아니라서 아무도 신고하지 않는다 - 이 저장소가 "조용한 실패"라 부르는 것 중
+# 결과가 가장 나쁜 쪽이다.
+#
+# ## 무엇을 고정하나
+#
+# 숫자/불리언 필드는 반드시 **`!= null` / `== null` 로 갈라야 한다.**
+# 참/거짓(truthy) 검사는 **0 과 null 을 같은 것으로 뭉갠다**:
+#
+#     {n ? `${n}명` : '정보 없음'}        <- 0명인 물건이 "정보 없음" 이 된다 (거짓 음성)
+#     {n ?? 0}명                          <- null 이 "0명" 이 된다 (거짓 안심) ★ 더 나쁘다
+#     {n != null ? `${n}명` : '정보 없음'} <- 옳다
+#
+# 2026-09-02 실측: 상세화면의 세 숫자 필드가 전부 `!= null` / `== null` 을 쓰고 있다.
+# 지금 옳다는 것과 앞으로도 지켜진다는 것은 다르므로 여기서 고정한다.
+#
+# 문자열 필드(`occupancy_status` 등)는 대상이 아니다 - 빈 문자열과 null 이 둘 다
+# "모른다"라서 `||` 로 묶어도 뜻이 갈라지지 않는다.
+# ---------------------------------------------------------------------------
+RIGHTS_DETAIL_PAGE = "src/app/properties/[id]/page.tsx"
+
+# 화면에 그려지는 rights_summary 의 **숫자/불리언** 필드.
+# (문자열 필드는 위 주석의 이유로 제외한다.)
+RIGHTS_NUMERIC_FIELDS = ("total_tenant_count", "is_vacant", "estimated_inheritance")
+
+
+def test_rights_badges_do_not_render_unknown_as_zero():
+    print("\n--- 권리분석 배지가 '모른다'를 '0'으로 말하지 않는가 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(root, RIGHTS_DETAIL_PAGE.replace("/", os.sep))
+    if not os.path.exists(path):
+        check_true("상세화면 파일이 있다 (%s)" % RIGHTS_DETAIL_PAGE, False, path)
+        return
+    src = codecs.open(path, encoding="utf-8-sig").read()
+    check_true("검사가 공허하지 않다(상세화면을 실제로 읽었다)", len(src) > 1000, len(src))
+
+    unguarded = []
+    missing = []
+    for field in RIGHTS_NUMERIC_FIELDS:
+        # 그 필드를 언급하는 줄만 본다.
+        lines = [ln for ln in src.splitlines() if field in ln]
+        if not lines:
+            missing.append(field)
+            continue
+        # 렌더 줄(JSX 안)에 null 을 명시적으로 가르는 표현이 있어야 한다.
+        rendered = [ln for ln in lines if "{" in ln and "rights_summary" in ln]
+        if not rendered:
+            continue          # 타입 선언에만 나오고 그리지 않는다면 대상 아님
+        for ln in rendered:
+            if ("!= null" not in ln) and ("== null" not in ln):
+                unguarded.append("%s: %s" % (field, ln.strip()[:90]))
+
+    check("전제: 검사 대상 필드를 화면에서 찾았다", missing, [])
+    check("★ 숫자 권리분석 필드가 null 을 0 으로 뭉개지 않는다", unguarded, [])
+    if unguarded:
+        print("      -> `!= null` 로 갈라라. truthy/`?? 0` 은 '모른다'를 '0'으로 바꾼다.")
+
+    # 생산자가 없는 필드는 **화면 타입에조차 없어야** 한다.
+    # 있으면 언젠가 그려지고, 그리는 순간 항상 빈 배지/0 이 된다.
+    PRODUCERLESS_RIGHTS = ("dangerous_tenant_count", "total_deposit", "priority_right",
+                           "lien_exists", "superficies_exists")
+    leaked = sorted(f for f in PRODUCERLESS_RIGHTS if f in src)
+    check("생산자 없는 권리 필드가 화면에 새어 들어오지 않았다", leaked, [])
+    if leaked:
+        print("      -> 이 필드는 항상 NULL 이다(§15). 그리려면 생산자부터 만들어야 한다.")
+
+    # 탐지기 자기 검증 - 합성 입력에서 반드시 잡혀야 한다.
+    bad_line = "{property.rights_summary.total_tenant_count ?? 0}명"
+    check_true("탐지기 자기검증: `?? 0` 은 가드로 인정하지 않는다",
+               ("!= null" not in bad_line) and ("== null" not in bad_line))
+    good_line = "{property.rights_summary.total_tenant_count != null ? 'x' : 'y'}"
+    check_true("탐지기 자기검증: `!= null` 은 가드로 인정한다", "!= null" in good_line)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import logging
 from typing import List, Dict
 from storage.database import get_connection
+from api.constants import escape_like   # LIKE 이스케이프 정본은 한 곳
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +47,14 @@ def filter_auctions(
             conditions.append("sido = ?")
             params.append(sido)
         if sigungu:
-            conditions.append("sigungu LIKE ?")
-            params.append("%" + sigungu + "%")
+            conditions.append("sigungu LIKE ? ESCAPE '\\'")
+            params.append("%" + escape_like(sigungu) + "%")
         if court_name:
             conditions.append("court_name = ?")
             params.append(court_name)
         if property_type:
-            conditions.append("property_type LIKE ?")
-            params.append("%" + property_type + "%")
+            conditions.append("property_type LIKE ? ESCAPE '\\'")
+            params.append("%" + escape_like(property_type) + "%")
         if auction_date_from:
             conditions.append("auction_date >= ?")
             params.append(auction_date_from)

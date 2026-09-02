@@ -37,6 +37,7 @@ if os.path.exists(_qa_dbmod.DB_PATH):
 _qa_dbmod.DB_PATH = _qa_scratch
 
 from storage.database import get_connection
+from normalizer.mylist_import import CASE_NO_RE
 from normalizer.mylist_import import (
     STATUS_ALREADY, STATUS_AMBIGUOUS, STATUS_DUPLICATE_INPUT, STATUS_MATCHED,
     STATUS_NOT_FOUND, STATUS_NO_CASE_NO,
@@ -604,9 +605,71 @@ def test_export_header_contract():
     check("존재하지 않는 검사 파일을 가리키지 않는다", missing, [])
 
 
+def test_nfd_paste_is_understood():
+    """macOS 에서 복사한 목록(NFD)이 조용히 0건이 되지 않는가 (2026-09-02 신설).
+
+    '타경' 은 유니코드에서 두 가지로 적힌다.
+
+        NFC  U+D0C0 U+ACBD          (완성형 두 글자)
+        NFD  U+1110 U+1161 ...      (자모 분해)
+
+    화면에는 똑같이 보이는데 `CASE_NO_RE` 의 '타경' 은 NFC 라 **정규식이 아예 맞지
+    않는다.** macOS 는 파일 이름을 NFD 로 보관하므로, 거기서 복사한 목록을 붙여 넣으면
+    이 경로 전체가 조용히 비어 버린다 - 오류도 없이 "가져올 항목 0건"이고, 사용자는
+    자기가 붙여 넣은 목록이 왜 비었는지 알 수 없다.
+
+    실측(2026-09-02, 수정 전):
+
+        CASE_NO_RE.search(NFC("2024타경1009"))  -> 맞음
+        CASE_NO_RE.search(NFD("2024타경1009"))  -> **안 맞음**
+
+    고친 방식은 `parse_mylist_text()` 입구에서 한 번 NFC 로 맞추는 것이다
+    (정본은 `api/constants.py:to_nfc`). 사건번호뿐 아니라 법원명·주소·메모·태그가
+    전부 같은 표현을 쓰게 된다.
+    """
+    import unicodedata
+    print("\n--- NFD 붙여넣기(맥에서 복사한 목록) ---")
+
+    NFC = lambda s: unicodedata.normalize("NFC", s)
+    NFD = lambda s: unicodedata.normalize("NFD", s)
+
+    # 전제: 두 표현이 실제로 다른 바이트다(같으면 아래가 공허하다).
+    check("전제: NFC 와 NFD 가 서로 다른 문자열이다", NFC("타경") != NFD("타경"), True)
+
+    text = "2024타경1009\n2023타경5555"
+    nfc_rows = rows_of(NFC(text))
+    nfd_rows = rows_of(NFD(text))
+
+    check("NFC 붙여넣기는 2건으로 읽힌다", len(nfc_rows), 2)
+    check("★ NFD 붙여넣기도 같은 2건으로 읽힌다", len(nfd_rows), 2)
+    check("★ NFD 로 붙여 넣어도 사건번호가 NFC 표준 표기로 나온다",
+          [r["case_no"] for r in nfd_rows],
+          ["2024타경1009", "2023타경5555"])
+
+    # 법원명/주소 같은 다른 필드도 같은 입구를 지난다.
+    #
+    # 필드 분해 규칙(어느 칸이 물건번호인가 등)은 여기서 다루지 않는다 — 그건 위
+    # `test_parser()` 의 몫이다. 여기서 고정할 것은 **표현이 달라도 결과가 같은가**
+    # 하나뿐이라, NFD 로 넣은 행과 NFC 로 넣은 행을 통째로 맞춰 본다.
+    line = "2024타경1009\t1\t서울중앙지방법원\t서울 강남구 역삼동"
+    check("★ NFD 로 넣은 행이 NFC 로 넣은 행과 완전히 같다",
+          rows_of(NFD(line)), rows_of(NFC(line)))
+
+    row = rows_of(NFD(line))[0]
+    for field in ("case_no", "court_name", "address"):
+        value = row.get(field) or ""
+        check("★ %s 가 NFC 로 저장된다" % field, value, NFC(value))
+
+    # 정규식 자체가 NFC 를 전제한다는 사실을 고정한다 - 입구 정규화가 빠지면
+    # 여기가 아니라 위 검사들이 먼저 울지만, 근본 이유를 남겨 둔다.
+    check("근본 원인: 정규식은 NFC 만 맞는다(그래서 입구에서 맞춰야 한다)",
+          bool(CASE_NO_RE.search(NFD("2024타경1009"))), False)
+
+
 if __name__ == "__main__":
     test_case_no()
     test_parser()
+    test_nfd_paste_is_understood()
     test_resolve()
 
     conn = get_connection()

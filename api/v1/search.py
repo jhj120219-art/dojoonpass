@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import date, datetime
 from storage.database import get_connection
 from api.auth import decode_supabase_jwt
-from api.constants import is_sqlite_int
+from api.constants import is_sqlite_int, escape_like, to_nfc
 from api.v1.thumbnails import fetch_thumbnail_seqs, thumbnail_url
 from normalizer.normalizer import extract_sido
 from intent.analyzer import (
@@ -23,6 +23,45 @@ router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def _clean_param(value):
+    """검색 텍스트 파라미터를 **받은 자리에서 한 번** 정리한다 (2026-09-02 신설).
+
+    두 가지를 한다. 둘 다 "화면에는 똑같이 보이는데 0건"을 만드는 원인이라 같이 둔다.
+
+    ## (1) 한글 표현을 NFC 로 맞춘다
+
+    '강' 은 유니코드에서 두 가지로 적힌다 — NFC `U+AC15` 한 글자, NFD `U+1100 U+1161
+    U+11BC` 세 글자. macOS 는 파일 이름을 NFD 로 보관하므로 거기서 복사해 붙여 넣으면
+    NFD 가 들어오고, 바이트가 달라 `LIKE`/`=` 가 하나도 맞지 않는다.
+
+        (수정 전 실측) address_detail=아파트   NFC 94건 / NFD **0건**
+
+    ## (2) 양끝 공백을 턴다
+
+    복사·붙여넣기는 앞뒤 공백을 자주 달고 온다. 그 값은 `f"%{값}%"` 로 감싸여
+    `LIKE '% 아파트 %'` 가 되므로 **문자열 앞이나 끝에 있는 말은 영원히 못 찾는다.**
+
+        (수정 전 실측, 실 DB 1,876행)
+            address_detail='아파트'    ->   94건
+            address_detail='  아파트'  ->  **0건**
+            sigungu=' 강남구 '         ->  **0건**  (공백 없이는 3건)
+            court_name=' 고양 '        ->  **0건**  (공백 없이는 61건)
+            case_no=' 2024타경 '       ->  **0건**  (공백 없이는 1,140건)
+
+    이것이 정책이 아니라 누락이라는 근거: 같은 함수의 `property_type` 은 예전부터
+    `t.strip()` 으로 공백을 털고 있었다. 여덟 중 하나만 털고 있었던 것이다.
+    (`sido` 만 우연히 멀쩡했다 — `extract_sido()` 가 문자열 **안**에서 찾기 때문이다.)
+
+    안쪽 공백은 건드리지 않는다 — `'서울 강남구'` 의 공백은 뜻이 있다.
+
+    털고 나서 빈 문자열이면 `None` 을 돌려준다. "공백만 친 것"은 필터가 아니다 —
+    호출부의 `if address_detail:` 이 그대로 걸러 준다(빈 문자열이 이미 그랬던 것과 같다).
+    """
+    if not value:
+        return value
+    return to_nfc(value).strip() or None
+
+
 def _address_detail_condition(address_detail: str):
     """
     address_detail 입력의 검색 의도(Intent)를 판별해 SQL 조건과 파라미터를 생성한다.
@@ -37,15 +76,17 @@ def _address_detail_condition(address_detail: str):
     if intent == INTENT_SIDO:
         return "sido = ?", [parsed["sido"]]
     if intent == INTENT_SIGUNGU:
-        return "sigungu LIKE ?", [f"%{parsed['sigungu']}%"]
+        return "sigungu LIKE ? ESCAPE '\\'", [f"%{escape_like(parsed['sigungu'])}%"]
     if intent == INTENT_DONG:
-        return "dong LIKE ?", [f"%{parsed['dong']}%"]
+        return "dong LIKE ? ESCAPE '\\'", [f"%{escape_like(parsed['dong'])}%"]
     if intent == INTENT_LOT_NUMBER:
         return "lot_number = ?", [parsed["lot_number"]]
     if intent == INTENT_FULL_ADDRESS:
         return (
-            "sido = ? AND sigungu LIKE ? AND dong LIKE ?",
-            [parsed["sido"], f"%{parsed['sigungu']}%", f"%{parsed['dong']}%"],
+            "sido = ? AND sigungu LIKE ? ESCAPE '\\' AND dong LIKE ? ESCAPE '\\'",
+            [parsed["sido"],
+             f"%{escape_like(parsed['sigungu'])}%",
+             f"%{escape_like(parsed['dong'])}%"],
         )
     if intent == INTENT_MIXED:
         sub_conditions = []
@@ -54,21 +95,21 @@ def _address_detail_condition(address_detail: str):
             sub_conditions.append("sido = ?")
             sub_params.append(parsed["sido"])
         if parsed["sigungu"]:
-            sub_conditions.append("sigungu LIKE ?")
-            sub_params.append(f"%{parsed['sigungu']}%")
+            sub_conditions.append("sigungu LIKE ? ESCAPE '\\'")
+            sub_params.append(f"%{escape_like(parsed['sigungu'])}%")
         if parsed["dong"]:
-            sub_conditions.append("dong LIKE ?")
-            sub_params.append(f"%{parsed['dong']}%")
+            sub_conditions.append("dong LIKE ? ESCAPE '\\'")
+            sub_params.append(f"%{escape_like(parsed['dong'])}%")
         if residual:
-            sub_conditions.append("full_address LIKE ?")
-            sub_params.append(f"%{residual}%")
+            sub_conditions.append("full_address LIKE ? ESCAPE '\\'")
+            sub_params.append(f"%{escape_like(residual)}%")
         if sub_conditions:
             return "(" + " AND ".join(sub_conditions) + ")", sub_params
         # 구조화 가능한 필드가 하나도 없으면(이론상 UNKNOWN으로 분류되어 도달하지
         # 않지만) 아래 기존 방식으로 안전하게 폴백한다.
 
     # UNKNOWN(건물명/도로명 등) — 기존 방식 그대로 유지
-    return "full_address LIKE ?", [f"%{address_detail}%"]
+    return "full_address LIKE ? ESCAPE '\\'", [f"%{escape_like(address_detail)}%"]
 
 def _area_of(row, key):
     """`row` 에서 면적 컬럼을 꺼낸다. 컬럼이 없는 DB 도 견딘다.
@@ -278,6 +319,18 @@ def search(
     include_closed: bool = Query(False),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):
+    # 사용자가 친 글자를 **입구 한 곳**에서 정리한다 (2026-09-02, `_clean_param()` 참고).
+    # 필드마다 흩어 두면 한 곳이 빠지는 날이 온다 — 실제로 `property_type` 만 공백을
+    # 털고 있었고 나머지 일곱은 아니었다.
+    case_no = _clean_param(case_no)
+    sido = _clean_param(sido)
+    sigungu = _clean_param(sigungu)
+    dong = _clean_param(dong)
+    address_detail = _clean_param(address_detail)
+    property_type = _clean_param(property_type)
+    court_name = _clean_param(court_name)
+    status = _clean_param(status)
+
     # sort_by/sort_order는 기존에 미등록 값을 조용히 기본값으로 폴백하고 있었다.
     # 안정성을 위해 여기서만 명시적으로 거부하고, 그 외 검색 조건/SQL 로직은 그대로 둔다.
     if sort_by is not None and sort_by not in SORT_COLUMNS:
@@ -383,8 +436,8 @@ def search(
         params = []
 
         if case_no:
-            conditions.append("case_no LIKE ?")
-            params.append(f"%{case_no}%")
+            conditions.append("case_no LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(case_no)}%")
         if sido:
             # "서울시"/"서울특별시"처럼 축약 코드가 아닌 표기로 와도, auction_item.sido에
             # 저장된 축약 코드("서울" 등)와 매치되도록 검색 진입 시에만 정규화한다.
@@ -392,11 +445,11 @@ def search(
             conditions.append("sido = ?")
             params.append(extract_sido(sido) or sido)
         if sigungu:
-            conditions.append("sigungu LIKE ?")
-            params.append(f"%{sigungu}%")
+            conditions.append("sigungu LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(sigungu)}%")
         if dong:
-            conditions.append("dong LIKE ?")
-            params.append(f"%{dong}%")
+            conditions.append("dong LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(dong)}%")
         if address_detail:
             addr_sql, addr_params = _address_detail_condition(address_detail)
             conditions.append(addr_sql)
@@ -409,15 +462,16 @@ def search(
                 # UI 어휘 <-> 법원 원문 어휘 차이를 별칭으로 흡수한다(위 PROPERTY_TYPE_ALIASES).
                 # 원본 패턴이 그대로 포함되므로 기존 결과는 줄지 않는다(순수 가산).
                 patterns = _property_type_patterns(types)
-                or_clause = " OR ".join(["property_type LIKE ?"] * len(patterns))
+                or_clause = " OR ".join(
+                    ["property_type LIKE ? ESCAPE '\\'"] * len(patterns))
                 conditions.append(f"({or_clause})")
-                params.extend(f"%{p}%" for p in patterns)
+                params.extend(f"%{escape_like(p)}%" for p in patterns)
         if court_name:
-            conditions.append("court_name LIKE ?")
-            params.append(f"%{court_name}%")
+            conditions.append("court_name LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(court_name)}%")
         if status:
-            conditions.append("status LIKE ?")
-            params.append(f"%{status}%")
+            conditions.append("status LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(status)}%")
         if auction_date_from:
             conditions.append("auction_date >= ?")
             params.append(auction_date_from)
