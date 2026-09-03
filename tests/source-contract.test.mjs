@@ -19,6 +19,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
+import { readTsFields } from './_ts_interface.mjs'
 
 describe('검색 실행이 현재 pathname을 유지한다 (MASTER_SPEC §8.2) — 소스 계약', () => {
   test('검색 Form이 /search로 하드코딩 push하지 않는다', () => {
@@ -2270,5 +2271,133 @@ describe('프런트 중복 심볼 래칫 (P0-1)', () => {
     assert.deepEqual(offenders, [],
       `금액 표기를 화면에서 다시 구현했습니다. src/lib/format.ts 의 ` +
       `formatWon() / formatPrice() / formatPriceEok() 를 쓰십시오: ${offenders}`)
+  })
+})
+
+// ================================================================
+// DB 스키마 ↔ 프런트 타입 nullability (2026-09-03 신규)
+//
+// ## 왜 응답 기반 검사만으로는 부족한가
+//
+// `frontend-contract.test.mjs` 의 "API 응답 ↔ 프런트 타입" 검사는 **받은 응답에
+// 실제로 null 이 있을 때만** 위반을 잡는다. 그런데 지금 이 DB 의 해당 컬럼에는
+// null 이 하나도 없다 — 그래서 그 검사는 통과하는데 선언은 틀린 상태가 유지됐다.
+//
+// 실측(2026-09-03): `auction_item` 에서 NOT NULL 인 컬럼은 `case_no` 뿐인데,
+// 상세 화면 타입은 11개 필드를 non-null 로 적고 있었다. 직렬화는 DB 행을 **보정 없이**
+// 그대로 내보낸다(`api/v1/item.py`, `api/v1/search.py:row_to_item`,
+// `api/v1/favorites.py`, `api/v1/recent_items.py` — 네 곳 모두 `row["..."]` 통과).
+// 즉 크롤이 값을 못 읽은 물건이 하나 들어오는 순간 화면이 "유찰 회" / "0.0억" 을 그린다.
+// **지금 null 이 없다는 것은 계약이 아니라 우연이다.**
+//
+// 그래서 근거를 응답이 아니라 **스키마**에 둔다. 컬럼이 NULL 을 허용하면 그 컬럼을
+// 그대로 내보내는 화면 타입도 nullable 이어야 한다.
+//
+// 반대 방향(스키마는 NOT NULL 인데 타입이 nullable)은 **위반이 아니다** — 더 방어적인
+// 선언은 안전하고, API 가 나중에 필드를 옵셔널로 만들 여지도 있다.
+// ================================================================
+describe('DB 스키마 ↔ 프런트 타입 nullability (직렬화가 보정하지 않는 컬럼)', () => {
+  // 이 표를 그대로 통과시키는 화면 타입들. (파일, 타입이름)
+  // (선언 파일, 타입 이름, 그 타입이 그대로 통과시키는 DB 표)
+  const MIRRORS = [
+    ['src/app/search/types.ts', 'SearchResultItem', 'auction_item'],
+    ['src/app/properties/[id]/page.tsx', 'AuctionItemDetail', 'auction_item'],
+    ['src/app/favorites/page.tsx', 'FavoriteItem', 'auction_item'],
+    ['src/app/properties/recent/page.tsx', 'RecentItem', 'auction_item'],
+    ['src/app/properties/[id]/page.tsx', 'CaseInfo', 'auction_case'],
+    ['src/app/properties/[id]/page.tsx', 'RightsSummary', 'rights_summary'],
+    ['src/app/properties/[id]/page.tsx', 'AuctionImage', 'auction_image'],
+    ['src/app/properties/[id]/page.tsx', 'DocumentStatusItem', 'document_status'],
+    ['src/app/mypage/page.tsx', 'Subscription', 'subscriptions'],
+    ['src/app/mypage/page.tsx', 'Payment', 'payments'],
+    ['src/app/mypage/page.tsx', 'RegistryRequest', 'registry_requests'],
+    ['src/app/properties/[id]/rightsAnalysis.ts', 'TenantRow', 'tenant_rights'],
+    ['src/app/properties/[id]/rightsAnalysis.ts', 'RightsSummaryRaw', 'rights_summary'],
+    ['src/app/properties/[id]/page.tsx', 'RegistryRequestSummary', 'registry_requests'],
+    ['src/app/search/SearchPresets.tsx', 'SearchPreset', 'search_presets'],
+  ]
+
+  // 선언 파서는 `tests/_ts_interface.mjs` 한 곳에만 있다(두 벌이 되면 규칙이 갈라진다).
+  const tsFields = (file, name) => readTsFields(file, name)
+
+  /** 표 하나의 {컬럼: NOT NULL 인가}. DB 가 없거나 표가 없으면 null. */
+  async function schemaNotNull(table) {
+    const { existsSync } = await import('node:fs')
+    if (!existsSync('auction.db')) return null
+    let DatabaseSync
+    try {
+      ({ DatabaseSync } = await import('node:sqlite'))
+    } catch {
+      return null              // node:sqlite 가 없는 런타임
+    }
+    const db = new DatabaseSync('auction.db')
+    try {
+      const out = new Map()
+      // 표 이름은 위 MIRRORS 의 **소스 리터럴**이라 사용자 입력이 섞이지 않는다.
+      for (const r of db.prepare(`PRAGMA table_info(${table})`).all()) {
+        // ★ `INTEGER PRIMARY KEY` 는 `notnull` 이 0 으로 보고되지만 **rowid 별칭**이라
+        //   NULL 이 될 수 없다(SQLite 규약: NULL 을 넣으면 rowid 가 대신 채워진다).
+        //   이 표의 `id` 가 정확히 그것이고, pk 플래그로 구별한다. 이 예외를 두지 않으면
+        //   검사가 `id: number` 를 위반으로 잡아 **거짓 경보**를 낸다(실제로 그랬다).
+        const isRowidAlias = Number(r.pk) >= 1 && String(r.type).toUpperCase() === 'INTEGER'
+        out.set(r.name, Number(r.notnull) === 1 || isRowidAlias)
+      }
+      return out
+    } finally {
+      db.close()
+    }
+  }
+
+  test('검사 대상 선언을 실제로 찾았다 (공허하지 않다)', async () => {
+    assert.ok(MIRRORS.length >= 8, `대조쌍이 ${MIRRORS.length}개뿐이다`)
+    for (const [file, name] of MIRRORS) {
+      const f = await tsFields(file, name)
+      assert.ok(f.size >= 3, `${name} 에서 필드를 ${f.size}개밖에 못 읽었습니다`)
+    }
+  })
+
+  test('자기 검증 — 좁은 선언을 실제로 잡는다', async () => {
+    // 파서가 nullable 을 항상 true 로 읽으면 아래 "0건"은 의미가 없다.
+    const f = await tsFields('src/app/search/types.ts', 'SearchResultItem')
+    assert.equal(f.get('id').nullable, false, 'non-null 선언을 nullable 로 잘못 읽습니다')
+    assert.equal(f.get('sido').nullable, true, 'nullable 선언을 못 읽습니다')
+    assert.equal(f.get('is_favorited').nullable, false)
+  })
+
+  test('★ NULL 을 허용하는 컬럼은 화면 타입도 nullable 이다', async (t) => {
+    const probe = await schemaNotNull('auction_item')
+    if (probe === null) {
+      t.skip('auction.db 를 읽지 못했다 — 판정 불가(통과가 아니다)')
+      return
+    }
+    assert.ok(probe.size >= 15, `auction_item 컬럼을 ${probe.size}개밖에 못 읽었습니다`)
+    // 실제로 NULL 허용 컬럼이 있어야 이 검사가 의미를 갖는다.
+    assert.ok([...probe.values()].some((v) => v === false),
+      'NULL 허용 컬럼이 하나도 없다 — 이 검사가 공허하다')
+
+    const bad = []
+    let compared = 0
+    for (const [file, name, table] of MIRRORS) {
+      const notNull = await schemaNotNull(table)
+      assert.ok(notNull && notNull.size > 0, `${table} 스키마를 읽지 못했습니다`)
+      const fields = await tsFields(file, name)
+      for (const [col, isNotNull] of notNull) {
+        if (isNotNull) continue                 // NOT NULL 이면 non-null 선언이 옳다
+        const spec = fields.get(col)
+        if (!spec) continue                     // 그 타입이 안 쓰는 컬럼
+        compared++
+        if (!spec.nullable) {
+          bad.push(`${name}.${col}: ${table} 는 NULL 허용인데 선언이 \`${spec.declared}\``)
+        }
+      }
+    }
+    // 대조가 실제로 일어났는가 — 표/타입 이름이 어긋나면 0건으로 조용히 통과한다.
+    assert.ok(compared >= 30, `대조한 컬럼이 ${compared}개뿐이다 — 검사가 공허하다`)
+    assert.deepEqual(bad, [], [
+      'DB 가 NULL 을 줄 수 있는 컬럼을 화면 타입이 non-null 로 선언했습니다.',
+      '이 컬럼들은 직렬화에서 보정되지 않고 그대로 나갑니다',
+      '(api/v1/item.py · search.py · favorites.py · recent_items.py).',
+      bad.join(' / '),
+    ].join(' '))
   })
 })

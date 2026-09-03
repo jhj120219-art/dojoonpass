@@ -13,7 +13,11 @@ export interface TenantRow {
   fixed_date: string | null
   demand_date: string | null
   has_demand: number | null
-  source: string
+  // 2026-09-03 — `tenant_rights.source` 는 NOT NULL 이 아니고 `api/v1/item.py` 가
+  // `_project()` 로 행 값을 그대로 실어 보낸다. 쓰는 곳은 `=== 'SPEC'` / `=== 'STATUS'`
+  // 동등 비교뿐이라 null 이 와도 **양쪽 어디에도 안 들어가고 조용히 빠진다** —
+  // 런타임 동작은 그대로 두고 선언만 사실에 맞춘다.
+  source: string | null
 }
 
 export interface RightsSummaryRaw {

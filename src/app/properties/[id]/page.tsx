@@ -15,7 +15,11 @@ import { useFocusTrap } from '@/lib/useFocusTrap'
 
 interface DocumentStatusItem {
   doc_type: string
-  status: string
+  // 2026-09-03 — `document_status.status` 는 DEFAULT 'COLLECTING' 이지만 NOT NULL 이
+  // 아니다(명시적 NULL 삽입을 막지 못한다). `api/v1/item.py:_document_entry` 는
+  // `row["status"]` 를 그대로 실어 보내므로 응답에 null 이 올 수 있다.
+  // 같은 날 정정한 `auction_item` 파생 타입들과 같은 규칙이다.
+  status: string | null
   // 2026-08-17 Sprint 144에 서버가 추가한 필드들. 예전 응답에는 없으므로 전부 optional로
   // 둔다 — 백엔드를 먼저 배포하지 않아도 프런트가 깨지지 않아야 한다.
   available?: boolean
@@ -56,10 +60,24 @@ interface CaseInfo {
 interface AuctionItemDetail {
   id: number
   case_no: string
-  item_no: string
-  court_name: string
-  property_type: string
-  full_address: string
+  item_no: string | null
+  // ★ 2026-09-03 — 아래 11개 필드의 nullability 를 **응답이 실제로 줄 수 있는 것**에 맞췄다.
+  //
+  //   `api/v1/item.py` 의 직렬화는 DB 행을 **아무 보정 없이 그대로** 내보낸다
+  //   (`"court_name": row["court_name"]` …). 그리고 `auction_item` 의 이 컬럼들은
+  //   전부 NOT NULL 이 아니다(실측: case_no 만 NOT NULL). 즉 서버는 null 을 줄 수 있다.
+  //
+  //   그런데 이 타입은 11개를 non-null 로 적어 두고 있었다. 지금 이 DB 에 null 이
+  //   없다는 것은 **계약이 아니라 우연**이다 — 크롤이 값을 못 읽은 물건 하나가 들어오는
+  //   순간 화면이 `null회`·`Invalid Date` 를 그리거나 인덱스 접근에서 죽는다.
+  //   검색 목록 타입(`src/app/search/types.ts`)은 문자열 5종을 이미 nullable 로
+  //   적고 있어서, **같은 컬럼을 두 화면이 다르게 선언**하고 있기도 했다.
+  //
+  //   타입만 정직하게 만들고, tsc 가 짚어 준 미보호 지점 4곳에 폴백을 넣었다
+  //   (런타임 동작은 값이 있을 때 종전과 완전히 같다).
+  court_name: string | null
+  property_type: string | null
+  full_address: string | null
   // 주소 구성요소. **응답에는 계속 있었는데 이 타입에만 없었다**(2026-08-31 실측 추가,
   // `api/v1/item.py` 가 내려준다). 화면에 쓰이지 않아도 계약에는 적어 둔다 —
   // 선언되지 않은 키는 "응답에 없는 것"으로 읽혀, 이미 있는 데이터를 다시 만들게 한다
@@ -78,13 +96,13 @@ interface AuctionItemDetail {
   // (`docs/FRONTEND_MASTER_SPEC.md` §9.3 범위 밖) 여기서는 계약만 적어 둔다.
   building_area?: number | null
   land_area?: number | null
-  appraisal_price: number
-  minimum_bid_price: number
-  bid_rate: number
-  auction_date: string
-  status: string
-  fail_count: number
-  validation_status: string
+  appraisal_price: number | null
+  minimum_bid_price: number | null
+  bid_rate: number | null
+  auction_date: string | null
+  status: string | null
+  fail_count: number | null
+  validation_status: string | null
   crawl_date: string | null
   documents: DocumentStatusItem[]
   // 사진 관련 필드도 전부 optional이다(위 DocumentStatusItem과 같은 이유).
@@ -364,7 +382,7 @@ export default function PropertyDetailPage() {
       // handleToggleFavorite와 동일한 idRef 가드: 이 요청이 시작된 뒤 다른 물건으로
       // 넘어가 있으면(idRef.current !== requestId) 늦게 도착한 응답은 화면에 반영하지 않는다.
       const requestId = id
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       if (idRef.current !== requestId) return
       const token = session?.access_token ?? null
@@ -403,7 +421,7 @@ export default function PropertyDetailPage() {
   async function requireToken(): Promise<string | null> {
     let token = accessToken
     if (!token) {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       token = session?.access_token ?? null
       setAccessToken(token)
@@ -612,7 +630,7 @@ export default function PropertyDetailPage() {
     const requestId = id
     let token = accessToken
     if (!token) {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       token = session?.access_token ?? null
       if (idRef.current === requestId) setAccessToken(token)
@@ -772,11 +790,17 @@ export default function PropertyDetailPage() {
           <div className="flex justify-between items-center mb-4">
             <div>
               <p className="text-xs text-gray-400 mb-1">감정가</p>
-              <p className="text-lg font-medium text-gray-700">{formatPrice(property.appraisal_price)}</p>
+              {/* ★ null 을 그대로 넘기면 안 된다 — 이 화면이 쓰는 표기는 `formatPriceEok`
+                  이고 그것은 0 을 "0.0억" 으로 그린다(의도된 동작). 값을 **모르는** 물건에
+                  "0.0억" 을 그리면 감정가가 0원이라고 단언하는 거짓말이 된다.
+                  같은 파일이 임차인 보증금·인수금액에 이미 쓰는 `!= null` 관문과 같은 규칙. */}
+              <p className="text-lg font-medium text-gray-700">
+                {property.appraisal_price != null ? formatPrice(property.appraisal_price) : '-'}</p>
             </div>
             <div className="text-right">
               <p className="text-xs text-gray-400 mb-1">최저입찰가</p>
-              <p className="text-2xl font-bold text-blue-500">{formatPrice(property.minimum_bid_price)}</p>
+              <p className="text-2xl font-bold text-blue-500">
+                {property.minimum_bid_price != null ? formatPrice(property.minimum_bid_price) : '-'}</p>
             </div>
           </div>
           <div className="pt-4 border-t border-gray-50 space-y-2">
@@ -809,7 +833,7 @@ export default function PropertyDetailPage() {
             </div>
             <div className="flex justify-between">
               <span className="text-sm text-gray-400">검증상태</span>
-              <span className="text-sm font-medium text-gray-700">{VALIDATION_STATUS_LABEL[property.validation_status] || property.validation_status}</span>
+              <span className="text-sm font-medium text-gray-700">{(property.validation_status && VALIDATION_STATUS_LABEL[property.validation_status]) || property.validation_status || '-'}</span>
             </div>
           </div>
         </div>
@@ -1168,7 +1192,7 @@ export default function PropertyDetailPage() {
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <span className={`text-sm font-medium ${ready ? 'text-gray-700' : 'text-gray-400'}`}>
-                        {DOC_STATUS_LABEL[doc.status] || doc.status}
+                        {(doc.status && DOC_STATUS_LABEL[doc.status]) || doc.status || '-'}
                       </span>
                       {ready && (
                         /* 다운로드는 새 탭으로 연다. 뷰어(모달)와 별개의 경로를 두는

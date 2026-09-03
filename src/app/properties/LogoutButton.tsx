@@ -7,7 +7,7 @@ export default function LogoutButton() {
   const router = useRouter()
 
   async function handleLogout() {
-    const supabase = createClient()
+    const supabase = await createClient()
     await supabase.auth.signOut()
     // 로그아웃 후에는 로그인 화면이 아니라 첫 화면(=검색 화면)으로 보낸다
     // (docs/FRONTEND_MASTER_SPEC.md §5.3) — 로그아웃했다고 검색을 못 하게 만들지 않는다.

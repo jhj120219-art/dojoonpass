@@ -58,10 +58,28 @@ warn_if_admin_keys_missing()
 #   "토큰이 틀렸다"로 읽혀 조용히 묻힌다 (BUGS #205).
 warn_if_auth_config_missing()
 
+# ★ 2026-09-03 — OpenAPI 문서 UI 를 **끌 수 있게** 한다 (기본값은 지금 동작 그대로).
+#
+#   실측: 인증 없이 `GET /openapi.json` 이 200 이고, 거기에 `/api/v1/admin/*` **16개**를
+#   포함한 전체 경로 42개와 요청/응답 스키마가 그대로 실려 있다. `/docs`·`/redoc` 도 200 이다.
+#
+#   지금 당장의 노출은 국지적이다 — 이 서버는 `127.0.0.1` 로만 바인딩한다(파일 하단
+#   `uvicorn.run(..., host="127.0.0.1")`). 그래서 **오늘의 결함이 아니라 배포 시점의 위험**이다:
+#   리버스 프록시 뒤로 올리는 순간 관리자 API 의 존재·경로·파라미터가 익명에게 공개된다.
+#   그 자체가 인증을 뚫지는 않지만(키는 여전히 필요하다) 공격 표면을 그대로 알려 준다.
+#
+#   기본값을 바꾸지 않는 이유: `/docs` 는 `docs/CLAUDE.md` 가 개발 워크플로로 안내하는
+#   자리다. 끌지 말지는 배포 정책이므로 **운영자가 정한다** — 여기서는 스위치만 만든다.
+#   `CORS_ALLOW_ORIGINS` 가 "미설정이면 기존 `*`" 로 도입된 것과 같은 방식이다.
+_docs_enabled = os.getenv("API_DOCS_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+
 app = FastAPI(
     title="도준패스 법원경매 API",
     description="전국 법원경매 데이터 검색 및 권리분석 API",
     version="1.0.0",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
 # 허용 Origin. 미설정이면 기존과 동일하게 "*"(전체 허용)로 동작한다 — 하위호환 유지.

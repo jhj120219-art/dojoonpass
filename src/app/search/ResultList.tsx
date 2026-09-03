@@ -100,7 +100,9 @@ function ResultItemRow({ item, navQuery }: { item: SearchResultItem; navQuery: s
             최저가율 {formatBidRate(item.bid_rate)}
           </span>
           <span className="text-xs font-medium text-gray-600 bg-gray-50 px-2 py-1 rounded-lg">
-            유찰 {item.fail_count}회
+            {/* null 을 그대로 끼우면 "유찰 회" 가 된다(JSX 는 null 을 아무것도 아닌 것으로
+                그린다). 옆의 `formatBidRate` 가 이미 null 을 '-' 로 다루는 것과 같은 규칙. */}
+            유찰 {item.fail_count ?? '-'}회
           </span>
         </div>
       </div>

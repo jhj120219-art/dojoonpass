@@ -45,7 +45,7 @@ export default function SearchPresets() {
 
   useEffect(() => {
     async function init() {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
       setAccessToken(token)

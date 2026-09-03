@@ -124,7 +124,7 @@ const PLACEHOLDER = [
 ].join('\n')
 
 async function getToken(): Promise<string | null> {
-  const supabase = createClient()
+  const supabase = await createClient()
   const { data: { session } } = await supabase.auth.getSession()
   return session?.access_token ?? null
 }

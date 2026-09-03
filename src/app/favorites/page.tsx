@@ -20,12 +20,15 @@ interface FavoriteItem {
   sido: string | null
   sigungu: string | null
   full_address: string | null
-  appraisal_price: number
-  minimum_bid_price: number
-  bid_rate: number
+  // 2026-09-03 — 검색/상세 타입과 같은 정정. 이 엔드포인트의 직렬화도
+  // (`api/v1/favorites.py` / `api/v1/recent_items.py`) DB 행을 보정 없이 그대로 내보내고,
+  // `auction_item` 의 이 컬럼들은 NOT NULL 이 아니다.
+  appraisal_price: number | null
+  minimum_bid_price: number | null
+  bid_rate: number | null
   auction_date: string | null
   status: string | null
-  fail_count: number
+  fail_count: number | null
   /** 대표 사진(가장 앞선 순번)의 서빙 URL. 사진이 없는 물건은 null 이다. */
   thumbnail_url: string | null
   favorited_at: string
@@ -49,7 +52,7 @@ export default function FavoritesPage() {
 
   useEffect(() => {
     async function fetchData() {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
       if (!token) {

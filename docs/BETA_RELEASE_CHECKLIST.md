@@ -1,7 +1,7 @@
 # Beta Release Readiness
 
 Status: Active
-Last Updated: 2026-08-26
+Last Updated: 2026-09-03
 Owner: Project Management
 
 > **이 문서를 읽는 법** (2026-08-26 추가, `docs/BUGS.md` #228)
@@ -20,6 +20,97 @@ Owner: Project Management
 >
 > **`Last Updated` 는 위 최신 절의 날짜와 같아야 한다** — 어긋나면 11-e 가 붉어진다.
 > (2026-08-26 이전에는 `2026-08-07` 로 19일 뒤처져 있었고, 아무도 몰랐다.)
+
+---
+
+## ★★★★★★★★ [2026-09-03, 개발 머신] 승인 A(지역 백필) 실행 — 데이터 결함 0, 남은 실패는 migration 뿐
+
+이 절이 **가장 최신**이다. 아래 절들은 시간순으로 남겨 두되, 값이 다르면 여기가 이긴다.
+
+> **★ 이 절의 실측은 개발 머신(데스크탑3) 기준이다.** 운영 상태를 말하지 않는다.
+> 이 머신의 `auction.db` 는 여전히 migration **020** 이고 마지막 크롤은 2026-08-12 다.
+
+### 무엇이 바뀌었나 — 승인 A 로 지역 오염을 실제로 고쳤다
+
+CEO 승인(*"승인 A 진행해줘 — 지역 오염 백필"*)으로 `backfill_region_normalize.py --apply`
+를 운영 `auction.db` 에 **실행했다**. 그전에 백업을 떴고, dry-run 과 실제 반영 건수가
+정확히 일치하는지 확인했다.
+
+```
+백업        auction.db.backup_before_region_backfill_20260903_141457 (integrity ok, 복구 가능 확인)
+변경        424건 = auction 212 + auction_item 212     (dry-run 424 == applied 424)
+            sido 값 오류 4 · sigungu 옛 형식 207 · 흘러든 오염값 1   (표당)
+부수 변경    **0건** — sido/sigungu 를 뺀 전 27개 표의 내용 md5 가 전부 동일
+```
+
+### 사용자에게 보이던 증상이 실제로 사라졌다 (실 API · 실 브라우저)
+
+```
+                                        BEFORE      AFTER
+/search/regions?sido=서울                계양구·시흥시가 선택지에 있었다  ->  24개 전부 실제 서울 자치구
+sigungu='고양시 일산동구' 검색            3건        ->  **9건** (주소 기준 실제 9건과 일치)
+구 단위 재현율 표본 5개                   —          고양시 일산동구 9/9 · 안산시 단원구 19/19 ·
+                                                    용인시 기흥구 4/4 · 창원시 성산구 6/6 ·
+                                                    청주시 서원구 4/4   전부 일치
+잔여 지역 드리프트/오염                   211 / 1    ->  **0 / 0**
+```
+
+경기 `'부천시'` 가 `'부천시 소사구'` 와 함께 남아 있는 것은 **오염이 아니다** — 36행을
+전수로 재계산해 전부 일치했고, 플레인 `'부천시'` 5행은 주소 자체에 구가 없다
+(부천시는 2016 년 구를 폐지했다가 2024 년에 되살렸다). 구를 추정해 채우려면 외부 주소
+DB 가 필요하다(새 의존성 + 정책 = 승인 영역).
+
+### 남은 실패 4건은 **전부 migration 하나**다 (세 실험으로 확정)
+
+`migration 부족` 을 이유로 자동 분류하지 않고 실제로 돌려서 판정했다.
+
+```
+① 빈 DB 로 fresh bootstrap (disposable 경로)
+     init_db() rc=0 · migrate_v4_1 rc=0 · run_migrations rc=0
+     표 28개 / migration 29건 기록 / 면적컬럼·favorite_notes·auction.filed_date 전부 생성
+② 이 DB **사본**에 021~029 적용 -> rc=0, 9건 전부 기록
+     test_auction_identity ALL PASS · test_bootstrap ALL PASS
+     test_schema_hygiene 의 migration 실패 전부 소멸
+③ 파일/기록 대조 -> 디스크 29 / 기록 20 / **유령 마이그레이션 0**
+```
+
+| Test | 결과 | 남은 이유 |
+|---|---|---|
+| `test_pipeline_integrity` | FAILED (**1**) | `filed_date: auction 컬럼 없음` = migration 028 |
+| `test_auction_identity` | ABORT | migration 025 — 스스로 중단하고 DB 를 건드리지 않는다 |
+| `test_bootstrap` | FAILED (4) | fresh 스키마 대비 드리프트 = 021·023·025·026·028 |
+| `test_schema_hygiene` | FAILED (2) | 021~029 미기록 + 021 이 지우는 중복 인덱스 |
+
+**production code defect 아님 / test harness 문제 아님 / dead migration 아님.**
+원인은 이 머신 DB 가 020 에 멈춰 있는 것 하나이고, 적용은 승인 영역이라 하지 않았다.
+
+### 함께 고친 것 (승인 불필요분)
+
+```
+nullability 계약   화면 타입이 **서버가 줄 수 있는 null** 을 거부하고 있었다.
+                  사본 DB 에 null 을 넣고 실 API 를 부르니 상세 응답 11개 필드가
+                  그대로 null 로 내려왔다. 6개 타입 정정 + 미보호 지점 4곳 폴백.
+                  런타임은 값이 있을 때 종전과 동일(실브라우저 확인).
+가드              스키마 기반 nullability 검사 신설 -> (타입, 표) **15쌍**
+                  클라이언트 초기 번들 경계 검사 신설(6검사)
+                  §15(b) 생산자 판정을 `is_operational_data()` 게이트에 편입
+부채              내가 복제했던 TS 선언 파서 2벌을 `tests/_ts_interface.mjs` 한 곳으로
+성능              supabase-js 를 초기 번들에서 제거 -> `/search` 265.5 -> 205.6KB gzip
+```
+
+### 게이트 (2026-09-03, 개발 머신)
+
+```
+python  64 통과 / 4 실패 / 3 건너뜀 / 1 판정없음   (단언 11,892건)
+node    329건 / 325 pass / 0 fail / 4 skip
+tsc 0 · eslint 0 · build 성공
+보안    admin 16 라우트 전부 인증 거부, ADMIN 키로 SUPER_ADMIN 작업 4건 403(권한 상승 차단)
+        IDOR: 리소스 id 라우트 전부 `WHERE id=? AND user_id=?` + 존재 비노출 404
+무결성  integrity ok · FK 위반 0 · 고아 0 · 중복 식별자 0 · favorites E2E 후 0행 원복
+```
+
+**남은 것은 승인 항목뿐이다** — B(migration 021~029) · C(load_spec_data 운영 적재) ·
+D(썸네일 축소) · E(위험등급 엔진) · F(날짜 표기) · G(filed_date 크롤) · H(부천시 구 보정).
 
 ---
 
@@ -136,7 +227,10 @@ worktree 사본)을 잰 것으로 보인다.** 루트에는 이름이 비슷한 
 
 ## ★★★★★★★ [2026-08-26 낮, 개발 머신] 스키마 드리프트가 **읽기 경로에 낸 상처** + 가드 4건의 시야 밖
 
-이 절이 **가장 최신**이다. 아래 절들은 시간순으로 남겨 두되, 값이 다르면 여기가 이긴다.
+> 2026-09-03 정정: 이 자리에도 *"이 절이 가장 최신이다"* 라고 적혀 있었다. 지금은
+> 맨 위 **[2026-09-03]** 절이 최신이다 — 이 절의 "지역 정규화 backfill 미적용
+> (드리프트 211 + 오염 1)" 은 그날 승인 A 로 해소돼 **더 이상 사실이 아니다.**
+> 아래 숫자는 2026-08-26 낮의 기록으로 남긴다.
 
 > **★ 이 절의 실측은 전부 개발 머신(데스크탑3) 기준이다.** 이 머신의 `auction.db` 는
 > migration 021~025 미적용 / 마지막 크롤 2026-08-12 / 예약 작업 **0개**(248개 전수 확인)다.

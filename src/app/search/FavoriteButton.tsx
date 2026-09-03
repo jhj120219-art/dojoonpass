@@ -35,7 +35,7 @@ export default function FavoriteButton({ itemId, initialFavorited }: { itemId: n
     // 위 가드를 그대로 통과한다 — await 이전에 동기적으로 busy 처리해 재진입을 막는다.
     setFavBusy(true)
 
-    const supabase = createClient()
+    const supabase = await createClient()
     const { data: { session } } = await supabase.auth.getSession()
     const token = session?.access_token ?? null
     if (!token) {

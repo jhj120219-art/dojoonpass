@@ -30,7 +30,13 @@ export function formatNumber(value: number) {
   return value.toLocaleString(DISPLAY_LOCALE)
 }
 
-export function formatPrice(price: number) {
+// ★ 2026-09-03 — 인자 타입을 **이미 하고 있던 런타임 동작**에 맞춘다.
+//   아래 `if (!price)` 는 null/undefined/NaN/0 을 전부 '-' 로 돌려주고 있었는데
+//   시그니처만 `number` 라, 서버가 null 을 줄 수 있는 금액 필드(`auction_item` 의
+//   appraisal_price/minimum_bid_price 는 NOT NULL 이 아니다)를 넘기려면 호출부가
+//   억지로 좁혀야 했다. 같은 파일의 `formatBidRate`/`formatDday` 는 이미 이렇게
+//   넓혀져 있다 — 그 선례에 맞춘다. **동작은 한 글자도 바뀌지 않는다.**
+export function formatPrice(price: number | null | undefined) {
   if (!price) return '-'
   if (price >= 100000000) return (price / 100000000).toFixed(1) + '억'
   if (price >= 10000) return Math.round(price / 10000) + '만'

@@ -49,7 +49,7 @@ export default function FavoriteNote({
     setBusy(true)
     setMessage('')
     try {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
       if (!token) {

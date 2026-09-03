@@ -113,7 +113,7 @@ export default function MyPage() {
 
   useEffect(() => {
     async function fetchAll() {
-      const supabase = createClient()
+      const supabase = await createClient()
       const { data: { session } } = await supabase.auth.getSession()
       const token = session?.access_token ?? null
       if (!token) {

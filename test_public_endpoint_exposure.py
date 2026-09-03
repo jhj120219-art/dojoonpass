@@ -282,11 +282,78 @@ def test_source_files_are_not_indexable():
                     rr.headers.get("x-robots-tag"))
 
 
+def test_openapi_docs_can_be_closed_for_deployment():
+    """OpenAPI 문서 UI 를 **끌 수 있는가** (2026-09-03).
+
+    ## 왜 이 검사가 필요한가 (실측)
+
+    인증 없이 `GET /openapi.json` 이 200 이고, 거기에 `/api/v1/admin/*` **16개**가
+    요청/응답 스키마와 함께 실려 있다. `/docs` · `/redoc` 도 200 이다.
+
+    지금은 서버가 `127.0.0.1` 로만 바인딩하므로 노출이 국지적이고, `/docs` 는
+    `docs/CLAUDE.md` 가 개발 워크플로로 안내하는 자리다. 그래서 **기본값은 공개 그대로**
+    두고 스위치만 만들었다(`CORS_ALLOW_ORIGINS` 가 "미설정이면 기존 `*`" 로 들어온 것과
+    같은 방식). 이 검사가 지키는 것은 두 가지다.
+
+        1. 기본값이 조용히 바뀌지 않는다      — 개발 워크플로가 깨지지 않는다
+        2. 스위치가 실제로 닫는다             — 배포 때 켜 봤더니 안 닫히면 의미가 없다
+
+    끄더라도 **API 자체는 그대로 돌아야 한다** — 그것까지 함께 확인한다.
+    """
+    print("\n--- OpenAPI 문서 UI 토글 (배포 시 닫을 수 있는가) ---")
+    import contextlib
+    import importlib
+    import io as _io
+    from fastapi.testclient import TestClient
+
+    saved = os.environ.get("API_DOCS_ENABLED")
+    DOC_PATHS = ("/docs", "/redoc", "/openapi.json")
+    try:
+        import api_server
+
+        # (1) 미설정 = 기존대로 공개
+        os.environ.pop("API_DOCS_ENABLED", None)
+        with contextlib.redirect_stderr(_io.StringIO()):
+            importlib.reload(api_server)
+            client = TestClient(api_server.app)
+        for p in DOC_PATHS:
+            _check_true("기본값(미설정)에서 %s 가 열려 있다" % p,
+                        client.get(p).status_code == 200, client.get(p).status_code)
+
+        # 공허 방지 — 열려 있을 때 admin 경로가 실제로 실린다는 것을 확인한다.
+        spec = client.get("/openapi.json")
+        admin_paths = [p for p in (spec.json().get("paths", {}) if spec.status_code == 200 else {})
+                       if "/admin/" in p]
+        _check_true("열려 있을 때 admin 경로가 스펙에 실린다(검사가 공허하지 않다)",
+                    len(admin_paths) >= 10, len(admin_paths))
+
+        # (2) 끄면 실제로 닫힌다
+        os.environ["API_DOCS_ENABLED"] = "0"
+        with contextlib.redirect_stderr(_io.StringIO()):
+            importlib.reload(api_server)
+            client = TestClient(api_server.app)
+        for p in DOC_PATHS:
+            _check_true("API_DOCS_ENABLED=0 에서 %s 가 닫힌다" % p,
+                        client.get(p).status_code == 404, client.get(p).status_code)
+
+        # (3) 껐다고 API 가 죽지 않는다
+        r = client.get("/api/v1/search?size=1")
+        _check_true("문서를 꺼도 API 는 그대로 동작한다", r.status_code == 200, r.status_code)
+    finally:
+        if saved is None:
+            os.environ.pop("API_DOCS_ENABLED", None)
+        else:
+            os.environ["API_DOCS_ENABLED"] = saved
+        with contextlib.redirect_stderr(_io.StringIO()):
+            importlib.reload(api_server)
+
+
 def run():
     test_whitelist_matches_the_actual_schema()
     test_item_detail_does_not_dump_whole_rows()
     test_pii_on_a_public_route_is_recorded_not_forgotten()
     test_source_files_are_not_indexable()
+    test_openapi_docs_can_be_closed_for_deployment()
     print("\n%s  (실패 %d)" % ("모두 통과" if not failures else "실패: %s" % failures,
                                len(failures)))
     return 1 if failures else 0

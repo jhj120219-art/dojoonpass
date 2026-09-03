@@ -141,6 +141,7 @@ def is_time_up() -> bool:
 | `SUPABASE_SERVICE_ROLE_KEY` | 서버가 RLS를 우회해 Supabase 데이터를 직접 조작해야 할 때 |
 | `CORS_ALLOW_ORIGINS` | 운영 배포 시 API를 프론트 도메인으로만 제한할 때(미설정 = 기존 `*`) |
 | `LOG_LEVEL` | API 서버 로그 레벨 조절이 필요할 때(미설정 = `INFO`) |
+| `API_DOCS_ENABLED` | 운영 배포 시 `/docs`·`/redoc`·`/openapi.json` 을 닫을 때(미설정 = 기존대로 공개) |
 
 ---
 
@@ -384,6 +385,19 @@ anon 키 값이든 신규 publishable 키 값이든 그대로 받아들인다(SD
 | 코드 참조 여부 | `api_server.py` (2026-08-07 신규) |
 | 비고 | 인증이 쿠키가 아니라 `Authorization: Bearer`라 CSRF 위험은 없지만, 운영에서 전 도메인에 API를 열어둘 이유도 없다. 값을 넣으면 그 목록만 허용된다 |
 | 예시 | `CORS_ALLOW_ORIGINS=https://kokchal.com,https://www.kokchal.com` |
+
+## API_DOCS_ENABLED
+
+| 항목 | 내용 |
+|---|---|
+| 구분 | API 서버 |
+| 설명 | OpenAPI 문서 UI(`/docs`, `/redoc`, `/openapi.json`) 노출 여부. `0`/`false`/`no` 면 셋 다 404 |
+| 필수 여부 | 선택 (미설정 시 기존과 동일하게 **공개**) |
+| 언제 필요한지 | **운영 배포 시** — 리버스 프록시 뒤로 올려 외부에서 닿게 될 때 |
+| 현재 필요한가 | **아니오 — 지금 Skip 가능**(서버가 `127.0.0.1` 로만 바인딩한다) |
+| 코드 참조 여부 | `api_server.py` (2026-09-03 신규) |
+| 비고 | 실측(2026-09-03): 인증 없이 `/openapi.json` 200, 경로 42개 중 `/api/v1/admin/*` **16개**가 스키마와 함께 노출된다. 인증을 뚫지는 못하지만 공격 표면을 그대로 알려 준다. 끄더라도 API 동작은 바뀌지 않는다 |
+| 예시 | `API_DOCS_ENABLED=0` |
 
 ## LOG_LEVEL
 

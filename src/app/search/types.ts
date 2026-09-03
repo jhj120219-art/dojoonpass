@@ -67,12 +67,16 @@ export type SearchResultItem = {
   sigungu: string | null
   dong: string | null
   full_address: string | null
-  appraisal_price: number
-  minimum_bid_price: number
-  bid_rate: number
+  // ★ 2026-09-03 — 숫자 4종도 nullable 이다. `api/v1/search.py:row_to_item` 은 DB 행을
+  //   보정 없이 그대로 내보내는데 `auction_item` 의 이 컬럼들은 NOT NULL 이 아니다.
+  //   문자열 5종은 이미 nullable 로 적혀 있었으므로 같은 표의 같은 컬럼끼리 선언이
+  //   갈려 있던 것을 맞춘다(상세 화면 타입도 같은 날 함께 정정했다).
+  appraisal_price: number | null
+  minimum_bid_price: number | null
+  bid_rate: number | null
   auction_date: string | null
   status: string | null
-  fail_count: number
+  fail_count: number | null
   validation_status: string | null
   crawl_date: string | null
   // 면적(㎡). **응답에는 2026-08-26 부터 실려 있었는데 이 타입에만 없었다**

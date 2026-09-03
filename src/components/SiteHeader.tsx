@@ -30,26 +30,40 @@ export default function SiteHeader({ current, title }: SiteHeaderProps) {
   const [authChecked, setAuthChecked] = useState(false)
 
   useEffect(() => {
-    const supabase = createClient()
     let cancelled = false
-    // getSession()으로 충분하다. src/proxy.ts가 모든 요청에서 getUser()로 세션을 서버 검증하고
-    // 쿠키를 갱신한 뒤에 이 페이지가 렌더되므로, 여기서 읽는 쿠키는 이미 신선하다.
-    // 헤더에서 getUser()를 또 부르면 로그인 사용자의 매 페이지 로드에 Supabase 왕복이
-    // 한 번씩 더 붙을 뿐 얻는 정확도가 없다.
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (cancelled) return
-      setEmail(session?.user?.email ?? null)
-      setAuthChecked(true)
-    })
-    // 로그인/로그아웃이 다른 화면에서 일어나도 Header가 즉시 따라가도록 구독한다.
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (cancelled) return
-      setEmail(session?.user?.email ?? null)
-      setAuthChecked(true)
-    })
+    // supabase-js는 이 effect 시점에 비로소 받아온다(`createClient()`가 Promise를 준다) —
+    // 이유는 `@/lib/supabaseClient` 주석 참고. effect는 hydration 직후에 돌기 때문에
+    // 청크 요청은 여기서 바로 시작되고, 화면 렌더/hydration을 막지 않는다.
+    let unsubscribe: (() => void) | null = null
+    createClient()
+      .then((supabase) => {
+        if (cancelled) return
+        // getSession()으로 충분하다. src/proxy.ts가 모든 요청에서 getUser()로 세션을 서버 검증하고
+        // 쿠키를 갱신한 뒤에 이 페이지가 렌더되므로, 여기서 읽는 쿠키는 이미 신선하다.
+        // 헤더에서 getUser()를 또 부르면 로그인 사용자의 매 페이지 로드에 Supabase 왕복이
+        // 한 번씩 더 붙을 뿐 얻는 정확도가 없다.
+        supabase.auth.getSession().then(({ data: { session } }) => {
+          if (cancelled) return
+          setEmail(session?.user?.email ?? null)
+          setAuthChecked(true)
+        })
+        // 로그인/로그아웃이 다른 화면에서 일어나도 Header가 즉시 따라가도록 구독한다.
+        const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+          if (cancelled) return
+          setEmail(session?.user?.email ?? null)
+          setAuthChecked(true)
+        })
+        unsubscribe = () => sub.subscription.unsubscribe()
+      })
+      .catch(() => {
+        // 세션 확인에 실패하면 로그인/로그아웃 어느 쪽도 그리지 않는다 — 이 컴포넌트가
+        // 원래부터 갖고 있던 실패 동작 그대로다(getSession()이 거절되면 authChecked가
+        // false로 남는다). 여기서 임의로 '로그인'을 띄우면 로그인한 사용자에게 로그아웃된
+        // 것처럼 보이게 만드는 새 동작이 된다. 처리되지 않은 rejection만 삼킨다.
+      })
     return () => {
       cancelled = true
-      sub.subscription.unsubscribe()
+      unsubscribe?.()
     }
   }, [])
 

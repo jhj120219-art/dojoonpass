@@ -1700,6 +1700,9 @@ def test_data_role_gate_is_wired():
             ("test_data_freshness_runway", "기본 검색에 뜰 물건이 남아 있다"),
             ("test_checklist_p0a_verdict_matches_reality",
              "체크리스트의 P0-A 판정이 실측과 일치한다"),
+            # 2026-09-03 추가: §15 (b) 도 같은 부류다 — "이 머신 DB 에 값이 있는가" 로
+            # 생산자 유무를 판정하므로 DB 나이에 따라 답이 뒤집힌다.
+            ("test_columns_with_no_producer", "새로 생산자를 잃은 컬럼 없음"),
         )
 
         # ★ 목록 자체가 줄어드는 것도 막는다 (2026-08-26, BUGS #222).
@@ -2047,6 +2050,155 @@ def test_stored_normalization_matches_code():
     check("bid_rate가 지금 공식과 일치한다", rate_bad[:3], [])
     check("fail_count가 status 문자열과 일치한다", fail_bad[:3], [])
     check("bid_rate가 0~1 범위 안이다(비율이므로)", range_bad[:3], [])
+
+    # ── 면적 2축 (2026-09-03 신설) ─────────────────────────────────────────
+    #
+    # ★ 이 축이 왜 빠져 있었나 — `building_area` / `land_area` 는 위 `sido`/`sigungu`/
+    #   `dong`/`lot_number` 와 **똑같이 `full_address` 에서 파생**되고, `migrate_execute.py`
+    #   의 **같은 merge 경로**를 탄다(355행: 병합된 `full_address` 로 `extract_areas()`).
+    #   그런데 드리프트를 세는 축은 넷뿐이라 면적 둘은 시야 밖이었다.
+    #
+    #   지역 오염(BUGS #214/#224)이 정확히 이 모양이었다 — 규칙이 좋아져도 기존 행은
+    #   재계산되지 않고, **재크롤되는 물건만 낫는다.** 기일이 지나 재크롤 대상이 아닌
+    #   물건은 영구히 옛 값으로 남는다. 그리고 면적은 **검색 필터가 쓰는 값**이다
+    #   (`api/v1/search.py` 의 `min_building_area` 등) — stale 이면 지역 오염이 지역
+    #   필터를 망친 것과 같은 방식으로 면적 필터가 조용히 틀린 결과를 낸다.
+    #
+    #   고치는 도구는 이미 있다(`backfill_area.py`). 없던 것은 **세는 사람**뿐이다.
+    #
+    # 판정은 정본 함수를 불러 쓴다 — 여기에 추출 규칙을 다시 적으면 두 벌이 되고,
+    # 한쪽만 바뀌는 날 두 검사가 서로를 눈감아 준다(§12 상단이 겪은 그 결함이다).
+    from normalizer.normalizer import extract_areas
+
+    # 검출기 자체 검증은 **컬럼 유무와 무관하게** 항상 돈다 — 컬럼이 없는 머신에서
+    # 이 절이 통째로 조용해지면 "판정했다"와 "판정하지 못했다"를 구별할 수 없다.
+    _probe = extract_areas("서울특별시 종로구 어디 1-2 [집합건물 철근콘크리트구조 29.95㎡]")
+    check_true("검출기 자체 검증: 주소에서 면적을 실제로 뽑는다",
+               _probe.get("building_area") is not None, _probe)
+    check_true("검출기 자체 검증: 면적이 없는 주소는 None 이다",
+               extract_areas("서울특별시 종로구 어디 1-2") .get("building_area") is None, True)
+
+    conn = connect()
+    try:
+        _cols = {r[1] for r in conn.execute("PRAGMA table_info(auction_item)")}
+        _has_area = {"building_area", "land_area"} <= _cols
+        arows = conn.execute(
+            "SELECT id, full_address, building_area, land_area FROM auction_item"
+        ).fetchall() if _has_area else []
+    finally:
+        conn.close()
+
+    if not _has_area:
+        # migration 025 미적용 머신 — 통과가 아니라 **판정하지 못한 것**이다.
+        print("    [판정 안 함] auction_item 에 면적 컬럼이 없다(migration 025 미적용) - "
+              "면적 드리프트는 컬럼이 있는 머신에서만 잴 수 있다")
+    else:
+        area_bad = []
+        for row_id, addr, b_stored, l_stored in arows:
+            want = extract_areas(addr or "")
+            for col, stored in (("building_area", b_stored), ("land_area", l_stored)):
+                w = want.get(col)
+                # None 끼리는 같다. 한쪽만 None 이면 어긋남이다.
+                if (w is None) != (stored is None):
+                    area_bad.append((row_id, col, stored, w))
+                elif w is not None and abs(float(w) - float(stored)) > 1e-9:
+                    area_bad.append((row_id, col, stored, w))
+        check_true("검사가 공허하지 않다 - 면적 대상 %d행을 봤다" % len(arows),
+                   len(arows) > 0, len(arows))
+        check("★ 저장된 면적이 지금 추출 규칙의 결과와 같다", area_bad[:3], [])
+        if area_bad:
+            print("      -> 검색의 면적 필터가 이 값을 쓴다. 고치려면: python backfill_area.py")
+
+    # ── 날짜/금액 파서가 통과시킨 값이 DB 에 들어갔는가 (2026-09-03 신설) ──────
+    #
+    # ★ 왜 필요한가 — `test_normalizer.py` 는 이 위험을 **이미 정확히 서술하고 파서
+    #   동작까지 고정**해 두었다:
+    #
+    #     (1) `normalize_date` 는 파싱하지 못한 값을 **원문 그대로 통과**시킨다.
+    #         이 저장소는 날짜를 **문자열로 비교**하므로('2026-8-19' > '2026-09-01' 이 참)
+    #         정렬·D7 필터·우선순위가 조용히 어긋난다.
+    #     (2) `normalize_price` 는 숫자를 못 찾으면 **0** 을 돌려준다 —
+    #         크롤이 깨진 것과 "실제로 0원"이 구분되지 않는다.
+    #
+    #   그런데 그 파일이 근거로 든 *"실제 데이터에는 두 경우 모두 0건"* 은
+    #   **2026-08-13 에 손으로 잰 값**이고, 그 전제를 **계속 감시하는 검사는 없었다.**
+    #   즉 파서 쪽 계약만 고정돼 있고 DB 쪽 결과는 아무도 세지 않는다.
+    #
+    #   실측(2026-09-03)으로 그 위험이 downstream 에서 실재함을 확인했다 —
+    #   파싱 실패값은 전부 오늘 날짜보다 "크다"고 판정된다:
+    #
+    #       '미상'       >= '2026-09-03'  -> True
+    #       '26.01.05'   >= '2026-09-03'  -> True
+    #       '2026.1.5'   >= '2026-09-03'  -> True
+    #       '2026-13-45' >= '2026-09-03'  -> True
+    #
+    #   즉 한 자리 월/일이나 '미상' 이 한 번 저장되면 그 물건은 **종결됐는데도
+    #   기본 검색(D7)에 계속 뜬다.** 지역 오염이 지역 필터를 망친 것과 같은 모양이다.
+    #
+    #   형식만 본다. "이 날짜가 사실인가"는 판정하지 않는다(그건 원천의 몫이다).
+    import re as _re
+    from datetime import datetime as _dt
+
+    DATE_COLS = [("auction_item", "auction_date"), ("auction_item", "crawl_date"),
+                 ("auction", "auction_date"), ("auction", "crawl_date"),
+                 ("document_queue", "auction_date"),
+                 ("auction_case", "filed_date"), ("auction_case", "demand_deadline")]
+    PRICE_COLS = [("auction_item", "appraisal_price"), ("auction_item", "minimum_bid_price"),
+                  ("auction", "appraisal_price"), ("auction", "minimum_bid_price")]
+
+    conn = connect()
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        bad_fmt, bad_real, zero_price = [], [], []
+        scanned_dates = scanned_prices = 0
+        for t, col in DATE_COLS:
+            if t not in tables or col not in {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}:
+                continue
+            for (v,) in conn.execute(
+                    "SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL AND TRIM(%s) <> ''"
+                    % (col, t, col, col)):
+                scanned_dates += 1
+                if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(v)):
+                    bad_fmt.append("%s.%s=%r" % (t, col, v))
+                    continue
+                # 형식은 맞는데 존재하지 않는 날짜('2026-13-45')도 문자열 비교를 깨뜨린다.
+                try:
+                    _dt.strptime(str(v), "%Y-%m-%d")
+                except ValueError:
+                    bad_real.append("%s.%s=%r" % (t, col, v))
+        for t, col in PRICE_COLS:
+            if t not in tables or col not in {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}:
+                continue
+            scanned_prices += 1
+            n = conn.execute("SELECT COUNT(*) FROM %s WHERE %s = 0" % (t, col)).fetchone()[0]
+            if n:
+                zero_price.append("%s.%s=0 인 행 %d개" % (t, col, n))
+    finally:
+        conn.close()
+
+    check_true("검사가 공허하지 않다 - 날짜 %d개 값 / 금액 %d개 컬럼을 봤다"
+               % (scanned_dates, scanned_prices),
+               scanned_dates > 0 and scanned_prices > 0, (scanned_dates, scanned_prices))
+    check("★ 저장된 날짜가 전부 YYYY-MM-DD 다", sorted(bad_fmt)[:3], [])
+    check("★ 저장된 날짜가 전부 실재하는 날짜다", sorted(bad_real)[:3], [])
+    check("★ 금액이 0 인 행이 없다(크롤 실패와 '0원'을 구별할 수 없다)", sorted(zero_price)[:3], [])
+    if bad_fmt or bad_real:
+        print("      -> 날짜를 **문자열로 비교**하므로 D7 필터/정렬/우선순위가 어긋난다."
+              " 원천 응답 형식이 바뀌었는지 먼저 본다(normalize_date 는 못 읽으면 원문을 통과시킨다).")
+
+    # 검출기 자체 검증 — 실 데이터가 0건이어도 판정이 살아 있는지 못박는다.
+    check_true("검출기 자체 검증: 한 자리 월/일을 형식 위반으로 잡는다",
+               not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", "2026-8-19"), True)
+    check_true("검출기 자체 검증: 정상 형식은 통과시킨다",
+               bool(_re.fullmatch(r"\d{4}-\d{2}-\d{2}", "2026-08-19")), True)
+    _fake_real = True
+    try:
+        _dt.strptime("2026-13-45", "%Y-%m-%d")
+        _fake_real = False
+    except ValueError:
+        pass
+    check_true("검출기 자체 검증: 형식은 맞지만 없는 날짜를 잡는다", _fake_real, True)
 
     # ── validation_status 는 왜 위 목록에 없는가 (2026-08-14 확인) ──────────
     #
@@ -2748,6 +2900,7 @@ def test_columns_with_no_producer():
     conn = connect()
     try:
         newly = []
+        scanned = 0
         for table in WATCHED:
             total = conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
             if not total:
@@ -2758,15 +2911,48 @@ def test_columns_with_no_producer():
                     continue
                 if (table, col) in PRODUCERLESS_COLUMNS:
                     continue
+                scanned += 1
                 filled = conn.execute(
                     "SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL" % (table, col)).fetchone()[0]
                 if filled == 0:
                     newly.append("%s.%s (0/%d)" % (table, col, total))
     finally:
         conn.close()
-    check("새로 생산자를 잃은 컬럼 없음", sorted(newly), [])
-    if newly:
-        print("      -> 이 컬럼을 쓰는 화면이 있으면 지금 빈 채로 나가고 있다.")
+
+    # ★ 이 머신이 **운영 데이터의 주인일 때만** 제품 판정으로 쓴다 (BUGS #200, §11 과 같은 규칙).
+    #
+    #   2026-09-03 재감사에서 이 자리가 게이트 밖에 있는 것을 찾았다. 바로 위 (a) 는
+    #   *"같은 코드가 DB 나이에 따라 뒤집히면 게이트가 아니라 소음이다"* 라며 판정 기준을
+    #   **최근 행**으로 옮겼는데, (b) 는 여전히 표 전체를 보고 `filled == 0` 을 물었다.
+    #   같은 질문("지금 도는 파이프라인이 이 컬럼을 채우는가")의 두 반쪽인데 한쪽만
+    #   고쳐져 있었다.
+    #
+    #   그래서 Sprint 285 가 `auction_case` 사건정보 3종을 목록에서 빼는 순간(생산자가
+    #   생겼으므로 옳은 변경이다) **크롤을 돌리지 않는 개발 머신 전부**가 곧바로 붉어졌다 —
+    #   그 DB 의 행은 전부 생산자가 생기기 전에 만들어졌으니 0 인 것이 당연하다.
+    #
+    #   실측(2026-09-03, 데스크탑3): auction_case 1,384행이 전부 2026-08-12 이전 생성이고
+    #   case_type / filed_date / demand_deadline 은 0/1384 다. 그런데 **같은 트리**를
+    #   사본 DB 에 두고 `load_spec_data.py` 를 돌리자 case_type 0->192,
+    #   demand_deadline 0->187 로 채워졌다(운영 DB 미변경, md5 동일 확인).
+    #   즉 생산자는 살아 있고 붉은 것은 DB 나이였다 — 코드를 고쳐 풀 수 있는 실패가 아니다.
+    #
+    #   개발 머신에서 고칠 수 없는 red 를 만드는 것이 정확히 §11 이 막으려던 상태다.
+    #   판정은 운영 머신에 맡기고, 개발 머신에서는 **재서 보여 주되 단언하지 않는다.**
+    if is_operational_data():
+        check_true("새로 생산자를 잃은 컬럼 없음", not newly, sorted(newly))
+        if newly:
+            print("      -> 이 컬럼을 쓰는 화면이 있으면 지금 빈 채로 나가고 있다.")
+    else:
+        print("    [판정 안 함] 이 머신은 운영 데이터의 주인이 아니다(%s 미선언) - "
+              "생산자 유무는 크롤이 도는 머신에서만 판정한다(통과가 아니다)." % DATA_ROLE_ENV)
+        print("    (참고) 지금 이 DB 에서 비어 있는 컬럼: %s"
+              % (", ".join(sorted(newly)) if newly else "없음"))
+        # 껍데기 방지 — 판정을 미루더라도 **훑는 일 자체는 실제로 했다**는 것은 여기서도
+        # 단언한다. WATCHED 표가 사라지거나 필터가 전부를 걸러 내면 위 목록은 언제나
+        # 빈 채로 조용히 통과할 것이므로, 그 상태를 개발 머신에서도 잡는다.
+        check_true("생산자 판정 대상 컬럼을 실제로 훑었다(개발 머신에서도 공허하지 않다)",
+                   scanned > 0, scanned)
 
     for (t, c), (f, n, r) in sorted(measured.items()):
         print("      %s.%s  최근 %d/%d  누적 %d/%d%s"
@@ -3174,17 +3360,18 @@ def test_non_nullable_numeric_columns_are_never_null():
 
     body = ts[ts.index("SearchResultItem"):]
     body = body[:body.index("\n}")]
-    # `이름: number` 이고 `| null` 도 `?` 도 없는 것만
+    # 숫자 필드 중 **옵셔널이 아닌 것** 전부(`number` / `number | null` 둘 다).
+    # `?` 가 붙은 것은 "서버가 안 줄 수도 있다"는 선언이라 제외한다(면적 2종).
     non_null_numbers = []
     for line in body.split("\n"):
         code = line.split("//")[0].strip()
-        m = _re.match(r"^([a-z_]+)\s*:\s*number\s*$", code)
+        m = _re.match(r"^([a-z_]+)\s*:\s*number(\s*\|\s*null)?\s*,?$", code)
         if m:
             non_null_numbers.append(m.group(1))
 
-    check_true("선언을 실제로 읽었다 (non-null number %d개: %s)"
+    check_true("선언을 실제로 읽었다 (감시 대상 숫자 컬럼 %d개: %s)"
                % (len(non_null_numbers), ", ".join(non_null_numbers)),
-               len(non_null_numbers) >= 3, non_null_numbers)
+               len(non_null_numbers) >= 4, non_null_numbers)
 
     conn = connect()
     try:

@@ -30,6 +30,7 @@
 
 import { test, describe, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { readTsFields } from './_ts_interface.mjs'
 import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
 
 const BASE = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
@@ -1161,40 +1162,10 @@ const KNOWN_UNDECLARED = {
 // 여러 물건을 표본으로 본다 — 한 건만 보면 그 한 건이 우연히 멀쩡할 수 있다.
 // ---------------------------------------------------------------------------
 describe('API 응답 ↔ 프런트 타입: nullability/타입 (2026-09-03)', () => {
-  // 선언에서 (nullable, 원문타입) 을 뽑는다. 위 tsKeys 와 같은 파서를 쓰되
-  // 타입 문자열까지 남긴다.
-  async function tsTypes(file, name) {
-    const { promises: fs } = await import('node:fs')
-    const src = await fs.readFile(file, 'utf8')
-    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
-    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
-    let depth = 1
-    let i = m.index + m[0].length
-    const start = i
-    while (i < src.length && depth > 0) {
-      if (src[i] === '{') depth++
-      else if (src[i] === '}') depth--
-      i++
-    }
-    let body = src.slice(start, i - 1)
-    for (;;) {
-      const next = body.replace(/\{[^{}]*\}/g, '')
-      if (next === body) break
-      body = next
-    }
-    const out = new Map()
-    for (const line of body.split('\n')) {
-      const code = line.split('//')[0].trim()
-      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:\s*(.+?),?$/.exec(code)
-      if (!km) continue
-      const declared = km[3].trim().replace(/,$/, '')
-      out.set(km[1], {
-        nullable: km[2] === '?' || /\bnull\b|\bundefined\b/.test(declared),
-        declared,
-      })
-    }
-    return out
-  }
+  // 선언 파서는 `tests/_ts_interface.mjs` 한 곳에만 있다 — 이 검사(응답 대조)와
+  // `source-contract` 의 스키마 대조가 **같은 규칙으로** 선언을 읽어야 한다.
+  // 두 벌이면 한쪽만 nullable 을 놓치고 서로를 눈감아 준다(BUGS #224 와 같은 모양).
+  const tsTypes = (file, name) => readTsFields(file, name)
 
   function violations(label, obj, types, id) {
     const bad = []
@@ -1239,9 +1210,16 @@ describe('API 응답 ↔ 프런트 타입: nullability/타입 (2026-09-03)', () 
   test('자기 검증 — 선언 위반을 실제로 잡는다', async () => {
     const types = await tsTypes('src/app/search/types.ts', 'SearchResultItem')
     // 일부러 깨뜨린 응답을 넣어 본다. 이것이 통과하면 아래 "0건"은 의미가 없다.
-    const broken = { ...cards[0], appraisal_price: null, fail_count: 'many' }
+    //
+    // ★ null 주입 대상은 **정말로 non-null 인 필드**여야 한다. 예전에는
+    //   `appraisal_price` 를 썼는데, 2026-09-03 에 그 컬럼이 DB 에서 NULL 을 허용한다는
+    //   것이 확인되어 선언이 `number | null` 로 정정됐다(`api/v1/search.py:row_to_item`
+    //   이 보정 없이 그대로 내보낸다). 그래서 그 필드로는 더 이상 위반이 만들어지지 않는다.
+    //   `id` 는 `INTEGER PRIMARY KEY`(rowid 별칭)라 NULL 이 될 수 없으므로 그 자리를 대신한다.
+    //   (스키마 쪽 대조는 `tests/source-contract.test.mjs` 의 nullability 검사가 맡는다.)
+    const broken = { ...cards[0], id: null, fail_count: 'many' }
     const bad = violations('items[]', broken, types, 'SELF')
-    assert.ok(bad.some((s) => s.includes('appraisal_price')),
+    assert.ok(bad.some((s) => s.includes('id')),
       `null 주입을 못 잡았습니다: ${JSON.stringify(bad)}`)
     assert.ok(bad.some((s) => s.includes('fail_count')),
       `타입 불일치를 못 잡았습니다: ${JSON.stringify(bad)}`)
