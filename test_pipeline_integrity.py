@@ -93,11 +93,43 @@ def test_path_rule_matches_api():
     # 지키려는 것은 "이 문자열이 소스에 있다"가 아니라 **쓰는 쪽과 읽는 쪽이 같은 경로를
     # 본다**는 것이므로, 두 구현의 결과를 직접 대조하는 쪽으로 바꾼다(더 강한 검사다 —
     # 리터럴이 같아도 결과가 다를 수 있고, 리터럴이 달라도 결과가 같으면 문제없다).
-    check_true("documents.py가 공용 정규화 함수를 쓴다", "sanitize_path_segment" in src, src[:0])
-    check_true("item_no 기본값이 '1'이다", '(item_no or "1")' in src)
-
     from api.v1.documents import get_doc_dir as _api_dir
     from crawler.doc_paths import _doc_dir_path as _crawler_dir
+
+    # ★ 2026-09-04 — 여기 있던 **소스 리터럴 검사 두 개**를 행위 검사로 바꿨다.
+    #
+    #     check_true("documents.py가 공용 정규화 함수를 쓴다", "sanitize_path_segment" in src)
+    #     check_true("item_no 기본값이 '1'이다", '(item_no or "1")' in src)
+    #
+    #   바로 위 주석(Sprint 146)이 이미 이 문제를 적어 두었다 — *"리터럴 검사를
+    #   그대로 두면 규칙이 좋아졌는데 테스트가 실패한다"*. 그때 한 개는 결과 대조로
+    #   바꿨는데 이 둘은 리터럴로 남았고, 2026-09-04 에 세 벌이던 경로 조립 규칙을
+    #   정본 하나로 모으자(`_doc_dir_path`) **규칙이 좋아졌다는 이유로** 붉어졌다.
+    #
+    #   지키려는 성질은 그대로 지킨다. 다만 문자열이 아니라 **값**으로 본다.
+    #   (a) 빈 물건번호는 "1" 로 떨어진다   (b) documents.py 는 규칙을 자기가 다시 적지 않는다
+    check("빈 item_no 는 '1' 로 떨어진다",
+          _api_dir("A법원", "2024타경9", ""),
+          _api_dir("A법원", "2024타경9", "1"))
+    check("None item_no 도 '1' 로 떨어진다",
+          _api_dir("A법원", "2024타경9", None),
+          _api_dir("A법원", "2024타경9", "1"))
+    # 그 값이 실제로 마지막 조각 "1" 인지도 본다(둘 다 똑같이 틀렸을 수 있다).
+    check("그 기본값이 실제로 '1' 이다",
+          os.path.basename(_api_dir("A법원", "2024타경9", "")), "1")
+
+    # documents.py 가 경로 규칙을 **자기가 다시 적지 않는다**.
+    #   join(DOCUMENT_ROOT, ...) 를 직접 조립하면 정본과 갈라질 수 있다.
+    #   (2026-09-04 이전에는 실제로 세 파일이 같은 식을 각자 적고 있었고,
+    #    그중 하나는 court=None 계약이 이미 갈라져 있었다.)
+    import inspect as _inspect
+    _api_src = _inspect.getsource(_api_dir)
+    check_true("documents.py 가 경로 규칙을 다시 적지 않는다(정본에 위임)",
+               "_doc_dir_path(" in _api_src and "sanitize_path_segment(" not in _api_src,
+               _api_src)
+    # 검사가 공허하지 않다 — 위임 대상이 실제로 규칙을 갖고 있다.
+    check_true("검사가 공허하지 않다 - 정본이 실제 규칙을 갖고 있다",
+               "sanitize_path_segment(" in _inspect.getsource(_crawler_dir))
     for _court, _case, _item in (("서울중앙지방법원", "2024타경1 / 2024타경2", "1"),
                                  ("고양지원", "2024\\타경1", "2"),
                                  ("A법원", "2024타경9", "")):

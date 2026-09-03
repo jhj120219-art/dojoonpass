@@ -53,6 +53,21 @@ _BASE_BTN_ID = {
     "appraisal": "mf_wfm_mainFrame_btn_aeeWevl",
 }
 
+# 상세페이지에 **수집 버튼이 존재하는** 문서 종류. `_BASE_BTN_ID` 에서 유도한다
+# (목록을 두 번 적지 않는다).
+#
+# 왜 필요한가 (2026-09-04) — `get_doc_button_id()` 가 None 을 돌려주는 이유가
+# **두 가지**인데 호출부가 그것을 구별할 방법이 없었다:
+#
+#     (a) 이 종류의 버튼 id 를 아직 모른다        -> "수집 불가" 로 다룰 만하다
+#     (b) 이 종류에는 버튼이라는 개념이 아예 없다  -> 이 함수의 소관이 아니다
+#
+# 사진(image)이 (b)다 — 캐러셀에서 긁어오지 버튼을 누르지 않는다. 그런데
+# `repair_unsupported_status_docs.py` 가 둘을 같게 보고 사진을 "수집 버튼이 없는
+# 문서" 로 분류해 FAILED 로 바꾸려 했다(실측 12행, 그중 NO_IMAGE 3행).
+# 그 구별을 여기서 이름 있는 값으로 내보낸다.
+DOC_BUTTON_DOC_TYPES = frozenset(_BASE_BTN_ID)
+
 
 def get_doc_button_id(doc_type: str, item_no: str) -> str:
     """문서 종류 + 물건번호(item_no) -> 상세페이지의 수집 버튼 id. 모르면 None.

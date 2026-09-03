@@ -269,6 +269,79 @@ def test_single_canonical_mutation_path():
                "낙관적 UI 로 바뀌었다면 실패 시 롤백 검사를 함께 넣어야 한다")
 
 
+# ---------------------------------------------------------------------------
+def test_add_uses_existence_check_not_a_second_item_shape():
+    """P0-1 (Frankenstein) — 담기 경로가 **물건 응답 모양을 또 조립하지 않는다.**
+
+    2026-09-04 이전에는 `api/v1/favorites.py:get_item_summary()` 가 `SELECT *` 로
+    14개 필드의 물건 dict 를 만들었고, 유일한 호출부가 그것을
+    **있다/없다만 보고 버렸다.** 그런데 실제 목록 응답(`get_favorites()`)은
+    그 사이 필드가 다섯 개 늘어 **같은 개념의 모양이 두 벌**이 됐다.
+
+    이름이 더 그럴듯한 쪽(쓰이지 않는 쪽)을 고치면 **아무 일도 일어나지
+    않고 오류도 안 난다** — 이 저장소가 반복해서 겉어 온 모양이라
+    되돌아오지 않게 여기서 못박는다.
+
+    두 층으로 본다 — **동작**(404/200 계약이 그대로인가)과
+    **모양**(담기 응답이 물건 필드를 실어 나르지 않는가).
+    동작만 보면 사본이 되살아나도 초록이다.
+    """
+    print("\n--- 6. 담기는 존재 확인만 한다 (P0-1 Frankenstein) ---")
+    import io as _io
+    import inspect as _inspect
+    import api.v1.favorites as fav
+
+    wipe()
+    item_id = some_items(1)[0]
+
+    # --- 동작: 판정 계약이 종전과 같다 ---
+    ok = client.post("/api/v1/favorites", json={"item_id": item_id}, headers=hdr())
+    check("있는 물건은 담긴다", ok.status_code, 200)
+    check("★ DB 에 실제로 1행", db_count(item_id=item_id), 1)
+
+    gone = client.post("/api/v1/favorites", json={"item_id": 2 ** 40}, headers=hdr())
+    check("없는 물건은 404", gone.status_code, 404)
+    # 범위 밖 id 는 sqlite3 OverflowError -> 500 이 될 수 있던 자리다
+    # (Sprint 154). 가드가 `item_exists()` 안에 그대로 남아 있는지 본다.
+    huge = client.post("/api/v1/favorites", json={"item_id": 2 ** 63}, headers=hdr())
+    check("★ SQLite 범위 밖 id 도 500 이 아니라 404", huge.status_code, 404)
+    neg = client.post("/api/v1/favorites", json={"item_id": -1}, headers=hdr())
+    check("음수 id 도 404", neg.status_code, 404)
+
+    # --- 모양: 담기 응답은 물건 필드를 실지 않는다 ---
+    body = (ok.json() or {}).get("data") or {}
+    check("담기 응답 키는 종전과 같다", sorted(body), ["created_at", "item_id"])
+    leaked = sorted(k for k in body
+                    if k in ("case_no", "court_name", "full_address",
+                             "appraisal_price", "minimum_bid_price", "bid_rate",
+                             "auction_date", "status", "fail_count"))
+    check("★ 담기 응답에 물건 필드가 실리지 않는다", leaked, [])
+
+    # --- 소스: 두 번째 물건 모양 조립기가 생기지 않는다 ---
+    #   `get_favorites()` 만이 목록 모양을 만든다. 담기/해제 쪽에
+    #   필드 목록이 다시 나타나면 같은 사고가 재발한 것이다.
+    root = os.path.dirname(os.path.abspath(__file__))
+    src = _io.open(os.path.join(root, "api", "v1", "favorites.py"),
+                   encoding="utf-8-sig").read()
+    builders = [name for name in ("add_favorite", "remove_favorite", "item_exists")
+                if '"case_no": row[' in _inspect.getsource(getattr(fav, name))]
+    check("★ 담기/해제/존재확인은 물건 모양을 조립하지 않는다", builders, [])
+    check("★ 목록 모양 조립기는 get_favorites 하나다",
+          src.count('"case_no": row['), 1)
+
+    # 존재 판정은 `favorite_import` 의 정본과 **같은 모양**이어야 한다.
+    exists_src = _inspect.getsource(fav.item_exists)
+    check_true("★ 존재 확인은 SELECT 1 이다(행 전체를 읽지 않는다)",
+               "SELECT 1 FROM auction_item" in exists_src
+               and "SELECT * FROM auction_item" not in exists_src,
+               exists_src)
+
+    # 자기 검증 — 위 소스 검사가 공허하지 않다(찾는 문자열이 실재한다).
+    check_true("자기 검증: 목록 조립기를 실제로 찾았다",
+               '"case_no": row[' in _inspect.getsource(fav.get_favorites),
+               "검사가 찾는 모양이 사라졌다 - 검사를 먼저 고쳐야 한다")
+    wipe()
+
 def run():
     try:
         test_empty_state_is_not_an_error()
@@ -276,6 +349,7 @@ def run():
         test_list_is_newest_first_and_deterministic()
         test_remove_paths()
         test_single_canonical_mutation_path()
+        test_add_uses_existence_check_not_a_second_item_shape()
     finally:
         wipe()
 

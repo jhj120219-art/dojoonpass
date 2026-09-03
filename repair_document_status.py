@@ -35,12 +35,11 @@ from storage.database import get_connection
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
 
-# api/v1/documents.py:DOC_TYPE_FILES 와 같아야 한다.
-DOC_TYPE_FILES = {
-    "APPRAISAL": "appraisal.pdf",
-    "SPEC": "spec.pdf",
-    "STATUS": "status.html",
-}
+# 뷰어가 서빙하는 파일명표는 아래에서 **정본을 그대로 빌려 쓴다** (`DOC_TYPE_FILES`).
+#   정본: `crawler/doc_paths.py:CANONICAL_DOC_FILENAME`
+# 예전에는 여기에 손으로 적은 사본이 있었고, 그 위에 "같아야 한다"는 주석만
+# 달려 있었다 — **그 약속을 강제하는 검사가 없었다.** 자세한 사유는
+# 아래 import 문 다음의 정의를 보라.
 
 
 # 2026-08-17 Sprint 153 (BUGS #111 계열 전수 검색): 조각 정규화를 **크롤러와 같은 함수**로
@@ -58,18 +57,54 @@ DOC_TYPE_FILES = {
 #
 # 현재 실데이터에 역슬래시는 0건이라 지금 터지는 버그는 아니다. 규칙이 세 벌인 상태를 없앤다.
 # `crawler.doc_paths`는 selenium/DB/fastapi 무의존이라 여기서 import해도 안전하다.
-from crawler.doc_paths import sanitize_path_segment  # noqa: E402
+from crawler.doc_paths import (  # noqa: E402
+    _doc_dir_path,
+    CANONICAL_DOC_FILENAME,
+)
+
+
+# 뷰어가 실제로 서빙하는 파일명. **사본을 두지 않는다** (2026-09-04).
+#
+# 이 스크립트는 "그 파일이 디스크에 있는가"로 `document_status` 를 READY 로
+# 바꾸기 때문에, 여기서 보는 파일과 뷰어가 내려주는 파일이 갈라지면
+# **화면만 '수집완료'이고 서빙은 404** 가 된다 — 이 파일 docstring 이 없애려는
+# 바로 그 상태다(BUGS #50/#61/#64/#129 와 같은 부류).
+#
+# 예전에는 여기에 세 항목을 손으로 적어 두고 "같아야 한다"라고만 적어 두었다.
+# 그런데 그 약속을 강제하는 검사가 없어서, 정본이 바뀌어도 여기는 조용히 낡을 수
+# 있었다. 같은 계열의 다른 사본은 전부 정본과 대조되고 있었고
+# (`test_doc_storage_atomicity.py` / `test_document_status_sync.py`),
+# `sanitize_path_segment` 는 Sprint 153 에 이미 정본 호출로 바뀌었다 —
+# 이 표만 반쪽만 옮겨진 채로 남아 있었다.
+#
+# 값은 종전과 **바이트까지 같다**(APPRAISAL/SPEC/STATUS → appraisal.pdf/spec.pdf/
+# status.html). 동작은 하나도 바뀐 것이 없고, 갈라질 **수 있는 자리**를 없앤다.
+DOC_TYPE_FILES = dict(CANONICAL_DOC_FILENAME)
 
 
 def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
-    """api/v1/documents.py:get_doc_dir() 와 동일한 규칙(둘 다 크롤러 함수를 그대로 쓴다).
+    """정본(`crawler/doc_paths.py:_doc_dir_path()`)을 그대로 쓴다.
 
     **디렉터리를 만들지 않는다** — 이 스크립트는 존재 여부만 판정하는 읽기 전용 도구다
     (BUGS #111: 조회 함수가 `os.makedirs()`를 불러 빈 디렉터리 1,674개가 생긴 사고).
+
+    ## `court_name or ""` 를 버렸다 (2026-09-04)
+
+    예전 구현은 법원 조각에 `or ""` 를 붙여 두었다. 그래서 `court_name=None` 일 때
+    **예외 없이 한 단계 위 경로**(`<ROOT>/<사건>/<물건>`)를 돌려줬다 — 정본과
+    서빙 쪽은 같은 입력에서 TypeError 를 낸다. 세 구현의 계약이 갈라져 있었고,
+    하필 이 파일 것만 **조용히 틀린 경로**를 냈다.
+
+    이 스크립트는 그 경로에 파일이 있으면 `document_status` 를 READY 로 바꾼다.
+    그 경로는 DOCUMENT_ROOT **안**이라 아래 담김 검사도 통과한다. 즉 "화면은
+    수집완료인데 뷰어는 404" 를 없애려고 만든 도구가, 바로 그 상태를 만들 수 있었다.
+
+    지금 실데이터에 `court_name IS NULL` 은 0행이고 `document_exists()` 가 호출
+    **전에** 그것을 걸러내므로 도달하지 않는다. 그래서 지우는 것은 동작 변경이
+    아니라 **갈라질 수 있는 자리를 없애는 것**이다.
     """
-    return os.path.join(DOCUMENT_ROOT, court_name or "",
-                        sanitize_path_segment(case_no),
-                        sanitize_path_segment(item_no or "1"))
+    # 뿌리는 **이 모듈 것**을 준다(위 documents.py 와 같은 이유).
+    return _doc_dir_path(court_name, case_no, item_no, root=DOCUMENT_ROOT)
 
 
 def document_exists(court_name: str, case_no: str, item_no: str, doc_type: str) -> bool:

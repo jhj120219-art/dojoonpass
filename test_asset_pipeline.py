@@ -3005,6 +3005,97 @@ def test_deletion_never_escapes_document_root():
     check_true("삭제 함수가 봉쇄를 호출한다",
                "if not is_inside_document_root(path)" in guard_src,
                "remove_stored_image_files 에 봉쇄가 없다")
+
+    # ★ 2026-09-04 — **만드는 쪽**에도 같은 봉쇄가 있어야 한다.
+    #
+    #   위 검사는 "지우는 쪽"만 본다. 그런데 `ensure_image_dir()` 은
+    #   `os.makedirs()` 를 부르면서 담김을 보지 않았다 — `_image_dir_path()` 가
+    #   법원 조각을 `sanitize_path_segment()` 에 넣지 않기 때문에(사건번호와
+    #   물건번호만 넣는다) 법원 값이 `..` / `D:` 면 documents/ 밖을 가리킨다.
+    #   문서 쪽(`doc_paths.get_doc_dir()`)과 **완전히 같은 결함**이었고 같은 날 함께 고쳤다.
+    check_true("만드는 함수도 봉쇄를 호출한다",
+               "if not is_inside_document_root(path)" in guard_src.split(
+                   "def ensure_image_dir")[1].split("def ")[0],
+               "ensure_image_dir 에 봉쇄가 없다")
+
+    # 소스 문자열만 보면 공허하다 — **실제로 거절하는지** 태운다.
+    import crawler.image_assets as _ia
+
+    def _sweep(start):
+        """이 검사가 만든 껍데기만 걷어낸다. `rmdir` 만 쓴다(비어야 지운다)."""
+        cur = os.path.abspath(start)
+        for _ in range(5):
+            try:
+                os.rmdir(cur)
+            except OSError:
+                return
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return
+            cur = parent
+
+    rejected, made, leaked = [], [], []
+    for _court in ("..", "../..", "/etc", "..\\..\\Windows", "D:"):
+        _p = _ia._image_dir_path(_court, "2099타경QA", "1")
+        if _ia.is_inside_document_root(_p):
+            continue                      # 이 값은 애초에 안 나간다
+        try:
+            made.append(_ia.ensure_image_dir(_court, "2099타경QA", "1"))
+        except ValueError:
+            rejected.append(_court)       # 가드가 제 일을 했다
+        except OSError as exc:
+            # ★ 가드가 없어서 **syscall 까지 갔다**는 뜻이다. OS 가 우연히 막아
+            #   준 것을 '안전하다'로 읽으면 안 된다(`D:` 가 없는 머신에서만 막힌다).
+            #   여기서 잡지 않으면 검사가 통째로 중단돼 뒤 항목이 아예 안 돈다
+            #   (2026-09-04 변이 M10 에서 실제로 그랬다).
+            leaked.append("%s -> %s" % (_court, type(exc).__name__))
+        _sweep(_p)                        # 붉어져도 파일시스템을 어지르지 않는다
+    check("★ 저장소 밖 사진 디렉터리를 만들지 않는다", made, [])
+    check("★ 가드가 syscall 전에 거절한다(OS 에 기대지 않는다)", leaked, [])
+    check_true("검사가 공허하지 않다 - 실제로 거절된 입력이 있다 (%d개)" % len(rejected),
+               len(rejected) >= 4, rejected)
+
+    # 대조군 — 정상 법원은 여전히 만들어진다(가드가 과하면 사진 수집이 멈춘다).
+    _ok = _ia.ensure_image_dir("QA사진법원", "2099타경QA", "1")
+    check_true("대조군: 정상 법원의 사진 디렉터리는 만들어진다", os.path.isdir(_ok), _ok)
+    _sweep(_ok)
+
+    # ★ 담김 규칙이 **한 벌**인지 — 두 모듈이 같은 함수를 본다.
+    #
+    #   2026-09-04 에 문서 쓰기 가드를 만들면서 하마터면 이 규칙의 두 번째 판본을
+    #   `doc_paths` 에 새로 적을 뻔했다(그것이 이 저장소의 단골 사고다). 규칙은
+    #   `crawler/doc_paths.py` 에 하나만 두고 이 모듈은 이름만 유지한 채 위임한다.
+    import crawler.doc_paths as _dp
+    import inspect as _inspect
+    _ia_src = _inspect.getsource(_ia.is_inside_document_root)
+    check_true("★ 사진 쪽 봉쇄는 정본에 위임한다(규칙 사본이 아니다)",
+               "doc_paths import is_inside_document_root" in _ia_src
+               and "commonpath" not in _ia_src,
+               _ia_src)
+    check_true("정본은 commonpath 로 판정한다(위임 대상이 실제 구현이다)",
+               "commonpath" in _inspect.getsource(_dp.is_inside_document_root))
+    # 두 진입점이 같은 답을 낸다.
+    #
+    #   ★ 뿌리를 **반드시 맞춰서** 비교한다. 이 지점은 위 `finally` 가
+    #     `ia.DOCUMENT_ROOT` 를 실제 뿌리로 되돌린 뒤다 — 처음 작성했을 때
+    #     정본 쪽에만 임시 뿌리(`docs`)를 넘겨서, 둘 다 각자 옳은 답을 냈는데도
+    #     검사만 붉어졌다. 뿌리가 다르면 답이 다른 것이 **정상**이다.
+    _real_root = _ia.DOCUMENT_ROOT
+    _probes = [
+        ("안쪽", os.path.join(_real_root, "법원", "사건", "1", "images", "01.jpg")),
+        ("바깥(임시)", outside),
+        ("바깥(탈출)", traversal),
+        ("바깥(다른 드라이브)", "D:\\어딘가\\01.jpg"),
+    ]
+    for _label, _probe in _probes:
+        check("두 진입점이 같은 답 (%s)" % _label,
+              _ia.is_inside_document_root(_probe),
+              _dp.is_inside_document_root(_probe, root=_real_root))
+    # 검사가 공허하지 않다 — 안쪽/바깥이 실제로 갈린다(전부 False 면 무의미).
+    check_true("검사가 공허하지 않다 - 안쪽과 바깥이 갈린다",
+               _ia.is_inside_document_root(_probes[0][1])
+               and not _ia.is_inside_document_root(_probes[1][1]),
+               [(l, _ia.is_inside_document_root(x)) for l, x in _probes])
     print("    삭제 지점 %d곳: %s"
           % (len(sites), ", ".join("%s:%d" % x for x in sorted(sites))))
 

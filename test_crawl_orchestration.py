@@ -77,6 +77,18 @@ def _item(ms, case_no, item_no="1", court="QA법원"):
     )
 
 
+def _lock_state(path):
+    """(존재, mtime). 없으면 (False, None).
+
+    운영 락을 **앞뒤로 비교**하기 위해 쓴다 — `_csv_state()` 와 같은 이유다
+    ("존재하는가"가 아니라 "내가 바꿨는가"를 본다, #250/#266).
+    """
+    try:
+        return (True, os.stat(path).st_mtime)
+    except OSError:
+        return (False, None)
+
+
 def _csv_state(path):
     """(존재, 크기, mtime). 없으면 (False, None, None)."""
     if not os.path.exists(path):
@@ -111,6 +123,8 @@ def run():
         os.path.dirname(os.path.abspath(__file__)),
         "auction_%s.csv" % datetime.date.today().strftime("%Y%m%d"))
     _csv_before = _csv_state(_today_csv)
+    _lock_before = _lock_state(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "logs", "mvp_scraper.lock"))
 
     tmp = tempfile.mkdtemp(prefix="crawlorch_")
     scratch = os.path.join(tmp, "auction.db")
@@ -147,6 +161,32 @@ def run():
         # 건드리지 않는다(그 흔적이 나중에 진짜 크롤 기록으로 오독된다).
         real_here = ms._HERE
         real_csv = ms.save_csv_backup
+
+        # ★ 실행 락도 격리한다 (2026-09-04, Frankenstein 감사 중 실측).
+        #
+        #   이 파일은 DB(#251)와 그날 CSV(#266)를 이미 격리한다. 그런데 **락만
+        #   운영 경로 그대로**였다 — `mvp_scraper.LOCK_PATH` = `logs/mvp_scraper.lock`.
+        #
+        #   그래서 이 머신에서 진짜 크롤이 도는 동안 이 검사를 돌리면 `main()` 이
+        #   **설계대로 조용히 건너뛴다.** 그러면 아래 단언들이 줄줄이 붉어진다:
+        #
+        #       ★ main() 이 document_queue 적재를 호출한다   0 (expected 1)
+        #       main() 이 넘긴 행 수                        0 (expected 2)
+        #       ★ main() 실패 경로의 종료 코드              0 (expected 1)
+        #
+        #   실측(2026-09-04): PID 11648 의 `mvp_scraper.py`(03:00 시작)가 락을 쥐고
+        #   있는 동안 전체 스위트에서 이 파일만 3건 실패했고, 락 경로만 임시로
+        #   돌려 같은 코드를 돌리니 **전부 통과**했다.
+        #
+        #   즉 제품은 옳게 동작하는데 게이트만 붉어진다. 이 저장소가 #250/#266 에서
+        #   두 번 겪은 것과 **같은 부류**다 — 검사가 자기 것이 아닌 공유 자원의
+        #   상태에 매달린다. 그때마다 내린 답을 여기서도 쓴다: **내 것을 쓴다.**
+        #
+        #   락 자체의 계약(배타성/오래된 락 회수)은 여기가 아니라
+        #   `test_checkpoint_atomicity.py`(RunLock)와 `test_doc_worker_recovery.py`
+        #   가 본다. 그러므로 여기서 락을 갈아 끼워도 잃는 검증이 없다.
+        real_lock = ms.LOCK_PATH
+        ms.LOCK_PATH = os.path.join(tmp, "logs", "mvp_scraper.lock")
         os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
         ms._HERE = tmp
         csv_calls = {"n": 0}
@@ -369,10 +409,20 @@ def run():
         try:
             ms._HERE = real_here
             ms.save_csv_backup = real_csv
+            ms.LOCK_PATH = real_lock
         except NameError:
             pass
         db.DB_PATH = real_db
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # ★ 운영 락 오염 검사 — 바로 위 격리가 실제로 성립했는가.
+    #   이 검사가 운영 락을 만들거나 지우면, 도는 크롤을 죽이거나
+    #   죽은 크롤을 살아 있는 것으로 보이게 만든다 — DB 오염보다 바로
+    #   아래 줄이 더 위험하다(그날 수집 전체를 잃는다).
+    _prod_lock = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "logs", "mvp_scraper.lock")
+    check("★ 이 검사가 운영 락 파일을 건드리지 않는다",
+          _lock_state(_prod_lock), _lock_before)
 
     # 운영 DB 오염 검사 — 이 파일이 스크래치만 썼다는 주장을 실제로 확인한다.
     con = sqlite3.connect("file:%s?mode=ro" % real_db.replace("\\", "/"), uri=True)

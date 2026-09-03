@@ -287,8 +287,30 @@ def _image_dir_path(court_code: str, case_no: str, item_no: str = "1") -> str:
 
 
 def ensure_image_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
-    """사진 디렉터리 경로. **없으면 만든다.** 쓰기 직전에만 부른다."""
+    """사진 디렉터리 경로. **없으면 만든다.** 쓰기 직전에만 부른다.
+
+    ## ★ 2026-09-04 — 여기에도 담김 검사가 없었다 (문서 쪽과 같은 결함)
+
+    `_image_dir_path()` 는 사건번호·물건번호만 `sanitize_path_segment()` 를
+    통과시키고 **법원 조각은 원문 그대로** `os.path.join()` 에 넣는다
+    (`doc_paths._doc_dir_path()` 와 같은 모양이다). 그래서 법원 값이 `..` 나
+    `D:` 같은 것이면 계산된 경로가 `documents/` 밖을 가리킨다.
+
+    이 모듈은 **지우는 쪽**에는 이미 담김 검사를 걸어 두었다
+    (`remove_stored_image_files()`, Sprint 192/BUGS #131). 그 주석이 적어 둔
+    문장이 여기에도 그대로 적용된다 — *"읽기보다 쓰기/삭제가 더 위험한데 방어는
+    읽기에만 있었던 셈이다."* 만드는 쪽이 남아 있었다.
+
+    실데이터의 법원 값 60종에는 위험 문자가 0건이라(2026-09-04 전수) 정상 수집의
+    동작은 하나도 바뀌지 않는다. 원천이 예상 밖 값을 주는 날을 막는다.
+    """
     path = _image_dir_path(court_code, case_no, item_no)
+    if not is_inside_document_root(path):
+        raise ValueError(
+            "사진 디렉터리가 DOCUMENT_ROOT 밖을 가리킨다 - 만들지 않는다 "
+            "(court=%r, case_no=%r, item_no=%r, path=%r)"
+            % (court_code, case_no, item_no, path)
+        )
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -380,14 +402,14 @@ def is_inside_document_root(path: str) -> bool:
     **지우는 쪽에는 그 검사가 없었다.** 읽기보다 쓰기/삭제가 더 위험한데 방어는 읽기에만
     있었던 셈이다. `auction_image.storage_path` 가 어떤 이유로든 `..` 를 품으면
     `remove_stored_image_files()` 가 `documents/` 밖의 파일을 지운다.
+    ★ 2026-09-04: 규칙 자체는 `crawler/doc_paths.py:is_inside_document_root()` 로
+    옮겼다. 문서 쓰기 경로에도 같은 가드가 필요해졌는데, 거기서 두 번째 판본을
+    만들면 이 저장소가 반복해 겪은 그 모양이 된다. **이름과 계약은 그대로**이고
+    (이 모듈의 공개 API 다) 뿌리도 **이 모듈 것**을 그대로 넘긴다 —
+    테스트가 모듈별 `DOCUMENT_ROOT` 를 갈아 끼워 격리하기 때문이다.
     """
-    try:
-        real_root = os.path.realpath(DOCUMENT_ROOT)
-        real_path = os.path.realpath(path)
-        return os.path.commonpath([real_root, real_path]) == real_root
-    except (OSError, ValueError):
-        # 드라이브가 다르면 commonpath 가 ValueError 를 낸다 — 그것도 "밖"이다.
-        return False
+    from crawler.doc_paths import is_inside_document_root as _canonical
+    return _canonical(path, root=DOCUMENT_ROOT)
 
 
 def remove_stored_image_files(paths) -> int:

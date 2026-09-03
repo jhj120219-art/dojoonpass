@@ -47,7 +47,8 @@ from storage.database import (get_connection,
 #
 # 이 저장소는 같은 사고를 이미 겪고 `_doc_dir_path()`(계산만)와 `get_doc_dir()`(생성까지)로
 # 분리해 `doc_exists()`를 고쳤다(2026-08-14). 그런데 이 스크립트에만 적용이 빠져 있었다.
-from crawler.doc_paths import _doc_dir_path, status_overlay_has_data
+from crawler.doc_paths import (_doc_dir_path, status_overlay_has_data,
+                               is_inside_document_root)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 QUARANTINE_ROOT = os.path.join(PROJECT_ROOT, "documents_quarantine")
@@ -113,8 +114,23 @@ def repair(apply: bool) -> int:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         moved = requeued = reset = 0
         for e in empty:
-            rel = os.path.relpath(e["dir"], os.path.join(PROJECT_ROOT, "documents"))
+            # ★ 담김 검사 (2026-09-04). `relpath()` 는 대상이 기준 밖이면
+            #   `..` 로 시작하는 값을 돌려주고, 그것을 이어 붙이면 **격리 폴더
+            #   밖**으로 파일을 옮기게 된다. 아래 `shutil.move()` 는 되돌리기
+            #   어려운 동작이라(원본이 사라진다) 옮기기 전에 확인한다.
+            #
+            #   같은 날 `doc_paths.get_doc_dir()` / `image_assets.ensure_image_dir()`
+            #   에 건 것과 **같은 함수**를 쓴다 — 담김 규칙은 저장소에 하나뿐이다.
+            #   여기서는 뿌리가 `documents/` 가 아니라 격리 폴더이므로 `root` 로 준다.
+            docs_root = os.path.join(PROJECT_ROOT, "documents")
+            if not is_inside_document_root(e["dir"], root=docs_root):
+                print("   [건너뜀] 문서 경로가 documents/ 밖이다: %s" % e["dir"])
+                continue
+            rel = os.path.relpath(e["dir"], docs_root)
             qdir = os.path.join(QUARANTINE_ROOT, stamp, rel)
+            if not is_inside_document_root(qdir, root=QUARANTINE_ROOT):
+                print("   [건너뜀] 격리 경로가 격리 폴더 밖이다: %s" % qdir)
+                continue
             os.makedirs(qdir, exist_ok=True)
             for name in ("status.html", "status.json"):
                 src = os.path.join(e["dir"], name)

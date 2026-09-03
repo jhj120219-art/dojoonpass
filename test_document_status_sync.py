@@ -816,6 +816,29 @@ def test_ready_means_the_viewer_can_serve_it():
           {k: v for k, v in CANONICAL_DOC_FILENAME.items()},
           {k: v[0] for k, v in DOC_TYPE_FILES.items()})
 
+    # ★ 보정 스크립트의 표도 **같은 대조에 넣는다** (2026-09-04, Frankenstein 감사).
+    #
+    #   `repair_document_status.py` 는 이 표로 "파일이 있는가"를 판정해
+    #   `document_status` 를 **READY 로 바꿈다.** 즉 위 두 정의와 완전히 같은
+    #   사고를 만드는 자리다 — 갈라지면 화면은 '수집완료'인데 뷰어는 404 다.
+    #
+    #   그런데 그 표만 **손으로 적은 사본**이었고("api/v1/documents.py:
+    #   DOC_TYPE_FILES 와 같아야 한다" 라는 주석만 달린 채), 그 약속을 강제하는
+    #   검사가 **없었다.** 2026-09-04 에 정본 유도로 바꾸고, 그 사실을 여기서
+    #   고정한다 — 다시 사본이 되는 순간 이 검사가 먼저 운다.
+    import importlib.util as _iu
+    _spec = _iu.spec_from_file_location(
+        "rds_filename_table", os.path.join(root, "repair_document_status.py"))
+    _rds = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_rds)
+    check("보정 스크립트 파일명표 == 뷰어 서빙 파일명",
+          dict(_rds.DOC_TYPE_FILES),
+          {k: v[0] for k, v in DOC_TYPE_FILES.items()})
+    # 검사가 공허하지 않다 — 빈 dict 끼리 비교하고 끝나지 않는다.
+    check_true("자기 검증: 보정 스크립트 표가 3종을 덮는다",
+               set(_rds.DOC_TYPE_FILES) == {"SPEC", "STATUS", "APPRAISAL"},
+               sorted(_rds.DOC_TYPE_FILES))
+
     c = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True)
     c.row_factory = sqlite3.Row
     try:

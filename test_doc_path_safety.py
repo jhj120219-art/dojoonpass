@@ -112,6 +112,26 @@ def test_separators_are_neutralised():
 # ---------------------------------------------------------------------------
 # 5. ★ 어떤 입력으로도 documents/ 를 벗어나지 않는다
 # ---------------------------------------------------------------------------
+def _cleanup_probe_dir(path):
+    """이 검사가 만든 탐침 디렉터리만 지운다. **파일은 절대 지우지 않는다.**
+
+    `rmdir` 만 쓴다 — 비어 있지 않으면 그대로 둔다. 잎 이름이 QA 표식
+    (`2099타경QA`)일 때만 시작하고, 위로 올라가며 비는 껍데기만 걷어낸다.
+    저장소 밖을 지울 수도 있는 코드이므로 `rmtree` 를 쓰지 않는다.
+    """
+    cur = os.path.abspath(path)
+    for _ in range(4):          # 잎 + 껍데기 3단계면 충분하다
+        if not os.path.isdir(cur):
+            break
+        try:
+            os.rmdir(cur)       # 비어 있을 때만 성공한다
+        except OSError:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
 def test_never_escapes_document_root():
     print("\n--- 5. DOCUMENT_ROOT 밖으로 나가지 않는다 ---")
     import crawler.doc_paths as dp
@@ -133,6 +153,64 @@ def test_never_escapes_document_root():
         d2 = os.path.abspath(dp._doc_dir_path("법원", "2024타경1", value))
         check_true("문서 경로가 root 안 (item_no=%r)" % value[:18],
                    os.path.commonpath([d2, root]) == root, d2)
+
+    # ★ 셋째 조각 — **법원**도 흔든다 (2026-09-04).
+    #
+    #   위 두 루프는 `case_no` 와 `item_no` 만 흔들고 법원 자리는 "법원" 으로
+    #   고정한다. 그런데 `sanitize_path_segment()` 를 지나는 것도 그 둘뿐이고,
+    #   **법원 조각은 원문 그대로** `os.path.join()` 에 들어간다. 즉 위 주석이
+    #   *"사건번호만 막으면 절반이다"* 라고 적어 둔 그 자리에서 셋째가 빠져 있었다.
+    #
+    #   실측(2026-09-04, 가드 도입 전):
+    #       _doc_dir_path('..',            '2024타경1','1') -> <저장소>/2024타경1/1
+    #       _doc_dir_path('../../Windows', '2024타경1','1') -> <바탕화면>/Windows/...
+    #       _doc_dir_path('D:',            '2024타경1','1') -> D: 드라이브로 튄다
+    #
+    #   경로 **계산**은 지금도 밖을 가리킬 수 있다(정상 입력의 경로를 바꾸지 않기
+    #   위해 법원 조각을 치환하지 않기로 했다 — `get_doc_dir()` docstring 참고).
+    #   대신 **디스크를 바꾸는** `get_doc_dir()` 이 담김을 확인하고 거절한다.
+    #   그래서 여기서는 "계산이 밖을 가리키면 쓰기가 거절되는가" 를 본다.
+    hostile_courts = ["..", "../..", "..\\..\\Windows", "/etc", "D:",
+                      "\\\\server\\share"]
+    rejected = []
+    for court in hostile_courts:
+        calculated = os.path.abspath(dp._doc_dir_path(court, "2099타경QA", "1"))
+        try:
+            inside = os.path.commonpath([calculated, root]) == root
+        except ValueError:
+            inside = False          # 드라이브가 다르면 비교 자체가 안 된다 = 밖
+        if inside:
+            continue                # 이 값은 애초에 밖으로 못 나간다 - 볼 것 없다
+        try:
+            made = dp.get_doc_dir(court, "2099타경QA", "1")
+            check_true("★ 저장소 밖 쓰기가 거절된다 (court=%r)" % court[:18],
+                       False, "만들어 버렸다 -> %s" % made)
+        except ValueError:
+            rejected.append(court)
+        # 거절했으면 디스크에 흔적이 없어야 한다.
+        left = os.path.exists(calculated)
+        check_true("거절된 경로가 디스크에 생기지 않았다 (court=%r)" % court[:18],
+                   not left, calculated)
+        # ★ 붉어진 경우에도 **저장소 밖을 어지르지 않는다** (2026-09-04).
+        #   가드가 깨진 변이에서 이 루프는 실제로 `C:\\etc\\...` 같은 자리에
+        #   디렉터리를 만들었다. 실패한 검사가 파일시스템을 남기면 안 된다.
+        #   이름이 QA 표식인 잎과, 그 뒤 비는 부모만 지운다(rmdir 은 비어야 지운다).
+        if left:
+            _cleanup_probe_dir(calculated)
+    check_true("검사가 공허하지 않다 - 실제로 거절된 입력이 있다 (%d개)" % len(rejected),
+               len(rejected) >= 4, rejected)
+
+    # 대조군 — 정상 법원은 여전히 만들어진다(가드가 과하면 수집이 통째로 멈춘다).
+    ok_dir = dp.get_doc_dir("QA경로법원", "2099타경QA", "1")
+    check_true("대조군: 정상 법원은 그대로 만들어진다", os.path.isdir(ok_dir), ok_dir)
+    check_true("대조군: 그 경로는 root 안이다",
+               os.path.commonpath([os.path.abspath(ok_dir), root]) == root, ok_dir)
+    # 뒷정리 - 이 검사가 만든 것만 지운다(역순으로 빈 디렉터리만).
+    for d in (ok_dir, os.path.dirname(ok_dir), os.path.dirname(os.path.dirname(ok_dir))):
+        try:
+            os.rmdir(d)
+        except OSError:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +269,66 @@ def test_all_consumers_agree():
     # 대조군 — 뿌리가 실제로 저장소 안의 documents/ 인지도 본다(전부 같지만 엉뚱한 곳일 수 있다).
     expected = os.path.realpath(os.path.join(ROOT, "documents"))
     check("그 경로가 저장소의 documents/ 이다", distinct[0], expected)
+
+    # ★ 뿌리만 같은 것으로는 부족하다 — **경로 생성기 자체**를 대조한다 (2026-09-04).
+    #
+    #   위 검사는 `DOCUMENT_ROOT` 네 개가 같은 곳인지만 본다. 그런데 그 뿌리 위에
+    #   경로를 **조립하는 식**도 세 벌이었다:
+    #
+    #       crawler/doc_paths._doc_dir_path()
+    #       api/v1/documents.get_doc_dir()
+    #       repair_document_status.get_doc_dir()
+    #
+    #   셋 다 `join(root, court, sanitize(case), sanitize(item or '1'))` 를 손으로
+    #   적고 있었고, **이미 갈라져 있었다** — `repair_document_status` 만 법원 조각에
+    #   `or ""` 를 붙여, `court_name=None` 에서 예외 대신 **한 단계 위 경로**를 돌려줬다:
+    #
+    #       canon / api  ->  TypeError
+    #       repair       ->  <ROOT>/<사건>/<물건>      (조용히 틀렸고 root 안이라 담김 검사도 통과)
+    #
+    #   그 경로에 파일이 있으면 `repair_document_status` 가 엉뚱한 근거로
+    #   `document_status` 를 READY 로 바꾼다 — 그 스크립트가 없애려던 상태 그대로다.
+    #
+    #   2026-09-04 에 셋을 하나로 모았다. 여기서 그것을 고정한다.
+    probes = [
+        ("강릉지원", "2024타경3528", "1"),
+        ("서울중앙지방법원", "2024타경1451 / 2024타경32745", "2"),
+        ("법원", "a\\b", "1"),
+        ("법원", "..", "1"),
+        ("법원", "2024타경1", ""),
+        ("법원", "2024타경1", None),
+        ("", "2024타경1", "1"),
+        (None, "2024타경1", "1"),          # <- 갈라져 있던 바로 그 입력
+        ("   ", "2024타경1", "1"),
+    ]
+
+    def _call(fn, args):
+        """경로 문자열 또는 예외 이름. 둘 다 계약이므로 함께 비교한다."""
+        try:
+            return os.path.normpath(fn(*args))
+        except Exception as exc:            # noqa: BLE001 - 예외 종류도 계약이다
+            return "!" + type(exc).__name__
+
+    builders = [
+        ("crawler/doc_paths._doc_dir_path", dp._doc_dir_path),
+        ("api/v1/documents.get_doc_dir", _apidocs.get_doc_dir),
+        ("repair_document_status.get_doc_dir", _repair.get_doc_dir),
+    ]
+    disagreements = []
+    for args in probes:
+        answers = {name: _call(fn, args) for name, fn in builders}
+        if len(set(answers.values())) != 1:
+            disagreements.append((args, answers))
+    check("★ 세 경로 생성기가 모든 입력에서 같은 답을 낸다", disagreements, [])
+
+    # 검사가 공허하지 않다 — 정상 입력에서 실제 경로가 나오는지(전부 예외면 무의미).
+    normal = _call(dp._doc_dir_path, probes[0])
+    check_true("검사가 공허하지 않다 - 정상 입력이 실제 경로를 낸다",
+               not normal.startswith("!") and "강릉지원" in normal, normal)
+    # 그리고 셋이 실제로 **서로 다른 함수 객체**인지도 본다(같은 것을 세 번 부르면 공허하다).
+    check_true("검사가 공허하지 않다 - 서로 다른 세 진입점을 불렀다",
+               len({id(fn) for _, fn in builders}) == 3,
+               [n for n, _ in builders])
 
 
 # ---------------------------------------------------------------------------

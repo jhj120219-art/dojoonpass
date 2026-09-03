@@ -31,13 +31,37 @@ DOC_TYPE_FILES = {
 #   현재 실데이터에 역슬래시는 0건이라 지금 터지는 버그는 아니지만, 규칙이 두 벌인 상태
 #   자체를 없앤다. `crawler.doc_paths`는 selenium/DB/fastapi 무의존이라 여기서 import해도
 #   안전하다(`api/v1/images.py`가 `crawler.image_assets`를 쓰는 것과 같은 방식).
-from crawler.doc_paths import sanitize_path_segment  # noqa: E402
+from crawler.doc_paths import _doc_dir_path  # noqa: E402
 
 
 def get_doc_dir(court_name: str, case_no: str, item_no: str) -> str:
-    return os.path.join(DOCUMENT_ROOT, court_name,
-                        sanitize_path_segment(case_no),
-                        sanitize_path_segment(item_no or "1"))
+    """뷰어가 여는 문서 디렉터리. **디스크를 건드리지 않는다.**
+
+    ## 규칙을 여기서 다시 쓰지 않는다 (2026-09-04)
+
+    예전에는 이 함수가 `os.path.join(DOCUMENT_ROOT, court_name, sanitize(...),
+    sanitize(...))` 를 **손으로 한 번 더** 적고 있었다. `crawler/doc_paths.py` 의
+    `_doc_dir_path()` 와 글자까지 같은 식이었는데, 같은 식을 두 곳에 두면
+    한쪽만 고쳐지는 날이 온다 — 이 저장소는 그 사고를 이미 세 번 겪었다
+    (Sprint 145/153/160, `test_doc_path_safety.py` 7번 검사의 주석).
+
+    실제로 세 벌이 **이미 갈라져 있었다**(2026-09-04 실측). `court_name=None` 에서
+
+        crawler/doc_paths._doc_dir_path   TypeError
+        api/v1/documents.get_doc_dir      TypeError
+        repair_document_status.get_doc_dir  <ROOT>/<사건>/<물건>   <- 조용히 한 단계 위
+
+    셋째 것이 가장 나쁘다: 예외도 안 나고 DOCUMENT_ROOT **안**이라 담김 검사도
+    통과한다. 그 경로에 우연히 파일이 있으면 `document_status` 가 엉뚱한 근거로
+    READY 가 된다. 이제 셋 다 같은 함수를 부르므로 갈라질 자리가 없다.
+
+    `crawler.doc_paths` 는 selenium/DB/fastapi 무의존이라 여기서 import 해도 안전하다
+    (`api/v1/images.py` 가 `crawler.image_assets` 를 쓰는 것과 같은 방식).
+    `DOCUMENT_ROOT` 는 이 모듈에도 남겨 둔다 — 아래 담김 검사가 쓰고,
+    `test_doc_path_safety.py` 가 네 소비자의 뿌리가 같은 곳인지 대조한다.
+    """
+    # 뿌리는 **이 모듈 것**을 준다 - 테스트가 모듈별로 갈아 끼워 격리한다.
+    return _doc_dir_path(court_name, case_no, item_no, root=DOCUMENT_ROOT)
 
 
 @router.get("/item/{item_id}/documents/{doc_type}")

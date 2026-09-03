@@ -14,41 +14,47 @@ router = APIRouter()
 class FavoriteRequest(BaseModel):
     item_id: int
 
-def get_item_summary(conn, item_id: int) -> dict:
-    # SQLite INTEGER 범위 밖의 id는 어떤 행도 될 수 없다 — 그대로 넘기면 sqlite3이
-    # OverflowError를 던져 **로그인한 사용자가 500을 만들 수 있다**
-    # (2026-08-17 Sprint 154 실측: POST /favorites {"item_id": 2**63} -> 500).
-    # "없음"과 같은 뜻이므로 None을 돌려주고, 호출부의 기존 404 경로를 그대로 탄다.
+def item_exists(conn, item_id: int) -> bool:
+    """이 id 의 물건이 실제로 있는가. 담기 전 404 판정에만 쓴다.
+
+    ## 예전에는 `get_item_summary()` 였다 (2026-09-04 Frankenstein 감사)
+
+    그 함수는 `SELECT *` 로 행을 읽어 **14개 필드의 물건 응답 dict 를
+    조립했다.** 그런데 유일한 호출부(`add_favorite`)는 그 dict 를
+    `if not item:` 으로 **있다/없다만 보고 버렸다.** 응답에는 한 번도
+    실리지 않는다(`success({"item_id": ..., "created_at": ...})`).
+
+    생긴 경위가 남아 있다 — 예전에는 `GET /favorites` 가 관심물건 개수만큼
+    이 함수를 반복 호출해 목록을 만들었다(N+1). 그 경로가 단일 JOIN 으로
+    바뀌면서 **목록의 물건 모양은 `get_favorites()` 안으로 옮겨갔는데**
+    이 함수는 그대로 남았다. 그 뒤 목록 쪽에만 필드가 다섯 개 늘어
+    (`thumbnail_url` / `favorited_at` / `memo` / `tags` / `note_source`)
+    **같은 개념의 물건 모양이 두 벌로 갈라졌다.**
+
+    지금 고장난 것은 없지만 함정이다 — 이름이 더 그럴듯해서, "관심물건
+    응답에 필드를 더하자"는 사람이 **응답에 쓰이지도 않는 이쪽을** 고치기
+    쉽다. 그러면 아무 일도 일어나지 않고, 오류도 나지 않는다.
+
+    그래서 **하는 일만 남긴다.** 같은 판정을 하는 정본이 이미 있고
+    (`api/v1/favorite_import.py:_commit_one()` 의 `SELECT 1 ... WHERE id = ?`),
+    이제 둘은 **같은 모양**이다.
+
+    SQLite INTEGER 범위 밖의 id 는 어떤 행도 될 수 없다 — 그대로 넘기면 sqlite3 이
+    OverflowError 를 던져 **로그인한 사용자가 500 을 만들 수 있다**
+    (2026-08-17 Sprint 154 실측: POST /favorites {"item_id": 2**63} -> 500).
+    "없음"과 같은 뜻이므로 False 를 돌려주고, 호출부의 기존 404 경로를 그대로 탄다.
+    """
     if not is_sqlite_int(item_id):
-        return None
-    row = conn.execute(
-        "SELECT * FROM auction_item WHERE id = ?", (item_id,)
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "case_no": row["case_no"],
-        "item_no": row["item_no"],
-        "court_name": row["court_name"],
-        "property_type": row["property_type"],
-        "sido": row["sido"],
-        "sigungu": row["sigungu"],
-        "full_address": row["full_address"],
-        "appraisal_price": row["appraisal_price"],
-        "minimum_bid_price": row["minimum_bid_price"],
-        "bid_rate": row["bid_rate"],
-        "auction_date": row["auction_date"],
-        "status": row["status"],
-        "fail_count": row["fail_count"],
-    }
+        return False
+    return conn.execute(
+        "SELECT 1 FROM auction_item WHERE id = ?", (item_id,)
+    ).fetchone() is not None
 
 @router.post("/favorites")
 def add_favorite(req: FavoriteRequest, user_id: str = Depends(get_current_user)):
     conn = get_connection()
     try:
-        item = get_item_summary(conn, req.item_id)
-        if not item:
+        if not item_exists(conn, req.item_id):
             raise HTTPException(status_code=404, detail="물건을 찾을 수 없습니다")
         now = datetime.now().isoformat()
         try:
@@ -93,7 +99,7 @@ def remove_favorite(item_id: int, user_id: str = Depends(get_current_user)):
 def get_favorites(user_id: str = Depends(get_current_user)):
     conn = get_connection()
     try:
-        # get_item_summary()를 즐겨찾기 개수만큼 반복 호출하던 N+1 쿼리를 단일 JOIN으로 교체
+        # 예전에 관심물건 개수만큼 행별 조회를 반복하던 N+1 쿼리를 단일 JOIN으로 교체
         # (recent_items.py:get_recent_items()와 동일한 패턴). 응답 필드/순서는 기존과 동일하게 유지.
         # ★ LEFT JOIN이어야 한다 (2026-08-23 Sprint 267, api/v1/admin.py:320의 registry_requests
         #   LEFT JOIN과 동일한 이유). INNER JOIN이면 `auction_item` 행이 없어진 관심물건이

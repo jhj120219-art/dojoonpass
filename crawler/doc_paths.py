@@ -67,16 +67,64 @@ def sanitize_path_segment(value: str) -> str:
     return safe
 
 
-def _doc_dir_path(court_code: str, case_no: str, item_no: str = "1") -> str:
+def _doc_dir_path(court_code: str, case_no: str, item_no: str = "1",
+                  root: Optional[str] = None) -> str:
     """경로만 계산한다. **디스크를 건드리지 않는다.**
 
     2026-08-14 분리. 경로 규칙은 여기 한 곳에만 두고, `get_doc_dir()`은 여기에
     디렉터리 생성을 얹는다 — 규칙이 두 벌이 되면 "쓰는 곳과 읽는 곳이 다른 경로를
     보는" 이 저장소의 단골 결함이 된다.
+
+    ## `root` 인자 (2026-09-04)
+
+    **이 함수가 이 저장소의 유일한 문서 경로 규칙이다.** 2026-09-04 에
+    `api/v1/documents.py` 와 `repair_document_status.py` 가 각자 갖고 있던 같은
+    식을 여기로 모았다(그 셋은 `court_name=None` 에서 이미 갈라져 있었다).
+
+    그런데 뿌리(`DOCUMENT_ROOT`)는 모듈마다 따로 계산한다 — 파일 깊이가 달라
+    표현식이 다르고, **테스트가 모듈별로 그 값을 갈아 끼워 격리한다**
+    (`test_rights_data_load.py:Env` 가 `api.v1.documents.DOCUMENT_ROOT` 를 돌린다).
+    그래서 규칙만 공유하고 **뿌리는 호출자가 준다.** 안 주면 이 모듈 것을 쓴다.
+
+    네 모듈의 뿌리가 같은 곳을 가리키는지는
+    `test_doc_path_safety.py:test_all_consumers_agree()` 가 따로 대조한다.
     """
-    return os.path.join(DOCUMENT_ROOT, court_code,
+    return os.path.join(DOCUMENT_ROOT if root is None else root, court_code,
                         sanitize_path_segment(case_no),
                         sanitize_path_segment(item_no or "1"))
+
+
+def is_inside_document_root(path: str, root: Optional[str] = None) -> bool:
+    """`path` 가 문서 뿌리 안인가. 판정할 수 없으면 **밖으로 본다.**
+
+    이 저장소의 **담김 규칙 정본**이다 — `realpath` 로 편 뒤 `commonpath` 로 본다.
+    드라이브가 다르면 Windows 의 `commonpath` 는 ValueError 를 낸다
+    (`docs/BUGS.md` #229). 그것도 "밖"이다.
+
+    ## 왜 여기인가 (2026-09-04)
+
+    같은 규칙이 `crawler/image_assets.py:is_inside_document_root()` 에도 있었다
+    (2026-08-18 Sprint 192, BUGS #131 — 사진 **삭제** 경로를 막으려고 만든 것).
+    2026-09-04 에 문서·사진 **쓰기** 경로에도 같은 가드가 필요해졌을 때,
+    하마터면 같은 규칙의 두 번째 판본을 만들 뻔했다(실제로 한 번 만들었다가
+    되돌렸다). 이 저장소가 반복해서 경계하는 그것이다.
+
+    그래서 규칙은 여기 하나만 두고, `image_assets` 쪽은 **이름을 유지한 채**
+    이 함수에 위임한다(그 이름은 공개 API 이고 `test_asset_pipeline.py` 가
+    소스까지 대조한다). 뿌리는 모듈마다 다를 수 있어 `root` 로 받는다 —
+    `_doc_dir_path()` 가 같은 이유로 `root` 를 받는 것과 짝이다.
+
+    ★ `api/v1/documents.py` / `api/v1/images.py` 의 인라인 검사는 **합치지 않았다.**
+      그 둘은 판정 뒤 곧바로 `HTTPException(404)` 를 던지는 요청 처리 코드라,
+      순수 판정 함수로 뽑으면 호출부에 분기만 늘어난다. 대신
+      `test_doc_path_safety.py` 가 저장소의 모든 `commonpath` 사용처를 훑어
+      ValueError 처리를 강제한다(그 검사가 이미 있다).
+    """
+    base = os.path.realpath(DOCUMENT_ROOT if root is None else root)
+    try:
+        return os.path.commonpath([base, os.path.realpath(path)]) == base
+    except (ValueError, OSError):
+        return False
 
 
 def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
@@ -85,8 +133,54 @@ def get_doc_dir(court_code: str, case_no: str, item_no: str = "1") -> str:
     쓰기 직전에 부르는 용도다(`doc_crawler`의 spec/status/appraisal 저장 4곳,
     `collect_documents`의 최종 경로). 조회만 할 때는 `_doc_dir_path()`를 쓴다 —
     아래 `doc_exists()`가 그렇게 한다.
+
+    ## ★ 2026-09-04 — **쓰는 쪽에만 담김 검사가 없었다**
+
+    이 저장소는 문서 경로를 세 조각으로 만든다. 그런데 `sanitize_path_segment()` 를
+    지나는 것은 **사건번호와 물건번호 둘뿐**이고, **법원 조각은 원문 그대로**
+    `os.path.join()` 에 들어간다. 실측(2026-09-04):
+
+        get_doc_dir("..",            "2024타경1", "1")  -> <저장소>/2024타경1/1
+        get_doc_dir("../../Windows",  "2024타경1", "1")  -> <바탕화면>/Windows/2024타경1/1
+        get_doc_dir("D:",            "2024타경1", "1")  -> D:2024타경1 (드라이브가 바뀐다)
+
+    읽는 쪽은 전부 막혀 있었다 — 서빙(`api/v1/documents.py`, `api/v1/images.py`)과
+    보정 판정(`repair_document_status.py`)은 각자 `realpath`+`commonpath` 로
+    DOCUMENT_ROOT 담김을 확인한다. **그런데 실제로 디스크를 바꾸는 이 함수에만
+    그 검사가 없었다.** 즉 방어가 정확히 거꾸로 걸려 있었다 — 읽기는 못 새고
+    쓰기는 저장소 밖에 디렉터리를 만들 수 있었다.
+
+    `test_doc_path_safety.py` 의 탈출 검사도 `case_no` 와 `item_no` 만 흔든다
+    (그 파일의 주석이 *"item_no 쪽도 같은 방어가 필요하다(사건번호만 막으면
+    절반이다)"* 라고 적어 둔 그 자리에서, 남은 **셋째 조각**이 빠져 있었다).
+
+    이 저장소는 이미 `documents/` 안에 빈 디렉터리 1,674개를 만든 사고를 겪었다
+    (BUGS #111). 그것은 **안쪽**이었다. 이 자리는 **바깥**이다.
+
+    ## 지금 터지는 버그는 아니다
+
+    법원 조각의 출처는 `config/courts.py:ALL_COURTS`(하드코딩 60개)이고,
+    실데이터 전수(2026-09-04: `auction_item.court_name` / `document_queue.court_code` /
+    `auction_case.court_code` / `auction.court_code` 각 60종)에 `/` `\\` `:`
+    선행점·양끝공백이 **0건**이다. 그래서 이 가드는 **정상 입력의 동작을 하나도
+    바꾸지 않는다.** 원천이 예상 밖 값을 주는 날을 막는 것이다.
+
+    ## 왜 경로를 고치지 않고 거절하는가
+
+    법원 조각을 `sanitize_path_segment()` 로 바꾸면 `"D:"` 같은 값은 여전히
+    통과하고(구분자가 없다), 무엇보다 **이미 저장된 문서의 경로가 달라질 수 있다.**
+    담김만 확인하면 정상 입력의 경로는 한 글자도 바뀌지 않으면서 바깥 쓰기만 막힌다.
+
+    모르는 `doc_type` 에 그럴듯한 답을 지어내지 않는 `doc_exists()` 와 같은 태도다 —
+    **경로를 만들 수 없으면 만들지 않는다.**
     """
     path = _doc_dir_path(court_code, case_no, item_no)
+    if not is_inside_document_root(path):
+        raise ValueError(
+            "문서 디렉터리가 DOCUMENT_ROOT 밖을 가리킨다 - 만들지 않는다 "
+            "(court=%r, case_no=%r, item_no=%r, path=%r)"
+            % (court_code, case_no, item_no, path)
+        )
     os.makedirs(path, exist_ok=True)
     return path
 

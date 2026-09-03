@@ -643,6 +643,164 @@ def test_document_status_vocabulary_is_declared_in_one_place():
 
 
 
+def test_unsupported_repair_never_touches_confirmed_answers():
+    """`repair_unsupported_status_docs.py` 가 **덮으면 안 되는 행**을 대상에 넣지 않는가.
+
+    ## 실제로 넣고 있었다 (2026-09-04 실측, 운영 DB 스냅샷)
+
+        FAILED 로 바꿀 대상 12행  <- **전부 doc_type='IMAGE'**
+          그중 status='NO_IMAGE'  3행
+
+    두 가지가 겹쳐 있었다.
+
+    (1) **사진이 흘러들었다.** 이 스크립트의 전제는 "상세페이지 수집 버튼 id 를
+        몰라서 못 받는 문서"다. 그런데 `get_doc_button_id()` 가 None 을 주는 이유는
+        둘이다 — (a) 버튼 id 를 모른다, (b) 버튼이라는 개념이 없다. 사진이 (b)인데
+        루프가 둘을 구별하지 않았다. Sprint 144 가 `IMAGE` 를 `document_status` 와
+        `QUEUE_TO_DOC_STATUS_TYPE` 에 넣는 순간 조용히 대상이 됐다 — 그 파일 상단이
+        *"대상이 0건이 됐다, 설계가 의도대로 동작한 사례"* 라고 적어 둔 **뒤에** 벌어졌다.
+
+    (2) **덮지 않을 상태를 손으로 적었다.** `== "READY"` 였는데 정본은
+        `storage/database.py:DOC_STATUS_HAS_ARTIFACT`(READY + NO_IMAGE)다.
+        `NO_IMAGE` 는 실패가 아니라 *"법원이 사진을 제공하지 않는다"* 는
+        **확인된 답**이고 재시도해도 같다. FAILED 로 뒤집으면 화면은 '수집실패'가
+        되고 큐는 영원히 다시 시도한다.
+
+    합성 DB 로 두 성질을 함께 고정한다(운영 데이터의 우연에 기대지 않는다).
+    """
+    print("\n--- 미지원 문서 보정이 확인된 답을 덮지 않는가 ---")
+    import importlib.util as iu
+    from storage.database import DOC_STATUS_HAS_ARTIFACT
+
+    db, path = fresh_db()
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    # ★ `document_status` 는 (item_id, doc_type) 이 UNIQUE 다. 한 물건에 같은 종류를
+    #   여러 상태로 심으면 INSERT OR REPLACE 가 접어 버린다(처음 짰을 때 5행이 2행이
+    #   됐고, 바로 아래 '공허하지 않다' 검사가 그것을 잡았다). 조합마다 물건을 새로 만든다.
+    seeded = [("IMAGE", "NO_IMAGE"), ("IMAGE", "COLLECTING"),
+              ("IMAGE", "READY"), ("SPEC", "READY"), ("SPEC", "COLLECTING")]
+    item_ids = []
+    c = sqlite3.connect(path)
+    try:
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO auction_case (court_code, case_no, created_at, updated_at)"
+                  " VALUES ('QA법원','2099타경1',?,?)", (now, now))
+        case_id = c.execute(
+            "SELECT id FROM auction_case WHERE case_no='2099타경1'").fetchone()[0]
+        for idx, (dt, st) in enumerate(seeded, start=1):
+            c.execute("INSERT INTO auction_item (case_id, case_no, item_no, court_name,"
+                      " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                      (case_id, '2099타경1', str(idx), 'QA법원', now, now))
+            iid = c.execute("SELECT id FROM auction_item WHERE case_id=? AND item_no=?",
+                            (case_id, str(idx))).fetchone()[0]
+            item_ids.append(iid)
+            c.execute("INSERT INTO document_status"
+                      " (item_id, doc_type, status, updated_at) VALUES (?,?,?,?)",
+                      (iid, dt, st, now))
+        c.commit()
+    finally:
+        c.close()
+
+    spec = iu.spec_from_file_location(
+        "rusd_qa", os.path.join(root, "repair_unsupported_status_docs.py"))
+    m = iu.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        targets, skipped, total = m.plan(conn)
+    finally:
+        conn.close()
+
+    # 검사가 공허하지 않다 — 심은 행이 실제로 보인다.
+    conn = sqlite3.connect(path)
+    try:
+        marks = ",".join("?" * len(item_ids))
+        rows_seen = conn.execute(
+            "SELECT COUNT(*) FROM document_status WHERE item_id IN (%s)" % marks,
+            item_ids).fetchone()[0]
+    finally:
+        conn.close()
+    check("검사가 공허하지 않다 - 심은 상태 행이 있다", rows_seen, len(seeded))
+    check_true("검사가 공허하지 않다 - NO_IMAGE 를 실제로 심었다",
+               "NO_IMAGE" in DOC_STATUS_HAS_ARTIFACT, sorted(DOC_STATUS_HAS_ARTIFACT))
+
+    # (1) 산출물이 있는 상태는 **절대** 대상이 아니다.
+    bad_status = sorted({t["status"] for t in targets} & set(DOC_STATUS_HAS_ARTIFACT))
+    check("★ 산출물이 있는 상태(READY/NO_IMAGE)를 대상에 넣지 않는다", bad_status, [])
+
+    # (2) 수집 버튼 개념이 없는 종류(IMAGE)는 이 스크립트의 소관이 아니다.
+    bad_types = sorted({t["doc_type"] for t in targets if t["doc_type"] == "IMAGE"})
+    check("★ 사진(IMAGE)을 미지원 문서로 분류하지 않는다", bad_types, [])
+
+    # 버튼 종류 정본과 어긋나지 않는다.
+    from config.settings import DOC_BUTTON_DOC_TYPES
+    check("버튼 있는 종류 정본이 사진을 포함하지 않는다",
+          sorted(DOC_BUTTON_DOC_TYPES), ["appraisal", "spec", "status"])
+    print("    대상 %d행 / 산출물 보유로 건너뜀 %d행 / 미지원 총 %d행"
+          % (len(targets), skipped, total))
+
+    # ------------------------------------------------------------------
+    # (2)번을 **독립적으로** 태운다.
+    #
+    #   위 블록만으로는 부족했다 — (1)번 수정이 사진을 먼저 걸러 내므로 상태 분기에
+    #   도달하는 행이 없고, 그래서 `DOC_STATUS_HAS_ARTIFACT` 를 `== "READY"` 로
+    #   되돌리는 변이가 **살아남았다**(2026-09-04 확인). 공허한 검사였다.
+    #
+    #   이 스크립트의 원래 대상은 "버튼을 가진 종류인데 그 item_no 의 버튼 id 를
+    #   모르는 경우"다. 지금 실코드에서는 그런 조합이 없으므로(전부 id 를 안다)
+    #   판정 함수만 그 상황으로 바꿔 상태 분기를 직접 태운다.
+    #   **규칙을 베끼는 것이 아니라 전제를 만드는 것**이다 - 대상 선정은 그대로 제품 코드가 한다.
+    db2, path2 = fresh_db()
+    spec2 = iu.spec_from_file_location(
+        "rusd_qa2", os.path.join(root, "repair_unsupported_status_docs.py"))
+    m2 = iu.module_from_spec(spec2)
+    spec2.loader.exec_module(m2)
+    m2.get_doc_button_id = lambda doc_type, item_no: None   # 버튼 id 미확보 상황
+
+    seeded2 = [("SPEC", "READY"), ("SPEC", "NO_IMAGE"), ("SPEC", "COLLECTING")]
+    ids2 = []
+    c = sqlite3.connect(path2)
+    try:
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO auction_case (court_code, case_no, created_at, updated_at)"
+                  " VALUES ('QA법원','2099타경2',?,?)", (now, now))
+        cid = c.execute(
+            "SELECT id FROM auction_case WHERE case_no='2099타경2'").fetchone()[0]
+        for idx, (dt, st) in enumerate(seeded2, start=1):
+            c.execute("INSERT INTO auction_item (case_id, case_no, item_no, court_name,"
+                      " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                      (cid, '2099타경2', str(idx), 'QA법원', now, now))
+            iid = c.execute("SELECT id FROM auction_item WHERE case_id=? AND item_no=?",
+                            (cid, str(idx))).fetchone()[0]
+            ids2.append(iid)
+            c.execute("INSERT INTO document_status"
+                      " (item_id, doc_type, status, updated_at) VALUES (?,?,?,?)",
+                      (iid, dt, st, now))
+        c.commit()
+    finally:
+        c.close()
+
+    conn = sqlite3.connect(path2)
+    conn.row_factory = sqlite3.Row
+    try:
+        t2, skipped2, total2 = m2.plan(conn)
+    finally:
+        conn.close()
+
+    # 검사가 공허하지 않다 — 이번에는 상태 분기에 **실제로 도달**한다.
+    check("검사가 공허하지 않다 - 미지원으로 잡힌 행이 있다", total2, len(seeded2))
+    check_true("검사가 공허하지 않다 - 대상이 하나는 나온다(COLLECTING)",
+               len(t2) >= 1, [(x["doc_type"], x["status"]) for x in t2])
+
+    got = sorted((x["doc_type"], x["status"]) for x in t2)
+    check("★ READY / NO_IMAGE 는 건너뛰고 COLLECTING 만 대상이다",
+          got, [("SPEC", "COLLECTING")])
+    check("★ 산출물 보유로 건너뛴 행이 정확히 둘이다(READY + NO_IMAGE)", skipped2, 2)
+
+
 if __name__ == "__main__":
     try:
         test_claim_cas_rejects_row_taken_meanwhile()
@@ -653,6 +811,7 @@ if __name__ == "__main__":
         test_resume_position()
         test_queue_status_vocabulary_is_declared_in_one_place()
         test_document_status_vocabulary_is_declared_in_one_place()
+        test_unsupported_repair_never_touches_confirmed_answers()
     finally:
         for d in _TMP:
             shutil.rmtree(d, ignore_errors=True)

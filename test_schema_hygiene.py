@@ -5217,6 +5217,112 @@ def test_onedrive_conflict_copies_do_not_grow():
         print("      -> 정리는 사람이 한다: 각 쌍에서 어느 쪽이 최신인지 고른 뒤"
               " `git rm --cached` 로 추적에서 뺀다. 자동으로 지우지 않는다.")
 
+    # ------------------------------------------------------------------
+    # ★ 그런데 "어느 쪽이 최신인가"는 **기계가 대신 대답할 수 있다**
+    #   (2026-09-04, Frankenstein 전수 감사)
+    #
+    # 바로 위 검사는 **개수만** 센다. 그래서 이 부채는 지금까지 "사람이 둘을
+    # 읽고 골라야 한다"로 영구히 미뤄졌다. 그런데 그 판단은 사실 사람이
+    # 읽을 필요가 없다 — 사본의 내용이 정본의 **어느 과거 커밋과
+    # 바이트까지 같으면**, 그 사본은 git 이 이미 보관하고 있는 판본이므로
+    # 지워도 잃을 것이 없다.
+    #
+    # 반대로 어느 과거 판본과도 일치하지 않으면, 그 사본에는 **정본에도
+    # 이력에도 없는 내용**이 있다. OneDrive 가 두 머신의 변경을 보고 사본을
+    # 만들었는데 **사본 쪽이 새 작업**이고 정본이 되돌려진 판본인 경우가
+    # 그것이다. 그때 사본을 지우면 그 작업은 어디에도 없다.
+    #
+    # 그래서 둘을 **가른다.** 지우라고 하지 않는다(파일 삭제는 승인 영역,
+    # docs/CLAUDE.md) — 사람이 무엇을 결정해야 하는지를 **정확히** 알려 줌 뿐이다.
+    # ------------------------------------------------------------------
+    def _blob_of_worktree(rel):
+        try:
+            r = subprocess.run(["git", "hash-object", "--", rel], cwd=root,
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def _historical_blobs(rel):
+        """rel 이 역사상 가졌던 **모든** blob 해시. 못 읽으면 None."""
+        try:
+            rv = subprocess.run(["git", "rev-list", "--all", "--", rel], cwd=root,
+                                capture_output=True, text=True, timeout=60)
+            if rv.returncode != 0:
+                return None
+            commits = [c for c in rv.stdout.split() if c]
+            if not commits:
+                return set()
+            probe = "".join("%s:%s\n" % (c, rel) for c in commits)
+            cf = subprocess.run(["git", "cat-file", "--batch-check=%(objectname)"],
+                                cwd=root, input=probe, capture_output=True,
+                                text=True, timeout=60)
+            if cf.returncode != 0:
+                return None
+            return set(ln.strip() for ln in cf.stdout.splitlines()
+                       if ln.strip() and " " not in ln.strip())
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    stale = []        # 정본의 과거 판본 - 지워도 잃을 것이 없다
+    unique = []       # ★ 정본 이력 어디에도 없는 내용 - 지우면 잃는다
+    undecidable = []  # 정본을 찾을 수 없다(산출물 등)
+    for c in conflicts:
+        canon_base = re.sub(r"-DESKTOP-[A-Z0-9]+", "", os.path.basename(c))
+        canon = (os.path.dirname(c) + "/" + canon_base).lstrip("/")
+        if canon == c or not os.path.exists(
+                os.path.join(root, canon.replace("/", os.sep))):
+            undecidable.append((c, canon))
+            continue
+        mine = _blob_of_worktree(c)
+        past = _historical_blobs(canon)
+        if mine is None or past is None:
+            undecidable.append((c, canon))
+            continue
+        if mine in past or mine == _blob_of_worktree(canon):
+            stale.append((c, canon))
+        else:
+            unique.append((c, canon))
+
+    for c, canon in stale:
+        print("      (과거 판본) %-44s == 정본 %s 의 옛 커밋" % (c, canon))
+    for c, canon in undecidable:
+        print("      (판정 보류) %-44s 정본 %s 를 확인할 수 없다" % (c, canon))
+    for c, canon in unique:
+        print("      ★ (고유 내용) %-40s 정본 %s 의 어떤 판본과도 다르다" % (c, canon))
+
+    # 검사가 공허하지 않다 - 사본이 있는데 한 건도 분류하지 못했다면
+    # "깨끗하다"가 아니라 "재지 못했다"다(이 파일의 기존 관례와 같다).
+    if conflicts:
+        check_true("검사가 공허하지 않다 - 사본을 실제로 분류했다 (%d/%d)"
+                   % (len(stale) + len(unique), len(conflicts)),
+                   (len(stale) + len(unique)) > 0,
+                   "git 이력을 읽지 못했다 - 이 검사는 지금 아무것도 보장하지 않는다")
+
+    check("★ 정본 이력에 없는 내용을 가진 충돌 사본이 없다",
+          sorted(c for c, _ in unique), [])
+    if unique:
+        print("      -> 이 사본은 **지우면 잃는다.** 정본이 되돌려졌거나"
+              " 사본 쪽에만 새 작업이 있다. 먼저 병합해야 한다.")
+    if stale and not unique:
+        print("      -> 추적 중인 사본 %d개가 전부 정본의 과거 판본이다."
+              " `git rm --cached` 로 빼도 **잃는 내용이 없다**"
+              " (실행은 사람의 승인 영역)." % len(stale))
+
+    # 자기 검증 - 판정기가 실제로 동작한다.
+    if conflicts:
+        _probe = conflicts[0]
+        _cb = re.sub(r"-DESKTOP-[A-Z0-9]+", "", os.path.basename(_probe))
+        _canon = (os.path.dirname(_probe) + "/" + _cb).lstrip("/")
+        _past = _historical_blobs(_canon)
+        if _past:
+            check_true("자기 검증: 정본의 현재 blob 을 읽었다",
+                       _blob_of_worktree(_canon) is not None, _canon)
+            check_true("자기 검증: 존재하지 않는 blob 은 이력에서 못 찾는다",
+                       ("0" * 40) not in _past, _canon)
+            check_true("자기 검증: 이력을 실제로 모았다(1개 이상)",
+                       len(_past) >= 1, len(_past))
+
 
 # ---------------------------------------------------------------------------
 # 제품 모듈 이름을 **가리는 낡은 사본**이 있는가 (2026-08-27, docs/BUGS.md #262)
@@ -5380,6 +5486,13 @@ KNOWN_DUPLICATE_SYMBOLS = {
     "extract_fail_count":   "filter_engine 은 어떤 진입점도 부르지 않는 진단 경로",
     "load_item":            "권리/명세 로더가 각자 다른 표를 읽는다",
     "purge_orphans":        "권리/명세 로더가 각자 다른 표를 지운다",
+    # 2026-09-04 추가. 규칙 자체는 `crawler/doc_paths.py` 하나뿐이고 사진 쪽은
+    # **위임만** 한다(본문에 commonpath 가 없다). 그런데 `def` 를 지울 수는 없다 —
+    # 뿌리(DOCUMENT_ROOT)를 **호출 시점**에 읽어야 하기 때문이다. partial 로 묶으면
+    # import 시점 값이 굳어 모듈별 뿌리를 갈아 끼우는 테스트 격리가 조용히 죽는다
+    # (audit_asset_integrity.py 가 경고해 둔 그 함정). 계약은
+    # test_asset_pipeline.py 가 고정한다 — 위임 여부(소스) + 두 진입점의 답 일치(행위).
+    "is_inside_document_root": "규칙은 doc_paths 한 곳 / 사진 쪽은 뿌리만 바인딩하는 위임 - test_asset_pipeline.py 가 고정",
 }
 
 

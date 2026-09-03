@@ -83,7 +83,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import get_doc_button_id
-from storage.database import QUEUE_TO_DOC_STATUS_TYPE
+from storage.database import (QUEUE_TO_DOC_STATUS_TYPE,  # noqa: E402
+                             DOC_STATUS_HAS_ARTIFACT)
+from config.settings import DOC_BUTTON_DOC_TYPES  # noqa: E402
 
 # ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
 #   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
@@ -109,12 +111,39 @@ def plan(conn):
         queue_type = DS_TO_QUEUE.get((r["doc_type"] or "").upper())
         if not queue_type:
             continue
+        # ★★ 2026-09-04 — **수집 버튼이라는 개념이 있는 종류만** 본다.
+        #
+        #   이 스크립트의 전제는 "버튼 id 를 몰라서 못 받는 문서" 다. 그런데
+        #   `get_doc_button_id()` 가 None 을 돌려주는 이유는 **두 가지**다:
+        #
+        #       (a) 이 종류의 버튼 id 를 아직 모른다      <- 이 스크립트의 대상
+        #       (b) 이 종류에는 버튼이라는 것이 아예 없다  <- 대상이 아니다
+        #
+        #   사진(image)이 (b)다. 캐러셀에서 긁어오지 버튼을 누르지 않는다.
+        #   그런데 Sprint 144 가 `IMAGE` 를 `document_status` 와
+        #   `QUEUE_TO_DOC_STATUS_TYPE` 에 넣으면서, 둘을 구별하지 않던 이 루프에
+        #   **사진이 통째로 흘러들었다.** 이 파일 상단이 "대상이 0건이 됐다,
+        #   설계가 의도대로 동작한 사례"라고 적어 둔 뒤에 조용히 벌어진 일이다.
+        #
+        #   실측(2026-09-04, 운영 DB 스냅샷): 대상 12행이 **전부 IMAGE** 였고
+        #   그중 3행이 `NO_IMAGE` 였다. `--apply` 했다면 "법원이 사진을 제공하지
+        #   않는다"는 **확인된 답**이 "수집실패"로 뒤집혔을 것이다.
+        #
+        #   버튼을 가진 종류의 정본은 `config/settings.py:_BASE_BTN_ID` 다
+        #   (그 표를 `DOC_BUTTON_DOC_TYPES` 로 노출했다). 여기 목록을 베끼지 않는다 —
+        #   이 파일이 처음부터 지켜 온 "판정은 코드에 물어본다" 원칙 그대로다.
+        if queue_type not in DOC_BUTTON_DOC_TYPES:
+            continue
         # ★ 판정은 코드에 물어본다(규칙 복제 금지).
         if get_doc_button_id(queue_type, r["item_no"]) is not None:
             continue
         unsupported_total += 1
-        if r["status"] == "READY":
-            # 실제로 파일이 있는 경우다. 절대 덮지 않는다.
+        if r["status"] in DOC_STATUS_HAS_ARTIFACT:
+            # ★ 2026-09-04 — 예전에는 `== "READY"` 라고 손으로 적었다.
+            #   덮으면 안 되는 상태의 정본은 `storage/database.py` 의
+            #   `DOC_STATUS_HAS_ARTIFACT`(READY + NO_IMAGE)이고, `mark_queue_failed()`
+            #   가 이미 그것을 쓴다. 여기만 사본이라 `NO_IMAGE` 가 빠져 있었다.
+            #   `NO_IMAGE` 는 실패가 아니라 **확인된 답**이다(재시도해도 같다).
             skipped_ready += 1
             continue
         if r["status"] == "FAILED":
