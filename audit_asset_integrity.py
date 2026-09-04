@@ -43,6 +43,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from crawler.doc_paths import DOC_REQUIRED_FILES, _doc_dir_path
 from crawler.image_assets import list_stored_images
 import storage.database as _db
+from api.constants import DocumentStatus, DocumentType
+
+# 상태값/문서종류는 **정본에서 가져와 바인딩한다** (2026-09-04).
+#
+#   감사기에서 리터럴 오타는 예외가 아니라 **0행 매치**이고, 0행 매치는
+#   이 파일에서 곧 "어긋남 없음" 이다. 즉 오타 하나가 감사기를 **거짓 초록**
+#   으로 만든다 - 결함을 못 찾는 것이 아니라 **찾았다고 말한다.**
+#   (`test_queue_safety_invariants.py` 가 큐 어휘에서 감사 질의까지 훑는
+#    이유와 같다. 같은 규칙을 화면 어휘에도 적용한다.)
+_READY = DocumentStatus.READY.value
+# 사진(IMAGE)은 문서 감사 대상이 아니다 - 단일 파일이 없고 `auction_image`
+# 행이 근거다. 그 판정을 문자열로 적지 않는다.
+_IMAGE = DocumentType.IMAGE.value
+# "볼 수 있는 자산이 있다"의 정본은 storage/database 에 하나뿐이다.
+_HAS_ARTIFACT = tuple(_db.DOC_STATUS_HAS_ARTIFACT)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SAMPLE = 8          # 각 항목당 출력할 예시 개수
@@ -255,8 +270,8 @@ def audit_documents(conn):
         FROM document_status ds
         JOIN auction_item ai ON ds.item_id = ai.id
         JOIN auction_case ac ON ai.case_id = ac.id
-        WHERE ds.status = 'READY' AND ds.doc_type <> 'IMAGE'
-    """).fetchall()
+        WHERE ds.status = ? AND ds.doc_type <> ?
+    """, (_READY, _IMAGE)).fetchall()
 
     broken = []
     for r in ready:
@@ -305,11 +320,11 @@ def audit_documents(conn):
         FROM document_status ds
         JOIN auction_item ai ON ds.item_id = ai.id
         JOIN auction_case ac ON ai.case_id = ac.id
-        WHERE ds.status = 'READY' AND ds.doc_type <> 'IMAGE'
+        WHERE ds.status = ? AND ds.doc_type <> ?
           AND NOT EXISTS (SELECT 1 FROM doc_raw dr
                           WHERE dr.item_id = ds.item_id
                             AND dr.doc_type = ds.doc_type)
-    """).fetchall()
+    """, (_READY, _IMAGE)).fetchall()
     _head("[4-b] READY 인데 doc_raw 행이 없다 (BUGS #144)")
     print("    %d개" % len(no_raw))
     for r in no_raw[:SAMPLE]:
@@ -413,11 +428,11 @@ def audit_queue_vs_status(conn):
         JOIN auction_item ai ON ai.case_id = ac.id AND ai.item_no = dq.item_no
         JOIN document_status ds ON ds.item_id = ai.id
                                AND ds.doc_type = UPPER(dq.doc_type)
-        WHERE (dq.status = ? AND ds.status NOT IN ('READY', 'NO_IMAGE'))
-           OR (dq.status IN (?, ?) AND ds.status = 'READY')
+        WHERE (dq.status = ? AND ds.status NOT IN (?, ?))
+           OR (dq.status IN (?, ?) AND ds.status = ?)
         GROUP BY dq.status, ds.status
-    """, (_db.QUEUE_STATUS_DONE, _db.QUEUE_STATUS_PENDING,
-          _db.QUEUE_STATUS_REFRESH)).fetchall()
+    """, (_db.QUEUE_STATUS_DONE,) + _HAS_ARTIFACT
+       + (_db.QUEUE_STATUS_PENDING, _db.QUEUE_STATUS_REFRESH, _READY)).fetchall()
 
     _head("[5] document_queue <-> document_status")
     if not rows:
@@ -427,8 +442,14 @@ def audit_queue_vs_status(conn):
         print("      큐=%s 화면=%s : %d행" % (r["q"], r["s"], r["n"]))
     # ★ 'pending + READY' 는 **정상**일 수 있다 — 재수집 대기 중인 문서는 여전히
     #   보여 줄 수 있다(BUGS #122 의 결정). 그래서 건수만 보고하고 결함으로 세지 않는다.
+    # ★ 위 질의가 쓰는 것과 **같은 정본**으로 센다 (2026-09-04).
+    #
+    #   예전에는 질의는 `_HAS_ARTIFACT` / `QUEUE_STATUS_DONE` 을 바인딩하는데
+    #   이 줄만 `"done"` 과 `("READY", "NO_IMAGE")` 를 손으로 다시 적고 있었다.
+    #   **한 함수 안에서 규칙이 둘**이라, 어휘가 늘거나 바뀌면 질의는 따라가고
+    #   집계만 옛 값에 머문다 - 그때 감사기는 어긋남을 **찾고도 0으로 센다**.
     return sum(r["n"] for r in rows
-               if r["q"] == "done" and r["s"] not in ("READY", "NO_IMAGE"))
+               if r["q"] == _db.QUEUE_STATUS_DONE and r["s"] not in _HAS_ARTIFACT)
 
 
 def selftest():
@@ -531,6 +552,21 @@ def selftest():
         check("파일 없는 사진 행을 잡는다", found > 0, True)
 
         # 결함 B — 문서가 READY 인데 파일이 없다
+        #
+        # ★ 여기 값만 **리터럴로 손으로 적는다** (2026-09-04, 변이 N2).
+        #
+        #   위 감사 질의는 `_READY` 를 쓴다(정본에서 파생). 그런데 시드까지
+        #   같은 상수를 쓰면 **시드와 판정이 한 출처**가 되어, 그 상수에 오타가 나도
+        #   둘이 함께 틀리면서 self-test 가 통과한다 — 실제로 `_READY = "REDY"` 로
+        #   바꿔 보니 이 self-test 가 초록이었다. 감사기는 그 상태로 운영 DB 를 보고
+        #   **"어긋남 없음"** 을 찍는다(0행 매치). 감사기의 거짓 초록이다.
+        #
+        #   그래서 시드는 상수와 **독립인 두 번째 출처**로 둔다. 이 저장소가 같은
+        #   이유로 같은 선택을 한 자리가 있다 - `test_queue_safety_invariants.py` (e):
+        #   *"두 출처가 독립이라 오타가 드러난다."*
+        #
+        #   이 리터럴은 `test_state_machines.py:ALLOWED_SQL_STATUS_LITERALS` 에
+        #   근거와 함께 등록돼 있다(탐지기가 정상 예외로 판정한다).
         c = sqlite3.connect(scratch)
         try:
             c.execute("""UPDATE document_status SET status='READY'
@@ -561,7 +597,7 @@ def selftest():
                 SELECT dr.item_id, dr.doc_type FROM doc_raw dr
                 JOIN document_status ds ON ds.item_id = dr.item_id
                                        AND ds.doc_type = dr.doc_type
-                WHERE ds.status = 'READY' LIMIT 1""").fetchone()
+                WHERE ds.status = 'READY' LIMIT 1""").fetchone()   # 시드: 독립 출처(N2)
             if row:
                 c.execute("DELETE FROM doc_raw WHERE item_id=? AND doc_type=?", row)
                 c.commit()
@@ -723,7 +759,11 @@ def classify_queue_orphans(rows, today):
     날짜가 비어 있으면 그 방어선을 통과하므로 만료로 세지 않는다.
     """
     total = sum(r["n"] for r in rows)
-    waiting = [r for r in rows if r["status"] in ("pending", "refresh")]
+    # ★ "아직 워커가 집어갈 수 있는 상태"의 정본은 하나뿐이다 (2026-09-04).
+    #   예전에는 `("pending", "refresh")` 를 손으로 적었다. 그 목록이 늘어나면
+    #   (`claim_next_queue_item()` 이 보는 목록이다) 워커는 새 상태를 집어 가는데
+    #   이 감사기만 옛 둘로 세어 **비용을 실제보다 적게 보고**한다.
+    waiting = [r for r in rows if r["status"] in _db.QUEUE_CLAIMABLE_STATUSES]
     waiting_n = sum(r["n"] for r in waiting)
     live_n = sum(r["n"] for r in waiting
                  if not (r["auction_date"] and r["auction_date"] < today))
@@ -943,8 +983,8 @@ def audit_api_promises(conn, api_base):
     ids = [r[0] for r in conn.execute("""
         SELECT DISTINCT item_id FROM auction_image
         UNION SELECT DISTINCT item_id FROM doc_raw
-        UNION SELECT DISTINCT item_id FROM document_status WHERE status='READY'
-        ORDER BY 1""")]
+        UNION SELECT DISTINCT item_id FROM document_status WHERE status=?
+        ORDER BY 1""", (_READY,))]
 
     bad = []
     unknown = []                 # 못 닿아서 판정하지 못한 것. **어긋남으로 세지 않는다**

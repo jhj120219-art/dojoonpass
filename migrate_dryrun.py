@@ -1,22 +1,23 @@
-﻿import sys, os, re
-sys.path.insert(0, os.getcwd())
+﻿import sys, os
+
+# ★ 저장소 루트는 **이 파일 기준**이다 (2026-09-04). `os.getcwd()` 를 넣으면 다른
+#   폴더에서 실행했을 때 엉뚱한 패키지를 집거나 import 단계에서 죽는다
+#   (`unlock_retry.py` / `reset_failures.py` 가 같은 이유로 같은 규칙을 쓴다).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from storage.database import get_connection
 from datetime import datetime
 
-def extract_fail_count(status: str) -> int:
-    if not status:
-        return 0
-    m = re.search(r"유찰\s*(\d+)회", status)
-    if m:
-        return int(m.group(1))
-    if "유찰" in status:
-        return 1
-    return 0
-
-def calc_bid_rate(appraisal: int, minimum: int) -> float:
-    if appraisal > 0:
-        return round(minimum / appraisal, 4)
-    return 0.0
+# ★ 파생 필드 규칙은 **실제 실행기와 같은 함수**를 쓴다 (2026-09-04).
+#
+#   여기에는 `extract_fail_count()` / `calc_bid_rate()` 가 `migrate_execute.py` 의
+#   것과 **글자까지 같은 사본**으로 들어 있었다. 이 스크립트의 존재 이유는
+#   "실제로 무엇이 바뀔지 미리 보여 주는 것"인데, 규칙이 두 벌이면 실행기 쪽만
+#   고쳐지는 날 **미리보기가 실제와 다른 숫자를 말한다** — 미리보기가 미리보기가
+#   아니게 되는, 조용하고 되돌리기 어려운 고장이다.
+#
+#   (`filter/filter_engine.py` 에도 같은 이름의 함수가 있지만 그쪽은 어떤 진입점도
+#    부르지 않는 진단 경로라 별개다 — `test_schema_hygiene.py` 가 그렇게 기록해 두었다.)
+from migrate_execute import extract_fail_count, calc_bid_rate  # noqa: E402
 
 def dryrun():
     # 읽고 **바로** 놓는다 (2026-08-27, 자원 누수 감사).

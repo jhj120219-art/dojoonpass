@@ -403,6 +403,7 @@ def test_status_vocabulary_is_not_hardcoded_in_sql():
     import ast
     import io as _io
     import re
+    import subprocess as _sp_scan
     from api.constants import (
         PaymentStatus, SubscriptionStatus, RegistryRequestStatus,
         DocumentStatus, DocumentType,
@@ -414,13 +415,27 @@ def test_status_vocabulary_is_not_hardcoded_in_sql():
         vocab |= {e.value for e in enum}
     check_true("어휘를 열거형에서 뽑았다(검사가 공허하지 않다)", len(vocab) >= 20)
 
-    # `status='X'` / `status IN ('X', ...)` / `doc_type IN ('X', ...)` 형태만 본다.
-    col = r"(?:status|doc_type)"
-    pat = re.compile(
-        r"%s\s*(?:=|==)\s*'(%s)'|%s\s+IN\s*\(\s*'(%s)'"
-        % (col, "|".join(re.escape(v) for v in sorted(vocab)),
-           col, "|".join(re.escape(v) for v in sorted(vocab))),
-        re.I)
+    # ★ 2026-09-04: **모양이 아니라 자리로** 본다.
+    #
+    #   예전 정규식은 `status='X'` / `status IN ('X',...)` 두 모양만 봤다. 그래서
+    #   같은 값이 다른 모양으로 박힌 것을 전부 놓쳤다 — 실측으로 확인한 것들:
+    #
+    #       INSERT ... VALUES (?, ?, 'READY', ?)     collect_documents.py
+    #       WHERE source='STATUS'                    load_rights_data.py (컬럼명이 다르다)
+    #       WHERE ds.doc_type <> 'IMAGE'             audit_asset_integrity.py (`<>` 다)
+    #       WHERE status NOT IN ('READY','NO_IMAGE') audit_asset_integrity.py
+    #
+    #   판정 기준을 바꾼다: **SQL 문자열 안에 어휘 값이 따옴표째 들어 있으면 위반이다.**
+    #   비교 연산자나 컬럼 이름을 열거하려 들면 그 목록이 늘 뒤처진다(방금 그랬다).
+    #
+    #   ★ 대소문자는 **구별한다.** 큐 어휘는 소문자('failed')이고 화면 어휘는
+    #     대문자('FAILED')다 — `re.I` 를 걸면 `document_queue` 의 정상적인 소문자
+    #     값을 화면 어휘 위반으로 오인한다.
+    sqlish = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+    pat = re.compile(r"'(%s)'" % "|".join(re.escape(v) for v in sorted(vocab)))
+
+    def offends(text):
+        return bool(sqlish.search(text) and pat.search(text))
 
     def code_strings(path):
         """실제 코드에 쓰이는 문자열만. docstring 은 뺀다."""
@@ -439,33 +454,186 @@ def test_status_vocabulary_is_not_hardcoded_in_sql():
                     and id(node) not in docs:
                 yield getattr(node, "lineno", 0), node.value
 
+    # ★ 2026-09-04: 훑는 범위를 **저장소 전체**로 넓힌다.
+    #
+    #   예전에는 `api/v1/*.py` 열몇 개만 봤다. 그런데 이 어휘를 SQL 에 박아 두는
+    #   코드는 거의 전부 그 바깥에 있었다 — 복구 스크립트, 로더, 감사기다.
+    #   실측(2026-09-04): 프로덕션 .py 96개 중 **9개 파일에 27자리**가 있었고
+    #   이 검사는 그동안 초록이었다. "검사했다"고 말하면서 결함이 있는 자리를
+    #   통째로 건너뛰고 있었던 셈이다.
+    #
+    #   특히 나쁜 조합이 둘 있었다:
+    #     * 복구 스크립트  오타 -> 0행 매치 -> "N건 보정했습니다"를 찍고 아무것도 안 고친다
+    #     * 감사기        오타 -> 0행 매치 -> **"어긋남 없음"** = 거짓 초록
+    #
+    #   `test_queue_safety_invariants.py` 가 큐 어휘에서 이미 같은 결론에 이르러
+    #   범위를 넓혔다(그 파일 (c) 항목). 같은 규칙을 화면 어휘에도 적용한다.
     root = os.path.dirname(os.path.abspath(__file__))
-    api_dir = os.path.join(root, "api", "v1")
+    try:
+        _out = _sp_scan.run(["git", "ls-files", "*.py"], cwd=root,
+                            capture_output=True, text=True, timeout=30)
+        files = ([f for f in _out.stdout.split()
+                  if f.endswith(".py") and "-DESKTOP-" not in f
+                  and not os.path.basename(f).startswith("test_")]
+                 if _out.returncode == 0 else [])
+    except (OSError, _sp_scan.SubprocessError):
+        files = []
+    if len(files) < 20:
+        # git 이 없는 배포본 - 예전 범위로 되돌린다(좁지만 0보다 낫다).
+        api_dir = os.path.join(root, "api", "v1")
+        files = ["api/v1/" + n for n in sorted(os.listdir(api_dir)) if n.endswith(".py")]
+
+    # ★ `test_*.py` 는 **일부러** 뺀다 - 편의가 아니라 규칙이다 (2026-09-04).
+    #
+    #   검사의 fixture 는 상태값을 리터럴로 심어야 한다. 그것이 상수와 **독립인
+    #   두 번째 출처**이기 때문이다. 이 저장소가 그 이유를 이미 적어 두었다
+    #   (`test_queue_safety_invariants.py` (e)):
+    #
+    #       (b)/(c) 는 전부 같은 상수에서 파생되므로, 상수 값에 오타가 나면
+    #       양쪽이 함께 틀려 **조용히 통과한다**(2026-08-31 변이 검증에서 실제로
+    #       생존했다). 그래서 제품 코드가 DB 에 실제로 쓴 값을 손으로 적은 기대
+    #       문자열과 맞춘다 - **두 출처가 독립이라 오타가 드러난다.**
+    #
+    #   즉 fixture 를 상수로 "정리"하면 그 독립성이 사라지고, 상수 자체의 오타를
+    #   잡던 마지막 그물이 없어진다. 아래 `_fixture_layer_stays_independent()` 가
+    #   그 전제가 아직 살아 있는지 확인한다.
+
     offenders = []
     scanned = 0
-    for name in sorted(os.listdir(api_dir)):
-        if not name.endswith(".py"):
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.exists(path):
             continue
-        path = os.path.join(api_dir, name)
         scanned += 1
-        for lineno, text in code_strings(path):
-            if pat.search(text):
-                offenders.append("api/v1/%s:%d" % (name, lineno))
-    check_true("훑을 파일을 실제로 찾았다", scanned >= 10)
-    check("SQL 에 상태값 리터럴이 박혀 있지 않다", sorted(set(offenders)), [])
+        try:
+            strings = list(code_strings(path))
+        except (OSError, SyntaxError):
+            continue
+        for lineno, text in strings:
+            if offends(text):
+                offenders.append((rel, lineno, text))
+    # ★ 하한을 고정한다. 파일 열거가 깨지면 offenders 는 당연히 비고 이 검사는
+    #   조용히 초록이 된다 - 방금 고친 것이 바로 그 침묵이다.
+    check_true("훑을 파일을 실제로 찾았다 (%d개)" % scanned, scanned >= 40)
+
+    # 정당한 예외는 뺀다(근거는 `ALLOWED_SQL_STATUS_LITERALS` 에 적혀 있다).
+    def excused(rel, text):
+        for (afile, marker) in ALLOWED_SQL_STATUS_LITERALS:
+            if afile == rel and marker in text:
+                return (afile, marker)
+        return None
+
+    remaining, used = [], set()
+    for rel, lineno, text in offenders:
+        key = excused(rel, text)
+        if key:
+            used.add(key)
+        else:
+            remaining.append("%s:%d" % (rel, lineno))
+    remaining = sorted(set(remaining))
+    if remaining:
+        print("   ★ SQL 에 상태값이 문자열로 박힌 곳:")
+        for o in remaining:
+            print("      %s" % o)
+        print("   오타는 예외가 아니라 0행 매치다. `api/constants.py` 의 값을 바인딩하라")
+        print("   정당한 예외라면 `ALLOWED_SQL_STATUS_LITERALS` 에 **근거와 함께** 등록하라")
+    check("SQL 에 상태값 리터럴이 박혀 있지 않다", remaining, [])
+
+    # ★ 죽은 예외를 잡는다. 코드가 고쳐졌는데 예외가 남아 있으면, 그 자리에
+    #   리터럴이 다시 생겨도 이 검사가 **눈감아 준다**(이 저장소의 다른 예외
+    #   목록들이 전부 같은 짝 검사를 갖고 있는 이유다).
+    dead = sorted("%s / %s" % k for k in ALLOWED_SQL_STATUS_LITERALS if k not in used)
+    check("허용 목록에 죽은 항목이 없다", dead, [])
+
+    # ★ 표식이 **한 문장만** 가리키는지 확인한다. 너무 짧은 표식은 여러 문장을
+    #   덮어 새 위반까지 조용히 면제해 준다 - 예외 목록이 탐지기를 무디게 하는
+    #   가장 흔한 방식이다.
+    ambiguous = []
+    for (afile, marker) in ALLOWED_SQL_STATUS_LITERALS:
+        hit = [ln for rel, ln, text in offenders if rel == afile and marker in text]
+        if len(hit) > 1:
+            ambiguous.append("%s / %s -> %d문장" % (afile, marker, len(hit)))
+    check("허용 표식이 문장 하나만 가리킨다", sorted(ambiguous), [])
+    check_true("근거 없는 예외가 없다",
+               all(isinstance(v, str) and len(v.strip()) >= 10
+                   for v in ALLOWED_SQL_STATUS_LITERALS.values()))
 
     # 탐지기 자체 증명 -- 합성 입력에서는 반드시 잡히고, 바인딩은 잡히지 않아야 한다.
     check_true("탐지기가 `status='PENDING'` 을 잡는다",
-               bool(pat.search("UPDATE t SET x=? WHERE status='PENDING'")))
+               offends("UPDATE t SET x=? WHERE status='PENDING'"))
     check_true("탐지기가 `IN ('READY',...)` 를 잡는다",
-               bool(pat.search("WHERE status IN ('READY','FAILED')")))
+               offends("SELECT 1 FROM t WHERE status IN ('READY','FAILED')"))
+    # ★ 아래 넷이 예전 탐지기가 놓치던 모양이다(2026-09-04 실측으로 확인).
+    check_true("★ INSERT VALUES 안의 리터럴도 잡는다",
+               offends("INSERT INTO document_status (a,b,c) VALUES (?, ?, 'READY')"))
+    check_true("★ 컬럼 이름이 달라도 잡는다(source='STATUS')",
+               offends("DELETE FROM tenant_rights WHERE source='STATUS'"))
+    check_true("★ `<>` 비교도 잡는다",
+               offends("SELECT 1 FROM t WHERE doc_type <> 'IMAGE'"))
+    check_true("★ NOT IN 도 잡는다",
+               offends("SELECT 1 FROM t WHERE status NOT IN ('READY','NO_IMAGE')"))
     check_true("바인딩 형태는 잡지 않는다(오탐 없음)",
-               not pat.search("UPDATE t SET status=? WHERE status=?"))
+               not offends("UPDATE t SET status=? WHERE status=?"))
     check_true("어휘 밖 문자열은 잡지 않는다",
-               not pat.search("WHERE status='NOT_A_REAL_STATUS'"))
+               not offends("SELECT 1 FROM t WHERE status='NOT_A_REAL_STATUS'"))
+    check_true("SQL 이 아닌 문자열은 잡지 않는다(오탐 없음)",
+               not offends("화면에 'READY' 라고 적는다"))
+    # ★ 큐 어휘(소문자)를 화면 어휘 위반으로 오인하지 않는다. 두 어휘는 값이
+    #   대소문자로 갈려 있고, 큐 쪽은 `test_queue_safety_invariants.py` 가 본다.
+    check_true("큐의 소문자 상태는 이 검사의 대상이 아니다",
+               not offends("SELECT 1 FROM document_queue WHERE status='failed'"))
+    # ★ 어휘가 실제로 IMAGE 를 포함한다 - 포함하지 않으면 위 `<>` 증명이 공허해진다
+    #   (`DocumentType` 에 IMAGE 가 빠져 있어 탐지기가 그 값을 찾지도 않던 때가 있었다).
+    check_true("어휘에 IMAGE 가 있다(누락되면 탐지기가 그 값을 찾지 않는다)",
+               "IMAGE" in vocab)
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# SQL 에 상태값 리터럴을 **그대로 둬도 되는** 자리 (2026-09-04)
+#
+# 탐지기의 목적은 어휘 드리프트를 잡는 것이지 리터럴을 0개로 만드는 것이 아니다.
+# 그래서 정당한 예외를 적을 자리를 둔다. **근거 없이는 늘리지 않는다** —
+# 이 저장소의 다른 예외 목록(`KNOWN_UNLABELED` / `ALLOWED_SQL_PERCENT_TEMPLATES` /
+# `SQL_PLACEHOLDER_SITES`)과 같은 규약이다.
+#
+# 예외로 인정할 수 있는 성격 (하나에 해당해야 한다)
+#
+#   역사적 값     지금 어휘에 없는 옛 값을 다루는 일회성 보정. 상수로 만들면
+#                 "지금 쓰는 값"처럼 보여 오히려 헷갈린다.
+#   부트스트랩    `api.constants` 를 import 할 수 없는 자리(순환 import 등).
+#   표시 문자열   실행되지 않고 사람에게 보여 주기만 하는 SQL 예시.
+#
+# ★ 지금은 **비어 있다**(2026-09-04 실측: 프로덕션 위반 0건). 비어 있는 것이
+#   정상이며, 아래 "죽은 예외" 검사가 목록이 낡는 것을 막는다.
+ALLOWED_SQL_STATUS_LITERALS = {
+    # ("파일경로", "문장 안의 표식"): "왜 정당한가",
+    #
+    # ★ 키는 **줄번호가 아니라 문장 표식**이다 (2026-09-04). 줄번호로 두면
+    #   위쪽을 한 줄만 고쳐도 예외가 어긋나 애먼 빨강이 난다(실제로 났다).
+    #   `ALLOWED_SQL_PERCENT_TEMPLATES` 가 SQL 문장 자체를 키로 쓰는 이유와 같다.
+    #   표식은 그 문장에만 있는 조각이어야 한다(아래 "표식이 실제로 그 문장에만
+    #   있다" 검사가 확인한다).
+    #
+    # ── 감사기 self-test 의 **시드** (2026-09-04, 변이 N2 로 발견) ──────────
+    #
+    #   `audit_asset_integrity.py --selftest` 는 스크래치 사본에 결함을 일부러
+    #   심고 감사기가 그것을 잡는지 본다. 그 **시드**는 감사 질의가 쓰는 상수와
+    #   독립이어야 한다.
+    #
+    #   같은 상수를 쓰게 했더니(2026-09-04 정본화 작업) `_READY = "REDY"` 오타에서
+    #   시드와 판정이 함께 틀리며 self-test 가 **통과**했다. 그 상태의 감사기는
+    #   운영 DB 에서 0행 매치로 "어긋남 없음"을 찍는다 — 감사기의 거짓 초록이다.
+    #
+    #   `test_queue_safety_invariants.py` (e) 가 같은 이유로 같은 선택을 한다:
+    #   *"두 출처가 독립이라 오타가 드러난다."* 그래서 이 두 자리는 리터럴이 정답이다.
+    ("audit_asset_integrity.py", "UPDATE document_status SET status='READY'"):
+        "self-test 결함 B 시드 - 감사 질의의 상수와 독립인 두 번째 출처여야 한다",
+    ("audit_asset_integrity.py", "WHERE ds.status = 'READY' LIMIT 1"):
+        "self-test 결함 C 시드 - 같은 이유(변이 N2)",
+}
 
 
 # 상태 UPDATE 를 담은 함수가 반드시 불러야 하는 전이 검증 함수.
@@ -474,6 +642,220 @@ TRANSITION_GUARDED_TABLES = (
     ("payments", "assert_payment_transition"),
     ("subscriptions", "assert_subscription_transition"),
 )
+
+
+def test_fixture_layer_stays_an_independent_source():
+    """검사 fixture 가 상태값을 **리터럴로** 들고 있는가 (2026-09-04 신설).
+
+    ## 왜 이것을 검사하나 — 없어지면 아무도 모른다
+
+    바로 위 탐지기는 제품 코드만 훑고 `test_*.py` 는 일부러 뺀다. 그 제외는
+    편의가 아니라 **설계**다 — fixture 의 리터럴이 `api/constants.py` 와 독립인
+    두 번째 출처이고, 그 독립성이 **상수 자체의 오타**를 잡는 마지막 그물이다
+    (`test_queue_safety_invariants.py` (e) 가 같은 이유로 같은 방식을 쓴다).
+
+    위험한 것은 선의의 정리다. 누군가 "일관성"을 이유로 fixture 의
+    `status='READY'` 를 `DocumentStatus.READY.value` 로 바꾸면:
+
+        * 어떤 검사도 붉어지지 않는다(오히려 더 깔끔해 보인다)
+        * 그런데 그 순간 제품과 검사가 **같은 한 출처**를 보게 되어,
+          `READY = "REDY"` 같은 오타가 양쪽을 함께 틀리게 만들어도
+          모든 검사가 통과한다
+
+    그래서 전제를 명시적으로 붙든다 — fixture 층에 리터럴이 **실제로 남아 있는지**.
+    """
+    print(chr(10) + "--- fixture 층이 독립된 출처로 남아 있는가 ---")
+    import ast
+    import io as _io
+    import re
+    import subprocess as _sp
+    from api.constants import (
+        PaymentStatus, SubscriptionStatus, RegistryRequestStatus,
+        DocumentStatus, DocumentType,
+    )
+
+    vocab = set()
+    for enum in (PaymentStatus, SubscriptionStatus, RegistryRequestStatus,
+                 DocumentStatus, DocumentType):
+        vocab |= {e.value for e in enum}
+    sqlish = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+    pat = re.compile(r"'(%s)'" % "|".join(re.escape(v) for v in sorted(vocab)))
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "--exclude-standard", "test_*.py"],
+                      cwd=root, capture_output=True, text=True, timeout=30)
+        files = ([f for f in out.stdout.split()
+                  if f.endswith(".py") and "-DESKTOP-" not in f]
+                 if out.returncode == 0 else [])
+    except (OSError, _sp.SubprocessError):
+        files = []
+    if len(files) < 10:
+        files = sorted(n for n in os.listdir(root)
+                       if n.startswith("test_") and n.endswith(".py")
+                       and "-DESKTOP-" not in n)
+    check_true("훑을 검사 파일을 실제로 찾았다 (%d개)" % len(files), len(files) >= 10)
+
+    literal_sites = 0
+    literal_files = set()
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            tree = ast.parse(_io.open(path, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue
+        docs = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)) and body \
+                    and isinstance(body[0], ast.Expr) \
+                    and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and id(node) not in docs:
+                if sqlish.search(node.value) and pat.search(node.value):
+                    literal_sites += 1
+                    literal_files.add(rel)
+
+    print("   fixture 리터럴 %d자리 / 파일 %d개" % (literal_sites, len(literal_files)))
+    # 하한은 넉넉히 잡는다 - 이 검사가 지키는 것은 "독립 출처가 살아 있다"이지
+    # 특정 개수가 아니다. 실측(2026-09-04): 113자리 / 파일 14개.
+    check_true("★ fixture 가 상태값을 리터럴로 들고 있다(독립 출처 %d자리)" % literal_sites,
+               literal_sites >= 20)
+    check_true("★ 한 파일에 몰려 있지 않다(검사 %d개가 독립적으로 심는다)"
+               % len(literal_files), len(literal_files) >= 3)
+
+
+def test_canonical_sets_are_not_relisted_in_python():
+    """정본 **집합**을 파이썬 리터럴로 다시 나열하지 않는가 (2026-09-04 신설).
+
+    ## 위 SQL 탐지기가 못 보는 자리
+
+    위 검사는 **SQL 문자열 안의** 값을 본다. 그런데 어휘 드리프트는 SQL 밖에서도
+    생긴다 — 같은 집합을 파이썬 튜플로 다시 적는 것이다. 실측(2026-09-04)에서
+    `audit_asset_integrity.py` 한 함수 안에 그 모양이 둘 있었다:
+
+        질의  ... ds.status NOT IN (?, ?)   <- `_HAS_ARTIFACT` 바인딩 (정본)
+        집계  r["s"] not in ("READY", "NO_IMAGE")   <- 손으로 다시 적음
+
+        질의  dq.status IN (?, ?)           <- QUEUE_STATUS_PENDING/REFRESH (정본)
+        집계  r["status"] in ("pending", "refresh")  <- 손으로 다시 적음
+
+    **한 함수 안에서 규칙이 둘**이다. 어휘가 늘면 질의는 따라가고 집계만 옛 값에
+    머문다 — 그때 감사기는 어긋남을 **찾고도 0으로 센다**(거짓 초록).
+
+    ## 판정 기준
+
+    문자열 상수만으로 이루어진 튜플/리스트/집합 리터럴이 **선언된 정본 집합과
+    정확히 같으면** 위반이다. 정본 자신의 선언(`X = ("A", "B")`)은 당연히 예외다.
+
+    ★ 부분집합은 보지 않는다. "두 값을 우연히 함께 쓰는 것"과 "그 집합을 뜻하는 것"은
+      다르고, 부분집합까지 잡으면 정상 코드를 괴롭힌다(이 검사의 목적은 어휘 드리프트
+      방지이지 리터럴 박멸이 아니다).
+    """
+    print(chr(10) + "--- 정본 집합을 파이썬에서 다시 나열하지 않는가 ---")
+    import ast
+    import io as _io
+    import subprocess as _sp
+    import storage.database as _db
+    from api.constants import (
+        DocumentType, DOCUMENT_STATUSES_IN_USE, PAID_STATUSES,
+        TERMINAL_PAYMENT_STATUSES, ENTITLED_SUBSCRIPTION_STATUSES,
+    )
+
+    # (정본 이름 -> 값 집합). 이름은 **선언과 같은 이름**이어야 한다 - 아래에서
+    # "정본 자신의 선언"을 그 이름으로 알아본다.
+    canon = {
+        "DOC_STATUS_HAS_ARTIFACT": frozenset(_db.DOC_STATUS_HAS_ARTIFACT),
+        "QUEUE_CLAIMABLE_STATUSES": frozenset(_db.QUEUE_CLAIMABLE_STATUSES),
+        "QUEUE_IN_PROGRESS_STATUSES": frozenset(_db.QUEUE_IN_PROGRESS_STATUSES),
+        "QUEUE_ACTIVE_STATUSES": frozenset(_db.QUEUE_ACTIVE_STATUSES),
+        "QUEUE_OVERWRITE_STATUSES": frozenset(_db.QUEUE_OVERWRITE_STATUSES),
+        "QUEUE_STATUSES": frozenset(_db.QUEUE_STATUSES),
+        "DOCUMENT_STATUSES_IN_USE": frozenset(str(v) for v in DOCUMENT_STATUSES_IN_USE),
+        "PAID_STATUSES": frozenset(str(v) for v in PAID_STATUSES),
+        "TERMINAL_PAYMENT_STATUSES": frozenset(str(v) for v in TERMINAL_PAYMENT_STATUSES),
+        "ENTITLED_SUBSCRIPTION_STATUSES":
+            frozenset(str(v) for v in ENTITLED_SUBSCRIPTION_STATUSES),
+        "DocumentType": frozenset(e.value for e in DocumentType),
+    }
+    check_true("정본 집합을 실제로 모았다 (%d개)" % len(canon), len(canon) >= 8)
+    check_true("집합이 비어 있지 않다",
+               all(len(v) >= 2 for v in canon.values()))
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "--exclude-standard", "*.py"], cwd=root,
+                      capture_output=True, text=True, timeout=30)
+        files = ([f for f in out.stdout.split()
+                  if f.endswith(".py") and "-DESKTOP-" not in f
+                  and not os.path.basename(f).startswith("test_")]
+                 if out.returncode == 0 else [])
+    except (OSError, _sp.SubprocessError):
+        files = []
+    if len(files) < 20:
+        files = sorted(n for n in os.listdir(root)
+                       if n.endswith(".py") and not n.startswith("test_")
+                       and "-DESKTOP-" not in n)
+    check_true("훑을 파일을 실제로 찾았다 (%d개)" % len(files), len(files) >= 20)
+
+    def relisted(tree):
+        """(줄번호, 정본이름) - 정본 자신의 선언은 뺀다."""
+        # `NAME = (...)` 형태로 선언되는 노드는 정본 자신이다.
+        own = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id in canon:
+                        own.add(id(node.value))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Tuple, ast.List, ast.Set)) or not node.elts:
+                continue
+            if id(node) in own:
+                continue
+            vals = [e.value for e in node.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if len(vals) < 2 or len(vals) != len(node.elts):
+                continue
+            same = frozenset(vals)
+            for name, values in canon.items():
+                if same == values:
+                    found.append((getattr(node, "lineno", 0), name))
+        return found
+
+    offenders = []
+    scanned = 0
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            tree = ast.parse(_io.open(path, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue
+        scanned += 1
+        for lineno, name in relisted(tree):
+            offenders.append("%s:%d  (%s 와 같다)" % (rel, lineno, name))
+    check_true("실제로 훑었다 (%d개)" % scanned, scanned >= 20)
+    if offenders:
+        print("   ★ 정본 집합을 손으로 다시 나열한 곳:")
+        for o in sorted(set(offenders)):
+            print("      %s" % o)
+        print("   그 상수를 그대로 참조하라 - 어휘가 늘면 한쪽만 옛 값에 머문다")
+    check("정본 집합을 다시 나열한 곳이 없다", sorted(set(offenders)), [])
+
+    # 탐지기 자기 증명 - 합성 입력에서 반드시 잡히고, 정본 선언은 잡히지 않는다.
+    bad = ast.parse('x = 1 if s in ("READY", "NO_IMAGE") else 0')
+    check_true("탐지기가 재나열을 잡는다",
+               any(n == "DOC_STATUS_HAS_ARTIFACT" for _, n in relisted(bad)))
+    own_decl = ast.parse('DOC_STATUS_HAS_ARTIFACT = ("READY", "NO_IMAGE")')
+    check_true("정본 자신의 선언은 잡지 않는다(오탐 없음)", not relisted(own_decl))
+    partial = ast.parse('x = s in ("READY",)')
+    check_true("부분집합은 잡지 않는다(오탐 없음)", not relisted(partial))
+    unrelated = ast.parse('x = s in ("A", "B")')
+    check_true("어휘 밖 목록은 잡지 않는다(오탐 없음)", not relisted(unrelated))
 
 
 def test_status_updates_call_transition_validation():
@@ -770,6 +1152,8 @@ def run():
     test_grace_period_end()
     test_corrupt_expiry_is_safe_and_logged()
     test_status_vocabulary_is_not_hardcoded_in_sql()
+    test_fixture_layer_stays_an_independent_source()
+    test_canonical_sets_are_not_relisted_in_python()
 
     print("\n" + "=" * 55)
     if failures:

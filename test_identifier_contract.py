@@ -41,6 +41,37 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if not os.getenv("SUPABASE_JWT_SECRET"):
     os.environ["SUPABASE_JWT_SECRET"] = "qa-idcontract-" + secrets.token_hex(16)
 
+# ★ 운영 `auction.db` 를 건드리지 않는다 (2026-09-04, docs/BUGS.md #186).
+#
+#   이 파일은 `favorites` / `recent_items` 에 합성 행을 심고 지운다. 끝에서 지우므로
+#   행수는 원복되지만 **그 사이 운영 DB 가 실제로 바뀐다** — `sqlite_sequence` 는
+#   영구히 전진하고, 중간에 죽으면 지우는 코드에 도달하지 못해 합성 행이 운영
+#   테이블에 그대로 남는다. `run_python_tests.py` 가 파일마다 운영 DB 지문을 재서
+#   이 파일을 지목하고 게이트를 붉게 만들고 있었다(실측 2026-09-04).
+#
+#   `test_subscription_policy.py` / `test_admin_failure_injection.py` 와 **같은 방식**
+#   이다 — 새 규칙이 아니라 이미 있는 규칙을 이 파일에도 적용한다.
+#   `get_connection()` 은 `sqlite3.connect(DB_PATH)` 로 **호출 시점에** 모듈 전역을
+#   읽으므로, 이 재지정 한 줄이 API 라우터까지 함께 돌린다.
+#
+#   ★ `import api_server` **보다 먼저** 와야 한다. 그 뒤에 두면 라우터가 이미
+#     import 된 뒤라 늦는 것은 아니지만(전역을 호출 시점에 읽는다), 순서를 규약으로
+#     고정해 두는 편이 나중에 `DB_PATH` 를 직접 읽는 코드가 생겼을 때 안전하다.
+#
+#   ★ 파일 복사가 아니라 **온라인 백업 스냅샷**이다 (2026-08-26 규칙 그대로).
+#     DocWorker(02:00~04:00)가 운영 DB 에 쓰는 동안 `shutil.copy2` 로 사본을 뜨면
+#     찢어진 DB 가 나와 검사가 제품과 무관한 이유로 붉어진다.
+import atexit as _qa_atexit
+import shutil as _qa_shutil                             # noqa: F401 - rmtree 등록용
+import tempfile as _qa_tempfile
+import storage.database as _qa_dbmod
+_qa_tmp = _qa_tempfile.mkdtemp(prefix="dojoonpass-qa-")
+_qa_atexit.register(_qa_shutil.rmtree, _qa_tmp, True)
+_qa_scratch = os.path.join(_qa_tmp, "auction.db")
+if os.path.exists(_qa_dbmod.DB_PATH):
+    _qa_dbmod.snapshot_live_db(_qa_scratch)
+_qa_dbmod.DB_PATH = _qa_scratch
+
 from jose import jwt                                    # noqa: E402
 from fastapi.testclient import TestClient               # noqa: E402
 

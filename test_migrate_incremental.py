@@ -285,6 +285,88 @@ def test_every_written_field_still_updates():
             check("%s 변경 -> auction_item.%s" % (field, col), got[col], want)
 
 
+# 빈 값으로 덮이면 안 되는 필드와, 그 필드가 비었을 때 크롤이 보낼 법한 값.
+#
+# `migrate_execute` 는 전부 `row["x"] or existing["x"]` 로 병합한다 — "새 값이
+# 비어 있으면 이전 값을 지킨다". 아래 표는 그 정책을 **필드별로** 고정한다.
+PRESERVE_ON_BLANK = [
+    # (필드, 크롤이 보낸 빈 값, auction_item 컬럼, 지켜져야 할 값)
+    ("sido", "", "sido", "서울특별시"),
+    ("sigungu", "", "sigungu", "강남구"),
+    ("dong", "", "dong", "역삼동"),
+    ("lot_number", "", "lot_number", "1-1"),
+    ("property_type", "", "property_type", "아파트"),
+    ("status", "", "status", "신건"),
+    ("auction_date", "", "auction_date", "2027-03-15"),
+    ("crawl_date", "", "crawl_date", "2026-08-27"),
+    ("full_address", "", "full_address",
+     "서울특별시 강남구 역삼동 1-1 제2층202호 [집합건물 철근콘크리트조 84.5㎡]"),
+    # 금액은 0 이 "모름"이다(파서가 못 읽으면 0을 보낸다). 0 으로 기존 감정가를
+    # 덮으면 화면의 낙찰가율이 통째로 틀어진다.
+    ("appraisal_price", 0, "appraisal_price", 100000001),
+    ("minimum_bid_price", 0, "minimum_bid_price", 70000001),
+]
+
+
+def test_blank_crawl_does_not_erase_existing_values():
+    """빈 값을 실은 크롤이 **이미 저장된 값을 지우지 않는가** (2026-09-04 신설).
+
+    ## 왜 필요한가 — 방어는 있는데 검사가 없었다
+
+    `migrate_execute` 는 `auction_item` 에 쓸 값을 전부 이렇게 만든다:
+
+        sido = row["sido"] or existing["sido"]
+
+    "새 값이 비어 있으면 이전 값을 지킨다"는 정책이다. 그런데 **그 정책을 지키는
+    검사가 하나도 없었다.** 변이 검증(2026-09-04)에서 네 필드의 `or existing` 을
+    각각 지워 봤더니 `test_migrate_incremental` / `test_pipeline_integrity` /
+    `test_upsert_change_detection` 이 **전부 통과했다.**
+
+    이 자리가 위험한 이유는 **고장의 규모**다. 이 함수는 매일 밤 누적 전체를 훑으며
+    `auction_item` 을 갱신한다. 크롤이 한 번 파싱에 실패해 빈 값을 실어 오면,
+    `or existing` 이 없는 순간 **그날 크롤된 모든 물건의 주소·지역·금액이 한꺼번에
+    비어 버린다.** 오류도 예외도 없다 — 조용히 지워지고, 되돌리려면 백업이 필요하다.
+
+    위 §2 는 반대 방향만 본다("값이 바뀌면 반영되는가"). 두 방향이 다 필요하다:
+    반영은 되면서 **빈 값에는 물러서야** 한다.
+
+    ## 무엇을 확인하나
+
+    필드마다 (1) 정상 값으로 한 번 적재하고, (2) 그 필드만 빈 값으로 다시 크롤이
+    들어왔을 때 (3) `auction_item` 의 값이 그대로인지 본다.
+    """
+    print("\n--- 2-B. 빈 크롤이 기존 값을 지우지 않는다 ---")
+    for field, blank, col, keep in PRESERVE_ON_BLANK:
+        path = scratch_db()
+        dbmod.upsert_batch([row(1)])
+        me = fresh_migrate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            me.execute()
+
+        # 전제 - 첫 적재로 값이 실제로 들어갔는지 확인한다(공허한 검사 방지).
+        c = sqlite3.connect(path)
+        c.row_factory = sqlite3.Row
+        try:
+            before = dict(c.execute("SELECT * FROM auction_item").fetchone())
+        finally:
+            c.close()
+        check("전제: %s 가 먼저 채워졌다" % col, before[col], keep)
+
+        # 같은 물건이 그 필드만 비어서 다시 들어온다.
+        dbmod.upsert_batch([row(1, **{field: blank})])
+        me = fresh_migrate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            me.execute()
+
+        c = sqlite3.connect(path)
+        c.row_factory = sqlite3.Row
+        try:
+            after = dict(c.execute("SELECT * FROM auction_item").fetchone())
+        finally:
+            c.close()
+        check("★ %s 가 비어 와도 기존 %s 를 지키다" % (field, col), after[col], keep)
+
+
 def test_fields_that_can_change_alone():
     """**혼자서만** 바뀔 수 있는 필드들.
 
@@ -920,6 +1002,7 @@ if __name__ == "__main__":
     try:
         test_noop_rerun_is_cheap_and_identical()
         test_every_written_field_still_updates()
+        test_blank_crawl_does_not_erase_existing_values()
         test_fields_that_can_change_alone()
         test_derived_columns_repaired()
         test_area_backfilled_without_address_change()

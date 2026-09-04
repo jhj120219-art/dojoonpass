@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
-import { fetchJSON, postJSON, deleteJSON, fetchAuthedJSON, fetchAuthedRaw, headOk, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
+import { fetchJSON, postJSON, deleteJSON, fetchAuthedRaw, headOk, ApiError, API_BASE_URL, ERROR_CODES } from '@/lib/api'
 import { createClient } from '@/lib/supabaseClient'
 import { mapSpecView, assembleRightsAnalysis, type TenantRow } from './rightsAnalysis'
 import { resolveNavContext } from './navContext'
@@ -55,6 +55,23 @@ interface CaseInfo {
   case_type: string | null
   filed_date: string | null
   demand_deadline: string | null
+}
+
+interface FieldVisitSummary {
+  status: string
+  completed_at: string | null
+  decision: string | null
+  decided_at: string | null
+  checked_count: number
+}
+
+// 판단 문구. 값 자체는 서버가 정한다(`api/v1/field_visits.py:DECISIONS`) —
+// 화면은 **문구만** 갖는다. 임장 화면의 같은 표와 값이 어긋나면 안 되지만,
+// 문구를 공유 모듈로 빼는 것은 화면 두 곳이 더 생긴 뒤에 한다(지금은 둘뿐이다).
+const FIELD_DECISION_LABEL: Record<string, string> = {
+  BID: '입찰',
+  HOLD: '보류',
+  DROP: '포기',
 }
 
 interface AuctionItemDetail {
@@ -114,6 +131,14 @@ interface AuctionItemDetail {
   rights_summary: RightsSummary | null
   case: CaseInfo | null
   is_favorited: boolean
+  /** 내 임장/판단 요약. 비로그인이거나 다녀온 적이 없으면 null.
+      메모·위험요소 본문은 여기 없다 — 그것은 임장 화면의 것이다. */
+  field_visit: FieldVisitSummary | null
+  // 내 등기부 신청 상태. 예전에는 별도로 `GET /api/v1/registry-requests`(내 신청
+  // **전체**)를 받아 이 물건 것만 골라 썼다 — 화면 하나에 왕복이 둘이었고, 실어
+  // 나르는 양이 사용자의 이력만큼 커졌다. 서버가 같은 선택(가장 최근 신청)을
+  // 그대로 해서 여기 담아 준다.
+  registry_request: RegistryRequestSummary | null
 }
 
 const DOC_TYPE_LABEL: Record<string, string> = {
@@ -392,24 +417,16 @@ export default function PropertyDetailPage() {
         if (idRef.current !== requestId) return
         setProperty(data)
         setFavorited(data.is_favorited)
+        setRegistryRequest(data.registry_request ?? null)
       } catch (err) {
         if (idRef.current !== requestId) return
         setLoadError(err instanceof ApiError && err.status === 404 ? 'notfound' : 'unavailable')
       }
-      // 등기부 신청 여부/상태는 백엔드(registry_requests)가 유일한 근거다 — 프론트는 무료횟수를
-      // 스스로 계산하지 않고, 이미 신청한 기록이 있는지만 조회해 그 상태를 그대로 보여준다.
-      if (token) {
-        try {
-          const result = await fetchAuthedJSON<RegistryRequestSummary[]>('/api/v1/registry-requests', token)
-          if (idRef.current !== requestId) return
-          if (result.success && result.data) {
-            const existing = result.data.find((r) => r.item_id === Number(id))
-            setRegistryRequest(existing ?? null)
-          }
-        } catch {
-          // 등기부 상태 조회 실패는 조용히 무시한다 — "신청하기" 버튼을 눌렀을 때 다시 확인된다.
-        }
-      }
+      // 등기부 신청 여부/상태는 백엔드(registry_requests)가 유일한 근거다 — 프론트는
+      // 무료횟수를 스스로 계산하지 않는다. 그 상태는 위 상세 응답의 `registry_request`
+      // 로 함께 온다(2026-09-05). 예전에는 여기서 `GET /api/v1/registry-requests` 를
+      // **이어서** 한 번 더 불러 내 신청 전체를 받아 `find()` 로 한 건만 골랐다.
+      // 순차 왕복이라 지연이 더해졌고, 페이로드는 이력이 쌓일수록 커졌다.
       if (idRef.current !== requestId) return
       setRegistryLoading(false)
       setLoading(false)
@@ -736,6 +753,29 @@ export default function PropertyDetailPage() {
         >
           {favorited ? '❤️' : '🤍'}
         </button>
+        {/* 임장(현장 확인) 진입 — DISCOVER→REVIEW→**FIELD**→DECIDE 를 실제로 잇는 지점.
+            이 링크가 없으면 임장 화면은 주소를 직접 쳐야만 닿는 "있지만 쓸 수 없는 기능"이다.
+            상세를 다 본 뒤 현장으로 가는 순서라 즐겨찾기 옆에 둔다. */}
+        {/* ★ 다녀온 결과를 여기서 보여 준다 (2026-09-04).
+            예전에는 늘 "임장"이라고만 적혀 있어서, 이미 다녀와 "포기"로 정해 둔
+            물건을 다시 열어도 그 사실이 화면 어디에도 없었다 — 사용자는 끝낸
+            검토를 처음부터 다시 한다. DECIDE 가 보이지 않으면 판단은 사라진다. */}
+        <Link
+          href={`/properties/${id}/field`}
+          className={`ml-3 rounded-lg border px-3 py-1.5 text-sm font-bold ${
+            property.field_visit?.decision
+              ? 'border-gray-900 bg-gray-900 text-white'
+              : 'border-gray-300 text-gray-800'
+          }`}
+        >
+          {property.field_visit?.decision
+            ? `임장 · ${FIELD_DECISION_LABEL[property.field_visit.decision] ?? property.field_visit.decision}`
+            : property.field_visit?.completed_at
+              ? '임장 완료'
+              : property.field_visit
+                ? '임장 중'
+                : '임장'}
+        </Link>
         {registryRequest?.is_free && registryRequest.free_remaining !== undefined && (
           <span className="ml-auto text-xs text-gray-400">등기열람 무료 잔여 {registryRequest.free_remaining}회</span>
         )}

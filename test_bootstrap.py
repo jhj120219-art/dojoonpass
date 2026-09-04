@@ -365,6 +365,49 @@ def test_bootstrap_matches_live_schema_columns_and_indexes():
     check("새로운 인덱스 드리프트 없음(fresh에만 있는 것)", new_fresh_only_idxs, [])
     check("새로운 인덱스 드리프트 없음(운영에만 있는 것)", new_live_only_idxs, [])
 
+    # ★ 붉을 때 **원인을 같은 화면에 적는다** (2026-09-04).
+    #
+    #   이 검사는 "fresh 스키마"와 "지금 이 머신의 auction.db"를 비교한다. 그런데 이
+    #   저장소에서 마이그레이션 적용은 승인 영역이라, 개발 머신의 DB 는 **정상적으로**
+    #   저장소보다 몇 칸 뒤에 있다. 그래서 여기가 붉은 것은 두 가지 중 하나다:
+    #
+    #       (가) 아직 안 돌린 마이그레이션이 있다        <- 환경, 코드 결함이 아니다
+    #       (나) 코드가 스키마를 몰래 바꿨다              <- 진짜 결함
+    #
+    #   지금까지는 둘을 **사람이 눈으로 대조**했다. 매번 같은 판단을 다시 하고, 그때마다
+    #   "코드 결함인가?"를 처음부터 되묻는다. 그래서 실패 옆에 미적용 목록을 찍는다.
+    #
+    #   둘을 **판정**하는 것은 여기가 아니다 - `test_migration_chain.py` 가 운영 사본에
+    #   남은 마이그레이션을 전부 적용한 뒤 fresh 와 대조한다. 거기서 드리프트가 0 이면
+    #   (가), 남으면 (나)다. 판정 로직을 여기에 한 벌 더 두지 않는 이유는 그 복제본이
+    #   갈라지는 순간 어느 쪽을 믿을지 알 수 없게 되기 때문이다.
+    if new_fresh_only_cols or new_live_only_cols or new_fresh_only_idxs or new_live_only_idxs:
+        try:
+            conn = sqlite3.connect(
+                "file:%s?mode=ro" % live_path.replace("\\", "/"), uri=True)
+            try:
+                applied = {r[0] for r in conn.execute(
+                    "SELECT filename FROM migration_history")}
+            finally:
+                conn.close()
+            mig_dir = os.path.join(REPO_ROOT, "storage", "migrations")
+            on_disk = sorted(f for f in os.listdir(mig_dir)
+                             if re.match(r"^\d{3}_.*\.sql$", f))
+            pending = [f for f in on_disk if f not in applied]
+        except (sqlite3.Error, OSError) as exc:
+            pending = None
+            print("   [원인] 미적용 목록을 읽지 못했다: %s" % exc)
+        if pending:
+            print("   [원인] 이 머신에 **아직 적용되지 않은** 마이그레이션 %d건:"
+                  % len(pending))
+            for f in pending:
+                print("      - %s" % f)
+            print("   위 드리프트가 이것으로 전부 설명되는지는 `test_migration_chain.py`")
+            print("   ('두 경로의 스키마가 같은가')가 판정한다. 여기서는 판정하지 않는다.")
+        elif pending == []:
+            print("   [원인] 미적용 마이그레이션은 없다 -> 환경 문제가 아니다.")
+            print("   코드가 스키마를 바꾸고 있을 수 있다. 실제 결함으로 다루십시오.")
+
     # 2026-08-17 Sprint 144: `sorted()`를 그냥 부르면 여기서 **테스트가 TypeError로 죽었다.**
     #   컬럼 항목은 (table, (name, type, notnull, default)) 모양이고 `default`는 값이
     #   없으면 None, 있으면 문자열이다("'RECEIVED'"). 두 항목의 앞 세 요소가 같으면
@@ -586,11 +629,38 @@ def test_claude_md_bootstrap_claims_are_true():
     check_true("마이그레이션 파일을 찾았다", bool(numbers), numbers)
 
     # (1) "001~NNN" 범위 주장이 실제 파일 번호와 맞는가
-    ranges = re.findall(r"(\d{3})\s*~\s*(\d{3})", doc)
-    check_true("CLAUDE.md에 마이그레이션 범위 서술이 있다", bool(ranges), ranges)
-    for lo, hi in ranges:
+    #
+    # ★ **부트스트랩을 안내하는 줄에만** 건다 (2026-09-04 정밀화).
+    #
+    #   예전에는 문서 안의 `NNN~NNN` 을 **전부** 잡아 시작=001 / 끝=최신을 요구했다.
+    #   그런데 이 문서는 과거 사고를 서술하면서 범위를 자주 인용한다 —
+    #   "001~007은 이미 적용돼 남는다", "011~013처럼 테이블을 재작성하는".
+    #   그런 문장이 하나 들어오는 순간 이 검사가 **정확한 서술을 결함으로** 잡았다
+    #   (2026-09-04 실증: "011~013" 한 줄을 넣자 즉시 두 건 실패).
+    #
+    #   그 방향이 나쁘다 — 가드가 사람에게 **증거를 지우라고 압박**하게 된다.
+    #   이 저장소는 왜 고쳤는지를 남기는 것을 규칙으로 삼는데 정반대다.
+    #
+    #   그래서 검사 대상을 "부트스트랩이 무엇을 적용하는가"를 말하는 **그 한 줄**로
+    #   좁힌다. 좁히는 것이 약해지는 것은 아니다 — 아래에서 그 줄을 **반드시 찾도록**
+    #   요구하므로, 줄이 사라지거나 문구가 바뀌면 조용히 통과하지 않고 실패한다.
+    bootstrap_lines = [ln for ln in doc.splitlines()
+                       if "run_migrations" in ln and re.search(r"\d{3}\s*~\s*\d{3}", ln)]
+    check("부트스트랩 범위를 주장하는 줄이 정확히 하나다", len(bootstrap_lines), 1)
+    for ln in bootstrap_lines:
+        lo, hi = re.search(r"(\d{3})\s*~\s*(\d{3})", ln).groups()
         check("CLAUDE.md가 말하는 마이그레이션 시작 번호", int(lo), numbers[0])
         check("CLAUDE.md가 말하는 마이그레이션 끝 번호", int(hi), numbers[-1])
+
+    # ★ 그 줄이 실제로 마지막 마이그레이션을 **이름으로도** 언급하는가.
+    #   번호 범위만 맞추면 "031 까지 적용한다"고 적어 두고 그 파일이 무엇인지는
+    #   아무 데도 없는 상태가 된다 - 새 세션이 무엇이 들어왔는지 알 수 없다.
+    latest = sorted(f for f in os.listdir(mig_dir)
+                    if re.match(r"^\d{3}_.*\.sql$", f))[-1]
+    latest_key = latest.split("_", 1)[1].rsplit(".", 1)[0].split("_")[0]
+    check_true("부트스트랩 안내가 마지막 마이그레이션을 언급한다 (%s)" % latest,
+               any(latest_key in ln or latest[:3] in ln for ln in bootstrap_lines),
+               latest)
 
     # (2) 번호가 비어 있지 않은가 (문서 범위가 맞아도 중간이 빠지면 안내가 거짓이 된다)
     check("마이그레이션 번호에 빠진 구간 없음",
@@ -824,6 +894,8 @@ def run():
     test_bootstrap_is_idempotent()
     test_db_path_does_not_depend_on_cwd()
     test_every_env_var_the_code_reads_is_documented()
+    test_readme_commands_actually_exist()
+    test_claude_md_schema_claims_match_reality()
 
     print("\n" + "=" * 60)
     if failures:
@@ -831,6 +903,220 @@ def run():
         return 1
     print("ALL BOOTSTRAP TESTS PASSED")
     return 0
+
+
+def test_readme_commands_actually_exist():
+    """README 가 시키는 명령이 **실제로 있는 것인가** (2026-09-04 신설).
+
+    ## 왜
+
+    README 는 새로 온 사람이 **가장 먼저 그대로 따라 치는** 문서다. 여기 적힌 명령이
+    한 줄이라도 실재하지 않으면 첫 경험이 오류이고, 더 나쁘게는 "이 저장소는 원래
+    좀 깨져 있다"는 인상으로 남는다. 그런데 파일 이름이 바뀌어도 README 는 아무
+    말을 하지 않는다 — 지금까지 이 저장소에서 README 를 대조하는 검사는 **하나도
+    없었다**(2026-09-04 확인).
+
+    같은 계기로 실제 결함도 하나 나왔다: '검사' 절이 파이썬 회귀 **74개 중 4개**만
+    안내하고 정작 게이트인 `run_python_tests.py` 를 언급하지 않았다. 그대로 따라 하면
+    네 파일만 돌려 놓고 다 봤다고 믿게 된다.
+
+    ## 무엇을 고정하나
+
+        1. README 코드블록의 `python X.py` 가 실제 파일이다
+        2. `npm run X` 가 package.json 의 scripts 에 있다
+        3. 검사 절이 **전체 러너를 언급한다**(부분집합만 안내하지 않는다)
+
+    셋 다 "이름이 바뀌면 붉어진다"는 한 가지 성질을 노린다.
+    """
+    print("\n--- README 명령 == 실제 ---")
+    import json as _json
+    import re as _re
+
+    readme = io.open(os.path.join(REPO_ROOT, "README.md"),
+                     encoding="utf-8-sig").read()
+    pkg = _json.loads(io.open(os.path.join(REPO_ROOT, "package.json"),
+                              encoding="utf-8-sig").read())
+    scripts = set(pkg.get("scripts", {}))
+
+    blocks = _re.findall(r"```(?:bash|sh)?\n(.*?)```", readme, _re.S)
+    lines = [ln.split("#")[0].strip()
+             for b in blocks for ln in b.splitlines()]
+    py = sorted({m.group(1) for ln in lines
+                 for m in [_re.match(r"^python (\S+\.py)$", ln)] if m})
+    npm = sorted({m.group(1) for ln in lines
+                  for m in [_re.match(r"^npm run (\S+)$", ln)] if m})
+
+    # 공허하지 않은가 — 블록을 못 읽으면 아래 검사가 전부 조용히 통과한다.
+    check_true("README 에서 명령을 읽었다 (python %d개 / npm %d개)"
+               % (len(py), len(npm)), len(py) >= 3 and len(npm) >= 2, (py, npm))
+
+    missing_py = [f for f in py if not os.path.isfile(os.path.join(REPO_ROOT, f))]
+    check("★ README 가 부르는 python 파일이 전부 존재한다", missing_py, [])
+    missing_npm = [s for s in npm if s not in scripts]
+    check("★ README 가 부르는 npm script 가 전부 정의돼 있다", missing_npm, [])
+
+    # 부분집합만 안내하고 게이트를 빠뜨리지 않았는가.
+    check_true("★ README 가 전체 파이썬 러너를 안내한다 (run_python_tests.py)",
+               "run_python_tests.py" in py, py)
+
+
+def test_claude_md_schema_claims_match_reality():
+    """문서가 이름으로 주장하는 **표와 컬럼**이 실제로 만들어지는가 (2026-09-05 신설).
+
+    ## 왜
+
+    `docs/CLAUDE.md` 의 부트스트랩 블록은 각 단계가 무엇을 만드는지 **이름으로**
+    적어 둔다.
+
+        init_db()          -> "creates the legacy auction, document_queue,
+                              document_version_log tables"
+        migrate_v4_1.py    -> "creates auction_case, auction_item, document_status, ..."
+        run_migrations     -> "... auction.filed_date(028), recent_items.first_viewed_at(031)"
+
+    새 세션이 이 저장소를 처음 세울 때 읽는 것이 정확히 이 세 줄이다. 그런데 표
+    하나가 이름이 바뀌거나 사라져도 **문서는 아무 말을 하지 않는다.** 실제로 이
+    저장소는 마이그레이션 *번호*가 어긋난 것을 최근에야 발견했고(29 vs 031), 그때
+    번호는 검사하면서 **표 이름은 아무도 검사하지 않는다**는 것이 함께 드러났다
+    (2026-09-05 확인: 이 파일의 기존 검사는 번호·파일 존재만 본다).
+
+    ## 무엇을 고정하나
+
+        1. `# creates ...` 가 나열한 표 집합 == 그 단계가 **실제로 만드는** 표 집합
+        2. 부트스트랩 블록이 `표.컬럼` 으로 지목한 것이 실제로 존재한다
+        3. 부트스트랩 블록이 지목한 `idx_*` 가 실제로 존재한다
+
+    ## 왜 부트스트랩 블록으로 좁히나
+
+    이 문서는 과거 사고를 서술하면서 표·인덱스 이름을 자주 인용한다 — "그때는
+    `auction_image` 테이블 자체가 없었다", "029 가 지운 `idx_ai_case_no`". 문서
+    전체를 훑어 "이름이 나오면 존재해야 한다"고 하면 **정확한 역사 서술이 결함으로
+    잡힌다.** 2026-09-04 에 마이그레이션 범위 검사가 정확히 그렇게 잘못돼 있었고,
+    가드가 사람에게 증거를 지우라고 압박하는 방향이었다. 같은 실수를 되풀이하지 않는다.
+
+    좁히는 것이 약해지는 것은 아니다 — 아래에서 블록과 각 줄을 **반드시 찾도록**
+    요구하므로, 안내가 사라지거나 문구가 바뀌면 조용히 통과하지 않고 실패한다.
+    """
+    print("\n--- 문서가 주장하는 스키마 == 실제 스키마 ---")
+    import re as _re
+    import contextlib as _ctx
+    import storage.database as dbmod
+    import storage.migrate_v4_1 as v41
+
+    doc_path = os.path.join(REPO_ROOT, "docs", "CLAUDE.md")
+    if not os.path.exists(doc_path):
+        print("[SKIP] docs/CLAUDE.md 없음")
+        return
+    doc = open(doc_path, encoding="utf-8-sig").read()
+
+    # 부트스트랩을 안내하는 코드블록 하나를 고른다.
+    blocks = [b for b in _re.findall(r"```[a-z]*\n(.*?)```", doc, _re.S)
+              if "run_migrations" in b and "migrate_v4_1" in b]
+    check("부트스트랩을 안내하는 코드블록이 정확히 하나다", len(blocks), 1)
+    if len(blocks) != 1:
+        return
+    block = blocks[0]
+
+    def claimed_tables(marker):
+        """`marker` 가 있는 줄의 `# creates ...` 가 나열한 이름들."""
+        for ln in block.splitlines():
+            if marker in ln and "creates" in ln:
+                tail = ln.split("creates", 1)[1]
+                tail = tail.split("(")[0]
+                tail = tail.replace("the legacy", " ").replace("tables", " ")
+                names = _re.findall(r"\b([a-z][a-z0-9_]{3,})\b", tail)
+                # 표 이름이 아닌 흔한 말은 뺀다.
+                return sorted(set(names) - {"and", "with", "into", "also", "only"})
+        return None
+
+    # 실제로 각 단계가 만드는 표를 **직접 만들어** 확인한다.
+    tmp = tempfile.mkdtemp(prefix="qa_doc_schema_")
+    db = os.path.join(tmp, "fresh.db")
+    saved = dbmod.DB_PATH
+    dbmod.DB_PATH = db
+    try:
+        with _ctx.redirect_stdout(_io_for_schema_doc()):
+            dbmod.init_db()
+        after_init = _tables_of(db)
+        with _ctx.redirect_stdout(_io_for_schema_doc()):
+            v41.migrate()
+        after_v41 = _tables_of(db)
+        with _ctx.redirect_stdout(_io_for_schema_doc()):
+            _load_runner().run()
+        final_tables = _tables_of(db)
+        final_cols = _columns_of(db)
+        final_idx = _indexes_of(db)
+    finally:
+        dbmod.DB_PATH = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # (1) 표 목록
+    for marker, actual, label in (
+            ("init_db", after_init, "init_db"),
+            ("migrate_v4_1", sorted(set(after_v41) - set(after_init)), "migrate_v4_1")):
+        names = claimed_tables(marker)
+        check_true("%s 의 '# creates' 안내를 찾았다" % label, names is not None, names)
+        if names is None:
+            continue
+        # 공허하지 않은가 - 이름을 못 읽으면 아래 비교가 통과해도 의미가 없다.
+        check_true("%s 안내에서 이름을 실제로 읽었다 (%d개)" % (label, len(names)),
+                   len(names) >= 3, names)
+        check("★ %s 가 만든다고 적힌 표 == 실제로 만드는 표" % label,
+              sorted(names), sorted(actual))
+
+    # (2) 블록이 `표.컬럼` 으로 지목한 것
+    dotted = set()
+    for tbl, col in _re.findall(r"\b([a-z][a-z0-9_]{2,})\.([a-z][a-z0-9_]{2,})\b", block):
+        if tbl in final_tables:            # `auction.db` 같은 파일 이름을 거른다
+            dotted.add((tbl, col))
+    check_true("블록에서 표.컬럼 주장을 읽었다 (%d개)" % len(dotted), len(dotted) >= 1,
+               sorted(dotted))
+    missing_cols = sorted("%s.%s" % (t, c) for t, c in dotted
+                          if c not in final_cols.get(t, set()))
+    check("★ 문서가 지목한 컬럼이 전부 존재한다", missing_cols, [])
+
+    # (3) 블록이 지목한 인덱스
+    idx_names = sorted(set(_re.findall(r"\bidx_[a-z0-9_]+\b", block)))
+    missing_idx = [i for i in idx_names if i not in final_idx]
+    check("★ 문서가 지목한 인덱스가 전부 존재한다", missing_idx, [])
+    if not idx_names:
+        # 판정하지 않은 것을 통과로 적지 않는다 - 사실을 남긴다.
+        print("      (부트스트랩 블록이 인덱스를 이름으로 지목하지 않는다 - 검사 대상 0개)")
+
+
+def _io_for_schema_doc():
+    import io as _io
+    return _io.StringIO()
+
+
+def _tables_of(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%'"))
+    finally:
+        conn.close()
+
+
+def _columns_of(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        out = {}
+        for t in _tables_of(db_path):
+            out[t] = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}
+        return out
+    finally:
+        conn.close()
+
+
+def _indexes_of(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name NOT LIKE 'sqlite_%'")}
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

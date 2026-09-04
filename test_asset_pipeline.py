@@ -2050,6 +2050,43 @@ def test_reconcile_queue_auction_date():
         with contextlib.redirect_stdout(io.StringIO()):
             unknown = reconcile_queue_auction_date(qid2, "없는사건", "9", "2020-01-01", court)
         check("물건이 없으면 큐 값 유지", unknown, "2020-01-01")
+
+        # ── ★ 권위 있는 값이 **비어 있으면** 큐 값을 덮지 않는다 (2026-09-04) ──
+        #
+        #   `auction_item.auction_date` 는 NULL 뿐 아니라 **빈 문자열**이 될 수 있다
+        #   (실측 2026-09-04, 운영 사본: `auction_item` 에 `auction_date=''` 행이 있다.
+        #    `migrate_execute` 가 `row["auction_date"] or existing[...]` 로 병합하는데
+        #    양쪽 다 비어 있으면 `''` 가 그대로 남는다).
+        #
+        #   그 값을 "권위 있는 값"으로 믿고 큐에 쓰면 두 가지가 한꺼번에 무너진다:
+        #
+        #     (1) 큐가 알고 있던 기일이 지워진다 — 되돌릴 근거가 사라진다.
+        #     (2) `doc_worker` 의 2차 방어선은 `if auction_date and auction_date < today`
+        #         라 **빈 값이면 통과한다.** 즉 기일이 지나 종결됐어야 할 물건이
+        #         "기일을 모르는 물건"으로 바뀌어 브라우저 작업을 계속 시도한다.
+        #
+        #   `if not actual` 가드가 그것을 막는다. 변이 검증(2026-09-04)에서 그 가드를
+        #   지웠을 때 스위트 넷이 전부 통과했다 — **아무 검사에도 묶여 있지 않았다.**
+        for label, blank in (("빈 문자열", ""), ("NULL", None)):
+            c = env.conn()
+            try:
+                c.execute("UPDATE auction_item SET auction_date=? WHERE id=1", (blank,))
+                c.execute("UPDATE document_queue SET auction_date='2026-12-31' WHERE id=?",
+                          (qid2,))
+                c.commit()
+            finally:
+                c.close()
+            with contextlib.redirect_stdout(io.StringIO()):
+                kept = reconcile_queue_auction_date(qid2, case_no, item_no,
+                                                    "2026-12-31", court)
+            check("★ 권위 있는 기일이 %s 면 큐 값을 유지한다" % label, kept, "2026-12-31")
+            c = env.conn()
+            try:
+                row = c.execute("SELECT auction_date FROM document_queue WHERE id=?",
+                                (qid2,)).fetchone()
+            finally:
+                c.close()
+            check("★ 큐 행도 덮어쓰지 않는다(%s)" % label, row["auction_date"], "2026-12-31")
     finally:
         env.close()
 

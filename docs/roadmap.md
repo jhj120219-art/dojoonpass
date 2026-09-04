@@ -4,16 +4,23 @@ Status: Beta v1
 
 Owner: Project Management
 
-Last Updated: 2026-08-07
+Last Updated: 2026-09-04
 
 ---
 
 # Project Vision
 
-콕찰(Kokchal)은 대한민국 법원경매 정보를 수집하고 검색·상세조회·권리분석·등기부 신청 서비스를 제공하는 플랫폼이다.
+콕찰(Kokchal)은 **본업이 있는 투자자가 경매 물건을 검토하고 입찰을 결정하는 데
+걸리는 시간을 줄이는 경매 의사결정 서비스**다.
+
+제품 정의(고객/문제/가치/Workflow/KPI)의 정본은 `docs/PRODUCT_STRATEGY.md` 다.
+사용자의 흐름은 네 칸이고, **칸과 칸의 연결**이 곧 제품이다:
+
+    DISCOVER (검색·필터) -> REVIEW (권리·임차인·문서) -> FIELD (임장) -> DECIDE (입찰 판단)
 
 Beta v1에서는 안정적인 검색 서비스 구축을 목표로 하며,
-AI 투자추천이나 자동 투자판단 기능은 범위에 포함하지 않는다.
+AI 투자추천이나 자동 투자판단 기능은 범위에 포함하지 않는다
+(`docs/decision-log.md` — 콕찰은 판단을 **대신하지 않고** 판단에 이르는 시간을 줄인다).
 
 ---
 
@@ -189,6 +196,25 @@ Beta v1 Development
 ---
 
 # Next Priority
+
+## Priority 0 — Workflow 연결 (2026-09-04 신설, 제품 전략 개정 반영)
+
+제품 전략이 T2D(Time to Decision)를 경쟁축으로 확정하면서, **단계가 끊긴 자리**가
+최우선 과제가 됐다. `docs/PRODUCT_STRATEGY.md` §5 참고.
+
+- ~~FIELD 단계 부재~~ → **2026-09-04 vertical slice 구현 완료**
+  (`api/v1/field_visits.py` · `src/app/properties/[id]/field` · migration 030)
+  상세 화면의 "임장" 버튼으로 REVIEW→FIELD 를 연결했고, 임장 화면 하단에서
+  FIELD→DECIDE 로 이어진다. 회귀는 `test_field_visits.py`.
+- ~~T2D 측정 구조 부재~~ → **2026-09-04 최소 구조 구현 완료**
+  (`audit_time_to_decision.py` · migration 031). 잴 수 있는 구간만 재고,
+  못 재는 구간은 못 잰다고 보고한다.
+- **임장 사진** — 미구현. 업로드 경로가 저장소에 없고 multipart 는 신규 의존성이며,
+  사용자 파일의 저장 위치·용량·정리 정책은 제품 결정이라 임의로 만들지 않았다. **승인 필요**
+- **migration 030 / 031 운영 적용** — 스키마 적용은 승인 영역. 적용 전에는 임장 API 가
+  503 + `FIELD_UNAVAILABLE` 로 정직하게 답한다(핵심 화면은 영향 없음). **승인 필요**
+- **최근 본 물건 20건 상한** — 화면에는 맞지만 T2D 측정의 시작점이 함께 지워진다.
+  보존 정책 변경은 저장 비용/목록 길이에 대한 제품 결정. **승인 필요**
 
 Priority 1 (완료, 2026-08-05)
 

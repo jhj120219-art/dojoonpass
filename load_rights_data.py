@@ -17,6 +17,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from storage.database import (get_connection, chunked_for_sql, guard_mass_purge,
                               PURGE_BLOCKED)
 from api.v1.documents import get_doc_dir
+from api.constants import DocumentType
+
+# `tenant_rights.source` 는 **어느 문서에서 뽑았는가**를 적는다.
+# 값 어휘는 문서 종류와 같으므로 정본을 그대로 쓴다 - 이 파일이
+# 다섯 자리에서 같은 문자열을 반복하고 있었고, 그중 셋은 대량 삭제
+# 차단기(기존 행수 / 지울 행수 / DELETE)라 **하나만 어긋나도
+# 차단기가 우회된다**(2026-09-04).
+_SOURCE = DocumentType.STATUS.value
 
 
 def parse_lease_counts(html: str):
@@ -106,7 +114,8 @@ def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -
         ),
     )
 
-    conn.execute("DELETE FROM tenant_rights WHERE item_id = ? AND source = 'STATUS'", (item_id,))
+    conn.execute("DELETE FROM tenant_rights WHERE item_id = ? AND source = ?",
+                 (item_id, _SOURCE))
     for address, count in lease_counts:
         if count <= 0:
             continue  # 확인된 임차인이 없는 주소는 tenant_rights 행을 만들지 않는다
@@ -116,9 +125,9 @@ def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -
                 INSERT INTO tenant_rights (
                     item_id, tenant_name, occupied_area, deposit, monthly_rent,
                     move_in_date, fixed_date, demand_date, has_demand, source, created_at
-                ) VALUES (?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, 'STATUS', ?)
+                ) VALUES (?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
                 """,
-                (item_id, address, now),
+                (item_id, address, _SOURCE, now),
             )
 
     conn.commit()
@@ -159,7 +168,8 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     #   순간 그 일이 **무인으로** 벌어지므로, 규모를 먼저 재고 차단기에 묻는다.
     existing = (conn.execute("SELECT COUNT(*) FROM rights_summary").fetchone()[0]
                 + conn.execute(
-                    "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS'").fetchone()[0])
+                    "SELECT COUNT(*) FROM tenant_rights WHERE source=?",
+                    (_SOURCE,)).fetchone()[0])
     to_delete = 0
     for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
         placeholders = ",".join("?" * len(chunk))
@@ -167,8 +177,8 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
             "SELECT COUNT(*) FROM rights_summary WHERE item_id IN (%s)" % placeholders,
             chunk).fetchone()[0]
         to_delete += conn.execute(
-            "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"
-            % placeholders, chunk).fetchone()[0]
+            "SELECT COUNT(*) FROM tenant_rights WHERE source=? AND item_id IN (%s)"
+            % placeholders, [_SOURCE] + list(chunk)).fetchone()[0]
 
     blocked = guard_mass_purge(existing, to_delete, "STATUS 파생 행 정리")
     if blocked:
@@ -183,8 +193,8 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
             chunk,
         ).rowcount
         removed += conn.execute(
-            "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)" % placeholders,
-            chunk,
+            "DELETE FROM tenant_rights WHERE source=? AND item_id IN (%s)" % placeholders,
+            [_SOURCE] + list(chunk),
         ).rowcount
     conn.commit()
     return removed

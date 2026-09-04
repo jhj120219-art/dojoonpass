@@ -173,6 +173,98 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             ).fetchone()
             is_favorited = fav is not None
 
+        # ── 내 임장/판단 요약 (2026-09-04) ────────────────────────────────
+        #
+        # 왜 상세 응답에 넣는가 — **DECIDE 가 다시 보이지 않으면 판단이 사라진다.**
+        #
+        #   임장을 다녀와 "포기"로 정해 놓고 며칠 뒤 같은 물건을 다시 열면, 화면에는
+        #   그 사실이 아무 데도 없었다(2026-09-04 전수 확인: 상세 화면에
+        #   `field-visits` 를 부르는 코드 0곳). 사용자는 이미 끝낸 검토를 처음부터
+        #   다시 한다 — 이 제품이 줄이겠다고 말한 그 시간을 정확히 되돌리는 셈이다.
+        #
+        # 왜 별도 요청이 아니라 여기인가 — REVIEW 는 **가장 자주 열리는 화면**이다.
+        #   화면 하나에 왕복을 더하면 그것 자체가 T2D 다. `is_favorited` 가 이미
+        #   같은 판단으로 이 응답에 실려 있어 규약도 같다(토큰이 있으면 개인화, 없으면 기본값).
+        #
+        # ★ 요약만 싣는다. 메모·위험요소 본문은 넣지 않는다 — 그것은 임장 화면의
+        #   것이고, 여기서는 "다녀왔는가 / 무엇으로 정했는가"만 있으면 된다.
+        #
+        # ★ 030 이 아직 안 돈 환경에서는 **조용히 null** 이다. 이 엔드포인트는 REVIEW
+        #   의 본체라 부가 정보 하나 때문에 죽으면 안 된다(`favorites.py` 가
+        #   `favorite_notes` 에 쓰는 것과 같은 판단).
+        field_visit = None
+        if user_id:
+            try:
+                has_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='field_visits'"
+                ).fetchone() is not None
+                if has_table:
+                    fv = conn.execute(
+                        "SELECT status, completed_at, decision, decided_at"
+                        "  FROM field_visits WHERE user_id=? AND item_id=?",
+                        (user_id, item_id)).fetchone()
+                    if fv:
+                        done_n = conn.execute(
+                            "SELECT COUNT(*) FROM field_visit_checks c"
+                            "  JOIN field_visits v ON v.id = c.visit_id"
+                            " WHERE v.user_id=? AND v.item_id=? AND c.checked=1",
+                            (user_id, item_id)).fetchone()[0]
+                        field_visit = {
+                            "status": fv["status"],
+                            "completed_at": fv["completed_at"],
+                            "decision": fv["decision"],
+                            "decided_at": fv["decided_at"],
+                            "checked_count": done_n,
+                        }
+            except sqlite3.Error:
+                logger.warning("임장 요약 조회 실패 (item_id=%s)", item_id, exc_info=True)
+
+        # ── 내 등기부 신청 상태 (2026-09-05) ──────────────────────────────
+        #
+        # 왜 상세 응답에 넣는가 — **화면 하나를 여는 데 왕복이 둘이었다.**
+        #
+        #   상세 화면은 `GET /api/v1/item/{id}` 를 받은 **뒤에 이어서**
+        #   `GET /api/v1/registry-requests` 를 불렀다. 그 목록은 사용자의 신청을
+        #   **전부** 내려주고, 프런트가 `find(r => r.item_id === id)` 로 한 건만
+        #   골라 썼다. 한 건이 필요한데 이력 전체를 실어 나른 셈이고, 그 비용은
+        #   사용자가 이 제품을 오래 쓸수록 **커진다** — 줄이겠다고 말한 시간을
+        #   가장 자주 열리는 화면에서 되돌린다.
+        #
+        #   두 요청이 **순차**라는 점이 특히 나쁘다. 두 번째는 첫 번째가 끝나야
+        #   시작하므로 지연이 더해진다(병렬이면 겹치기라도 한다).
+        #
+        # ★ 프런트의 선택을 **그대로** 재현한다. 목록은
+        #   `ORDER BY requested_at DESC, id DESC` 로 내려갔고 `find()` 는 그중
+        #   첫 항목을 잡았다 — 즉 **가장 최근 신청**이다. 여기서 정렬을 빠뜨리면
+        #   같은 물건에 신청이 둘 이상일 때 조용히 다른 건을 보여 준다.
+        #
+        # ★ `is_free` / `free_remaining` 은 싣지 않는다. 그 둘은 신청을 **만든**
+        #   응답에만 있는 값이고(그 순간의 잔여 횟수), 나중에 다시 조회했을 때의
+        #   값은 의미가 다르다. 목록 응답에도 없었다 — 계약을 넓히지 않는다.
+        #
+        # ★ 조회가 실패해도 상세는 계속 내려간다. 예전 프런트도 이 목록 실패를
+        #   조용히 무시했다("신청하기를 누르면 다시 확인된다") — 같은 판단이다.
+        registry_request = None
+        if user_id:
+            try:
+                rr = conn.execute(
+                    "SELECT id, item_id, status, reason, requested_at, completed_at"
+                    "  FROM registry_requests WHERE user_id=? AND item_id=?"
+                    " ORDER BY requested_at DESC, id DESC LIMIT 1",
+                    (user_id, item_id)).fetchone()
+                if rr:
+                    registry_request = {
+                        "id": rr["id"],
+                        "item_id": rr["item_id"],
+                        "status": rr["status"],
+                        "reason": rr["reason"],
+                        "requested_at": rr["requested_at"],
+                        "completed_at": rr["completed_at"],
+                    }
+            except sqlite3.Error:
+                logger.warning("등기부 신청 상태 조회 실패 (item_id=%s)",
+                               item_id, exc_info=True)
+
         return {
             "id": row["id"],
             "case_no": row["case_no"],
@@ -213,6 +305,9 @@ def get_item(item_id: int, credentials: HTTPAuthorizationCredentials = Depends(b
             "tenants": [_project(t, _TENANT_FIELDS) for t in tenants],
             "rights_summary": _project(rights, _RIGHTS_FIELDS) if rights else None,
             "is_favorited": is_favorited,
+            # 내 임장/판단 요약. 비로그인이거나 다녀온 적이 없으면 null.
+            "field_visit": field_visit,
+            "registry_request": registry_request,
         }
     finally:
         conn.close()

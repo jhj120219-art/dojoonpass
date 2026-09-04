@@ -562,7 +562,13 @@ def main() -> int:
         #   다만 그 10분 동안 화면은 '수집중'이고, 다음 실행이 그 사이에 뜨면
         #   집지 못한다. 시도하지 않은 것을 붙들고 있을 이유가 없다.
         if batch:
-            release_queue_rows([r["id"] for r in batch])
+            # ★ claim 토큰을 함께 넘긴다 (2026-09-04). 회수된 뒤 다른 실행이
+            #   다시 집은 행을 여기서 풀어 버리면 그쪽이 받고 있는 문서의
+            #   소유권이 사라진다 — 종결하는 네 함수가 이미 같은 확인을 한다
+            #   (BUGS #181). 되돌리는 쪽만 예외로 두지 않는다.
+            release_queue_rows(
+                [r["id"] for r in batch],
+                {r["id"]: r.get("claim_token") for r in batch})
         try:
             driver.quit()
         except Exception:

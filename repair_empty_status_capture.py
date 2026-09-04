@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from storage.database import (get_connection,
                               QUEUE_STATUS_PENDING, QUEUE_STATUS_DONE)
+from api.constants import DocumentStatus, DocumentType
 # ★ `get_doc_dir()`이 아니라 `_doc_dir_path()`를 쓴다 (2026-08-17 Sprint 153, BUGS #111).
 #
 # `get_doc_dir()`은 `os.makedirs()`를 부른다. 아래 `find_empty_captures()`는 **읽기 전용
@@ -139,9 +140,15 @@ def repair(apply: bool) -> int:
                     moved += 1
 
             # 화면이 읽는 상태를 "수집중"으로 되돌린다.
+            # 상태값/문서종류 둘 다 바인딩한다 (2026-09-04). 큐 쪽 UPDATE 는 이미
+            # 그렇게 하고 있었는데(바로 아래) 화면 쪽만 리터럴이라 규칙이 반쯤
+            # 지켜지고 있었다. 오타면 0행 매치라 "COLLECTING 으로 되돌림: 0행"이
+            # 조용히 찍히고, 파일은 격리됐는데 화면은 계속 READY 로 남는다.
             reset += conn.execute(
-                "UPDATE document_status SET status='COLLECTING' "
-                "WHERE item_id=? AND doc_type='STATUS'", (e["item_id"],)).rowcount
+                "UPDATE document_status SET status=? "
+                "WHERE item_id=? AND doc_type=?",
+                (DocumentStatus.COLLECTING.value, e["item_id"],
+                 DocumentType.STATUS.value)).rowcount
             # 큐도 다시 집도록 되돌린다(재시도 횟수도 초기화 — 실패가 아니라 잘못 저장된 것이므로).
             #
             # 식별키에 반드시 법원을 넣는다. 사건번호는 법원마다 독립적으로 매겨져서

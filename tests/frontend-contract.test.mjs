@@ -30,7 +30,7 @@
 
 import { test, describe, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { readTsFields } from './_ts_interface.mjs'
+import { readTsFields, readTsKeys } from './_ts_interface.mjs'
 import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
 
 const BASE = (process.env.BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
@@ -987,36 +987,10 @@ describe('검색 파라미터 계약 — 보내는 것과 읽는 것이 일치�
 // ================================================================
 
 describe('API 응답 ↔ 프런트 타입 (2026-08-31)', () => {
-  // TS 소스에서 인터페이스의 **최상위 키**를 뽑는다. 중첩 블록은 지우고 본다.
-  async function tsKeys(file, name) {
-    const { promises: fs } = await import('node:fs')
-    const src = await fs.readFile(file, 'utf8')
-    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
-    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
-    let depth = 1
-    let i = m.index + m[0].length
-    const start = i
-    while (i < src.length && depth > 0) {
-      if (src[i] === '{') depth++
-      else if (src[i] === '}') depth--
-      i++
-    }
-    let body = src.slice(start, i - 1)
-    for (;;) {
-      const next = body.replace(/\{[^{}]*\}/g, '')
-      if (next === body) break
-      body = next
-    }
-    const required = new Set()
-    const optional = new Set()
-    for (const line of body.split('\n')) {
-      const code = line.split('//')[0].trim()
-      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
-      if (!km) continue
-      ;(km[2] === '?' ? optional : required).add(km[1])
-    }
-    return { required, optional, all: new Set([...required, ...optional]) }
-  }
+  // 선언 파서는 `tests/_ts_interface.mjs` 하나만 쓴다 (2026-09-04 통합).
+  // 바로 아래 §값 대조가 이미 그 규약을 적어 두고 있었는데(1165행) 이 §키 대조만
+  // 자기 복사본을 들고 있었다. 두 벌이면 한쪽만 규칙이 바뀌고 서로를 눈감아 준다.
+  const tsKeys = (file, name) => readTsKeys(file, name)
 
   async function apiJson(path) {
     const res = await fetch(`${API_BASE}${path}`, { cache: 'no-store' })

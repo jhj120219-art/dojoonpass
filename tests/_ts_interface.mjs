@@ -61,6 +61,10 @@ export async function readTsFields(file, name) {
     out.set(km[1], {
       // `?`(옵셔널) 도 "서버가 안 줄 수 있다"는 뜻이라 nullable 로 본다.
       nullable: km[2] === '?' || /\bnull\b|\bundefined\b/.test(declared),
+      // ★ 그래도 **원래 어느 쪽이었는지**는 남긴다 (2026-09-04). 키 대조는
+      //   `foo?: string`(안 줄 수 있다)와 `foo: string | null`(주지만 비었다)를
+      //   구별해야 하는데, `nullable` 로 합치면 그 정보가 사라진다.
+      optional: km[2] === '?',
       declared,
     })
   }
@@ -75,4 +79,27 @@ export async function assertParses(assert, file, name, { min = 3 } = {}) {
   const f = await readTsFields(file, name)
   assert.ok(f.size >= min, `${name} 에서 필드를 ${f.size}개밖에 못 읽었습니다`)
   return f
+}
+
+/**
+ * 같은 선언을 **키 집합**으로 본다 (2026-09-04 통합).
+ *
+ * `readTsFields()` 는 nullability 를 보려고 `?`(옵셔널)와 `| null` 을 한 값으로
+ * 합친다. 키 대조 쪽은 그 둘을 **구별해야** 한다 — `foo?: string` 은 "서버가 안 줄
+ * 수 있다"이고 `foo: string | null` 은 "주긴 주는데 값이 없을 수 있다"라서,
+ * "타입이 필수라고 적었는데 응답에 없다"를 판정할 때 결과가 갈린다.
+ *
+ * 그래서 파싱은 한 곳에 두고 **보는 각도만** 여기서 바꾼다. 예전에는 이 함수 대신
+ * 같은 파서가 세 벌 복사돼 있었다(`frontend-contract` 1 / `source-contract` 2).
+ *
+ * @returns { required: Set, optional: Set, all: Set }
+ */
+export async function readTsKeys(file, name) {
+  const fields = await readTsFields(file, name)
+  const required = new Set()
+  const optional = new Set()
+  for (const [key, spec] of fields) {
+    (spec.optional ? optional : required).add(key)
+  }
+  return { required, optional, all: new Set([...required, ...optional]) }
 }

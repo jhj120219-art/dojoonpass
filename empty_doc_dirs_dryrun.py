@@ -42,11 +42,32 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DOCUMENT_ROOT = os.path.join(ROOT, "documents")
+
+
+def _force_utf8_stdout():
+    """콘솔 인코딩을 UTF-8 로 고정한다. **`__main__` 에서만 부른다.**
+
+    ## 왜 모듈 최상단이면 안 되는가 (2026-09-04)
+
+    예전에는 이 두 줄이 import 시점에 그냥 실행됐다. 그러면 **이 모듈을 import
+    하는 것만으로 `sys.stdout` 이 교체된다.** 교체된 순간, 옛 스트림의 버퍼에
+    쌓여 있던 출력은 아무도 flush 하지 않으므로 **통째로 사라진다.**
+
+    실측(2026-09-04): `test_doc_path_safety.py` 가 경로 생성기 대조에 이 모듈을
+    넣자 그 앞 §1~§6 의 출력이 화면에서 사라졌다. 검사는 전부 돌고 통과했는데
+    보고만 없어져, 회귀 실행기의 단언 집계가 175 -> 122 로 떨어졌다.
+    **검사 결과가 조용히 줄어드는 것**이라 이 저장소가 가장 경계하는 모양이다.
+
+    이 저장소는 로그 핸들러에 대해 이미 같은 규칙을 세워 두었다(BUGS #192 —
+    `mvp_scraper.attach_file_log()` / `collect_documents.attach_file_log()` 는
+    `__main__` 안에서만 부른다). stdout 도 같은 종류의 전역 자원이다.
+    """
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                                      errors="replace")
 
 
 def scan():
@@ -157,4 +178,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _force_utf8_stdout()
     sys.exit(main())

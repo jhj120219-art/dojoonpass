@@ -309,10 +309,35 @@ def test_all_consumers_agree():
         except Exception as exc:            # noqa: BLE001 - 예외 종류도 계약이다
             return "!" + type(exc).__name__
 
+    # ★ 2026-09-04 — **네 번째 소비자**를 넣는다.
+    #
+    #   위 목록은 셋뿐이었고, `backfill_doc_raw.py` 가 빠져 있었다. 바로 아래 §7 의
+    #   docstring 이 *"Sprint 160  backfill_doc_raw.py 가 목록에 없어 또 살아남았다"*
+    #   라고 그 파일을 이름으로 지목해 두었는데, 이 목록에는 여전히 없었다(세 번째다).
+    #
+    #   실제로 갈라져 있었다 — 그 파일이 `join(ROOT, court_name or "", ...)` 로
+    #   조립하고 있어서:
+    #
+    #       _doc_dir_path(None, ...)             TypeError
+    #       backfill_doc_raw.doc_file_path(None) <ROOT>/<사건>/<물건>/spec.pdf
+    #
+    #   `repair_document_status` 에서 잡힌 것과 **글자까지 같은 결함**이다. 그 파일은
+    #   `doc_raw` 의 해시·크기·쪽수를 쓰므로, 한 단계 위에 우연히 파일이 있으면
+    #   **엉뚱한 파일의 메타데이터**가 그 물건의 것으로 기록된다.
+    #
+    #   ★ 파일 경로 생성기라 디렉터리 생성기와 인자 모양이 다르다(doc_type 이 붙는다).
+    #     그래서 디렉터리 부분만 떼어 비교한다 — 비교 대상은 **규칙**이지 파일명이 아니다.
+    import backfill_doc_raw as _backfill
+
+    def _backfill_dir(court, case_no, item_no):
+        p = _backfill.doc_file_path(court, case_no, item_no, "SPEC")
+        return os.path.dirname(p) if p else p
+
     builders = [
         ("crawler/doc_paths._doc_dir_path", dp._doc_dir_path),
         ("api/v1/documents.get_doc_dir", _apidocs.get_doc_dir),
         ("repair_document_status.get_doc_dir", _repair.get_doc_dir),
+        ("backfill_doc_raw.doc_file_path", _backfill_dir),
     ]
     disagreements = []
     for args in probes:
@@ -326,8 +351,8 @@ def test_all_consumers_agree():
     check_true("검사가 공허하지 않다 - 정상 입력이 실제 경로를 낸다",
                not normal.startswith("!") and "강릉지원" in normal, normal)
     # 그리고 셋이 실제로 **서로 다른 함수 객체**인지도 본다(같은 것을 세 번 부르면 공허하다).
-    check_true("검사가 공허하지 않다 - 서로 다른 세 진입점을 불렀다",
-               len({id(fn) for _, fn in builders}) == 3,
+    check_true("검사가 공허하지 않다 - 서로 다른 네 진입점을 불렀다",
+               len({id(fn) for _, fn in builders}) == 4,
                [n for n, _ in builders])
 
 
@@ -398,6 +423,117 @@ def test_no_new_copies_of_the_rule():
         offenders,
     )
 
+
+
+# ---------------------------------------------------------------------------
+# 7-B. ★ 디렉터리 **조립식** 사본이 다시 생기지 않았는가 (2026-09-04 신설)
+# ---------------------------------------------------------------------------
+def test_no_new_copies_of_the_directory_assembly():
+    """§7 은 **정규화**(`/`->`_`) 사본만 본다. 조립식 사본은 아무도 안 봤다.
+
+    ## 왜 필요한가 — 같은 파일이 세 번 빠졌다
+
+    §6 의 경로 생성기 대조는 **손으로 적은 목록**이고, §7 의 docstring 은 그 목록
+    방식이 두 번 실패했다고 적어 두었다:
+
+        Sprint 153  repair_document_status.py 가 목록에 없어 옛 사본이 살아남았다
+        Sprint 160  backfill_doc_raw.py 가 목록에 없어 또 살아남았다
+
+    그런데 §6 의 목록에는 2026-09-04 까지도 `backfill_doc_raw.py` 가 없었고, 그
+    파일은 실제로 갈라진 사본(`join(ROOT, court_name or "", ...)`)을 들고 있었다.
+    **세 번째다.** §7 의 교훈("목록이 아니라 전수 스캔으로 짜야 한다")을 조립식에도
+    적용한다.
+
+    ## 무엇을 잡나
+
+    `os.path.join(<무엇이든>, <법원 조각>, sanitize_path_segment(...), ...)` 처럼
+    **문서 뿌리 위에 디렉터리를 손으로 조립하는 식**을 찾는다. 판정 기준은
+    "같은 문장 안에 `sanitize_path_segment` 가 두 번 이상 나오는 `os.path.join`" —
+    그것이 곧 <사건>/<물건> 조각을 직접 잇는다는 뜻이다.
+
+    정당한 사본은 `_doc_dir_path()` 자신 하나뿐이다.
+    """
+    print("\n--- 7-B. 디렉터리 조립식 사본이 다시 생기지 않았다 (전수 스캔) ---")
+
+    # ★ 대상은 **추적되는 제품 파일**이다 (2026-09-04).
+    #
+    #   `git ls-files` + `--exclude-standard` 로 고른다 — `.gitignore` 대상인
+    #   일회성 조사 스크립트(`step*.py`)는 제품 경로가 아니다. 이것은 이 저장소가
+    #   이미 세운 규약이다(`test_auction_identity.py` 의 같은 스캐너:
+    #   *"`--exclude-standard` 를 함께 주므로 .gitignore 대상(산출물, step*.py 등)은
+    #   여전히 빠진다"*).
+    #
+    #   실제로 `step7_report.py` / `step11_report.py` 가 조립식을 들고 있는데,
+    #   그 둘은 뿌리부터 다르다(`"documents"` 상대경로). 제품이 아니라 그때
+    #   한 번 돌린 진단 출력이다. **몇 개를 뺐는지는 화면에 남긴다** — 조용히
+    #   좁히면 이 검사가 무엇을 안 봤는지 알 수 없다.
+    import subprocess as _sp
+    tracked = []
+    try:
+        _out = _sp.run(["git", "ls-files", "--exclude-standard", "*.py"],
+                       cwd=ROOT, capture_output=True, text=True, timeout=30)
+        if _out.returncode == 0:
+            tracked = [f for f in _out.stdout.split()
+                       if f.endswith(".py") and "-DESKTOP-" not in f
+                       and not os.path.basename(f).startswith("test_")]
+    except (OSError, _sp.SubprocessError):
+        tracked = []
+
+    skip_dirs = {".git", "node_modules", ".next", "__pycache__", "htmlcov",
+                 ".claude", "logs", "venv", ".venv"}
+    if len(tracked) < 20:
+        # git 이 없는 배포본 - 디렉터리 열거로 되돌린다(범위는 넓지만 0보다 낫다).
+        scanned = []
+        for dirpath, dirnames, filenames in os.walk(ROOT):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for name in filenames:
+                if name.endswith(".py") and not name.startswith("test_"):
+                    scanned.append(os.path.join(dirpath, name))
+        print("      (git 을 쓰지 못해 디렉터리 열거로 훑는다)")
+    else:
+        scanned = [os.path.join(ROOT, f.replace("/", os.sep)) for f in tracked]
+        print("      추적되는 제품 .py %d개를 훑는다"
+              " (.gitignore 대상 step*.py 등은 제품 경로가 아니라 제외)" % len(scanned))
+    check_true("스캔 대상이 실제로 모였다", len(scanned) > 20, len(scanned))
+
+    # `os.path.join(...)` 한 호출 안에 sanitize_path_segment 가 2회 이상 나오면
+    # <사건>/<물건> 을 직접 잇고 있다는 뜻이다.
+    call = re.compile(r"os\.path\.join\(((?:[^()]|\([^()]*\))*)\)", re.S)
+    offenders = []
+    for path in sorted(scanned):
+        rel = os.path.relpath(path, ROOT)
+        try:
+            src_text = open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        body = "\n".join(
+            "" if l.lstrip().startswith("#") else l for l in src_text.splitlines())
+        canonical_file = "def _doc_dir_path" in body
+        for m in call.finditer(body):
+            if m.group(1).count("sanitize_path_segment") < 2:
+                continue
+            if canonical_file:
+                continue          # 정본 자신의 단 하나뿐인 사본
+            offenders.append("%s:%d" % (rel, body[:m.start()].count("\n") + 1))
+
+    if offenders:
+        print("      ★ 디렉터리 규칙을 손으로 조립하는 곳:")
+        for o in offenders:
+            print("         %s" % o)
+        print("      `crawler.doc_paths._doc_dir_path()` 를 부르십시오"
+              " (뿌리는 `root=` 로 준다)")
+    check("★ 디렉터리 조립식 사본이 없다", sorted(set(offenders)), [])
+
+    # 탐지기 자기 증명 — 합성 입력에서는 반드시 잡혀야 한다.
+    probe = ("os.path.join(DOCUMENT_ROOT, court or '', "
+             "sanitize_path_segment(case_no), sanitize_path_segment(item_no))")
+    check_true("탐지기가 조립식을 실제로 잡는다",
+               any(m.group(1).count("sanitize_path_segment") >= 2
+                   for m in call.finditer(probe)))
+    check_true("정본 호출은 잡지 않는다(오탐 없음)",
+               not any(m.group(1).count("sanitize_path_segment") >= 2
+                       for m in call.finditer(
+                           "os.path.join(_doc_dir_path(a, b, c), filename)")))
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +1053,7 @@ if __name__ == "__main__":
     test_never_escapes_document_root()
     test_all_consumers_agree()
     test_no_new_copies_of_the_rule()
+    test_no_new_copies_of_the_directory_assembly()
     test_readonly_lookup_never_creates_directories()
     test_serving_guard_survives_uncomparable_paths()
     test_every_containment_check_handles_uncomparable_paths()

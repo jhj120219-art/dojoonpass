@@ -1192,6 +1192,34 @@ def reconcile_queue_auction_date(queue_id: int, case_no: str, item_no: str,
     않고 큐 값을 그대로 돌려준다** — 잘못 고치는 것보다 안 고치는 편이 낫다.
 
     매칭되는 물건이 없어도 큐 값을 그대로 돌려준다(판단을 바꾸지 않는다).
+
+    ## ★ 이 함수만 claim 토큰/CAS 가 없다 — 왜 예외인가 (2026-09-04 재검토)
+
+    큐를 쓰는 나머지 함수는 전부 `_claim_is_still_ours()` 로 소유권을 확인한다
+    (`mark_queue_done` / `mark_queue_failed` / `mark_queue_skipped_expired` /
+    `mark_queue_unsupported` / `release_queue_rows`). 이 함수만 그것이 없다.
+    **의도한 예외다.** 근거는 셋이고, 셋 다 코드로 확인된다:
+
+      1. **상태 전이가 아니라 사실 정정이다.** 쓰는 것은 `auction_date` 와 그
+         파생값인 `priority` 뿐이고 `status` / `retry_count` / `last_attempt_at` 는
+         건드리지 않는다. 소유권 확인이 막으려는 것("남의 실행이 집은 행의 **상태**를
+         바꾸는 것", BUGS #181)이 여기서는 일어날 수 없다.
+
+      2. **결과가 실행에 의존하지 않는다.** 쓰는 값은 언제나
+         `auction_item.auction_date` 라는 **단일 권위 출처**에서 읽어 온 그대로다.
+         두 실행이 동시에 이 함수를 돌려도 같은 값을 쓴다(멱등). 그래서 "누가
+         이겼는가"를 가릴 이유가 없다 — 이기든 지든 결과가 같다.
+
+      3. **막으면 오히려 나빠진다.** 회수당한 행이라도 큐가 들고 있는 날짜가 사실과
+         다른 것은 그대로 사실이고, 그 값을 `refresh_queue_priority()` 와 다음
+         실행의 2차 방어선이 계속 참조한다. 소유권이 없다고 정정을 건너뛰면
+         **틀린 값이 더 오래 남는다.**
+
+    대신 이 함수가 지켜야 하는 것은 다른 쪽이다 — **모르는 값으로 아는 값을 덮지
+    않는 것.** 그것이 위 `if not actual` 가드이고, 회귀는
+    `test_asset_pipeline.py:test_reconcile_queue_auction_date()` 가 빈 문자열과
+    NULL 두 모양으로 고정한다(2026-09-04 변이 검증에서 그 가드가 아무 검사에도
+    묶여 있지 않은 것이 드러나 추가했다).
     """
     if not court_code:
         # 법원 없이는 물건을 안전하게 특정할 수 없다. 추측해서 고치지 않는다.
@@ -2417,7 +2445,8 @@ def claim_next_item_rows(max_rows: int = QUEUE_BATCH_MAX_ROWS) -> List[Dict]:
     return rows
 
 
-def release_queue_rows(queue_ids: List[int]) -> int:
+def release_queue_rows(queue_ids: List[int],
+                       claim_tokens: Optional[Dict[int, str]] = None) -> int:
     """집어 두었지만 **한 번도 시도하지 않은** 행을 즉시 대기 상태로 돌려놓는다.
 
     실행 창이 닫혀 묶음의 뒷부분을 처리하지 못한 경우에 쓴다.
@@ -2428,10 +2457,31 @@ def release_queue_rows(queue_ids: List[int]) -> int:
 
     ★ `last_attempt_at` 도 건드리지 않는다 — 그 값을 지우면 30분 재시도 간격이
       사라져, 방금 실패한 행이 곧바로 다시 태워질 수 있다. 회수 경로와 동일하게 둔다.
+
+    ## `claim_tokens` — 남의 claim 을 풀지 않는다 (2026-09-04)
+
+    종결하는 네 함수(`mark_queue_done` / `mark_queue_failed` /
+    `mark_queue_skipped_expired` / `mark_queue_unsupported`)는 전부
+    `_claim_is_still_ours()` 로 **그때 집은 그 claim 이 아직 살아 있는지** 확인한다
+    (BUGS #181). 되돌리는 이 함수만 그 확인이 없었다.
+
+    상태(`in_progress`)만으로는 구별할 수 없다는 것이 #181 의 요지 그대로다 —
+    회수당한 뒤 다른 실행이 다시 집어도 상태는 똑같이 `in_progress` 다. 그래서
+    이 함수는 **지금 그 행을 실제로 받고 있는 실행의 claim 을 `pending` 으로
+    풀어 버릴 수 있다.** 그러면 제3의 실행이 같은 문서를 동시에 받고, 먼저 끝난
+    쪽의 종결이 `_claim_is_still_ours()` 에 걸려 조용히 버려진다.
+
+    워커 잠금(PID)이 보통 동시 실행을 막지만, 그 잠금이 죽은 소유자 판정에
+    기대고 있어 **가정에 방어를 걸어 두지 않는다** — 나머지 네 자리가 이미
+    같은 판단을 내렸다.
+
+    `claim_tokens` 는 `{queue_id: claim_token}` 이다. 넘기지 않으면 **예전 동작
+    그대로**다(토큰을 모르는 호출부와 회귀 테스트의 계약을 바꾸지 않는다).
     """
     ids = [int(q) for q in queue_ids]
     if not ids:
         return 0
+    tokens = claim_tokens or {}
     conn = get_connection()
     try:
         # ★ SQL 을 문자열로 조립하지 않는다.
@@ -2439,8 +2489,16 @@ def release_queue_rows(queue_ids: List[int]) -> int:
         #   검사는 그것을 구별할 수 없다(구별하려 들면 검사가 무뎌진다).
         #   한 번에 되돌리는 행은 많아야 QUEUE_BATCH_MAX_ROWS 개라 반복문으로 충분하다.
         released = 0
-        for in_progress, back_to in QUEUE_RESUME_STATUS.items():
-            for queue_id in ids:
+        skipped = 0
+        for queue_id in ids:
+            token = tokens.get(queue_id)
+            if not _claim_is_still_ours(conn, queue_id, token):
+                skipped += 1
+                logger.warning(
+                    "큐 행(id=%s)을 되돌리지 않는다 - 그 사이 회수돼 다른 실행이 "
+                    "집어갔다. 남의 claim 을 풀지 않는다", queue_id)
+                continue
+            for in_progress, back_to in QUEUE_RESUME_STATUS.items():
                 cur = conn.execute(
                     "UPDATE document_queue SET status=? WHERE status=? AND id=?",
                     (back_to, in_progress, queue_id))
@@ -2448,6 +2506,8 @@ def release_queue_rows(queue_ids: List[int]) -> int:
         conn.commit()
         if released:
             logger.info("시도하지 않은 큐 %d행을 대기 상태로 돌려놓았다", released)
+        if skipped:
+            logger.info("큐 %d행은 claim 이 이미 남의 것이라 그대로 두었다", skipped)
         return released
     finally:
         conn.close()

@@ -43,18 +43,40 @@ import argparse
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from storage.database import (  # noqa: E402
     get_connection, _sha256_file, _pdf_page_count, to_relative_storage_path,
 )
 from crawler.doc_paths import (  # noqa: E402
-    CANONICAL_DOC_FILENAME, _PRIMARY_EXT, sanitize_path_segment,
+    CANONICAL_DOC_FILENAME, _PRIMARY_EXT, sanitize_path_segment, _doc_dir_path,
 )
+from api.constants import DocumentStatus  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
+
+
+def _force_utf8_stdout():
+    """콘솔 인코딩을 UTF-8 로 고정한다. **`__main__` 에서만 부른다.**
+
+    ## 왜 모듈 최상단이면 안 되는가 (2026-09-04)
+
+    예전에는 이 두 줄이 import 시점에 그냥 실행됐다. 그러면 **이 모듈을 import
+    하는 것만으로 `sys.stdout` 이 교체된다.** 교체된 순간, 옛 스트림의 버퍼에
+    쌓여 있던 출력은 아무도 flush 하지 않으므로 **통째로 사라진다.**
+
+    실측(2026-09-04): `test_doc_path_safety.py` 가 경로 생성기 대조에 이 모듈을
+    넣자 그 앞 §1~§6 의 출력이 화면에서 사라졌다. 검사는 전부 돌고 통과했는데
+    보고만 없어져, 회귀 실행기의 단언 집계가 175 -> 122 로 떨어졌다.
+    **검사 결과가 조용히 줄어드는 것**이라 이 저장소가 가장 경계하는 모양이다.
+
+    이 저장소는 로그 핸들러에 대해 이미 같은 규칙을 세워 두었다(BUGS #192 —
+    `mvp_scraper.attach_file_log()` / `collect_documents.attach_file_log()` 는
+    `__main__` 안에서만 부른다). stdout 도 같은 종류의 전역 자원이다.
+    """
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                                      errors="replace")
 
 
 def doc_file_path(court_name: str, case_no: str, item_no: str, doc_type: str):
@@ -74,13 +96,31 @@ def doc_file_path(court_name: str, case_no: str, item_no: str, doc_type: str):
       실데이터로 확인: `auction_item` 1,876행 + `document_status` 조인 5,628행,
       총 7,504개 조합에서 **옛 규칙과 새 규칙의 결과가 다른 경우 0건**이다
       (역슬래시 0건). 즉 기존 경로는 하나도 바뀌지 않는다.
+
+    ★★ 2026-09-04: **디렉터리 조립도** 정본으로 모았다. Sprint 161 이 정규화만
+      가져오고 `os.path.join(ROOT, court_name or "", ...)` 는 그대로 뒀는데,
+      그 `or ""` 가 정확히 `repair_document_status.py` 에서 잡힌 것과 같은
+      갈라짐이었다 — 실측(2026-09-04):
+
+          _doc_dir_path(None, ...)   TypeError            (시끄럽게 죽는다)
+          이 함수(None, ...)          <ROOT>/<사건>/<물건>  (조용히 **한 단계 위**)
+
+      두 번째가 나쁘다. 예외도 안 나고 `DOCUMENT_ROOT` 안이라 담김 검사도 통과한다.
+      그 경로에 우연히 파일이 있으면 이 스크립트가 **엉뚱한 파일의 해시·크기·쪽수**를
+      그 물건의 `doc_raw` 로 적는다 — 뷰어의 쪽 이동이 그 값을 읽는다.
+
+      `test_doc_path_safety.py` §7 의 docstring 이 이 파일을 이름으로 지목해
+      *"Sprint 160 backfill_doc_raw.py 가 목록에 없어 또 살아남았다"* 라고 적어
+      두었는데, 경로 생성기 대조 목록에도 여전히 빠져 있었다(세 번째다).
     """
     filename = CANONICAL_DOC_FILENAME.get((doc_type or "").upper())
     if not filename:
         return None
-    safe_case_no = sanitize_path_segment(case_no)
-    safe_item_no = sanitize_path_segment(item_no or "1")
-    return os.path.join(DOCUMENT_ROOT, court_name or "", safe_case_no, safe_item_no, filename)
+    # 규칙은 정본 하나뿐이다. 뿌리는 이 모듈 것을 준다 — 테스트가 모듈별로
+    # `DOCUMENT_ROOT` 를 갈아 끼워 격리하기 때문이다(`_doc_dir_path` 의 `root` 주석).
+    return os.path.join(
+        _doc_dir_path(court_name, case_no, item_no or "1", root=DOCUMENT_ROOT),
+        filename)
 
 
 def primary_file_path(court_name: str, case_no: str, item_no: str, doc_type: str):
@@ -95,11 +135,10 @@ def primary_file_path(court_name: str, case_no: str, item_no: str, doc_type: str
     ext = _PRIMARY_EXT.get(key)
     if not ext:
         return None
-    # 위 doc_file_path()와 같은 이유로 정본 함수를 쓴다 (Sprint 161).
-    safe_case_no = sanitize_path_segment(case_no)
-    safe_item_no = sanitize_path_segment(item_no or "1")
-    return os.path.join(DOCUMENT_ROOT, court_name or "", safe_case_no, safe_item_no,
-                        key + "." + ext)
+    # 위 doc_file_path()와 같은 이유로 정본 함수를 쓴다 (Sprint 161 / 2026-09-04).
+    return os.path.join(
+        _doc_dir_path(court_name, case_no, item_no or "1", root=DOCUMENT_ROOT),
+        key + "." + ext)
 
 
 def plan(conn):
@@ -110,9 +149,10 @@ def plan(conn):
                ai.court_name, ai.case_no, ai.item_no
         FROM document_status ds
         JOIN auction_item ai ON ai.id = ds.item_id
-        WHERE ds.status = 'READY'
+        WHERE ds.status = ?
         ORDER BY ds.item_id, ds.doc_type
-        """
+        """,
+        (DocumentStatus.READY.value,),
     ).fetchall()
 
     existing = {(r["item_id"], r["doc_type"])
@@ -198,4 +238,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _force_utf8_stdout()
     sys.exit(main())

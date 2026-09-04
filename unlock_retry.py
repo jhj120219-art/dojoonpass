@@ -30,6 +30,12 @@ import argparse
 import sqlite3
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 상태 어휘는 저장소에 하나뿐이다 - 여기서 문자열을 새로 적으면 언젠가 갈라진다
+# (`repair_empty_status_capture.py` 가 같은 이유로 같은 곳에서 가져온다).
+from storage.database import QUEUE_CLAIMABLE_STATUSES
+
 # ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
 #   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
 #   "no such table" 로 죽는다(실측). 운영 도구가 엉뚱한 DB 를 보는 것보다 낫지만,
@@ -48,6 +54,38 @@ def build_where(court, case_no, doc_type, item_no):
         where.append("doc_type = ?")
         params.append(doc_type)
     return " AND ".join(where), params
+
+
+# ★ 잠금을 풀어도 되는 상태 (2026-09-04).
+#
+# `last_attempt_at` 한 컬럼이 **성격이 다른 두 가지**를 겸한다.
+#
+#   대기 상태(pending / refresh)   재시도 잠금이다.
+#                                  `claim_next_queue_item()` 이
+#                                  `last_attempt_at <= now-30분` 일 때만 집는다.
+#                                  NULL 로 만들면 "지금 바로 집어도 된다"가 된다 —
+#                                  이 도구가 하려던 일이 바로 그것이다.
+#
+#   그 밖의 상태                    **회수와 소유권의 유일한 근거**다.
+#                                  - `reset_stale_queue()` 는 `in_progress` 회수와
+#                                    `failed` -> `pending` 복구를 둘 다
+#                                    `last_attempt_at IS NOT NULL` 로 걸러 낸다.
+#                                  - `_claim_is_still_ours()` 는 claim 시점의
+#                                    `last_attempt_at` 을 토큰으로 삼아 종결 권한을
+#                                    확인한다(BUGS #181).
+#
+# 그래서 예전 동작(조건에 맞는 **모든** 행을 NULL)은 잠금을 푸는 것이 아니라
+# **회수 장치를 부수는 것**이었다. 임시 DB 로 재현했다(2026-09-04):
+#
+#     in_progress + last_attempt_at=NULL  -> reset_stale_queue() 가 영원히 회수 못 한다
+#                                            (in_progress 는 claim 대상도 아니다)
+#                                         = 아무도 다시 집을 수 없는 **영구 정지 행**
+#     failed      + last_attempt_at=NULL  -> 하루 뒤 pending 복구가 영원히 일어나지 않는다
+#
+# 둘 다 "재시도를 앞당기려고" 부른 도구가 **재시도를 영영 없애는** 정반대 결과다.
+# 그래서 대기 상태만 푼다. 나머지는 건드리지 않고 왜 건너뛰었는지 화면에 남긴다 —
+# 조용히 빼면 운영자는 "풀었다"고 믿는다(이 저장소가 반복해 잡아 온 침묵이다).
+UNLOCKABLE_STATUSES = tuple(QUEUE_CLAIMABLE_STATUSES)
 
 
 def main():
@@ -73,22 +111,48 @@ def main():
             print("대상이 없다: %s %s" % (args.court, args.case_no))
             return 1
 
-        locked = [r for r in rows if r["last_attempt_at"]]
-        print("조건에 맞는 큐 행 %d개 (그중 잠긴 것 %d개)" % (len(rows), len(locked)))
+        unlockable = [r for r in rows
+                      if r["last_attempt_at"] and r["status"] in UNLOCKABLE_STATUSES]
+        protected = [r for r in rows
+                     if r["last_attempt_at"] and r["status"] not in UNLOCKABLE_STATUSES]
+        print("조건에 맞는 큐 행 %d개 (풀 수 있는 것 %d개 / 건드리지 않는 것 %d개)"
+              % (len(rows), len(unlockable), len(protected)))
         for r in rows:
-            print("   %s %s-%s %-10s %-12s last_attempt=%s"
+            mark = ""
+            if r["last_attempt_at"] and r["status"] not in UNLOCKABLE_STATUSES:
+                mark = "   <- 대기 상태가 아니라 건너뛴다(회수 근거를 지우면 안 된다)"
+            print("   %s %s-%s %-10s %-12s last_attempt=%s%s"
                   % (r["court_code"], r["case_no"], r["item_no"], r["doc_type"],
-                     r["status"], r["last_attempt_at"] or "-"))
+                     r["status"], r["last_attempt_at"] or "-", mark))
+
+        if protected:
+            print("\n[주의] 위 %d행은 %s 상태가 아니다. last_attempt_at 을 지우면"
+                  % (len(protected), " / ".join(UNLOCKABLE_STATUSES)))
+            print("       reset_stale_queue() 가 그 행을 영원히 회수하지 못한다"
+                  "(in_progress 는 정지, failed 는 복구 불가).")
 
         if not args.apply:
             print("\n[dry-run] --apply 를 붙이면 위 %d개의 last_attempt_at을 NULL로 만든다."
-                  % len(locked))
+                  % len(unlockable))
             return 0
 
+        if not unlockable:
+            print("\n풀 수 있는 행이 없다. 아무것도 바꾸지 않았다.")
+            return 0
+
+        # ★ 상태 조건을 **SQL 에** 건다. 위에서 목록을 골라 두었지만 그 조회와
+        #   여기 사이에 워커가 행을 집어갔을 수 있다 — 그러면 방금 in_progress 가
+        #   된 행의 claim 토큰을 지우게 된다. 판정을 조회 시점 가정에 기대게 두지
+        #   않는다(`storage/database.py:enqueue_documents()` 의 CAS 가드와 같은 규칙).
+        status_ph = ", ".join("?" * len(UNLOCKABLE_STATUSES))
         cur = conn.execute(
-            "UPDATE document_queue SET last_attempt_at = NULL WHERE " + where, params)
+            "UPDATE document_queue SET last_attempt_at = NULL WHERE " + where
+            + " AND status IN (" + status_ph + ")",
+            params + list(UNLOCKABLE_STATUSES))
         conn.commit()
         print("\n재시도 잠금 해제된 항목 수:", cur.rowcount)
+        if protected:
+            print("건드리지 않은 항목 수:", len(protected))
         return 0
     finally:
         conn.close()

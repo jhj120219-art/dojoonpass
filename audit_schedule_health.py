@@ -37,6 +37,12 @@ import sys
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from api.constants import DocumentStatus, DocumentType
+
+# 감사기의 리터럴 오타는 0행 매치라 **거짓 초록**이 된다 - "미파싱 0건"이
+# 찍히는데 실제로는 아무것도 세지 않은 것이다(2026-09-04).
+_READY = DocumentStatus.READY.value
+_STATUS_DOC = DocumentType.STATUS.value
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -272,20 +278,20 @@ def db_state():
                     "SELECT substr(dr.created_at,1,10) AS d, COUNT(*),"
                     " SUM(CASE WHEN EXISTS(SELECT 1 FROM rights_summary rs"
                     "                      WHERE rs.item_id=dr.item_id) THEN 1 ELSE 0 END)"
-                    " FROM doc_raw dr WHERE dr.doc_type='STATUS'"
-                    " GROUP BY 1 ORDER BY 1 DESC LIMIT 7")
+                    " FROM doc_raw dr WHERE dr.doc_type=?"
+                    " GROUP BY 1 ORDER BY 1 DESC LIMIT 7", (_STATUS_DOC,))
             ]
             st["status_ready_unparsed"] = con.execute(
                 "SELECT COUNT(*) FROM document_status ds"
-                " WHERE ds.doc_type='STATUS' AND ds.status='READY'"
-                " AND NOT EXISTS (SELECT 1 FROM rights_summary rs WHERE rs.item_id=ds.item_id)"
-            ).fetchone()[0]
+                " WHERE ds.doc_type=? AND ds.status=?"
+                " AND NOT EXISTS (SELECT 1 FROM rights_summary rs WHERE rs.item_id=ds.item_id)",
+                (_STATUS_DOC, _READY)).fetchone()[0]
             st["status_ready_unparsed_visible"] = con.execute(
                 "SELECT COUNT(*) FROM document_status ds"
                 " JOIN auction_item ai ON ai.id=ds.item_id"
-                " WHERE ds.doc_type='STATUS' AND ds.status='READY' AND ai.auction_date >= ?"
+                " WHERE ds.doc_type=? AND ds.status=? AND ai.auction_date >= ?"
                 " AND NOT EXISTS (SELECT 1 FROM rights_summary rs WHERE rs.item_id=ds.item_id)",
-                (today,)).fetchone()[0]
+                (_STATUS_DOC, _READY, today)).fetchone()[0]
         except sqlite3.Error:
             st["parse_by_day"] = None
             st["status_ready_unparsed"] = None

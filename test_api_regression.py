@@ -2557,6 +2557,16 @@ EXPECTED_ENDPOINTS = {
     ("GET", "/api/v1/admin/payments/webhooks"),
     ("GET", "/api/v1/admin/payments/webhooks/{webhook_id}"),
     ("POST", "/api/v1/admin/payments/webhooks/{webhook_id}/reprocess"),
+    # 2026-09-04 임장(현장 확인) — DISCOVER→REVIEW→**FIELD**→DECIDE 의 세 번째 칸.
+    # migration 030 이 적용되지 않은 환경에서는 전부 503 + FIELD_UNAVAILABLE 로 답한다
+    # (경로 자체는 존재해야 한다 — 없으면 화면이 '없는 기능'과 '아직 준비 안 된 기능'을
+    #  구별하지 못한다). 도메인 회귀는 `test_field_visits.py` 가 따로 본다.
+    ("POST", "/api/v1/field-visits"),
+    ("GET", "/api/v1/field-visits/{item_id}"),
+    ("PUT", "/api/v1/field-visits/{item_id}/checks"),
+    ("PUT", "/api/v1/field-visits/{item_id}/notes"),
+    ("POST", "/api/v1/field-visits/{item_id}/complete"),
+    ("PUT", "/api/v1/field-visits/{item_id}/decision"),
 }
 
 

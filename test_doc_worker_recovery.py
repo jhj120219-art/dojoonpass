@@ -111,7 +111,7 @@ def test_driver_restart_failure_stops_run_instead_of_burning_retry_budget():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
         "claim_next_item_rows": fake_claim_next_item_rows,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
@@ -200,7 +200,7 @@ def test_driver_restart_success_continues_processing():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
         "claim_next_item_rows": fake_claim_next_item_rows,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
@@ -284,7 +284,7 @@ def test_case_not_reachable_does_not_restart_the_driver():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
         "claim_next_item_rows": fake_claim,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
@@ -343,7 +343,7 @@ def test_real_exception_still_restarts_the_driver():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
         "claim_next_item_rows": fake_claim,
         "get_doc_button_id": lambda doc_type, item_no: "qa-fake-btn-id",
@@ -448,9 +448,12 @@ def test_lock_released_after_normal_run():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": lambda: _FakeDriver("initial"),
-        "claim_next_item_rows": lambda: [],  # 큐가 비어 즉시 종료
+        # 대역도 실물과 **같은 모양**이다(`max_rows`). 고정 0인자로 두면 워커가
+        # 그 인자를 넘기기 시작한 날 대역만 터져서 제품 결함으로 보인다
+        # (같은 파일 위쪽 `fake_mark_queue_failed` 주석과 같은 이유, 2026-09-04).
+        "claim_next_item_rows": lambda max_rows=None: [],  # 큐가 비어 즉시 종료
     })
     orig_sleep = doc_worker.time_module.sleep
     doc_worker.time_module.sleep = lambda *_a, **_kw: None
@@ -490,9 +493,9 @@ def test_driver_startup_failure_releases_lock():
     originals = _patch_all({
         "init_db": lambda: None,
         "reset_stale_queue": lambda: None,
-        "release_queue_rows": lambda ids: 0,
+        "release_queue_rows": lambda ids, claim_tokens=None: 0,
         "build_download_driver": _boom,
-        "claim_next_item_rows": lambda: [],
+        "claim_next_item_rows": lambda max_rows=None: [],
     })
     raised = None
     try:
@@ -538,7 +541,7 @@ def test_out_of_window_run_does_not_start_browser():
         "init_db": lambda: None,
         "reset_stale_queue": _spy_reset,
         "build_download_driver": _spy_driver,
-        "claim_next_item_rows": lambda: [],
+        "claim_next_item_rows": lambda max_rows=None: [],
     })
     try:
         rc = doc_worker.main()

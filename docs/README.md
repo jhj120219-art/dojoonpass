@@ -8,6 +8,15 @@ Claude Code는 프로젝트를 이해할 때 이 문서들을 참고한다.
 
 # Documents
 
+## PRODUCT_STRATEGY.md
+
+**제품 정의의 정본.** 고객 / 문제 / 가치 / Workflow(DISCOVER→REVIEW→FIELD→DECIDE) /
+기능 분류 / KPI(Time to Decision).
+
+다른 문서가 제품 정의를 이것과 다르게 말하면 이 문서를 기준으로 고친다.
+
+---
+
 ## architecture.md
 
 프로젝트 전체 시스템 구조

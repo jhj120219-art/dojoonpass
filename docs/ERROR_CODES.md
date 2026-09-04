@@ -118,6 +118,18 @@ Owner: CTO
 | `ITEM_NOT_FOUND` | 물건 없음 |
 | `INTERNAL_ERROR` | 분류되지 않은 서버 오류 |
 
+### FIELD (임장·현장 확인, 2026-09-04)
+
+`api/v1/field_visits.py` — DISCOVER→REVIEW→**FIELD**→DECIDE 의 세 번째 칸.
+
+| 코드 | 의미 |
+|---|---|
+| `FIELD_UNAVAILABLE` | 임장 테이블(migration 030) 미적용. **코드 결함이 아니라 환경**이라 503 으로 답한다 — `FAVORITE_NOTE_UNAVAILABLE` 과 같은 성격이다 |
+| `FIELD_VISIT_NOT_FOUND` | 이 물건에 내 임장 기록이 없음(아직 시작하지 않음) |
+| `FIELD_INVALID_CHECK_KEY` | 체크리스트에 없는 확인 항목. 어휘 정본은 `api/v1/field_visits.py:CHECK_ITEMS` |
+| `FIELD_INVALID_DECISION` | BID / HOLD / DROP 밖의 판단 값 |
+| `FIELD_NOTE_TOO_LONG` | 메모·위험요소가 `MAX_NOTE_LEN` 초과 |
+
 ---
 
 ## 적용 현황 (2026-08-07 서술, 2026-08-13 Sprint 72 실측으로 재확인)

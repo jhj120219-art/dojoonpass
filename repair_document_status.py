@@ -31,6 +31,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from storage.database import get_connection
+from api.constants import DocumentStatus  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DOCUMENT_ROOT = os.path.join(PROJECT_ROOT, "documents")
@@ -202,8 +203,10 @@ def main() -> int:
         now = datetime.now().isoformat()
         for r in to_fix:
             conn.execute(
-                "UPDATE document_status SET status='READY', updated_at=? WHERE id=?",
-                (now, r["id"]),
+                # 상태값은 바인딩한다 - 오타가 예외가 아니라 **0행 매치**라
+                # "N건 보정했습니다"를 찍으면서 아무것도 안 고치게 된다(2026-09-04).
+                "UPDATE document_status SET status=?, updated_at=? WHERE id=?",
+                (DocumentStatus.READY.value, now, r["id"]),
             )
         conn.commit()
         print("")

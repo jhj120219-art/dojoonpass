@@ -423,8 +423,23 @@ def test_queue_status_vocabulary_is_declared_in_one_place():
     #     값을 SQL 텍스트에 넣으면 오타가 조용히 0행 매치가 되고, 이 저장소의
     #     SQL 조립 감사 규칙(값은 예외 없이 바인딩)과도 어긋난다.
     root = os.path.dirname(os.path.abspath(__file__))
-    literal = re.compile(r"status\s*=\s*'(%s)'" % "|".join(
-        re.escape(v) for v in sorted(QUEUE_STATUSES)))
+    # ★ `=` 뿐 아니라 `IN (...)` 도 잡는다 (2026-09-04).
+    #
+    #   예전 정규식은 `status = '...'` 하나만 봤다. 그래서 `status IN ('SKIPPED_EXPIRED',
+    #   'SKIPPED_UNSUPPORTED')` 형태가 **전수 검사를 그대로 통과**했고, 실제로
+    #   `reset_failures.py` 가 그 모양으로 남아 있었다(2026-09-04 실측 1곳).
+    #
+    #   그 자리가 특히 나쁘다 — 그 스크립트는 이 목록으로 "되살리면 안 되는 행"을
+    #   고른다. 오타가 나면 0행 매치라 **보호 대상이 없다**가 되어, 성공할 수 없는
+    #   문서까지 COLLECTING 으로 되돌린다. 이 검사가 막으려던 바로 그 모양이
+    #   검사의 사각지대에 있었다.
+    _alt = "|".join(re.escape(v) for v in sorted(QUEUE_STATUSES))
+    #   ★ 대소문자는 **구별한다.** 큐 어휘는 소문자('failed')이고 화면 어휘는
+    #     대문자('FAILED')다 - `re.I` 를 걸면 `document_status` 의 정상적인
+    #     'FAILED' 를 큐 리터럴로 오인한다(실제로 `repair_unsupported_status_docs.py`
+    #     가 그렇게 오탐으로 잡혔다). 키워드 `IN` 의 대소문자만 열어 둔다.
+    literal = re.compile(r"status\s*=\s*'(%s)'|status\s+(?i:IN)\s*\(\s*'(%s)'"
+                         % (_alt, _alt))
 
     def code_strings(path):
         """그 파일의 **실제 코드에 쓰이는 문자열**만. docstring 은 뺀다.
@@ -489,8 +504,13 @@ def test_queue_status_vocabulary_is_declared_in_one_place():
     # 탐지기 자체 증명 - 합성 입력에서는 반드시 잡혀야 한다.
     check_true("리터럴 탐지기가 동작한다",
                bool(literal.search("UPDATE q SET status='done' WHERE id=?")))
+    check_true("★ IN (...) 형태도 잡는다",
+               bool(literal.search(
+                   "SELECT 1 WHERE q.status IN ('SKIPPED_EXPIRED', 'SKIPPED_UNSUPPORTED')")))
     check_true("바인딩 형태는 잡지 않는다(오탐 없음)",
                not literal.search("UPDATE q SET status=? WHERE id=?"))
+    check_true("IN 의 바인딩 형태도 잡지 않는다(오탐 없음)",
+               not literal.search("SELECT 1 WHERE q.status IN (?, ?)"))
 
     # (d) 실제 DB 에 어휘 밖의 값이 없다. 스크립트가 몰래 늘렸는지까지 본다.
     db_path = os.path.join(root, "auction.db")
@@ -801,6 +821,229 @@ def test_unsupported_repair_never_touches_confirmed_answers():
     check("★ 산출물 보유로 건너뛴 행이 정확히 둘이다(READY + NO_IMAGE)", skipped2, 2)
 
 
+# ---------------------------------------------------------------------------
+# 9. `unlock_retry.py` 는 **대기 상태만** 푼다 (2026-09-04)
+# ---------------------------------------------------------------------------
+def test_unlock_retry_only_clears_waiting_rows():
+    """재시도 잠금 해제 도구가 회수 근거를 지우지 않는가.
+
+    ## 왜 이 검사가 필요한가
+
+    `document_queue.last_attempt_at` 은 한 컬럼으로 **두 가지**를 겸한다.
+
+        pending / refresh   재시도 잠금 (`claim_next_queue_item()` 의 30분 간격)
+        그 밖의 상태         회수·소유권의 유일한 근거
+                            - `reset_stale_queue()` 의 `in_progress` 회수와
+                              `failed` -> `pending` 복구가 둘 다
+                              `last_attempt_at IS NOT NULL` 을 요구한다
+                            - `_claim_is_still_ours()` 의 claim 토큰이다(BUGS #181)
+
+    `unlock_retry.py` 는 조건에 맞는 **모든** 행의 값을 NULL 로 만들었다. 그래서
+    운영자가 "재시도를 앞당기려고" 부른 도구가 정반대 결과를 냈다 — 임시 DB 재현:
+
+        in_progress + NULL  -> reset_stale_queue() 가 영원히 회수 못 한다.
+                               in_progress 는 claim 대상도 아니므로 **영구 정지 행**이다.
+        failed      + NULL  -> 하루 뒤 pending 복구가 영원히 일어나지 않는다.
+
+    조용한 결함이다 — 도구는 "해제했다"고 출력하고, 큐는 줄지 않으며, 로그에도
+    아무 오류가 없다. 그래서 검사로 묶는다.
+    """
+    print(chr(10) + "--- unlock_retry 는 대기 상태만 푼다 ---")
+    import unlock_retry
+
+    db, path = fresh_db()
+    old = (datetime.now() - timedelta(days=3)).isoformat()
+    seed_queue(path, [
+        ("QA법원", "2099타경7", "1", "spec", "in_progress", 1, old),
+        ("QA법원", "2099타경7", "1", "appraisal", "failed", 3, old),
+        ("QA법원", "2099타경7", "1", "status", "pending", 1, old),
+    ])
+
+    saved_argv, saved_db = sys.argv, unlock_retry.DB_PATH
+    try:
+        unlock_retry.DB_PATH = path
+        sys.argv = ["unlock_retry.py", "QA법원", "2099타경7", "--apply"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = unlock_retry.main()
+    finally:
+        sys.argv, unlock_retry.DB_PATH = saved_argv, saved_db
+    check("도구가 정상 종료한다", rc, 0)
+
+    def att(doc_type):
+        return q(path, "SELECT last_attempt_at FROM document_queue WHERE doc_type=?",
+                 (doc_type,))
+
+    # 하려던 일은 실제로 한다 — 그러지 않으면 이 검사는 "아무것도 안 하기"도 통과시킨다.
+    check("대기(pending) 행의 잠금은 풀린다", att("status"), None)
+    # 회수 근거는 지우지 않는다.
+    check_true("in_progress 행의 회수 근거는 남는다", att("spec") == old, att("spec"))
+    check_true("failed 행의 복구 근거는 남는다", att("appraisal") == old, att("appraisal"))
+
+    # ★ 결과로 확인한다 — 값이 남아 있다는 것만으로는 회수가 실제로 되는지 모른다.
+    with contextlib.redirect_stdout(io.StringIO()):
+        db.reset_stale_queue()
+
+    def st(doc_type):
+        return q(path, "SELECT status FROM document_queue WHERE doc_type=?", (doc_type,))
+
+    check("★ in_progress 행이 회수된다(영구 정지 아님)", st("spec"), "pending")
+    check("★ failed 행이 재시도로 복구된다", st("appraisal"), "pending")
+
+    # ★ 어휘를 손으로 적지 않았는지 확인한다. `UNLOCKABLE_STATUSES` 가 claim 가능
+    #   상태와 갈라지면 refresh 행이 조용히 안 풀리거나, 진행 중인 행이 풀린다.
+    check("풀 수 있는 상태 = claim 가능 상태",
+          sorted(unlock_retry.UNLOCKABLE_STATUSES),
+          sorted(db.QUEUE_CLAIMABLE_STATUSES))
+
+
+# ---------------------------------------------------------------------------
+# 10. `release_queue_rows()` 는 **남의 claim** 을 풀지 않는다 (2026-09-04)
+# ---------------------------------------------------------------------------
+def test_release_does_not_steal_a_reclaimed_row():
+    """되돌리는 경로에도 claim 토큰 확인이 걸려 있는가.
+
+    ## 왜 필요한가
+
+    BUGS #181 은 "회수당한 뒤 다시 집힌 행을 남의 실행이 종결하면 안 된다"를 세우고
+    종결하는 네 함수에 `_claim_is_still_ours()` 를 걸었다. **되돌리는 함수만
+    빠져 있었다.**
+
+        A 가 묶음으로 4행을 집는다 -> 실행 창이 닫힌다
+        그 사이 회수돼 B 가 그중 한 행을 다시 집어 실제로 문서를 받고 있다
+        A 의 finally 가 `release_queue_rows()` 로 그 행을 'pending' 으로 푼다
+        -> C 가 같은 문서를 동시에 받는다. B 의 종결은 토큰에 걸려 조용히 버려진다.
+
+    상태(`in_progress`)로는 구별할 수 없다는 것이 #181 의 요지 그대로다 —
+    회수 후 다시 집은 행도 `in_progress` 다. 그래서 토큰으로 판정해야 한다.
+    """
+    print(chr(10) + "--- release_queue_rows 는 남의 claim 을 풀지 않는다 ---")
+    db, path = fresh_db()
+    seed_queue(path, [
+        ("QA법원", "2099타경8", "1", "spec", "pending", 0, None),
+        ("QA법원", "2099타경8", "1", "appraisal", "pending", 0, None),
+    ])
+
+    mine = db.claim_next_queue_item()
+    check_true("전제: 한 행을 집었다", mine is not None, mine)
+    other = db.claim_next_queue_item()
+    check_true("전제: 다른 행도 집었다", other is not None, other)
+
+    # 내 행이 회수됐다가 다른 실행에 다시 집혔다 — 토큰만 달라지고 상태는 그대로다.
+    stolen_token = (datetime.now() + timedelta(seconds=1)).isoformat()
+    c = sqlite3.connect(path)
+    try:
+        c.execute("UPDATE document_queue SET last_attempt_at=? WHERE id=?",
+                  (stolen_token, mine["id"]))
+        c.commit()
+    finally:
+        c.close()
+    check("전제: 상태로는 구별되지 않는다(둘 다 진행 중)",
+          q(path, "SELECT status FROM document_queue WHERE id=?", (mine["id"],)),
+          "in_progress")
+
+    released = db.release_queue_rows(
+        [mine["id"], other["id"]],
+        {mine["id"]: mine["claim_token"], other["id"]: other["claim_token"]})
+
+    check("★ 남에게 넘어간 행은 풀지 않는다",
+          q(path, "SELECT status FROM document_queue WHERE id=?", (mine["id"],)),
+          "in_progress")
+    check("★ 남에게 넘어간 행의 claim 토큰도 그대로다",
+          q(path, "SELECT last_attempt_at FROM document_queue WHERE id=?", (mine["id"],)),
+          stolen_token)
+    # 검사가 공허하지 않다 — 내 것인 행은 실제로 풀려야 한다.
+    check("아직 내 것인 행은 되돌린다",
+          q(path, "SELECT status FROM document_queue WHERE id=?", (other["id"],)),
+          "pending")
+    check("되돌린 행 수는 하나다", released, 1)
+
+    # 토큰을 넘기지 않는 예전 호출부의 계약은 그대로다(하위호환).
+    db2, path2 = fresh_db()
+    seed_queue(path2, [("QA법원", "2099타경9", "1", "spec", "pending", 0, None)])
+    got = db2.claim_next_queue_item()
+    check("토큰 없이 부르면 예전처럼 되돌린다", db2.release_queue_rows([got["id"]]), 1)
+
+
+# ---------------------------------------------------------------------------
+# 11. `reset_failures.py` — 되살리지 않는 행의 **근거**를 지우지 않는다 (2026-09-04)
+# ---------------------------------------------------------------------------
+def test_reset_failures_keeps_evidence_for_rows_it_leaves_failed():
+    """실패 해제 도구가 보호한 행의 사유까지 지우지는 않는가.
+
+    ## 두 가지를 함께 본다
+
+    (1) **보호** — 큐가 `SKIPPED_EXPIRED` / `SKIPPED_UNSUPPORTED` 로 종결된 행은
+        화면 상태를 `COLLECTING` 으로 되돌리지 않는다. 되돌리면 큐는 종결인데 화면은
+        영원히 "수집중"인, 앞뒤가 안 맞는 상태가 된다(BUGS #69 계열).
+
+    (2) **근거** — 예전에는 `DELETE FROM document_collect_failures` 로 사유를 **통째로**
+        지웠다. 그래서 (1) 이 일부러 FAILED 로 남긴 행까지 이유가 사라졌다. 화면은
+        "수집실패"라고 말하는데 왜인지는 아무 데도 없다 — 그 표는 정확히 그 침묵을
+        없애려고 채우기 시작한 것이다(`_record_collect_failure()`, 2026-09-02).
+
+    둘은 같은 결정의 앞뒤다. 한쪽만 검사하면 다른 쪽이 조용히 되돌아간다.
+    """
+    print(chr(10) + "--- reset_failures 는 보호한 행의 근거를 지우지 않는다 ---")
+    import runpy
+    import storage.database as _db
+
+    db, path = fresh_db()
+    now = datetime.now().isoformat()
+    c = sqlite3.connect(path)
+    try:
+        c.execute("INSERT INTO auction_case (court_code, case_no, created_at, updated_at)"
+                  " VALUES ('QA법원','2099타경11',?,?)", (now, now))
+        cid = c.execute("SELECT id FROM auction_case WHERE case_no='2099타경11'").fetchone()[0]
+        c.execute("INSERT INTO auction_item (case_id, case_no, item_no, court_name,"
+                  " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                  (cid, '2099타경11', '1', 'QA법원', now, now))
+        iid = c.execute("SELECT id FROM auction_item WHERE case_id=?", (cid,)).fetchone()[0]
+        # 같은 물건의 두 문서: 하나는 큐가 종결(보호), 하나는 재시도 소진(되살림).
+        for doc_type, qstatus in (("appraisal", "SKIPPED_UNSUPPORTED"), ("spec", "failed")):
+            c.execute("INSERT INTO document_queue (court_code, case_no, item_no, doc_type,"
+                      " priority, auction_date, status, retry_count, enqueued_at)"
+                      " VALUES ('QA법원','2099타경11','1',?,1,?,?,3,?)",
+                      (doc_type, future(), qstatus, now))
+            c.execute("INSERT INTO document_status (item_id, doc_type, status, updated_at)"
+                      " VALUES (?,?, 'FAILED', ?)", (iid, doc_type.upper(), now))
+            c.execute("INSERT INTO document_collect_failures"
+                      " (item_id, doc_type, error_message, created_at)"
+                      " VALUES (?,?, 'qa-seeded-reason', ?)", (iid, doc_type, now))
+        c.commit()
+    finally:
+        c.close()
+
+    saved_argv, saved_db = sys.argv, _db.DB_PATH
+    try:
+        _db.DB_PATH = path
+        sys.argv = ["reset_failures.py", "--apply"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            runpy.run_path(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "reset_failures.py"),
+                run_name="__main__")
+    except SystemExit:
+        pass
+    finally:
+        sys.argv, _db.DB_PATH = saved_argv, saved_db
+
+    def ds(doc_type):
+        return q(path, "SELECT status FROM document_status WHERE doc_type=?",
+                 (doc_type,))
+
+    def reasons(doc_type):
+        return q(path, "SELECT COUNT(*) FROM document_collect_failures"
+                       " WHERE UPPER(doc_type)=UPPER(?)", (doc_type,))
+
+    # (1) 보호 — 검사가 공허하지 않도록 되살리는 쪽도 함께 본다.
+    check("★ 큐가 종결된 행은 FAILED 그대로 둔다", ds("APPRAISAL"), "FAILED")
+    check("되살릴 행은 COLLECTING 이 된다", ds("SPEC"), "COLLECTING")
+
+    # (2) 근거
+    check("★ 보호한 행의 실패 사유는 남는다", reasons("appraisal"), 1)
+    check("되살린 행의 사유는 지운다(다시 시도하므로)", reasons("spec"), 0)
+
+
 if __name__ == "__main__":
     try:
         test_claim_cas_rejects_row_taken_meanwhile()
@@ -812,6 +1055,9 @@ if __name__ == "__main__":
         test_queue_status_vocabulary_is_declared_in_one_place()
         test_document_status_vocabulary_is_declared_in_one_place()
         test_unsupported_repair_never_touches_confirmed_answers()
+        test_unlock_retry_only_clears_waiting_rows()
+        test_release_does_not_steal_a_reclaimed_row()
+        test_reset_failures_keeps_evidence_for_rows_it_leaves_failed()
     finally:
         for d in _TMP:
             shutil.rmtree(d, ignore_errors=True)

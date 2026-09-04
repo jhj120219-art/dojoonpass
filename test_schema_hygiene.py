@@ -345,6 +345,9 @@ EMITTED_ERROR_CODES = {
     # api/v1/favorite_import.py (2026-08-28 마이리스트 가져오기)
     "FAVORITE_IMPORT_EMPTY", "FAVORITE_IMPORT_TOO_LARGE",
     "FAVORITE_NOTE_UNAVAILABLE", "ITEM_NOT_FOUND",
+    # api/v1/field_visits.py (2026-09-04 임장 — DISCOVER→REVIEW→FIELD→DECIDE)
+    "FIELD_UNAVAILABLE", "FIELD_VISIT_NOT_FOUND", "FIELD_INVALID_CHECK_KEY",
+    "FIELD_INVALID_DECISION", "FIELD_NOTE_TOO_LONG",
 }
 
 
@@ -389,6 +392,13 @@ KNOWN_UNLABELED = {
     # 상세 화면은 PAYMENT_REQUIRED 를 라벨이 아니라 **결제 버튼 분기**로 그린다
     # (그 파일의 주석이 그렇게 적어 뒀고, JSX 에 실제 분기가 있다).
     ("REGISTRY_STATUS_LABEL", "RegistryRequestStatus"): {"PAYMENT_REQUIRED"},
+    # 사진(IMAGE)은 **문서 목록에 그리지 않는다.** 상세 화면이 그 행을 명시적으로
+    # 걸러 내고(`.filter(doc.doc_type !== 'IMAGE')`), 사진은 갤러리와
+    # `images_status` 로 따로 나간다. 문서 뷰어로 열 수도 없다 - 0~N장이라 단일
+    # 파일이 없고, 서빙 계층(`api/v1/documents.py:DOC_TYPE_FILES`)이 그 판정의
+    # 정본이다(BUGS #241). 그래서 라벨이 없는 것이 정상이다.
+    # (2026-09-04 `DocumentType` 에 IMAGE 를 채우면서 함께 적는다.)
+    ("DOC_TYPE_LABEL", "DocumentType"): {"IMAGE"},
 }
 
 # (프런트 상수 이름, 파일, 백엔드 enum 이름)
@@ -2081,6 +2091,14 @@ ALLOWED_SQL_CONCAT_OPERANDS = {
     # 예외 없이 `?` 로 바인딩된다 — 위 `storage/database.py`/`filter_engine.py` 의
     # `where` 항목과 **같은 패턴**이다. 사용자 입력(argparse)은 조각이 아니라 params 로만 간다.
     ("unlock_retry.py", "where"),
+    # 2026-09-04: 잠금 해제를 **대기 상태(pending/refresh)로만** 좁히면서 생겼다.
+    # 그렇게 하지 않으면 `in_progress` / `failed` 행의 `last_attempt_at` 까지 지워
+    # `reset_stale_queue()` 가 그 행을 영원히 회수하지 못한다(영구 정지 행).
+    # `status_ph` 는 `", ".join("?" * len(UNLOCKABLE_STATUSES))` 로 **`?` 반복만**
+    # 담는다 — 상태 값 자체는 `storage/database.QUEUE_CLAIMABLE_STATUSES` 에서 와서
+    # 예외 없이 바인딩된다. `storage/database.py` 의
+    # `QUEUE_CLAIMABLE_PLACEHOLDERS` 와 같은 패턴이다.
+    ("unlock_retry.py", "status_ph"),
     # SQL 이 아니다 — 진단 출력 문자열이 "[select ..." 라 키워드 매칭에 걸린다.
     ("verify_courts.py", "sel_id"),
     ("verify_courts.py", "sel_name"),
@@ -2125,10 +2143,14 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
     ("detect_stale_region_contamination_dryrun.py",
      "SELECT id, full_address, sido, sigungu, dong, lot_number FROM %s"),
     ("load_rights_data.py", "DELETE FROM rights_summary WHERE item_id IN (%s)"),
+    # 2026-09-04: `source` 값도 **바인딩으로** 바뀌었다(어휘 정본은
+    # `api/constants.DocumentType`). 리터럴이던 시절에는 같은 값이 이 파일 안
+    # 다섯 자리에 반복됐고, 그중 셋이 대량 삭제 차단기(기존 행수 / 지울 행수 /
+    # DELETE)라 **하나만 오타가 나도 차단기가 우회**될 수 있었다.
     ("load_rights_data.py",
-     "DELETE FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
+     "DELETE FROM tenant_rights WHERE source=? AND item_id IN (%s)"),
     ("load_spec_data.py",
-     "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"),
+     "DELETE FROM tenant_rights WHERE source=? AND item_id IN (%s)"),
     # 2026-09-02 — 위 DELETE 세 문장을 **지우기 전에 세는** COUNT 짝이다
     # (`guard_mass_purge()` 에 넘길 규모를 재는 용도, BUGS #245 배선의 전제).
     # `%s` 자리에 들어가는 것은 위 DELETE 와 **글자 그대로 같은 값** —
@@ -2136,14 +2158,16 @@ ALLOWED_SQL_PERCENT_TEMPLATES = {
     # 요청이 닿지 않는 CLI 운영 스크립트라는 점도 같다.
     ("load_rights_data.py", "SELECT COUNT(*) FROM rights_summary WHERE item_id IN (%s)"),
     ("load_rights_data.py",
-     "SELECT COUNT(*) FROM tenant_rights WHERE source='STATUS' AND item_id IN (%s)"),
+     "SELECT COUNT(*) FROM tenant_rights WHERE source=? AND item_id IN (%s)"),
     ("load_spec_data.py",
-     "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"),
+     "SELECT COUNT(*) FROM tenant_rights WHERE source=? AND item_id IN (%s)"),
+    # 2026-09-04: `reset_failures.py` 는 되살릴 행을 **먼저 고른 뒤** 행마다
+    # UPDATE/DELETE 하도록 바뀌었다(되살리지 않는 행의 실패 사유를 지우지 않기
+    # 위해서다). 그래서 `%s` 를 쓰는 문장은 이 SELECT 하나만 남았고, 상태값도
+    # 리터럴이 아니라 바인딩이다.
     ("reset_failures.py",
-     "SELECT COUNT(*) FROM document_status WHERE status='FAILED' AND id IN (%s)"),
-    ("reset_failures.py",
-     "UPDATE document_status SET status='COLLECTING', updated_at=? "
-     "WHERE status='FAILED' AND id NOT IN (%s)"),
+     "SELECT id, item_id, doc_type FROM document_status"
+     " WHERE status=? AND id NOT IN (%s)"),
 }
 _SQL_KEYWORDS = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "WHERE ", "ORDER BY",
                  " FROM ", "VALUES", "SET ", "JOIN ", "GROUP BY", "PRAGMA ", "CREATE ")
@@ -2307,6 +2331,12 @@ SQL_PLACEHOLDER_SITES = {
     #   아무리 늘어도 커지지 않는다. 나눌 대상이 아니다.
     ("storage/database.py", "len(cols)"):
         "_build_upsert_sql(): 한 행의 컬럼 수(리터럴 목록 17~18개). 입력 크기와 무관하므로 상한에 닿지 않는다.",
+    # 2026-09-04. `unlock_retry.py` 가 잠금 해제를 대기 상태로만 좁히면서 생겼다.
+    #   입력은 `storage/database.QUEUE_CLAIMABLE_STATUSES` -- **모듈 상수 튜플(2개)** 이라
+    #   명령줄 인자가 크기를 정하지 못한다. `storage/database.py` 쪽의 같은 상수
+    #   항목(`len(QUEUE_CLAIMABLE_STATUSES)`)과 같은 근거다. 나눌 대상이 아니다.
+    ("unlock_retry.py", "len(UNLOCKABLE_STATUSES)"):
+        "QUEUE_CLAIMABLE_STATUSES 에서 온 모듈 상수 튜플(2개). 입력 크기와 무관하다.",
 }
 
 
@@ -4458,6 +4488,61 @@ def test_entrypoints_do_not_attach_file_logs_on_import():
     check_true("자기 검증: 다른 함수는 다른 구조로 나온다",
                other is not None and other not in set(shapes.values()), other)
 
+    # ── ★ 같은 모양의 **의도된 중복**이 하나 더 있다 (2026-09-04) ─────────────
+    #
+    #   `crawler/base_crawler.py:restart_driver()` 와
+    #   `crawler/doc_crawler.py:restart_download_driver()` 는 본문이 글자까지 같고
+    #   **부르는 빌더만 다르다**(`build_driver` vs `build_download_driver`).
+    #
+    #   합치지 않는 것이 맞다 — 두 크롤러가 쓰는 드라이버 계약이 다르고
+    #   (문서 크롤러는 다운로드 설정을 유지해야 한다), `doc_crawler` 는 지금도
+    #   `base_crawler` 를 **함수 안에서만** 늦게 import 한다(모듈 최상단 결합을
+    #   일부러 피한다, 그 파일 1132행 주석). 그래서 `attach_file_log()` 와 같은
+    #   판단이다: **인라인을 유지하되 갈라짐을 검사로 막는다.**
+    #
+    #   갈라지면 무엇이 나쁜가: 이 함수는 `doc_worker` 의 장애 복구 경로다
+    #   (드라이버가 죽었을 때 되살린다). 한쪽에만 고침이 들어가면 그 크롤러만
+    #   되살아나지 못하고, 증상은 "그 배치만 조용히 일찍 끝난다"로 나타난다.
+    restart_shapes = {
+        "crawler/base_crawler.py:restart_driver":
+            shape_of(os.path.join(root, "crawler", "base_crawler.py"), "restart_driver"),
+        "crawler/doc_crawler.py:restart_download_driver":
+            shape_of(os.path.join(root, "crawler", "doc_crawler.py"),
+                     "restart_download_driver"),
+    }
+    check_true("두 드라이버 재시작 함수를 찾았다",
+               all(v is not None for v in restart_shapes.values()), restart_shapes)
+    check("★ 드라이버 재시작 두 구현의 구조가 같다(한쪽만 고쳐지지 않았는가)",
+          len(set(restart_shapes.values())), 1)
+    if len(set(restart_shapes.values())) != 1:
+        print("      -> 한쪽만 바꿨다면 다른 쪽도 같이 바꾸라. 일부러 다르게 만든 것이라면")
+        print("         이 검사를 갱신하고 **왜 달라야 하는지**를 함께 적으라 (BUGS #204)")
+
+    # ── ★ 미리보기는 실행기와 **같은 함수**를 써야 한다 (2026-09-04) ──────────
+    #
+    #   `migrate_dryrun.py` 는 "오늘 무엇이 바뀔지 미리 보여 주는" 도구다. 그런데
+    #   파생 필드 규칙(`extract_fail_count` / `calc_bid_rate`)이 `migrate_execute.py`
+    #   의 것과 **글자까지 같은 사본**으로 들어 있었다(2026-09-04 실측).
+    #
+    #   위 두 쌍과 달리 여기는 인라인할 이유가 없다 - 같은 저장소의 추적 파일끼리라
+    #   그냥 import 하면 된다. 그래서 사본을 지우고 import 로 바꿨고, 여기서는
+    #   **같은 함수 객체인지**를 본다. 구조 비교보다 강한 조건이고, 어떻게 import
+    #   하든(별칭·재노출) 통과한다.
+    #
+    #   갈라지면: 미리보기가 실제와 **다른 숫자**를 말한다. 운영자는 그 숫자를 보고
+    #   `--apply` 를 결정하므로, 미리보기가 미리보기가 아니게 되는 고장이다.
+    import importlib as _imp
+    try:
+        _me = _imp.import_module("migrate_execute")
+        _md = _imp.import_module("migrate_dryrun")
+    except Exception as exc:            # noqa: BLE001 - import 실패도 결함이다
+        check_true("migrate_dryrun / migrate_execute 를 import 할 수 있다",
+                   False, "%s: %s" % (type(exc).__name__, exc))
+    else:
+        for fname in ("extract_fail_count", "calc_bid_rate"):
+            check_true("★ migrate_dryrun 이 실행기와 같은 %s() 를 쓴다" % fname,
+                       getattr(_md, fname, None) is getattr(_me, fname, object()))
+
 
 
 # 프런트가 보내는데 백엔드가 읽지 않는 검색 파라미터 (2026-08-25 실측, docs/BUGS.md #195).
@@ -4838,6 +4923,7 @@ def run():
     test_claude_md_paths_exist()
     test_no_new_tracked_sqlite_databases()
     test_entrypoints_do_not_attach_file_logs_on_import()
+    test_frontend_api_default_matches_server_bind_host()
     test_search_form_params_reach_the_backend()
     test_pipeline_resolves_chrome_driver_through_one_place()
     test_no_python_syntax_warnings()
@@ -5785,6 +5871,60 @@ def test_unreachable_product_modules_are_known():
                    if f in reach or f not in tracked)
     check("목록에 죽은 항목이 없다(배선됐거나 사라진 파일)", stale, [])
     print("    도달 불가로 **알려진** 제품 모듈 %d개" % len(unreached))
+
+
+def test_frontend_api_default_matches_server_bind_host():
+    """`src/lib/api.ts` 의 기본 주소가 `api_server.py` 의 바인딩 주소와 같은가.
+
+    ## 왜 이것이 성능 문제인가 (2026-09-04 실측)
+
+    `api_server.py` 는 `uvicorn.run(..., host="127.0.0.1")` 로 **IPv4 루프백에만**
+    바인딩한다(의도된 보안 선택). 그런데 프런트 기본값은 `http://localhost:8000`
+    이었고, Windows 에서 `localhost` 는 **`::1`(IPv6) 로 먼저 해석된다.**
+    그 주소에는 아무도 듣고 있지 않으니 연결이 타임아웃될 때까지 기다렸다가
+    IPv4 로 폴백한다.
+
+        http://localhost:8000/api/v1/search   p50  2,044ms
+        http://127.0.0.1:8000/api/v1/search   p50      5.7ms   <- 360배
+        서버 내부(TestClient) 같은 요청        p50      5.5ms
+
+    **서버는 5ms 인데 화면은 2초를 기다린다.** 오류가 아니라 대기라서 로그에도
+    남지 않고, 화면 하나가 여러 번 부르면 그만큼 곱해진다. 이 저장소가 줄이겠다고
+    말한 시간(T2D)을 개발/QA 환경에서 통째로 되돌린다.
+
+    ## 무엇을 고정하나
+
+    두 값이 **같은 호스트**를 가리키는지만 본다. 포트나 스킴은 보지 않는다 —
+    배포에서는 `NEXT_PUBLIC_API_BASE_URL` 이 이기므로 여기서 다투는 것은
+    **그 변수를 주지 않았을 때의 기본값**뿐이다.
+    """
+    print("\n--- 프런트 기본 API 주소 == 서버 바인딩 주소 ---")
+    import io as _io
+    import re as _re
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    api_ts = _io.open(os.path.join(root, "src", "lib", "api.ts"),
+                     encoding="utf-8-sig").read()
+    server = _io.open(os.path.join(root, "api_server.py"),
+                     encoding="utf-8-sig").read()
+
+    m = _re.search(r"NEXT_PUBLIC_API_BASE_URL\s*\|\|\s*'https?://([^:'/]+)", api_ts)
+    check_true("프런트 기본 주소를 찾았다", m is not None, m)
+    b = _re.search(r'uvicorn\.run\([^)]*host\s*=\s*"([^"]+)"', server, _re.S)
+    check_true("서버 바인딩 주소를 찾았다", b is not None, b)
+    if not (m and b):
+        return
+
+    front_host, bind_host = m.group(1), b.group(1)
+    print("      프런트 기본 %s  /  서버 바인딩 %s" % (front_host, bind_host))
+    check("★ 프런트 기본 호스트 == 서버 바인딩 호스트", front_host, bind_host)
+    if front_host != bind_host:
+        print("      -> `localhost` 는 Windows 에서 ::1 로 먼저 해석돼 요청마다")
+        print("         약 2초를 그냥 기다린다(실측 2,044ms vs 5.7ms).")
+
+    # 자기 검증 - 탐지기가 실제로 값을 읽고 있는가(둘 다 비어 있으면 공허하다).
+    check_true("검사가 공허하지 않다 - 두 값을 모두 읽었다",
+               bool(front_host) and bool(bind_host), (front_host, bind_host))
 
 
 if __name__ == "__main__":

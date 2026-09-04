@@ -23,19 +23,90 @@ def record_view(conn, user_id: str, item_id: int):
     사용자에게 보이는 동작은 그대로다(이미 20건 넘게는 안 보였다), 저장 공간만 준다.
     """
     now = datetime.now().isoformat()
-    conn.execute("""
-        INSERT INTO recent_items (user_id, item_id, viewed_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, item_id) DO UPDATE SET viewed_at = ?
-    """, (user_id, item_id, now, now))
-    conn.execute("""
-        DELETE FROM recent_items
-         WHERE user_id = ?
-           AND id NOT IN (
-               SELECT id FROM recent_items WHERE user_id = ?
-                ORDER BY viewed_at DESC, id DESC LIMIT ?
-           )
-    """, (user_id, user_id, RECENT_ITEMS_DISPLAY_LIMIT))
+    # ★ "처음 본 시각"을 함께 남긴다 (2026-09-04, migration 031).
+    #
+    #   `viewed_at` 은 재조회마다 덮어써진다 — 그것이 "최근 본 물건" 정렬의 의미이므로
+    #   그대로 둔다. 그런데 Time-to-Decision 의 **시작점**은 그 값이 될 수 없다:
+    #   같은 물건을 다시 볼수록 시작점이 앞으로 끌려와, 오래 고민한 물건일수록
+    #   T2D 가 짧게 나온다(정반대로 틀린다).
+    #
+    #   그래서 덮어쓰지 않는 열을 따로 둔다. `COALESCE(first_viewed_at, ?)` 가
+    #   그 "덮어쓰지 않음"이다 — 이미 값이 있으면 지킨다.
+    #
+    #   031 의 운영 적용은 승인 영역이라 **열이 없는 환경이 실제로 존재한다.**
+    #   무조건 쓰면 `no such column` 으로 물건 상세 조회가 통째로 500 이 된다 —
+    #   부가 측정값 하나 때문에 핵심 화면이 죽는다. `favorites.py` 가
+    #   `favorite_notes` 에 쓰는 것과 같은 판단이다.
+    has_first = conn.execute(
+        "SELECT 1 FROM pragma_table_info('recent_items') WHERE name='first_viewed_at'"
+    ).fetchone() is not None
+    if has_first:
+        conn.execute("""
+            INSERT INTO recent_items (user_id, item_id, viewed_at, first_viewed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                viewed_at = ?,
+                first_viewed_at = COALESCE(recent_items.first_viewed_at, ?)
+        """, (user_id, item_id, now, now, now, now))
+    else:
+        conn.execute("""
+            INSERT INTO recent_items (user_id, item_id, viewed_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET viewed_at = ?
+        """, (user_id, item_id, now, now))
+    # ★ 임장을 다녀온 물건의 행은 **지우지 않는다** (2026-09-04).
+    #
+    #   ## 왜 지금까지 문제가 아니었나
+    #
+    #   이 DELETE 는 저장 공간을 묶는 장치다. 위 주석이 적어 둔 그대로 —
+    #   "사용자에게 보이는 동작은 그대로다(이미 20건 넘게는 안 보였다), 저장 공간만 준다."
+    #   **표시 쿼리(`get_recent_items`)에 자체 `LIMIT` 이 이미 있기 때문에** 그 말이
+    #   성립한다. 즉 행을 더 남겨도 화면은 20건 그대로다.
+    #
+    #   ## 왜 이제는 문제인가
+    #
+    #   2026-09-04 에 `first_viewed_at`(migration 031)이 이 표에 붙었다. 그 값은
+    #   Time-to-Decision 의 **시작점**이다. 그런데 행이 지워지면 열이 있어도 소용없다 —
+    #   물건을 많이 보는 사용자일수록 처음 본 기록이 먼저 사라지고, 그 결과 T2D 는
+    #   **가벼운 사용자 쪽으로 치우쳐** 측정된다(`audit_time_to_decision.py` [5]).
+    #
+    #   ## 왜 이것이 정책 변경이 아닌가
+    #
+    #   상한(20)을 바꾸지 않는다. 화면에 보이는 개수도 그대로다. 남기는 것은
+    #   **임장을 다녀온 물건**뿐이고, 그 수는 사용자가 실제로 현장에 간 횟수라
+    #   본질적으로 작다(500건을 임장하지 않는다). 즉 저장 비용의 성격이 바뀌지 않는다.
+    #
+    #   그리고 이 물건들이야말로 사용자가 **가장 오래 붙들고 판단한 것**이다 —
+    #   T2D 가 재려는 바로 그 대상이 지워지고 있었던 셈이다.
+    #
+    #   ## 030 이 없는 환경
+    #
+    #   `field_visits` 가 없으면 예전 그대로 동작한다. 부가 측정 하나 때문에
+    #   최근 본 물건 기록이 통째로 실패하면 안 된다(이 파일의 다른 방어와 같은 판단).
+    keep_visited = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='field_visits'"
+    ).fetchone() is not None
+    if keep_visited:
+        conn.execute("""
+            DELETE FROM recent_items
+             WHERE user_id = ?
+               AND id NOT IN (
+                   SELECT id FROM recent_items WHERE user_id = ?
+                    ORDER BY viewed_at DESC, id DESC LIMIT ?
+               )
+               AND item_id NOT IN (
+                   SELECT item_id FROM field_visits WHERE user_id = ?
+               )
+        """, (user_id, user_id, RECENT_ITEMS_DISPLAY_LIMIT, user_id))
+    else:
+        conn.execute("""
+            DELETE FROM recent_items
+             WHERE user_id = ?
+               AND id NOT IN (
+                   SELECT id FROM recent_items WHERE user_id = ?
+                    ORDER BY viewed_at DESC, id DESC LIMIT ?
+               )
+        """, (user_id, user_id, RECENT_ITEMS_DISPLAY_LIMIT))
     conn.commit()
 
 @router.get("/recent-items")

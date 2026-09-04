@@ -177,9 +177,37 @@ DOCUMENT_STATUSES_IN_USE = frozenset({
 
 
 class DocumentType(StrEnum):
+    """`document_status.doc_type` / `doc_raw.doc_type` — 수집 자산의 종류.
+
+    ★ 2026-09-04 정정: **`IMAGE` 가 빠져 있었다.** `NO_IMAGE` 때(2026-08-31)와
+      **같은 모양의 누락**이다 — 제품 전체가 아는 값을 상태값 정의만 몰랐다:
+
+          storage/database.py       QUEUE_TO_DOC_STATUS_TYPE 에 "image" -> "IMAGE"
+                                    (`_set_document_status()` 가 그 값을 실제로 쓴다)
+          api/v1/item.py            `doc_type == "IMAGE"` 행을 찾아 images_status 를 만든다
+          audit_asset_integrity.py  `ds.doc_type <> 'IMAGE'` 로 문서 감사에서 제외한다
+          properties/[id]/page.tsx  `.filter(doc.doc_type !== 'IMAGE')` 로 목록에서 뺀다
+
+      즉 DB·수집기·API·화면·감사기가 전부 쓰는 네 번째 값을 이 열거형만 몰랐다.
+      값은 이미 DB 에 들어 있는 것 그대로 옮긴다(이 모듈의 규약: 값을 새로 정하지 않는다).
+
+      누락이 실제로 해를 끼치던 자리 — 이 열거형은 **리터럴 탐지기의 어휘**이기도 하다
+      (`test_state_machines.py`). `IMAGE` 가 어휘에 없으니 탐지기는 `'IMAGE'` 를
+      아예 찾지 않았고, `audit_asset_integrity.py` 의 두 리터럴이 그대로 통과했다.
+      "정의가 불완전하면 그 정의로 만든 검사도 불완전하다"가 그대로 나타난 자리다.
+
+    ★ **파일로 서빙되는 종류와는 다르다.** `IMAGE` 는 문서 뷰어로 열 수 없다 —
+      사진은 0~N장이라 단일 파일이 없고, `images[]` / `representative_image` 로 나간다.
+      그 판정의 정본은 `api/v1/documents.py:DOC_TYPE_FILES` 이고 이 열거형이 아니다
+      (BUGS #241 이 세운 규칙 — 서빙 계층을 진실의 원천으로 삼는다).
+      그래서 화면의 `DOC_TYPE_LABEL` 에도 IMAGE 라벨이 없는 것이 정상이다
+      (`test_schema_hygiene.py:KNOWN_UNLABELED` 에 근거와 함께 적어 둔다).
+    """
+
     SPEC = "SPEC"
     STATUS = "STATUS"
     APPRAISAL = "APPRAISAL"
+    IMAGE = "IMAGE"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +309,18 @@ class ErrorCode(StrEnum):
     # 않기 위해** 별도 코드를 둔다 - INTERNAL_ERROR 로 뭉뚱그리면 화면이 "서버 오류"를
     # 띄워, 운영자가 고쳐야 할 것(마이그레이션 적용)을 알 수 없다.
     FAVORITE_NOTE_UNAVAILABLE = "FAVORITE_NOTE_UNAVAILABLE"
+
+    # FIELD - 임장(현장 확인) (2026-09-04, api/v1/field_visits.py)
+    #
+    # `FIELD_UNAVAILABLE` 은 `FAVORITE_NOTE_UNAVAILABLE` 과 같은 성격이다 -
+    # migration 030 이 아직 적용되지 않은 환경. 운영자가 고쳐야 할 것(마이그레이션
+    # 적용)을 화면이 말할 수 있어야 하므로 INTERNAL_ERROR 로 뭉뚱그리지 않는다.
+    FIELD_UNAVAILABLE = "FIELD_UNAVAILABLE"
+    FIELD_VISIT_NOT_FOUND = "FIELD_VISIT_NOT_FOUND"
+    FIELD_INVALID_CHECK_KEY = "FIELD_INVALID_CHECK_KEY"
+    FIELD_INVALID_DECISION = "FIELD_INVALID_DECISION"
+    FIELD_NOTE_TOO_LONG = "FIELD_NOTE_TOO_LONG"
+
     ITEM_NOT_FOUND = "ITEM_NOT_FOUND"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -294,6 +334,7 @@ ERROR_CODE_DOMAINS = {
     "ADMIN": "관리자 (api/v1/admin.py)",
     "SUBSCRIPTION": "구독 (api/v1/subscriptions.py)",
     "FAVORITE": "관심물건 (api/v1/favorites.py)",
+    "FIELD": "임장·현장 확인 (api/v1/field_visits.py)",
     "ITEM": "물건 공통",
     "INTERNAL": "서버 내부 오류",
 }

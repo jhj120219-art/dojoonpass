@@ -3136,14 +3136,77 @@ FIELD_CHAIN = {
     "crawl_date":        ("normalizer", "auction", "auction_item", "search+item", "both"),
     "full_address":      ("normalizer", "auction", "auction_item", "search+item", "both"),
     "property_type":     ("normalizer", "auction", "auction_item", "search+item", "both"),
+    # 지역 — 검색 필터의 뼈대다. 값이 아니라 **배선**을 본다(값은 §12 가 실데이터로 본다).
+    #
+    # ★ 왜 뒤늦게 넣나 (2026-09-04): 이 넷은 `full_address` 를 쪼갠 파생값인데
+    #   `sido`/`sigungu`/`dong` 은 검색의 **주 필터**이고 `lot_number` 는 상세 화면의
+    #   지번 표기다. 그런데 끝에서 끝까지 보는 검사가 없어, 어느 한 이음매가 끊겨도
+    #   구간 검사 넷은 전부 초록일 수 있었다(이 검사가 만들어진 사유 그대로다).
+    "sido":              ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "sigungu":           ("normalizer", "auction", "auction_item", "search+item", "both"),
+    "dong":              ("normalizer", "auction", "auction_item", "search+item", "both"),
+    # 지번은 검색 목록에 내보내지 않는다 — 상세 화면에서만 쓴다.
+    "lot_number":        ("normalizer", "auction", "auction_item", "item", "detail"),
     # 파생 — 정규화기가 아니라 migrate_execute 가 계산한다
     "bid_rate":          ("derived",    None,     "auction_item", "search+item", "both"),
     "fail_count":        ("derived",    None,     "auction_item", "search+item", "both"),
+    # 면적 — `extract_areas(full_address)` 가 뽑아 `migrate_execute` 가 쓴다.
+    #   `auction` 에는 컬럼이 없다(주소에서 파생되므로 원시 표에 둘 이유가 없다).
+    "building_area":     ("derived",    None,     "auction_item", "search+item", "both"),
+    "land_area":         ("derived",    None,     "auction_item", "search+item", "both"),
     # 사건 정보 — 이번 세션에 배선했다 (BUGS #285)
     "filed_date":        ("normalizer", "auction", "auction_case", "item", "case"),
     "case_type":         ("spec_pdf",   None,     "auction_case", "item", "case"),
     "demand_deadline":   ("spec_pdf",   None,     "auction_case", "item", "case"),
 }
+
+
+# ---------------------------------------------------------------------------
+# 컬럼이 없을 때 — **환경인가 결함인가** (2026-09-04)
+#
+# 위 검사는 컬럼이 없으면 곧바로 "끊긴 이음매"라고 말했다. 그런데 이 저장소의
+# 개발/QA 장비는 번호 마이그레이션이 뒤처져 있는 것이 정상 상태다(실측: 이 머신의
+# `auction.db` 는 020 까지만 적용, 021~029 미적용). 그러면 `auction.filed_date` 와
+# `auction_item.building_area` 가 없고, 검사는 **배선이 끊겼다고 말한다** — 사실이
+# 아니다. 배선은 멀쩡하고 이 DB 가 낡았을 뿐이다(제품 코드는 `auction_has_filed_date()`
+# / `api/v1/search.py:_area_of()` 로 그 경우를 이미 다룬다).
+#
+# 그 말이 사실이 아니면 검사는 신뢰를 잃고, 신뢰를 잃은 빨강은 결국 무시된다.
+# 그래서 **나눠서 말한다.** 다만 조용히 통과시키지 않는다 — §15 가
+# `DOJOONPASS_DATA_ROLE` 에서 쓴 것과 같은 규약이다("판정 안 함. 통과가 아니다").
+#
+# 나누는 근거는 손으로 적지 않는다. `storage/migrations/*.sql` 의
+# `ALTER TABLE ... ADD COLUMN` 을 읽어 **어느 파일이 그 컬럼을 만드는지** 알아내고,
+# 그 파일이 `migration_history` 에 없을 때만 "아직 안 돌았다"로 본다.
+#
+# ★ 마이그레이션이 **이미 적용됐는데도** 컬럼이 없으면 그것은 여전히 결함이다.
+#   그래서 이 완화는 "마이그레이션을 안 돌린 DB" 하나에만 열린다.
+def pending_column_migrations(conn):
+    """{(table, column): filename} — 아직 적용되지 않은 ADD COLUMN 들."""
+    import re as _re
+    import io as _io
+    import glob as _glob
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        applied = {r[0] for r in conn.execute(
+            "SELECT filename FROM migration_history")}
+    except sqlite3.Error:
+        applied = set()          # 이력 표가 없다 = 아무것도 적용되지 않았다고 본다
+    pat = _re.compile(
+        r"ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)", _re.I)
+    pending = {}
+    for path in sorted(_glob.glob(os.path.join(root, "storage", "migrations", "*.sql"))):
+        name = os.path.basename(path)
+        if name in applied:
+            continue
+        try:
+            sql = _io.open(path, encoding="utf-8-sig").read()
+        except OSError:
+            continue
+        for table, column in pat.findall(sql):
+            pending[(table, column)] = name
+    return pending
 
 
 def test_core_field_chains_are_wired_end_to_end():
@@ -3175,6 +3238,7 @@ def test_core_field_chains_are_wired_end_to_end():
         cols = {}
         for t in ("auction", "auction_item", "auction_case"):
             cols[t] = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t)}
+        pending_cols = pending_column_migrations(conn)
         row = conn.execute(
             "SELECT ai.id FROM auction_item ai JOIN auction_case ac ON ai.case_id=ac.id"
             " WHERE ac.filed_date IS NOT NULL AND ac.case_type IS NOT NULL"
@@ -3211,6 +3275,18 @@ def test_core_field_chains_are_wired_end_to_end():
         return _re.search(r"^\s*%s\??\s*:" % _re.escape(field), src, _re.M) is not None
 
     broken = []
+    deferred = []          # 마이그레이션 미적용이라 **판정하지 않은** 이음매
+
+    def column_seam(field, table):
+        """표에 컬럼이 있는가. 없으면 환경(미적용 마이그레이션)인지 가른다."""
+        if not table or field in cols.get(table, set()):
+            return
+        pend = pending_cols.get((table, field))
+        if pend:
+            deferred.append("%s: %s.%s - %s 미적용" % (field, table, field, pend))
+        else:
+            broken.append("%s: %s 컬럼 없음" % (field, table))
+
     for field, (producer, raw_tab, out_tab, api_where, ts_where) in sorted(FIELD_CHAIN.items()):
         # (1) 생산자 — 출력 dict 의 **키**로 본다
         if producer == "normalizer":
@@ -3224,10 +3300,8 @@ def test_core_field_chains_are_wired_end_to_end():
             broken.append("%s: 생산자(%s) 없음" % (field, producer))
 
         # (2)(3) 표 컬럼
-        if raw_tab and field not in cols.get(raw_tab, set()):
-            broken.append("%s: %s 컬럼 없음" % (field, raw_tab))
-        if out_tab and field not in cols.get(out_tab, set()):
-            broken.append("%s: %s 컬럼 없음" % (field, out_tab))
+        column_seam(field, raw_tab)
+        column_seam(field, out_tab)
 
         # (4) API 응답에 **키가 실제로 있는가**
         if detail_json:
@@ -3242,13 +3316,40 @@ def test_core_field_chains_are_wired_end_to_end():
             broken.append("%s: /api/v1/search 응답에 없음" % field)
 
         # (5) 프런트 선언
-        if ts_where in ("both", "case") and not ts_declares(ts_detail, field):
+        if ts_where in ("both", "case", "detail") and not ts_declares(ts_detail, field):
             broken.append("%s: 상세 화면 타입에 선언 없음" % field)
         if ts_where == "both" and not ts_declares(ts_search, field):
             broken.append("%s: 검색 타입에 선언 없음" % field)
 
     check("★ 끊긴 이음매 없음", sorted(broken), [])
     print("    검사한 필드 %d개 x 5이음매" % len(FIELD_CHAIN))
+
+    # ★ 판정하지 못한 이음매는 **반드시 화면에 남긴다.** 조용히 빼면 "초록"이
+    #   거짓말이 된다(§15 의 DOJOONPASS_DATA_ROLE 규약과 같다).
+    if deferred:
+        print("    [판정 안 함] 이 DB 는 번호 마이그레이션이 뒤처져 있어 아래 컬럼"
+              " 이음매를 재지 못했다 - **통과가 아니다**:")
+        for d in sorted(deferred):
+            print("        %s" % d)
+        print("        해소: python -m storage.migrations.run_migrations")
+
+    # ★ 완화가 새는지 자기 검증한다 - 세 가지를 본다.
+    #   이 분류가 느슨해지면 **모든 컬럼 결함을 삼킨다.**
+    #   (a) 없는 컬럼을 지어내지 않는다
+    #   (b) **이미 적용된** 마이그레이션의 컬럼은 유예 대상이 아니다
+    #       (010 은 어느 DB 에도 적용돼 있다 - 그런데도 pending 이면
+    #        적용목록 대조가 깨진 것이다)
+    #   (c) 유예한 것은 전부 실제 파일을 가리킨다
+    check_true("완화 자기검증(a): 없는 컬럼을 지어내지 않는다",
+               ("auction", "qa_nonexistent_column_probe") not in pending_cols)
+    check_true("완화 자기검증(b): 이미 적용된 마이그레이션은 유예 대상이 아니다",
+               ("registry_requests", "reason") not in pending_cols,
+               sorted(pending_cols))
+    _bad_file = sorted(f for f in set(pending_cols.values())
+                       if not os.path.exists(os.path.join(
+                           os.path.dirname(os.path.abspath(__file__)),
+                           "storage", "migrations", f)))
+    check("완화 자기검증(c): 유예 근거가 전부 실제 파일이다", _bad_file, [])
 
 
 # ---------------------------------------------------------------------------

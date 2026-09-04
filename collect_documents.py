@@ -16,6 +16,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from storage.database import get_connection, record_doc_raw_row
+from api.constants import DocumentStatus
 from config.settings import random_delay
 # 경로 규칙은 selenium 무의존 모듈에서 가져온다 — 여기서 규칙을 따로 만들면
 # 뷰어(api/v1/documents.py)·doc_worker와 갈라져 "READY인데 404"가 된다.
@@ -352,8 +353,8 @@ def save_doc_raw(conn, item_id: int, doc_type: str, pdf_path: str) -> bool:
         conn.execute("""
             INSERT OR REPLACE INTO document_status
             (item_id, doc_type, status, updated_at)
-            VALUES (?, ?, 'READY', ?)
-        """, (item_id, doc_type, now))
+            VALUES (?, ?, ?, ?)
+        """, (item_id, doc_type, DocumentStatus.READY.value, now))
 
         conn.commit()
         return True
@@ -377,8 +378,8 @@ def save_failure(conn, item_id: int, doc_type: str, error: str):
     conn.execute("""
         INSERT OR REPLACE INTO document_status
         (item_id, doc_type, status, updated_at)
-        VALUES (?, ?, 'FAILED', ?)
-    """, (item_id, doc_type, now))
+        VALUES (?, ?, ?, ?)
+    """, (item_id, doc_type, DocumentStatus.FAILED.value, now))
     conn.commit()
 
 def collect_all(limit: int = 10):
@@ -389,9 +390,9 @@ def collect_all(limit: int = 10):
             SELECT DISTINCT ai.id, ai.case_no, ai.item_no, ai.court_name
             FROM auction_item ai
             JOIN document_status ds ON ai.id = ds.item_id
-            WHERE ds.status = 'COLLECTING'
+            WHERE ds.status = ?
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, (DocumentStatus.COLLECTING.value, limit)).fetchall()
 
         logger.info("수집 대상: %d건", len(items))
 
@@ -406,8 +407,8 @@ def collect_all(limit: int = 10):
             # doc_type별 미수집 확인
             pending_docs = conn.execute("""
                 SELECT doc_type FROM document_status
-                WHERE item_id = ? AND status = 'COLLECTING'
-            """, (item_id,)).fetchall()
+                WHERE item_id = ? AND status = ?
+            """, (item_id, DocumentStatus.COLLECTING.value)).fetchall()
             pending_types = [d["doc_type"] for d in pending_docs]
 
             if not pending_types:

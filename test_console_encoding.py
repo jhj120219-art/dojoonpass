@@ -601,6 +601,7 @@ def run():
     test_known_operator_warnings_are_safe()
     test_no_escape_frozen_into_a_control_character()
     test_batch_files_are_ascii()
+    test_stdout_is_not_replaced_at_import_time()
 
     print("\n" + "=" * 55)
     if failures:
@@ -608,6 +609,134 @@ def run():
         return 1
     print("ALL TESTS PASSED")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# import 부작용으로 `sys.stdout` 을 갈아치우지 않는가 (2026-09-04 신설)
+# ---------------------------------------------------------------------------
+def test_stdout_is_not_replaced_at_import_time():
+    """콘솔 인코딩 고정은 **`__main__` 안에서만** 한다.
+
+    ## 무슨 일이 있었나 (2026-09-04 실측)
+
+    세 스크립트가 모듈 최상단에서 이렇게 하고 있었다:
+
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", ...)
+
+    의도는 맞다(cp949 콘솔에서 죽지 않게). 문제는 **자리**다. 최상단에 두면
+    **그 모듈을 import 하는 것만으로 `sys.stdout` 이 교체되고**, 교체되는 순간
+    옛 스트림의 버퍼에 쌓여 있던 출력은 아무도 flush 하지 않으므로 사라진다.
+
+    `test_doc_path_safety.py` 가 경로 생성기 대조에 `backfill_doc_raw` 를 넣자
+    그 앞 §1~§6 의 출력이 화면에서 통째로 사라졌다. 검사는 전부 돌고 통과했는데
+    **보고만 없어져** 회귀 실행기의 단언 집계가 175 -> 122 로 떨어졌다.
+    실패가 아니라 **검사 결과가 조용히 줄어드는 것**이라 더 나쁘다 — 이 파일이
+    막으려는 "로그 라인이 조용히 소실되는" 사고와 같은 계열이다.
+
+    이 저장소는 로그 핸들러에 대해 이미 같은 규칙을 세워 두었다(BUGS #192):
+    *"운영 파일 로그는 `if __name__ == '__main__':` 안에서만 붙인다."*
+    `sys.stdout` 도 같은 종류의 전역 자원이다.
+
+    ## 무엇을 보나
+
+    `sys.stdout = ...` 대입이 **최상위 문(statement)** 으로 있으면 위반이다.
+    함수 안(`def _force_utf8_stdout(): ...`)에 있는 것은 정상이다 — 부르는 쪽이
+    `__main__` 인지 정하기 때문이다.
+    """
+    import ast
+    import subprocess as _sp
+
+    print("\n--- import 만으로 sys.stdout 을 바꾸지 않는가 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = _sp.run(["git", "ls-files", "--exclude-standard", "*.py"], cwd=root,
+                      capture_output=True, text=True, timeout=30)
+        files = ([f for f in out.stdout.split()
+                  if f.endswith(".py") and "-DESKTOP-" not in f]
+                 if out.returncode == 0 else [])
+    except (OSError, _sp.SubprocessError):
+        files = []
+    if len(files) < 20:
+        files = sorted(n for n in os.listdir(root)
+                       if n.endswith(".py") and "-DESKTOP-" not in n)
+    check("훑을 파일을 실제로 찾았다 (%d개)" % len(files), len(files) >= 20, True)
+
+    def toplevel_stdout_assign(tree):
+        """최상위(모듈/if/try 블록 포함, 함수 밖)에서 sys.stdout 에 대입하는 줄."""
+        hits = []
+
+        def walk(body):
+            for node in body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                    continue                      # 함수 안은 정상이다
+                if isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if (isinstance(t, ast.Attribute) and t.attr == "stdout"
+                                and isinstance(t.value, ast.Name)
+                                and t.value.id == "sys"):
+                            hits.append(node.lineno)
+                for field in ("body", "orelse", "finalbody"):
+                    inner = getattr(node, field, None)
+                    if isinstance(inner, list):
+                        walk(inner)
+        walk(tree.body)
+        return hits
+
+    offenders = []
+    scanned = 0
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            tree = ast.parse(io.open(path, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue
+        scanned += 1
+        # `if __name__ == "__main__":` 안의 대입은 정상이다 - 그 블록만 걷어낸다.
+        tree.body = [n for n in tree.body if not _is_main_guard(n)]
+        for lineno in toplevel_stdout_assign(tree):
+            offenders.append("%s:%d" % (rel, lineno))
+
+    check("실제로 훑었다 (%d개)" % scanned, scanned >= 20, True)
+    if offenders:
+        print("   ★ import 만으로 sys.stdout 을 교체하는 곳:")
+        for o in sorted(set(offenders)):
+            print("      %s" % o)
+        print("   함수로 감싸고 `if __name__ == \"__main__\":` 에서 부르십시오"
+              " (예: backfill_doc_raw._force_utf8_stdout)")
+    check("최상위에서 sys.stdout 을 갈아치우는 곳이 없다", sorted(set(offenders)), [])
+
+    # 탐지기 자기 증명 - 합성 입력에서는 반드시 잡히고, 정상 형태는 잡히지 않는다.
+    bad_src = ('import sys, io\n'
+               'if hasattr(sys.stdout, "buffer"):\n'
+               '    sys.stdout = io.TextIOWrapper(sys.stdout.buffer)\n')
+    good_src = ('import sys, io\n'
+                'def fix():\n'
+                '    sys.stdout = io.TextIOWrapper(sys.stdout.buffer)\n')
+    check("탐지기가 최상위 교체를 잡는다",
+          bool(toplevel_stdout_assign(ast.parse(bad_src))), True)
+    check("함수 안의 교체는 잡지 않는다(오탐 없음)",
+          bool(toplevel_stdout_assign(ast.parse(good_src))), False)
+    main_src = ('import sys, io\n'
+                'if __name__ == "__main__":\n'
+                '    sys.stdout = io.TextIOWrapper(sys.stdout.buffer)\n')
+    _t = ast.parse(main_src)
+    _t.body = [n for n in _t.body if not _is_main_guard(n)]
+    check("`__main__` 안의 교체는 잡지 않는다(오탐 없음)",
+          bool(toplevel_stdout_assign(_t)), False)
+
+
+def _is_main_guard(node):
+    """`if __name__ == "__main__":` 노드인가."""
+    import ast
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+        return False
+    left = node.test.left
+    if not (isinstance(left, ast.Name) and left.id == "__name__"):
+        return False
+    return any(isinstance(c, ast.Constant) and c.value == "__main__"
+               for c in node.test.comparators)
 
 
 if __name__ == "__main__":

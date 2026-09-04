@@ -694,7 +694,8 @@ def test_overwrite_reaches_the_collector():
         return {"success": True, "previous_hash": "", "new_hash": "h", "partial": False}
 
     _run_doc_worker({
-        "claim_next_item_rows": lambda: ([claims.pop(0)] if claims else []),
+        # 대역은 실물과 같은 모양을 유지한다(`max_rows`) - 2026-09-04.
+        "claim_next_item_rows": lambda max_rows=None: ([claims.pop(0)] if claims else []),
         "collect_document": fake_collect,
     })
 
@@ -721,7 +722,8 @@ def test_refresh_skips_sibling_shortcut():
                 "reused_from": "/qa/sibling/dir" if driver is None else ""}
 
     _run_doc_worker({
-        "claim_next_item_rows": lambda: ([claims.pop(0)] if claims else []),
+        # 대역은 실물과 같은 모양을 유지한다(`max_rows`) - 2026-09-04.
+        "claim_next_item_rows": lambda max_rows=None: ([claims.pop(0)] if claims else []),
         "collect_document": fake_collect,
         "find_sibling_case_document": fake_sibling,
     })

@@ -36,6 +36,7 @@ from api.v1.doc_stats import router as doc_stats_router
 from api.v1.favorites import router as favorites_router
 from api.v1.favorite_import import router as favorite_import_router
 from api.v1.recent_items import router as recent_router
+from api.v1.field_visits import router as field_visits_router
 from api.v1.search_presets import router as presets_router
 from api.v1.registry import router as registry_router
 from api.v1.documents import router as documents_router
@@ -184,6 +185,11 @@ app.include_router(favorites_router, prefix="/api/v1", tags=["favorites"])
 # 달라 충돌하지 않지만, 순서를 바꾸면 앞으로 추가될 GET 경로에서 갈릴 수 있다.
 app.include_router(favorite_import_router, prefix="/api/v1", tags=["favorites"])
 app.include_router(recent_router, prefix="/api/v1", tags=["recent"])
+# 임장(현장 확인) (2026-09-04, migration 030). DISCOVER->REVIEW->FIELD->DECIDE 의
+# 세 번째 칸이다. 030 이 아직 안 돈 환경에서는 라우터가 503+FIELD_UNAVAILABLE 로
+# 정직하게 답하므로, 등록 자체는 조건부로 두지 않는다(조건부로 두면 경로가
+# 아예 404 라 화면이 '없는 기능'과 '아직 준비 안 된 기능'을 구별하지 못한다).
+app.include_router(field_visits_router, prefix="/api/v1", tags=["field"])
 app.include_router(presets_router, prefix="/api/v1", tags=["presets"])
 app.include_router(registry_router, prefix="/api/v1", tags=["registry"])
 app.include_router(documents_router, prefix="/api/v1", tags=["documents"])

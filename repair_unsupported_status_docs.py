@@ -86,6 +86,7 @@ from config.settings import get_doc_button_id
 from storage.database import (QUEUE_TO_DOC_STATUS_TYPE,  # noqa: E402
                              DOC_STATUS_HAS_ARTIFACT)
 from config.settings import DOC_BUTTON_DOC_TYPES  # noqa: E402
+from api.constants import DocumentStatus  # noqa: E402
 
 # ★ DB 경로는 **현재 작업 디렉터리가 아니라 이 파일 기준**이다 (2026-08-21 Sprint 246).
 #   상대경로면 다른 폴더에서 실행했을 때 그 폴더에 0바이트 auction.db 가 생기고
@@ -181,8 +182,10 @@ def main() -> int:
 
         now = datetime.now().isoformat()
         for t in targets:
-            conn.execute("UPDATE document_status SET status='FAILED', updated_at=? WHERE id=?",
-                         (now, t["ds_id"]))
+            # 상태값 바인딩 (2026-09-04) - 오타는 0행 매치라 "[APPLIED] N행 반영"을
+            # 찍으면서 실제로는 아무 행도 바뀌지 않는다.
+            conn.execute("UPDATE document_status SET status=?, updated_at=? WHERE id=?",
+                         (DocumentStatus.FAILED.value, now, t["ds_id"]))
         conn.commit()
         print("\n[APPLIED] %d행 반영" % len(targets))
 

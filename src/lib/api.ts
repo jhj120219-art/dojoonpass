@@ -2,7 +2,28 @@
 // FastAPI 백엔드(api_server.py, /api/v1/*) 호출용 최소 래퍼
 // ================================================================
 
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000'
+// ★ 기본값이 `localhost` 가 아니라 **`127.0.0.1`** 이다 (2026-09-04 실측으로 교체).
+//
+// `api_server.py` 는 `uvicorn.run(..., host="127.0.0.1")` 로 **IPv4 루프백에만**
+// 바인딩한다(보안상 의도된 선택이고 `docs/CLAUDE.md` 에 적혀 있다). 그런데 Windows 에서
+// `localhost` 는 **`::1`(IPv6) 로 먼저 해석된다.** 그 주소에는 아무도 듣고 있지 않으므로
+// 연결이 타임아웃될 때까지 기다렸다가 IPv4 로 폴백한다.
+//
+// 실측(2026-09-04, 이 개발 머신):
+//
+//     http://localhost:8000/api/v1/search   p50  2,044ms
+//     http://127.0.0.1:8000/api/v1/search   p50      5.7ms      <- 360배
+//     서버 내부(TestClient) 같은 요청        p50      5.5ms
+//
+// 즉 **서버는 5ms 인데 화면은 2초를 기다린다.** 느린 것이 아니라 아무것도 안 하고
+// 기다리는 시간이고, 화면 하나가 여러 번 부르면 그만큼 곱해진다 — 이 제품이 줄이겠다고
+// 말한 시간(T2D)을 개발/QA 환경에서 통째로 되돌리고 있었다.
+//
+// ★ 배포에는 영향이 없다 — `NEXT_PUBLIC_API_BASE_URL` 이 있으면 그것이 이긴다.
+//   바뀌는 것은 **그 변수를 주지 않았을 때의 기본값**뿐이고, 그 값은 서버가 실제로
+//   바인딩하는 주소와 같아야 한다. `check_release_build.py` 가 배포 빌드에서 이
+//   fallback 이 박혔 나가는 것을 여전히 잡는다.
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000'
 
 export class ApiError extends Error {
   status: number

@@ -21,6 +21,11 @@ import pdfplumber
 from storage.database import (get_connection, chunked_for_sql, guard_mass_purge,
                               PURGE_BLOCKED)
 from api.v1.documents import get_doc_dir
+from api.constants import DocumentType
+
+# `load_rights_data.py:_SOURCE` 와 같은 이유다 - 이 파일도 같은 값을
+# 다섯 자리에서 반복했고 그중 셋이 대량 삭제 차단기다(2026-09-04).
+_SOURCE = DocumentType.SPEC.value
 
 # 헤더 셀 텍스트 -> 필드명 매칭 규칙.
 # 원본 서식이 "보 증 금"처럼 글자 사이에 공백을 넣는 경우가 있어, 매칭은 공백을 모두 제거한
@@ -254,18 +259,20 @@ def load_item(conn, item_id: int, court_name: str, case_no: str, item_no: str) -
         return "table_found_no_rows"
 
     now = datetime.now().isoformat()
-    conn.execute("DELETE FROM tenant_rights WHERE item_id = ? AND source = 'SPEC'", (item_id,))
+    conn.execute("DELETE FROM tenant_rights WHERE item_id = ? AND source = ?",
+                 (item_id, _SOURCE))
     for t in tenants:
         conn.execute(
             """
             INSERT INTO tenant_rights (
                 item_id, tenant_name, occupied_area, deposit, monthly_rent,
                 move_in_date, fixed_date, demand_date, has_demand, source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'SPEC', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id, t["tenant_name"], t["occupied_area"], t["deposit"], t["monthly_rent"],
-                t["move_in_date"], t["fixed_date"], t["demand_date"], t["has_demand"], now,
+                t["move_in_date"], t["fixed_date"], t["demand_date"], t["has_demand"],
+                _SOURCE, now,
             ),
         )
     conn.commit()
@@ -299,13 +306,13 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     # ★ 대량 삭제 차단기 (2026-09-02). 판정 규칙은 `storage/database.py:guard_mass_purge()`
     #   한 곳에만 둔다 — 같은 규칙을 두 스크립트에 베끼면 갈라진다(BUGS #204).
     existing = conn.execute(
-        "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC'").fetchone()[0]
+        "SELECT COUNT(*) FROM tenant_rights WHERE source=?", (_SOURCE,)).fetchone()[0]
     to_delete = 0
     for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
         placeholders = ",".join("?" * len(chunk))
         to_delete += conn.execute(
-            "SELECT COUNT(*) FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)"
-            % placeholders, chunk).fetchone()[0]
+            "SELECT COUNT(*) FROM tenant_rights WHERE source=? AND item_id IN (%s)"
+            % placeholders, [_SOURCE] + list(chunk)).fetchone()[0]
 
     blocked = guard_mass_purge(existing, to_delete, "SPEC 파생 행 정리")
     if blocked:
@@ -316,8 +323,8 @@ def purge_orphans(conn, missing_file_item_ids, evidence_found: int):
     for chunk in chunked_for_sql(missing_file_item_ids, conn=conn):
         placeholders = ",".join("?" * len(chunk))
         removed += conn.execute(
-            "DELETE FROM tenant_rights WHERE source='SPEC' AND item_id IN (%s)" % placeholders,
-            chunk,
+            "DELETE FROM tenant_rights WHERE source=? AND item_id IN (%s)" % placeholders,
+            [_SOURCE] + list(chunk),
         ).rowcount
     conn.commit()
     return removed

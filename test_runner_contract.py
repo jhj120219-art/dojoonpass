@@ -259,12 +259,147 @@ def test_verdict_vocabulary_matches_reality():
                    any(m in body for m in R.SKIP_MARKERS), f)
 
 
+# ---------------------------------------------------------------------------
+# 테스트 **대역**이 실물 시그니처를 따라가는가 (2026-09-04 신설)
+# ---------------------------------------------------------------------------
+def test_doubles_accept_what_the_real_function_accepts():
+    """`_patch_all({...})` 로 갈아끼우는 대역이 실물만큼 인자를 받는가.
+
+    ## 왜 필요한가 — 규칙은 이미 적혀 있는데 지키는 것이 없었다
+
+    `test_doc_worker_recovery.py` 가 그 규칙을 문장으로 적어 두고 있다:
+
+        `claim_token` 은 2026-08-24 Sprint 254(BUGS #181)에 붙었다. 대역도 실물과 같은
+        모양이어야 한다 — 고정 인자 2개로 두면 워커가 토큰을 넘기기 시작한 날 대역만
+        터져서, **제품 결함이 아닌 것을 결함처럼 보이게** 만든다.
+
+    적어 두기만 했지 **아무도 확인하지 않았다.** 실제로 두 번 어긋났다:
+
+        2026-09-04  `release_queue_rows()` 에 `claim_tokens` 를 더하자 대역 6개가
+                    `lambda ids: 0` 이라 전부 TypeError — 제품은 멀쩡한데 스위트가 붉었다.
+        2026-09-04  `claim_next_item_rows(max_rows=8)` 의 대역 5개가 `lambda: []` 였다.
+                    지금은 호출부가 인자를 안 넘겨 우연히 통과할 뿐이다.
+
+    ## 방향이 중요하다 — "실물만큼 받는가"만 본다
+
+    대역이 실물보다 **더 받는 것**은 막지 않는다(해가 없다). 막는 것은 **덜 받는
+    것**뿐이다 — 그것이 위 두 사고의 모양이다. `*args` 대역도 통과시킨다.
+
+    ★ 이 검사가 잡는 것은 제품 결함이 아니라 **검사 도구의 결함**이다. 그래서
+      실행기 계약을 다루는 이 파일에 둔다(`run_python_tests.py` 자신을 검사하는 것과
+      같은 취지 — 도구가 조용히 거짓말하는 자리를 막는다).
+    """
+    import ast
+    import inspect
+    import subprocess as _sp
+
+    print("\n--- 테스트 대역이 실물 시그니처를 따라가는가 ---")
+    root = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, root)
+    import storage.database as db
+
+    real = {}
+    for name, fn in vars(db).items():
+        if (callable(fn) and getattr(fn, "__module__", "") == "storage.database"
+                and not name.startswith("_")):
+            try:
+                real[name] = inspect.signature(fn)
+            except (ValueError, TypeError):
+                continue
+    check_true("실물 함수를 실제로 모았다 (%d개)" % len(real), len(real) >= 15)
+
+    def max_positional(sig):
+        """받을 수 있는 위치 인자 최대 개수. `*args` 면 None(무제한)."""
+        hi = 0
+        for p in sig.parameters.values():
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                hi += 1
+            elif p.kind == p.VAR_POSITIONAL:
+                return None
+        return hi
+
+    try:
+        out = _sp.run(["git", "ls-files", "test_*.py"], cwd=root,
+                      capture_output=True, text=True, timeout=30)
+        files = ([f for f in out.stdout.split()
+                  if f.endswith(".py") and "-DESKTOP-" not in f]
+                 if out.returncode == 0 else [])
+    except (OSError, _sp.SubprocessError):
+        files = []
+    # ★ git 이 없으면 **조용히 돌아가지 않는다** (2026-09-04 변이 M19).
+    #
+    #   처음에는 여기서 `print("[SKIP]"); return` 했다. 그런데 그러면 파일 열거가
+    #   어떤 이유로든 비는 순간 이 검사는 **아무 말 없이 초록**이 된다 - 이 파일이
+    #   막으려는 바로 그 모양이다("판정이 망가지면 결과는 빨간색이 아니라 초록색으로
+    #   기운다"). 변이 검증에서 실제로 살아남았다.
+    #
+    #   그래서 디렉터리 열거로 되돌아간다. 저장소 안에서는 어느 쪽이든 비지 않고,
+    #   정말로 비면 아래 하한이 붉게 잡는다.
+    if len(files) < 20:
+        files = sorted(n for n in os.listdir(root)
+                       if n.startswith("test_") and n.endswith(".py")
+                       and "-DESKTOP-" not in n)
+    check_true("훑을 검사 파일을 실제로 찾았다 (%d개)" % len(files), len(files) >= 20)
+
+    offenders = []
+    checked = 0
+    for rel in files:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        try:
+            tree = ast.parse(io.open(path, encoding="utf-8-sig").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, val in zip(node.keys, node.values):
+                if not (isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)):
+                    continue
+                if key.value not in real or not isinstance(val, ast.Lambda):
+                    continue
+                checked += 1
+                if val.args.vararg:
+                    continue                      # `*a` 대역은 무엇이든 받는다
+                double_max = len(val.args.args)
+                need = max_positional(real[key.value])
+                if need is not None and double_max < need:
+                    offenders.append(
+                        "%s:%d  %s  대역 %d개 < 실물 %d개  %s"
+                        % (rel, val.lineno, key.value, double_max, need,
+                           real[key.value]))
+
+    # 하한 - dict 대역을 한 개도 못 찾았으면 이 검사는 공허하다.
+    check_true("대역을 실제로 찾았다 (%d개)" % checked, checked >= 20)
+    if offenders:
+        print("   ★ 실물보다 인자를 적게 받는 대역:")
+        for o in sorted(set(offenders)):
+            print("      %s" % o)
+        print("   제품이 그 인자를 넘기기 시작하면 대역만 터진다 - 실물과 같은 모양으로 두라")
+    check("실물보다 좁은 대역이 없다", sorted(set(offenders)), [])
+
+    # 탐지기 자기 증명 - 합성 입력에서 반드시 잡혀야 한다.
+    probe = ast.parse("d = {'release_queue_rows': lambda ids: 0}")
+    found = []
+    for node in ast.walk(probe):
+        if isinstance(node, ast.Dict):
+            for key, val in zip(node.keys, node.values):
+                if (isinstance(key, ast.Constant) and key.value in real
+                        and isinstance(val, ast.Lambda) and not val.args.vararg):
+                    need = max_positional(real[key.value])
+                    if need is not None and len(val.args.args) < need:
+                        found.append(key.value)
+    check_true("탐지기가 좁은 대역을 실제로 잡는다(자기 증명)",
+               found == ["release_queue_rows"])
+
+
 if __name__ == "__main__":
     test_exit_code_beats_wording()
     test_no_verdict_is_not_a_pass()
     test_summary_separates_pass_from_not_run()
     test_discover_finds_new_files_and_admits_its_blind_spot()
     test_verdict_vocabulary_matches_reality()
+    test_doubles_accept_what_the_real_function_accepts()
 
     print("\n" + "=" * 55)
     if failures:

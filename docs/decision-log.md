@@ -4,11 +4,52 @@ Status: Active
 
 Owner: Project Management
 
-Last Updated: 2026-08-07
+Last Updated: 2026-09-04
 
 ---
 
 # Core Decisions
+
+## Product Positioning (2026-09-04 개정, CEO 확정)
+
+결정
+
+- 콕찰은 **본업이 있는 투자자를 위한 경매 의사결정 서비스**다
+- 경쟁축은 데이터 양·가격·AI 가 아니라 **Time to Decision(T2D)** 이다
+- 사용자 흐름은 `DISCOVER -> REVIEW -> FIELD -> DECIDE` 이고, **단계 간 연결**이 제품이다
+- 외부 제품 정의에서 "저빈도 투자자 / 월 N건 / 저렴한 / AI 경매서비스 / 공공 경매정보"를
+  핵심 고객·가치로 쓰지 않는다. 사용 빈도는 **내부 행동 세그먼트**로만 쓴다
+
+영향
+
+- `docs/PRODUCT_STRATEGY.md` (정본), `README.md`, `docs/roadmap.md`,
+  `CEO/04 Product Strategy.md`, `CEO/05 Business Model.md`
+
+---
+
+## 임장(FIELD)과 판단(DECIDE) — 기록하되 대신하지 않는다 (2026-09-04)
+
+결정
+
+- 임장 기록(체크리스트/메모/위험요소)과 입찰 판단(BID/HOLD/DROP)을 제품 안에 둔다
+- **판단은 사용자가 고른다.** 제품은 점수·추천·수익률을 계산해 제시하지 않는다
+  (아래 "Out of Scope" 의 자동 투자판단 금지와 같은 선이다 — 이 기능은 그 선을 넘지 않는다)
+- 체크리스트 어휘의 정본은 `api/v1/field_visits.py:CHECK_ITEMS` 하나다
+- 임장 기록은 `auction_item` 에 붙는다(관심물건 해제와 무관하게 남는다)
+
+영향
+
+- `api/v1/field_visits.py`, `src/app/properties/[id]/field/`,
+  migration 030, `test_field_visits.py`
+
+미결(승인 필요)
+
+- 임장 **사진**: 업로드 경로가 없고 multipart 는 신규 의존성. 사용자 파일의
+  저장 위치·용량·정리 정책은 제품 결정이라 임의로 만들지 않았다
+- migration 030 / 031 운영 적용
+- 임장 없이 내리는 판단(지금은 판단이 임장 기록에 붙어 있다)
+
+---
 
 ## Service Name
 

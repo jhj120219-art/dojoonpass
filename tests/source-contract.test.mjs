@@ -19,7 +19,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { KNOWN_UNSUPPORTED } from './_search_param_contract.mjs'
-import { readTsFields } from './_ts_interface.mjs'
+import { readTsFields, readTsKeys } from './_ts_interface.mjs'
 
 describe('검색 실행이 현재 pathname을 유지한다 (MASTER_SPEC §8.2) — 소스 계약', () => {
   test('검색 Form이 /search로 하드코딩 push하지 않는다', () => {
@@ -1600,50 +1600,46 @@ describe('인증 필요 응답 ↔ 프런트 타입 (2026-08-31) — 소스 계�
     return new Set(best)
   }
 
-  async function tsKeys(file, name) {
-    const src = await read(file)
-    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
-    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
-    let depth = 1
-    let i = m.index + m[0].length
-    const start = i
-    while (i < src.length && depth > 0) {
-      if (src[i] === '{') depth++
-      else if (src[i] === '}') depth--
-      i++
-    }
-    let body = src.slice(start, i - 1)
-    for (;;) {
-      const next = body.replace(/\{[^{}]*\}/g, '')
-      if (next === body) break
-      body = next
-    }
-    const required = new Set()
-    const optional = new Set()
-    for (const line of body.split('\n')) {
-      const code = line.split('//')[0].trim()
-      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
-      if (!km) continue
-      ;(km[2] === '?' ? optional : required).add(km[1])
-    }
-    return { required, optional, all: new Set([...required, ...optional]) }
-  }
+  // 선언 파서는 `tests/_ts_interface.mjs` 하나만 쓴다 (2026-09-04 통합).
+  // 이 파일이 두 자리에서 그 규칙을 적어 두고 있었는데, 정작 같은 파서가
+  // 여기 두 벌 + `frontend-contract.test.mjs` 한 벌로 **세 벌 더** 복사돼 있었다.
+  // 복사본은 글자까지 같아 지금은 결과가 같지만, 규칙이 바뀌는 날 한쪽만 고쳐진다
+  // (이 저장소가 BUGS #224 에서 겪은 모양 그대로다).
+  const tsKeys = (file, name) => readTsKeys(file, name)
 
+  // [라벨, 파이썬 직렬화기, 함수명, TS 선언 파일, 타입 이름, 양쪽에 반드시 있는 대표 키]
+  //
+  // ★ 대표 키를 **케이스마다** 둔다 (2026-09-04). 예전에는 `case_no` 로 못박혀 있었는데,
+  //   그건 물건 카드 계열에만 있는 키다. 임장처럼 카드가 아닌 응답을 추가하는 순간
+  //   "검사가 공허하지 않다"가 엉뚱하게 실패한다 — 목록을 늘리기 어렵게 만드는 가드는
+  //   결국 목록이 뒤처지게 만든다(이 저장소가 여러 번 겪은 모양).
   const CASES = [
     ['GET /api/v1/favorites', 'api/v1/favorites.py', 'get_favorites',
-     'src/app/favorites/page.tsx', 'FavoriteItem'],
+     'src/app/favorites/page.tsx', 'FavoriteItem', 'case_no'],
     ['GET /api/v1/recent-items', 'api/v1/recent_items.py', 'get_recent_items',
-     'src/app/properties/recent/page.tsx', 'RecentItem'],
+     'src/app/properties/recent/page.tsx', 'RecentItem', 'case_no'],
+    // 2026-09-04 임장(FIELD). `_serialize()` 가 응답 모양을 한 벌만 만들고
+    // 시작/조회/저장/완료/판단이 전부 그것을 쓴다 — 그래서 이 한 쌍만 대조하면 된다.
+    ['GET /api/v1/field-visits/{item_id}', 'api/v1/field_visits.py', '_serialize',
+     'src/app/properties/[id]/field/page.tsx', 'FieldVisit', 'item_id'],
+  ]
+
+  // 곁딸린 배열(`checks[]`)도 같은 규약으로 본다 — 항목 키가 갈라지면 화면이
+  // 체크 상태를 못 읽는데 런타임 오류가 나지 않아 조용히 어긋난다.
+  const NESTED_CASES = [
+    ['field-visits checks[]', 'api/v1/field_visits.py', 'checks.append({',
+     'src/app/properties/[id]/field/page.tsx', 'FieldCheck'],
   ]
 
   test('검사가 공허하지 않다 — 양쪽 키를 실제로 뽑았다', async () => {
-    for (const [label, py, fn, ts, iface] of CASES) {
+    for (const [label, py, fn, ts, iface, sentinel] of CASES) {
       const api = await apiKeys(py, fn)
       const t = await tsKeys(ts, iface)
       assert.ok(api.size > 10, `${label}: API 키 추출 실패 (${api.size}개)`)
       assert.ok(t.all.size > 10, `${label}: TS 키 추출 실패 (${t.all.size}개)`)
       // 두 쪽 다 아는 대표 키가 실제로 잡히는지 확인한다.
-      assert.ok(api.has('case_no') && t.all.has('case_no'), `${label}: case_no 를 못 찾았습니다`)
+      assert.ok(api.has(sentinel) && t.all.has(sentinel),
+        `${label}: ${sentinel} 를 못 찾았습니다`)
     }
   })
 
@@ -1662,6 +1658,39 @@ describe('인증 필요 응답 ↔ 프런트 타입 (2026-08-31) — 소스 계�
       const api = await apiKeys(py, fn)
       const t = await tsKeys(ts, iface)
       const phantom = [...t.required].filter((k) => !api.has(k)).sort()
+      assert.deepEqual(phantom, [],
+        `${label}: ${iface} 가 필수라고 적었는데 응답에 없는 키입니다: ${phantom.join(', ')}`)
+    }
+  })
+
+  test('★ 곁딸린 배열(checks[])의 키도 화면 타입과 맞는다', async () => {
+    // `_serialize()` 안쪽의 `checks.append({...})` 는 위 apiKeys() 가 고르는
+    // "가장 큰 dict" 가 아니라서 그 검사에 잡히지 않는다. 항목 키가 갈라지면
+    // 화면이 체크 상태를 못 읽는데 **런타임 오류가 나지 않아** 조용히 어긋난다.
+    const { promises: fs } = await import('node:fs')
+    for (const [label, py, marker, tsFile, iface] of NESTED_CASES) {
+      const code = await fs.readFile(py, 'utf8')
+      const at = code.indexOf(marker)
+      assert.ok(at !== -1, `${label}: ${py} 에서 ${marker} 를 찾지 못했습니다`)
+      // 중괄호 짝을 세어 블록 끝을 찾는다.
+      let i = at + marker.length
+      let depth = 1
+      while (i < code.length && depth > 0) {
+        if (code[i] === '{') depth++
+        else if (code[i] === '}') depth--
+        i++
+      }
+      const apiKeysNested = new Set(
+        [...code.slice(at, i).matchAll(/^\s*"([a-zA-Z_][a-zA-Z0-9_]*)"\s*:/gm)]
+          .map((m) => m[1]))
+      const t = await tsKeys(tsFile, iface)
+      assert.ok(apiKeysNested.size >= 3,
+        `${label}: 응답 키를 ${apiKeysNested.size}개밖에 못 읽었습니다`)
+      assert.ok(t.all.size >= 3, `${label}: TS 키를 ${t.all.size}개밖에 못 읽었습니다`)
+      const undeclared = [...apiKeysNested].filter((k) => !t.all.has(k)).sort()
+      const phantom = [...t.required].filter((k) => !apiKeysNested.has(k)).sort()
+      assert.deepEqual(undeclared, [],
+        `${label}: 응답에는 있는데 ${iface} 에 없는 키입니다: ${undeclared.join(', ')}`)
       assert.deepEqual(phantom, [],
         `${label}: ${iface} 가 필수라고 적었는데 응답에 없는 키입니다: ${phantom.join(', ')}`)
     }
@@ -1723,35 +1752,12 @@ describe('마이페이지 3종 응답 ↔ 프런트 타입 (2026-08-31) — 소�
     return new Set(best)
   }
 
-  async function tsKeys(file, name) {
-    const src = await read(file)
-    const m = new RegExp(String.raw`(?:interface|type)\s+${name}\s*=?\s*\{`).exec(src)
-    assert.ok(m, `${file} 에서 ${name} 선언을 찾지 못했습니다`)
-    let depth = 1
-    let i = m.index + m[0].length
-    const start = i
-    while (i < src.length && depth > 0) {
-      if (src[i] === '{') depth++
-      else if (src[i] === '}') depth--
-      i++
-    }
-    let body = src.slice(start, i - 1)
-    for (;;) {
-      const next = body.replace(/\{[^{}]*\}/g, '')
-      if (next === body) break
-      body = next
-    }
-    const required = new Set()
-    const all = new Set()
-    for (const line of body.split('\n')) {
-      const code = line.split('//')[0].trim()
-      const km = /^([a-zA-Z_][a-zA-Z0-9_]*)(\??)\s*:/.exec(code)
-      if (!km) continue
-      all.add(km[1])
-      if (km[2] !== '?') required.add(km[1])
-    }
-    return { required, all }
-  }
+  // 선언 파서는 `tests/_ts_interface.mjs` 하나만 쓴다 (2026-09-04 통합).
+  // 이 파일이 두 자리에서 그 규칙을 적어 두고 있었는데, 정작 같은 파서가
+  // 여기 두 벌 + `frontend-contract.test.mjs` 한 벌로 **세 벌 더** 복사돼 있었다.
+  // 복사본은 글자까지 같아 지금은 결과가 같지만, 규칙이 바뀌는 날 한쪽만 고쳐진다
+  // (이 저장소가 BUGS #224 에서 겪은 모양 그대로다).
+  const tsKeys = (file, name) => readTsKeys(file, name)
 
   // 응답에는 있지만 타입에 적지 않기로 **한 것**. 늘리려면 근거가 있어야 한다.
   const MYPAGE = [
@@ -2364,6 +2370,33 @@ describe('DB 스키마 ↔ 프런트 타입 nullability (직렬화가 보정하�
     assert.equal(f.get('is_favorited').nullable, false)
   })
 
+  // ★ 공용 파서의 **required / optional 구별**을 여기서 고정한다 (2026-09-04).
+  //
+  //   `?`(옵셔널)와 `| null` 은 다른 말이다 —
+  //     `foo?: string`        서버가 그 키를 **안 줄 수 있다**
+  //     `foo: string | null`  주긴 주는데 값이 비어 있을 수 있다
+  //   키 대조("타입이 필수라고 적은 키가 응답에 실제로 있는가")는 그 구별 위에 서 있다.
+  //
+  //   변이 검증에서 `optional` 을 **항상 true** 로 만들어 봤더니 프런트 스위트
+  //   329개가 전부 통과했다. 모든 키가 "없어도 되는 키"가 되어 그 검사들이 통째로
+  //   공허해지는데 아무 신호가 없었다. 파서를 한 곳으로 모은 만큼, 그 한 곳이
+  //   무뎌지면 소비자 셋이 함께 무뎌진다 — 그래서 여기서 붙든다.
+  test('자기 검증 — 공용 파서가 optional(`?`) 과 필수를 구별한다', async () => {
+    const k = await readTsKeys('src/app/properties/[id]/page.tsx', 'DocumentStatusItem')
+    // 실제 선언: `doc_type: string` (필수) / `available?: boolean` (옵셔널)
+    assert.ok(k.required.has('doc_type'),
+      '필수 선언을 optional 로 잘못 읽습니다 — 키 대조가 공허해집니다')
+    assert.ok(k.optional.has('available'),
+      'optional 선언을 필수로 잘못 읽습니다 — 없는 키를 있다고 요구하게 됩니다')
+    assert.ok(!k.optional.has('doc_type'), '필수 키가 optional 집합에도 들어 있습니다')
+    assert.ok(!k.required.has('available'), 'optional 키가 필수 집합에도 들어 있습니다')
+    // `| null` 은 optional 이 아니다 — 둘을 합치면 위 구별이 사라진다.
+    assert.ok(k.required.has('status'),
+      '`string | null` 을 optional 로 읽습니다 — `?` 와 `| null` 을 합치고 있습니다')
+    assert.equal(k.all.size, k.required.size + k.optional.size,
+      'all 이 required/optional 의 합이 아닙니다')
+  })
+
   test('★ NULL 을 허용하는 컬럼은 화면 타입도 nullable 이다', async (t) => {
     const probe = await schemaNotNull('auction_item')
     if (probe === null) {
@@ -2399,5 +2432,71 @@ describe('DB 스키마 ↔ 프런트 타입 nullability (직렬화가 보정하�
       '(api/v1/item.py · search.py · favorites.py · recent_items.py).',
       bad.join(' / '),
     ].join(' '))
+  })
+})
+
+describe('상세 진입은 왕복 한 번이다 (2026-09-05) — 소스 계약', () => {
+  // ## 무엇을 막나
+  //
+  // 상세 화면은 진입할 때 `GET /api/v1/item/{id}` 를 받은 **뒤에 이어서**
+  // `GET /api/v1/registry-requests`(내 신청 **전체**)를 한 번 더 불렀다. 그러고는
+  // `find(r => r.item_id === id)` 로 한 건만 골라 썼다.
+  //
+  //   - 순차라 지연이 겹치지 않고 **더해진다**
+  //   - 한 건이 필요한데 전체를 받아 비용이 **이력에 비례해 커진다**
+  //     (실측: 신청 50건이면 14,736 B vs 지금 127 B 고정)
+  //
+  // 서버가 같은 선택을 해서 상세 응답의 `registry_request` 로 실어 준다. 이 검사는
+  // 그 왕복이 **다시 생기는 것**을 막는다. 성능 개선은 조용히 되돌아오기 쉽다 —
+  // 되돌아와도 화면은 똑같이 동작하므로 아무도 알아채지 못한다.
+  //
+  // ★ 신청을 **만드는** 호출(POST)은 그대로 둔다. 막는 것은 "상태를 알려고 목록을
+  //   받아 오는 것"이지 등기부 기능 자체가 아니다.
+  const DETAIL = 'src/app/properties/[id]/page.tsx'
+  // 이 파일은 `fs` 를 최상위에서 가져오지 않는다 - 다른 describe 와 같은 규약으로
+  // 각자 동적 import 한다.
+  const read = async (p) => (await import('node:fs')).promises.readFile(p, 'utf8')
+
+  test('검사가 공허하지 않다 — 상세 화면을 실제로 읽었고 등기부를 다룬다', async () => {
+    const src = await read(DETAIL)
+    assert.ok(src.length > 5000, `상세 화면이 너무 짧습니다 (${src.length}자)`)
+    assert.ok(src.includes('registry-requests'),
+      '상세 화면에서 등기부 관련 코드를 찾지 못했습니다 — 검사 대상이 사라졌습니다')
+  })
+
+  test('★ 상세가 등기부 상태를 상세 응답에서 읽는다', async () => {
+    const src = await read(DETAIL)
+    // ★ 앵커를 **상세 로드 지점**에 둔다 (2026-09-05, 변이 D6 이 드러냄).
+    //   처음에는 `data.registry_request` 만 봤는데, 그 모양은 결제 응답을 반영하는
+    //   기존 코드(`result.data.registry_request`)에도 걸린다. 그래서 상세가 그 값을
+    //   **버려도** 검사가 통과했다 — 넓은 정규식이 만든 조용한 초록이다.
+    assert.ok(/setRegistryRequest\(\s*data\.registry_request/.test(src),
+      '상세 응답의 `registry_request` 를 화면 상태로 세우지 않습니다 — 그러면 그 '
+      + '상태를 어딘가에서 또 받아 와야 합니다')
+    assert.ok(/registry_request:\s*RegistryRequestSummary/.test(src),
+      '상세 타입에 `registry_request` 가 선언돼 있지 않습니다')
+  })
+
+  test('★ 상세가 등기부 목록을 다시 받아 오지 않는다', async () => {
+    const src = await read(DETAIL)
+    // 주석은 지운다 — 위 설명 자체가 엔드포인트 이름을 담고 있다.
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+
+    const listReads = [...code.matchAll(/(fetchAuthedJSON|fetchJSON)\s*<[^>]*>\s*\(\s*['"`]\/api\/v1\/registry-requests['"`]/g)]
+    assert.equal(listReads.length, 0,
+      `상세 화면이 등기부 목록을 다시 받아 옵니다 (${listReads.length}곳). `
+      + '그 상태는 상세 응답의 `registry_request` 로 이미 옵니다.')
+
+    // 배열로 받는 모양 자체가 "전체를 받아 하나를 고른다"의 표식이다.
+    assert.ok(!/RegistryRequestSummary\[\]/.test(code),
+      '상세 화면이 등기부 신청을 **배열**로 받습니다 — 한 건이 필요한 자리입니다.')
+  })
+
+  test('신청을 만드는 호출(POST)은 그대로 있다 — 기능을 지운 게 아니다', async () => {
+    const src = await read(DETAIL)
+    assert.ok(/postJSON<[^>]*>\(\s*['"`]\/api\/v1\/registry-requests['"`]/.test(src),
+      '등기부 신청 생성 호출이 사라졌습니다 — 왕복을 줄이려다 기능을 지웠습니다')
   })
 })
